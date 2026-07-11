@@ -17,3 +17,7 @@ path = "src/bin/inspect.rs"
 [dependencies]
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }
+
+[[bin]]
+name = "wer-replay"
+path = "src/bin/replay.rs"

@@ -32,3 +32,23 @@ pub trait TaskExecutor {
     /// budgeting. Returns at least 1.
     fn parallelism(&self) -> usize;
 }
+
+/// Runs every job synchronously on the calling thread.
+///
+/// Platform-neutral (it spawns nothing), so it lives here rather than in a
+/// platform crate. This is the executor for headless tools, tests, and the
+/// continuity replay (phase-1-plan.md section 11.3), and the reference for the
+/// ordering-independence contract: results integrated through a real thread
+/// pool must be indistinguishable from results integrated inline.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InlineExecutor;
+
+impl TaskExecutor for InlineExecutor {
+    fn submit(&self, _priority: TaskPriority, job: Box<dyn FnOnce() + Send>) {
+        job();
+    }
+
+    fn parallelism(&self) -> usize {
+        1
+    }
+}

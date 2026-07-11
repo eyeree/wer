@@ -14,4 +14,8 @@ workspace = true
 glam = { workspace = true }
 
 [dev-dependencies]
-# (none yet — determinism tests use only the public API)
+criterion = { workspace = true }
+
+[[bench]]
+name = "generation"
+harness = false

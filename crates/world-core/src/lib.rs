@@ -16,13 +16,26 @@
 // facilities that break the wasm build. We stay on `std` for now (allocation,
 // collections) but forbid the obviously non-portable pieces via review + CI.
 
+pub mod anchor;
+pub mod climate;
 pub mod coord;
+pub mod ecology;
+pub mod field;
 pub mod hash;
+pub mod layer;
 pub mod possibility;
+pub mod possibility_field;
+pub mod terrain;
 
+pub use anchor::{domain_mask, project_plausible, steer, Anchor, AnchorKind};
+pub use climate::{climate, Climate};
 pub use coord::{LocalPos, RegionCoord, REGION_SIZE};
+pub use ecology::vegetation_density;
+pub use field::{FieldTile, FIELD_RES};
 pub use hash::{feature_hash, mix, splitmix64, FeatureKey, Rng};
-pub use possibility::{PossibilityDomain, PossibilityVector};
+pub use possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS};
+pub use possibility_field::PossibilityField;
+pub use terrain::{elevation, is_water, SEA_LEVEL};
 
 /// Version of the world-generation algorithms. Any change that alters generated
 /// output for the same inputs MUST bump this so persisted worlds can detect that

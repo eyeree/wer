@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 world-core = { path = "../world-core" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "update"
+harness = false

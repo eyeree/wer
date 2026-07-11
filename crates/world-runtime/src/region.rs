@@ -68,10 +68,12 @@ impl RegionState {
         if next != self.current {
             self.current = next;
             self.revision = self.revision.wrapping_add(1);
-            // Any change to realized state dirties all dependent layers; a real
-            // implementation will narrow this using the dependency graph
-            // (section 6.5). For the bootstrap we conservatively mark everything.
-            self.dirty_layers = u32::MAX;
+            // Possibility drift dirties only the possibility-dependent layers
+            // (climate, ecology). Terrain depends on position + the slow dims
+            // through a smooth map and is deliberately never dirtied by drift —
+            // the Phase 1 incremental-regeneration narrowing (phase-1-plan.md
+            // section 6.4; Phase 2 generalizes this into a dependency graph).
+            self.dirty_layers |= world_core::layer::DRIFT_LAYERS;
             true
         } else {
             false

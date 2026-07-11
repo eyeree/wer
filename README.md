@@ -11,9 +11,11 @@ See the design and architecture documents:
 - [`implementation-plan.md`](implementation-plan.md) — the high-level technical plan.
 - [`docs/adr/`](docs/adr/) — architecture decision records.
 
-This repository is currently at **Phase 0** (architecture and technical spikes):
-a compiling workspace with deterministic core primitives, a native window shell,
-and a wasm smoke target.
+This repository is currently at **Phase 1** (continuous world transformation
+prototype, see [`phase-1-plan.md`](phase-1-plan.md)): an infinite deterministic
+heightfield with climate and ecology layers, a sparse possibility field steered
+by anchors, distance-based stability streaming, and an interactive false-color
+debug map that makes continuity — or its failure — visible.
 
 ## Workspace layout
 
@@ -23,12 +25,12 @@ hold everything OS/browser-specific (see
 
 | Crate | Kind | Responsibility |
 |-------|------|----------------|
-| [`world-core`](crates/world-core) | neutral lib | Deterministic hashing, coordinates, possibility space. |
-| [`world-runtime`](crates/world-runtime) | neutral lib | Region lifecycle, abstract storage & task interfaces. |
-| [`renderer`](crates/renderer) | native/gpu lib | wgpu/WGSL renderer (clear-screen for now). |
-| [`platform-native`](crates/platform-native) | bin `wer` | winit window + event loop; native services. |
+| [`world-core`](crates/world-core) | neutral lib | Deterministic hashing, coordinates, possibility space, terrain/climate/ecology generation. |
+| [`world-runtime`](crates/world-runtime) | neutral lib | Region streaming, convergence, budgeted regeneration; abstract storage & task interfaces. |
+| [`renderer`](crates/renderer) | native/gpu lib | wgpu/WGSL renderer (debug-map presentation). |
+| [`platform-native`](crates/platform-native) | bin `wer` | winit window + event loop, input, Rayon executor. |
 | [`platform-web`](crates/platform-web) | cdylib | wasm-bindgen smoke shell (grows into the browser runtime). |
-| [`tools`](crates/tools) | bin `wer-inspect` | Inspectors, validators, replay tools. |
+| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay` | Inspectors, validators, the continuity replay. |
 
 ## Prerequisites
 
@@ -39,22 +41,50 @@ hold everything OS/browser-specific (see
 ## Common commands
 
 ```sh
-# Build & run the native application shell (opens a window, clears the frame).
-cargo run --bin wer
+# Build & run the interactive continuity prototype (opens the debug map).
+cargo run --release --bin wer
 
-# Deterministic inspector: world position -> region + feature hash.
+# Deterministic inspector: world position -> region, hashes, field samples.
 cargo run --bin wer-inspect -- 300 -10
 
-# Test everything, including the determinism golden fixtures.
+# Headless continuity replay: scripted path + anchors, machine-checked.
+cargo run --bin wer-replay
+
+# Test everything, including determinism goldens and the continuity replay.
 cargo test --workspace
 
+# Generation & streaming benchmarks (sizes the per-frame budgets).
+cargo bench -p world-core --bench generation
+cargo bench -p world-runtime --bench update
+
 # Continuously verify the core still compiles for the browser target.
-cargo check -p world-core -p platform-web --target wasm32-unknown-unknown
+cargo check -p world-core -p world-runtime -p platform-web --target wasm32-unknown-unknown
 
 # Lints & formatting (as run in CI).
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 ```
+
+## Driving the prototype
+
+`cargo run --release --bin wer` opens a top-down false-color map of the
+streaming window centered on the player. Watch the distance transform while the
+ground near you stays put.
+
+| Input | Effect |
+|-------|--------|
+| `WASD` / arrows (+`Shift`) | Move (sprint) |
+| `1`–`8` (+`Shift`) | Nudge a possibility dimension up (down): Planetary, Climate, Geology, Hydrology, Ecology, Morphology, Behavior, Aesthetics |
+| `Z` | Reset all nudges |
+| `E` / `Q` | Drop an Emphasize / Suppress anchor at the player |
+| `C` | Clear anchors |
+| `V` | Cycle channel: biome → elevation → temperature → moisture → vegetation → stability → revision |
+| `G` / `N` / `X` | Toggle region grid / stability rings / changed-while-pinned flash |
+| `Esc` | Quit |
+
+The white and orange rings are the near (pinned) and far (free) stability
+radii. Any region that flashes red changed while pinned — that is a continuity
+bug by definition; the same condition fails `wer-replay` and CI.
 
 ## Browser smoke test
 
