@@ -12,13 +12,16 @@ browser/WebAssembly/WebGPU target) for an exploration game built around
 [`Infinite_World_Exploration_Project_Overview.md`](Infinite_World_Exploration_Project_Overview.md);
 the phased technical plan is in [`implementation-plan.md`](implementation-plan.md).
 
-The repository is at **Phase 0** (architecture + technical spikes): a compiling
-workspace with deterministic core primitives, a native window shell that clears
-the frame, and a wasm smoke target. It is scaffolding — much of the code is
-explicitly marked as throwaway or bootstrap and exists to prove the crate
-boundaries and the portability/determinism contracts hold from day one. Do not
-mistake stubs (`demo_world_tick`, clear-only renderer, one-scalar possibility
-vector) for finished subsystems.
+The repository is at **Phase 2** (layered environmental generation, see
+[`phase-2-plan.md`](phase-2-plan.md)): an eight-layer declared dependency
+graph — terrain, geology, macro drainage, climate, hydrology, soils, biome,
+vegetation — with dependency-hash staleness (ADR 0008), topological
+cost-budgeted dispatch, stable integer river topology (ADR 0009), the
+continuity replay, and the invalidation-precision harness (`wer-ledger`).
+The renderer still only presents one CPU-composed debug texture, the
+possibility vector is still one scalar per domain, and the `Storage` trait is
+still unused — those grow in later phases; do not mistake them for finished
+subsystems.
 
 ## Toolchain
 
@@ -93,17 +96,23 @@ Non-negotiable rules when touching generation code:
 - **Floating point is for approximate simulation and presentation only — never
   for a permanent identity.** Region coordinates are integers quantized from
   continuous positions; feature indices are integers.
-- **The field fold order in `feature_hash` is part of the stable contract.**
-  Changing the hashing, the fold order, or *any* generation algorithm that alters
-  output for the same inputs requires **bumping `WORLD_ALGORITHM_VERSION`**
-  (`world-core/src/lib.rs`) **and updating the golden fixtures in
+- **The field fold order in `feature_hash` (and in `layer_dep_hash`) is part
+  of the stable contract.** Changing the hashing, a fold order, or *any*
+  generation algorithm that alters output for the same inputs requires
+  **bumping `WORLD_ALGORITHM_VERSION`** (`world-core/src/lib.rs`) — or, when
+  the change is confined to one layer's math, **bumping that layer's
+  `algorithm_revision`** in the `world-core/src/layer.rs` declaration table
+  (phase-2-plan.md §9.2) — **and updating the golden fixtures in
   `crates/world-core/tests/determinism.rs` in the same commit**. The golden
   determinism tests exist to catch accidental drift; a casual "just re-bless the
   test" is a determinism bug unless you meant to change the algorithm.
 - **Native and wasm must agree.** `platform_web::origin_feature_hash()` must
   return the identical value as native `cargo run --bin wer-inspect -- 0 0`
-  (currently `0xc830af9c636e1510` at algorithm version 1). This equality is the
-  determinism guarantee the browser port depends on.
+  (currently `0x4c6ca5de38f90b17` at algorithm version 2). The same applies to
+  every parity export (terrain gradient seed, control-point seed, lithology
+  seed, and the drainage routing sample — routing is all-integer topology, so
+  full direction+accumulation equality is required, ADR 0009). This equality
+  is the determinism guarantee the browser port depends on.
 - A portable PRNG (`Rng`) may be seeded *from* a stable hash for approximate
   sampling; its float outputs are not sources of identity.
 

@@ -6,7 +6,7 @@
 //! is testable without a window (phase-1-plan.md section 10).
 
 use font8x8::legacy::BASIC_LEGACY;
-use world_core::{Anchor, AnchorKind, POSSIBILITY_DIMS};
+use world_core::{Anchor, AnchorKind, LAYER_COUNT, POSSIBILITY_DIMS};
 use world_runtime::FrameStats;
 
 use crate::viz::Channel;
@@ -51,9 +51,21 @@ pub struct CursorInfo {
     pub temperature: Option<f32>,
     /// Moisture under the cursor.
     pub moisture: Option<f32>,
+    /// Rock hardness under the cursor.
+    pub hardness: Option<f32>,
+    /// River expression under the cursor.
+    pub river: Option<f32>,
+    /// Surface wetness under the cursor.
+    pub wetness: Option<f32>,
+    /// Soil depth under the cursor.
+    pub soil_depth: Option<f32>,
+    /// Soil fertility under the cursor.
+    pub fertility: Option<f32>,
     /// Vegetation density under the cursor.
     pub vegetation: Option<f32>,
-    /// Biome classification of the cell.
+    /// Canopy height under the cursor.
+    pub canopy: Option<f32>,
+    /// Biome classification of the cell (from the biome id tile).
     pub biome: Option<&'static str>,
 }
 
@@ -66,6 +78,11 @@ pub struct PanelInfo<'a> {
     pub update_ms: f64,
     /// The most recent frame's streaming stats.
     pub stats: FrameStats,
+    /// Cumulative regenerated-tile counts per layer since startup
+    /// (phase-2-plan.md §11 — per-layer regen visibility).
+    pub regen_totals: &'a [u64; LAYER_COUNT as usize],
+    /// Resident macro drainage tiles.
+    pub macro_tiles: usize,
     /// Generation jobs dispatched but not yet integrated.
     pub jobs_in_flight: usize,
     /// Changed-while-pinned events observed so far (0 = continuity holds).
@@ -85,14 +102,7 @@ pub struct PanelInfo<'a> {
 /// Short display names for the eight possibility domains, indexed like
 /// [`world_core::PossibilityDomain::ALL`].
 const DOMAIN_SHORT: [&str; POSSIBILITY_DIMS] = [
-    "Planetary",
-    "Climate",
-    "Geology",
-    "Hydrology",
-    "Ecology",
-    "Morpholog",
-    "Behavior",
-    "Aesthetic",
+    "Plan", "Clim", "Geol", "Hydr", "Ecol", "Morp", "Behv", "Aest",
 ];
 
 /// Composes `map (side × side)` + `panel (PANEL_WIDTH × side)` into one RGBA
@@ -147,7 +157,7 @@ impl Hud {
         let x = self.map_side + MARGIN;
         let mut cur = PanelCursor { x, y: MARGIN };
 
-        cur.line(self, "INFINITE WORLD  PHASE 1", TITLE);
+        cur.line(self, "INFINITE WORLD  PHASE 2", TITLE);
         cur.rule(self);
 
         cur.pair(
@@ -162,7 +172,10 @@ impl Hud {
             "regions",
             &format!("{}", info.stats.active_regions),
             "cache",
-            &format!("{:.1}MB", info.stats.cache_bytes as f64 / (1024.0 * 1024.0)),
+            &format!(
+                "{:.1}MB",
+                (info.stats.cache_bytes + info.stats.macro_cache_bytes) as f64 / (1024.0 * 1024.0)
+            ),
         );
         cur.pair(
             self,
@@ -175,8 +188,18 @@ impl Hud {
             self,
             "converged",
             &format!("{}", info.stats.converged),
-            "regen",
-            &format!("{}", info.stats.layers_regenerated),
+            "cost",
+            &format!("{}", info.stats.regen_cost_spent),
+        );
+        cur.pair(
+            self,
+            "macro tiles",
+            &format!("{}", info.macro_tiles),
+            "macro regen",
+            &format!(
+                "{}",
+                info.regen_totals[world_core::layer::LAYER_DRAINAGE as usize]
+            ),
         );
         let viol_color = if info.pinned_violations == 0 {
             VALUE
@@ -191,24 +214,54 @@ impl Hud {
         );
         cur.rule(self);
 
-        cur.label_value(self, "channel (V)", info.channel.name(), ACTIVE);
-        cur.label_value(
+        // Cumulative per-layer regen counters, two layers per line
+        // (phase-2-plan.md §11): watching these is how invalidation precision
+        // is eyeballed live — an Ecology nudge must tick vegetation only.
+        cur.line(self, "REGEN BY LAYER", HEADER);
+        for pair in (0..LAYER_COUNT as usize).step_by(2) {
+            let entry = |layer: usize| {
+                format!(
+                    "{:<9}{:>6}",
+                    world_core::layer::LAYERS[layer].name,
+                    info.regen_totals[layer]
+                )
+            };
+            let row_y = cur.y;
+            self.text(cur.x, row_y, &entry(pair), VALUE);
+            if pair + 1 < LAYER_COUNT as usize {
+                self.text(cur.x + 16 * 8 * SCALE, row_y, &entry(pair + 1), VALUE);
+            }
+            cur.y += LINE_HEIGHT;
+        }
+        cur.rule(self);
+
+        cur.pair(
             self,
+            "chan",
+            info.channel.name(),
             "player",
-            &format!("{:.0}, {:.0}", info.player.0, info.player.1),
-            VALUE,
+            &format!("{:.0},{:.0}", info.player.0, info.player.1),
         );
         cur.rule(self);
 
         cur.line(self, "BIAS  1-8 up, shift down, Z", HEADER);
-        for (i, name) in DOMAIN_SHORT.iter().enumerate() {
-            let value = info.bias[i];
-            let color = if value.abs() > f32::EPSILON {
-                ACTIVE
-            } else {
-                LABEL
-            };
-            cur.line(self, &format!("{} {:<9} {:+.2}", i + 1, name, value), color);
+        for pair in (0..POSSIBILITY_DIMS).step_by(2) {
+            let row_y = cur.y;
+            for (slot, i) in (pair..(pair + 2).min(POSSIBILITY_DIMS)).enumerate() {
+                let value = info.bias[i];
+                let color = if value.abs() > f32::EPSILON {
+                    ACTIVE
+                } else {
+                    LABEL
+                };
+                self.text(
+                    cur.x + slot * 15 * 8 * SCALE,
+                    row_y,
+                    &format!("{} {} {:+.2}", i + 1, DOMAIN_SHORT[i], value),
+                    color,
+                );
+            }
+            cur.y += LINE_HEIGHT;
         }
         cur.rule(self);
 
@@ -216,7 +269,7 @@ impl Hud {
         if info.anchors.is_empty() {
             cur.line(self, "none", LABEL);
         } else {
-            const SHOWN: usize = 4;
+            const SHOWN: usize = 2;
             for anchor in info.anchors.iter().take(SHOWN) {
                 let kind = match anchor.kind {
                     AnchorKind::Emphasize => "EMPH",
@@ -268,8 +321,8 @@ impl Hud {
                     "rev",
                     &format!("{}", c.revision),
                 );
-                match (c.elevation, c.temperature, c.moisture, c.vegetation) {
-                    (Some(e), Some(t), Some(m), Some(v)) => {
+                match (c.elevation, c.temperature, c.moisture) {
+                    (Some(e), Some(t), Some(m)) => {
                         cur.pair(
                             self,
                             "elev",
@@ -281,8 +334,29 @@ impl Hud {
                             self,
                             "moisture",
                             &format!("{m:.2}"),
+                            "rock",
+                            &c.hardness.map_or("-".into(), |h| format!("{h:.2}")),
+                        );
+                        cur.pair(
+                            self,
+                            "river",
+                            &c.river.map_or("-".into(), |r| format!("{r:.2}")),
+                            "wet",
+                            &c.wetness.map_or("-".into(), |w| format!("{w:.2}")),
+                        );
+                        cur.pair(
+                            self,
+                            "soil",
+                            &c.soil_depth.map_or("-".into(), |d| format!("{d:.2}")),
+                            "fert",
+                            &c.fertility.map_or("-".into(), |f| format!("{f:.2}")),
+                        );
+                        cur.pair(
+                            self,
                             "veg",
-                            &format!("{v:.2}"),
+                            &c.vegetation.map_or("-".into(), |v| format!("{v:.2}")),
+                            "canopy",
+                            &c.canopy.map_or("-".into(), |h| format!("{h:.1}m")),
                         );
                         cur.label_value(self, "biome", c.biome.unwrap_or("?"), ACTIVE);
                     }
@@ -294,12 +368,9 @@ impl Hud {
 
         cur.line(self, "KEYS", HEADER);
         for (keys, action) in [
-            ("WASD/arrows", "move, shift=fast"),
-            ("1-8 shift Z", "nudge bias/reset"),
+            ("WASD 1-8 Z", "move, bias, reset"),
             ("E / Q / C", "anchors, clear"),
-            ("V", "cycle channel"),
-            ("G / N / X", "grid,rings,flash"),
-            ("Esc", "quit"),
+            ("V G N X", "channel,overlays"),
         ] {
             let row_y = cur.y;
             self.text(cur.x, row_y, keys, KEY);

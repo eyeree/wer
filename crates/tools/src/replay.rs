@@ -1,18 +1,26 @@
-//! Headless continuity replay (phase-1-plan.md section 11.3, milestone M4).
+//! Headless continuity replay (phase-1-plan.md section 11.3, extended for the
+//! Phase 2 stack by phase-2-plan.md §12.2).
 //!
 //! Drives a [`RegionMap`] along a scripted, fully deterministic camera path —
 //! moving the player, ramping possibility bias, dropping and clearing anchors —
-//! and machine-checks the Phase 1 success criterion without graphics:
+//! and machine-checks the continuity guarantees without graphics:
 //!
 //! - **Pinned stability**: a region that is pinned (`stability == 1`) across an
-//!   update never bumps its revision, and its drift-layer tiles never change —
-//!   the "no near-field pop" guarantee.
+//!   update never bumps its revision, and none of its tiles (any channel, the
+//!   biome ids) ever change — the "no near-field pop" guarantee.
+//! - **Stable trio**: terrain and geology tiles never change while resident,
+//!   and macro drainage tiles never regenerate — the script drives only fast
+//!   domains, under which the stable trio must hold *everywhere*, not just in
+//!   the pinned zone (phase-2-plan.md §12.2).
 //! - **Bounded per-frame delta**: no cached sample within the window moves more
-//!   than a small epsilon in one frame (no snapping).
+//!   than its channel's epsilon in one frame (no snapping).
+//! - **Macro seams**: river expression steps across macro-tile boundaries stay
+//!   inside the truncated-catchment bound (phase-2-plan.md §7.3).
 //! - **No orphan seams**: adjacent resident regions never differ in target by
 //!   more than the field's per-region gradient bound.
 //! - **Determinism**: two runs of the same script produce bit-identical final
-//!   state (asserted by callers via [`ReplayReport::state_hash`]).
+//!   state — regions, field cache, biome tiles, and macro cache (asserted by
+//!   callers via [`ReplayReport::state_hash`]).
 //!
 //! This replay is the automated proxy for the visual success criterion and
 //! guards against regressions once the prototype "looks right".
@@ -20,12 +28,12 @@
 use std::collections::BTreeMap;
 
 use world_core::{
-    domain_mask, mix, Anchor, AnchorKind, PossibilityDomain, PossibilityField, RegionCoord,
-    POSSIBILITY_DIMS,
+    domain_mask, macro_coord_for, mix, Anchor, AnchorKind, PossibilityDomain, PossibilityField,
+    RegionCoord, POSSIBILITY_DIMS,
 };
 use world_runtime::{
-    Budget, FrameStats, InlineExecutor, RegionMap, StreamConfig, CHANNEL_COUNT, CHANNEL_MOISTURE,
-    CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+    Budget, FrameStats, InlineExecutor, RegionMap, StreamConfig, CHANNEL_CANOPY, CHANNEL_COUNT,
+    CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER, CHANNEL_TEMPERATURE,
 };
 
 /// Script + thresholds for one replay run.
@@ -39,10 +47,18 @@ pub struct ReplayConfig {
     pub budget: Budget,
     /// Player velocity per frame, world units.
     pub velocity: (f64, f64),
-    /// Max allowed per-frame change of a `[0, 1]` field sample.
+    /// Max allowed per-frame change of a `[0, 1]` field sample. Sized to admit
+    /// a biome-classification flip (adjacent classes differ in base density by
+    /// up to ~0.45) while still catching full-range snaps.
     pub unit_epsilon: f32,
     /// Max allowed per-frame change of a temperature sample (°C).
     pub temperature_epsilon: f32,
+    /// Max allowed per-frame change of a canopy-height sample (world units) —
+    /// canopy legitimately steps when a cell's biome class flips.
+    pub canopy_epsilon: f32,
+    /// Max allowed river-expression step between edge-adjacent samples across
+    /// a macro-tile boundary (the truncated-catchment bound, §7.3).
+    pub river_seam_bound: f32,
     /// Max allowed per-dimension target difference between adjacent regions.
     pub seam_bound: f32,
 }
@@ -67,14 +83,16 @@ impl Default for ReplayConfig {
             budget: Budget {
                 max_loads: 64,
                 max_converge_regions: 512,
-                max_regen_layers: 512,
+                max_regen_cost: 2048,
             },
             velocity: (37.0, 23.0),
             // One converge step moves a dimension ≤ converge_rate; generation
             // maps dimensions to samples with modest slopes. Snapping shows up
             // as near-full-range jumps, far above these.
-            unit_epsilon: 0.35,
+            unit_epsilon: 0.6,
             temperature_epsilon: 15.0,
+            canopy_epsilon: 30.0,
+            river_seam_bound: 0.6,
             seam_bound: 0.35,
         }
     }
@@ -87,14 +105,15 @@ pub struct ReplayReport {
     pub frames: u32,
     /// Continuity violations found (capped; empty means the run passed).
     pub violations: Vec<String>,
-    /// Order-stable hash of the final region + cache state. Two runs of the
-    /// same script must produce the same value (single-platform determinism).
+    /// Order-stable hash of the final region + cache + macro state. Two runs
+    /// of the same script must produce the same value (single-platform
+    /// determinism).
     pub state_hash: u64,
     /// Stats from the final frame, for logging.
     pub final_stats: FrameStats,
     /// Peak resident region count observed.
     pub peak_regions: usize,
-    /// Peak field-cache bytes observed.
+    /// Peak field-cache bytes observed (macro cache included).
     pub peak_cache_bytes: usize,
 }
 
@@ -116,7 +135,9 @@ fn record(violations: &mut Vec<String>, message: String) {
 
 /// The scripted possibility bias at a frame: a piecewise-linear ramp that
 /// pushes Ecology and Hydrology up through the middle of the run and eases
-/// back — deterministic, no clocks, no randomness.
+/// back — deterministic, no clocks, no randomness. Fast domains only: the
+/// stable-trio assertion depends on the script never touching Geology or
+/// Planetary.
 fn scripted_bias(frame: u32, frames: u32) -> [f32; POSSIBILITY_DIMS] {
     let mut bias = [0.0f32; POSSIBILITY_DIMS];
     let t = frame as f32 / frames.max(1) as f32;
@@ -168,23 +189,31 @@ fn scripted_anchors(frame: u32, frames: u32, velocity: (f64, f64)) -> Vec<Anchor
     anchors
 }
 
-/// Snapshot of the drift-layer samples of every cached region, used for the
-/// frame-to-frame delta checks.
-type TileSnapshot = BTreeMap<RegionCoord, [Option<Vec<f32>>; CHANNEL_COUNT]>;
+/// Snapshot of every cached tile of every region, for the frame-to-frame
+/// delta checks.
+#[derive(Debug, Default, Clone)]
+struct RegionSnapshot {
+    channels: [Option<Vec<f32>>; CHANNEL_COUNT],
+    biome: Option<Vec<u8>>,
+}
+
+type TileSnapshot = BTreeMap<RegionCoord, RegionSnapshot>;
 
 fn snapshot_tiles(map: &RegionMap) -> TileSnapshot {
     let mut snap = TileSnapshot::new();
     for (&coord, tiles) in map.cache().iter() {
-        let mut channels: [Option<Vec<f32>>; CHANNEL_COUNT] = Default::default();
+        let mut region = RegionSnapshot::default();
         for (i, tile) in tiles.channels.iter().enumerate() {
-            channels[i] = tile.as_ref().map(|t| t.samples().to_vec());
+            region.channels[i] = tile.as_ref().map(|t| t.samples().to_vec());
         }
-        snap.insert(coord, channels);
+        region.biome = tiles.biome.as_ref().map(|t| t.samples().to_vec());
+        snap.insert(coord, region);
     }
     snap
 }
 
-/// Order-stable hash of the full end-of-run state (regions + cache).
+/// Order-stable hash of the full end-of-run state (regions + field cache +
+/// biome tiles + macro cache).
 fn state_hash(map: &RegionMap) -> u64 {
     let mut h: u64 = 0xC017_1401_7CBE_11A5;
     for region in map.iter_active() {
@@ -200,12 +229,28 @@ fn state_hash(map: &RegionMap) -> u64 {
         for tile in tiles.channels.iter().flatten() {
             h = mix(h, tile.content_hash());
         }
+        if let Some(biome) = &tiles.biome {
+            h = mix(h, biome.content_hash());
+        }
+    }
+    for (_, tile) in map.macro_cache().iter() {
+        h = mix(h, tile.content_hash());
     }
     h
 }
 
+/// Per-frame delta bound for a channel.
+fn channel_epsilon(cfg: &ReplayConfig, channel: usize) -> f32 {
+    match channel {
+        CHANNEL_TEMPERATURE => cfg.temperature_epsilon,
+        CHANNEL_CANOPY => cfg.canopy_epsilon,
+        _ => cfg.unit_epsilon,
+    }
+}
+
 /// Run the scripted continuity replay and collect violations.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
     let field = PossibilityField::default();
     let mut map = RegionMap::new(cfg.stream);
@@ -217,6 +262,10 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
     // (revision, pinned) per region from the previous frame.
     let mut prev_state: BTreeMap<RegionCoord, (u32, bool)> = BTreeMap::new();
     let mut prev_tiles = TileSnapshot::new();
+    // Stable-trio ledger: (elevation, hardness) content hashes per region and
+    // macro-tile content hashes, fixed for as long as the entry is resident.
+    let mut trio_hashes: BTreeMap<RegionCoord, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    let mut macro_hashes: BTreeMap<RegionCoord, u64> = BTreeMap::new();
 
     // Travel per frame fuels convergence (ADR 0006); the scripted camera
     // moves at constant velocity except frame 0 (nothing traveled yet).
@@ -241,7 +290,8 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
             &InlineExecutor,
         );
         peak_regions = peak_regions.max(final_stats.active_regions);
-        peak_cache_bytes = peak_cache_bytes.max(final_stats.cache_bytes);
+        peak_cache_bytes =
+            peak_cache_bytes.max(final_stats.cache_bytes + final_stats.macro_cache_bytes);
 
         // -- Pinned stability: pinned before and after ⇒ revision unchanged.
         for region in map.iter_active() {
@@ -260,28 +310,74 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
             }
         }
 
-        // -- Bounded per-frame delta on every cached sample still resident.
+        // -- Stable trio: terrain/geology tiles never change while resident
+        //    (fast-dims-only script), and macro tiles never regenerate.
+        trio_hashes.retain(|c, _| map.get(*c).is_some());
+        for (&coord, tiles) in map.cache().iter() {
+            let elevation = tiles.channels[CHANNEL_ELEVATION]
+                .as_ref()
+                .map(|t| t.content_hash());
+            let hardness = tiles.channels[CHANNEL_HARDNESS]
+                .as_ref()
+                .map(|t| t.content_hash());
+            let entry = trio_hashes.entry(coord).or_insert((None, None));
+            for (label, now, seen) in [
+                ("terrain", elevation, &mut entry.0),
+                ("geology", hardness, &mut entry.1),
+            ] {
+                match (*seen, now) {
+                    (Some(a), Some(b)) if a != b => record(
+                        &mut violations,
+                        format!(
+                            "frame {frame}: stable-trio {label} tile of ({}, {}) changed under fast drift",
+                            coord.x, coord.y
+                        ),
+                    ),
+                    (None, Some(b)) => *seen = Some(b),
+                    _ => {}
+                }
+            }
+        }
+        macro_hashes.retain(|c, _| map.iter_active().any(|r| macro_coord_for(r.coord) == *c));
+        for (&mc, tile) in map.macro_cache().iter() {
+            let now = tile.content_hash();
+            match macro_hashes.get(&mc) {
+                Some(&seen) if seen != now => record(
+                    &mut violations,
+                    format!(
+                        "frame {frame}: macro drainage tile ({}, {}) regenerated under drift",
+                        mc.x, mc.y
+                    ),
+                ),
+                None => {
+                    macro_hashes.insert(mc, now);
+                }
+                _ => {}
+            }
+        }
+
+        // -- Bounded per-frame delta on every cached sample still resident;
+        //    pinned regions must not change at all (any channel, biome ids).
         let tiles_now = snapshot_tiles(&map);
-        for (coord, channels) in &tiles_now {
-            let Some(prev_channels) = prev_tiles.get(coord) else {
+        for (coord, snapshot) in &tiles_now {
+            let Some(prev) = prev_tiles.get(coord) else {
                 continue;
             };
-            for (i, samples) in channels.iter().enumerate() {
-                let (Some(now), Some(before)) = (samples, &prev_channels[i]) else {
+            let pinned_now = map.get(*coord).is_some_and(|r| r.stability >= 1.0);
+            let was_pinned = prev_state.get(coord).is_some_and(|&(_, p)| p);
+            let hold_still = pinned_now && was_pinned;
+            for (i, samples) in snapshot.channels.iter().enumerate() {
+                let (Some(now), Some(before)) = (samples, &prev.channels[i]) else {
                     continue;
                 };
                 if now.len() != before.len() {
                     continue;
                 }
-                let eps = if i == CHANNEL_TEMPERATURE {
-                    cfg.temperature_epsilon
-                } else {
-                    cfg.unit_epsilon
-                };
                 let mut worst = 0.0f32;
                 for (a, b) in now.iter().zip(before) {
                     worst = worst.max((a - b).abs());
                 }
+                let eps = channel_epsilon(cfg, i);
                 if worst > eps {
                     record(
                         &mut violations,
@@ -291,23 +387,25 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
                         ),
                     );
                 }
-                // Pinned regions must not change at all.
-                if let (Some(region), Some(&(_, was_pinned))) =
-                    (map.get(*coord), prev_state.get(coord))
-                {
-                    if was_pinned
-                        && region.stability >= 1.0
-                        && worst > 0.0
-                        && (i == CHANNEL_MOISTURE || i == CHANNEL_VEGETATION)
-                    {
-                        record(
-                            &mut violations,
-                            format!(
-                                "frame {frame}: pinned region ({}, {}) drift channel {i} changed by {worst}",
-                                coord.x, coord.y
-                            ),
-                        );
-                    }
+                if hold_still && worst > 0.0 {
+                    record(
+                        &mut violations,
+                        format!(
+                            "frame {frame}: pinned region ({}, {}) channel {i} changed by {worst}",
+                            coord.x, coord.y
+                        ),
+                    );
+                }
+            }
+            if let (Some(now), Some(before)) = (&snapshot.biome, &prev.biome) {
+                if hold_still && now != before {
+                    record(
+                        &mut violations,
+                        format!(
+                            "frame {frame}: pinned region ({}, {}) biome ids changed",
+                            coord.x, coord.y
+                        ),
+                    );
                 }
             }
         }
@@ -341,6 +439,10 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
         prev_tiles = tiles_now;
     }
 
+    // -- Macro seam assertion (final frame): river expression across
+    //    macro-tile boundaries steps by less than the truncation bound.
+    check_macro_seams(&map, cfg, &mut violations);
+
     ReplayReport {
         frames: cfg.frames,
         violations,
@@ -348,5 +450,46 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
         final_stats,
         peak_regions,
         peak_cache_bytes,
+    }
+}
+
+/// Compare edge-adjacent river samples of neighboring regions that live in
+/// different macro tiles (phase-2-plan.md §12.2). The step includes the
+/// legitimate cross-cell gradient plus the truncated-catchment error; the
+/// bound is a tear detector, not a precision gauge.
+fn check_macro_seams(map: &RegionMap, cfg: &ReplayConfig, violations: &mut Vec<String>) {
+    let res = cfg.stream.field_resolution;
+    for region in map.iter_active() {
+        let coord = region.coord;
+        for (dx, dy) in [(1i32, 0i32), (0, 1)] {
+            let neighbor = RegionCoord::new(coord.x + dx, coord.y + dy);
+            if macro_coord_for(coord) == macro_coord_for(neighbor) {
+                continue;
+            }
+            let (Some(a), Some(b)) = (
+                map.cache().channel(coord, CHANNEL_RIVER),
+                map.cache().channel(neighbor, CHANNEL_RIVER),
+            ) else {
+                continue;
+            };
+            let mut worst = 0.0f32;
+            for k in 0..res {
+                let (av, bv) = if dx == 1 {
+                    (a.get(res - 1, k), b.get(0, k))
+                } else {
+                    (a.get(k, res - 1), b.get(k, 0))
+                };
+                worst = worst.max((av - bv).abs());
+            }
+            if worst > cfg.river_seam_bound {
+                record(
+                    violations,
+                    format!(
+                        "macro seam: river steps {worst} (> {}) between ({}, {}) and ({}, {})",
+                        cfg.river_seam_bound, coord.x, coord.y, neighbor.x, neighbor.y
+                    ),
+                );
+            }
+        }
     }
 }

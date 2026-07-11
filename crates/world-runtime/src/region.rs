@@ -6,7 +6,7 @@
 //! target a little each update, which is the mechanism behind seamless
 //! transformation without global regeneration.
 
-use world_core::{PossibilityVector, RegionCoord};
+use world_core::{PossibilityDomain, PossibilityVector, RegionCoord};
 
 /// Where a region is in the generation pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,13 @@ pub struct RegionState {
     /// 0 = free to transform, 1 = fully pinned (near the player).
     pub stability: f32,
     /// Monotonic revision, bumped whenever `current` changes materially.
+    /// Kept for the pinned-stability contract and the continuity replay; it
+    /// no longer drives staleness — dependency hashes do (phase-2-plan.md
+    /// §4.3, ADR 0008).
     pub revision: u32,
-    /// Bitset of procedural layers that need recomputation (indexed by layer id).
+    /// Bitset of layers whose dependency hash may have changed (indexed by
+    /// layer id). An optimization hint over the dep-hash ground truth: regions
+    /// with no set bits skip hash checks entirely (phase-2-plan.md §7.8).
     pub dirty_layers: u32,
     /// Pipeline status.
     pub status: GenerationStatus,
@@ -55,28 +60,84 @@ impl RegionState {
 
     /// Step `current` toward `target`, scaled by how *unstable* the region is and
     /// by `rate` (a per-update fraction). Pinned regions (`stability == 1.0`) do
-    /// not move. Returns `true` if the realized state changed, bumping `revision`.
+    /// not move.
+    ///
+    /// Returns `None` if the realized state did not change; otherwise the
+    /// bitmask of possibility domains whose *quantized bucket* flipped (bit =
+    /// `domain.index()`), which may be empty — sub-bucket drift costs zero
+    /// regeneration (phase-2-plan.md §4.2). Callers translate flipped buckets
+    /// into dirty layers via the declared graph
+    /// ([`world_core::layer::domain_dirty_mask`]); this module deliberately
+    /// knows nothing about layers (ADR 0007 superseded the static drift mask).
     ///
     /// This is the core of continuous transformation: it never snaps, so callers
     /// can budget how much convergence happens per frame (section 6.6).
-    pub fn converge(&mut self, rate: f32) -> bool {
+    pub fn converge(&mut self, rate: f32) -> Option<u8> {
         let t = (1.0 - self.stability) * rate.clamp(0.0, 1.0);
         if t <= 0.0 {
-            return false;
+            return None;
         }
         let next = self.current.lerp(&self.target, t);
-        if next != self.current {
-            self.current = next;
-            self.revision = self.revision.wrapping_add(1);
-            // Possibility drift dirties only the possibility-dependent layers
-            // (climate, ecology). Terrain depends on position + the slow dims
-            // through a smooth map and is deliberately never dirtied by drift —
-            // the Phase 1 incremental-regeneration narrowing (phase-1-plan.md
-            // section 6.4; Phase 2 generalizes this into a dependency graph).
-            self.dirty_layers |= world_core::layer::DRIFT_LAYERS;
-            true
-        } else {
-            false
+        if next == self.current {
+            return None;
         }
+        let mut flipped = 0u8;
+        for (i, domain) in PossibilityDomain::ALL.iter().enumerate() {
+            if self.current.quantized(*domain) != next.quantized(*domain) {
+                flipped |= 1 << i;
+            }
+        }
+        self.current = next;
+        self.revision = self.revision.wrapping_add(1);
+        Some(flipped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converge_reports_flipped_buckets() {
+        let mut region = RegionState::new(RegionCoord::new(0, 0));
+        region.stability = 0.0;
+        region.target.set(PossibilityDomain::Climate, 0.9);
+        let flipped = region.converge(0.5).expect("state moved");
+        assert_ne!(
+            flipped & (1 << PossibilityDomain::Climate.index()),
+            0,
+            "a 0.2 step must cross climate buckets"
+        );
+        assert_eq!(
+            flipped & (1 << PossibilityDomain::Geology.index()),
+            0,
+            "untouched domains must not flip"
+        );
+        assert_eq!(region.revision, 1);
+    }
+
+    #[test]
+    fn sub_bucket_drift_reports_no_flips() {
+        let mut region = RegionState::new(RegionCoord::new(0, 0));
+        region.stability = 0.0;
+        // A target offset far below one bucket (1/4096).
+        let base = region.current.get(PossibilityDomain::Ecology);
+        region
+            .target
+            .set(PossibilityDomain::Ecology, base + 0.00001);
+        if let Some(flipped) = region.converge(1.0) {
+            assert_eq!(flipped, 0, "sub-bucket drift must not flip buckets");
+        }
+    }
+
+    #[test]
+    fn pinned_regions_never_move() {
+        let mut region = RegionState::new(RegionCoord::new(0, 0));
+        region.stability = 1.0;
+        region.target.set(PossibilityDomain::Ecology, 1.0);
+        let before = region.current;
+        assert!(region.converge(1.0).is_none());
+        assert_eq!(region.current, before);
+        assert_eq!(region.revision, 0);
     }
 }

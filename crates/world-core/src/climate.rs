@@ -1,11 +1,12 @@
 //! Climate: temperature and moisture from possibility + elevation
-//! (phase-1-plan.md section 6.2, milestone M3).
+//! (phase-1-plan.md section 6.2; re-plumbed through the layer graph by
+//! phase-2-plan.md §7.1).
 //!
-//! One of the two layers that *drift* with possibility state. Deliberately
-//! cheap — pure per-sample arithmetic, no lattice beyond the region's own
-//! possibility vector and elevation — so a whole region tile can be recomputed
-//! every time its realized state changes (the naïve incremental regeneration
-//! Phase 1 can afford).
+//! The Phase 1 math survives unchanged; what changed is plumbing — the layer
+//! now reads *dequantized* possibility buckets and the terrain input tile
+//! (its declared inputs, see [`crate::layer`]) instead of raw `current` floats
+//! and recomputed elevation. Deliberately cheap — pure per-sample arithmetic —
+//! so a whole region tile can be recomputed every time a bucket flips.
 
 use crate::possibility::{PossibilityDomain, PossibilityVector};
 use crate::terrain::SEA_LEVEL;

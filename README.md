@@ -11,11 +11,15 @@ See the design and architecture documents:
 - [`implementation-plan.md`](implementation-plan.md) — the high-level technical plan.
 - [`docs/adr/`](docs/adr/) — architecture decision records.
 
-This repository is currently at **Phase 1** (continuous world transformation
-prototype, see [`phase-1-plan.md`](phase-1-plan.md)): an infinite deterministic
-heightfield with climate and ecology layers, a sparse possibility field steered
-by anchors, distance-based stability streaming, and an interactive false-color
-debug map that makes continuity — or its failure — visible.
+This repository is currently at **Phase 2** (layered environmental generation,
+see [`phase-2-plan.md`](phase-2-plan.md), building on the Phase 1 continuity
+prototype of [`phase-1-plan.md`](phase-1-plan.md)): an eight-layer declared
+dependency graph — terrain, geology, macro drainage, climate, hydrology,
+soils, biomes, vegetation — where staleness is a dependency-hash comparison,
+changes recompute exactly the layers that declare a dependency on them
+(machine-checked by `wer-ledger`), river networks are stable integer topology,
+and an interactive false-color debug map makes continuity — or its failure —
+visible.
 
 ## Workspace layout
 
@@ -25,12 +29,12 @@ hold everything OS/browser-specific (see
 
 | Crate | Kind | Responsibility |
 |-------|------|----------------|
-| [`world-core`](crates/world-core) | neutral lib | Deterministic hashing, coordinates, possibility space, terrain/climate/ecology generation. |
-| [`world-runtime`](crates/world-runtime) | neutral lib | Region streaming, convergence, budgeted regeneration; abstract storage & task interfaces. |
+| [`world-core`](crates/world-core) | neutral lib | Deterministic hashing, coordinates, possibility space, the layer graph and every environmental generator. |
+| [`world-runtime`](crates/world-runtime) | neutral lib | Region streaming, convergence, dep-hash staleness, topological cost-budgeted dispatch; abstract storage & task interfaces. |
 | [`renderer`](crates/renderer) | native/gpu lib | wgpu/WGSL renderer (debug-map presentation). |
 | [`platform-native`](crates/platform-native) | bin `wer` | winit window + event loop, input, Rayon executor. |
 | [`platform-web`](crates/platform-web) | cdylib | wasm-bindgen smoke shell (grows into the browser runtime). |
-| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay` | Inspectors, validators, the continuity replay. |
+| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay`, `wer-ledger` | Inspectors, the continuity replay, the invalidation-precision harness. |
 
 ## Prerequisites
 
@@ -44,14 +48,19 @@ hold everything OS/browser-specific (see
 # Build & run the interactive continuity prototype (opens the debug map).
 cargo run --release --bin wer
 
-# Deterministic inspector: world position -> region, hashes, field samples.
-cargo run --bin wer-inspect -- 300 -10
+# Deterministic inspector: world position -> region, hashes, every layer's
+# samples; --layers adds the dependency-hash chain and stale/fresh verdicts.
+cargo run --bin wer-inspect -- 300 -10 --layers
 
 # Headless continuity replay: scripted path + anchors, machine-checked.
 cargo run --bin wer-replay
 
+# Invalidation-precision harness: asserts each scripted change regenerates
+# exactly the declared-dependent layers (phase-2-plan.md §12.3).
+cargo run --bin wer-ledger
+
 # Headless map screenshot (no window/GPU): settle the world and dump a PPM.
-cargo run --release --bin wer -- --screenshot map.ppm biome 0 0
+cargo run --release --bin wer -- --screenshot map.ppm composite 0 0
 
 # Test everything, including determinism goldens and the continuity replay.
 cargo test --workspace
@@ -91,7 +100,7 @@ world drifts toward it only as you move (sprinting drifts it faster).
 | `Z` | Reset all nudges |
 | `E` / `Q` | Drop an Emphasize / Suppress anchor at the player |
 | `C` | Clear anchors |
-| `V` | Cycle channel: biome → elevation → temperature → moisture → vegetation → stability → revision |
+| `V` | Cycle channel: composite → elevation → geology → temperature → moisture → river → wetness → soil → biome → vegetation → stability → revision |
 | `G` / `N` / `X` | Toggle region grid / stability rings / changed-while-pinned flash |
 | `Esc` | Quit |
 
@@ -131,11 +140,14 @@ depends on.
 ## Determinism
 
 Permanent world identities are derived from integer hashing over stable inputs
-(world version, region coordinate, layer, feature index, possibility revision).
-Any change to a generation algorithm must bump `WORLD_ALGORITHM_VERSION` and
-update the golden fixtures in
-[`crates/world-core/tests/determinism.rs`](crates/world-core/tests/determinism.rs).
-See [ADR 0003](docs/adr/0003-deterministic-integer-hashing.md).
+(world version, region coordinate, layer, feature index, possibility revision);
+drainage routing is all-integer topology, parity-tested against wasm. Any
+change that alters generated output must bump `WORLD_ALGORITHM_VERSION` — or,
+for a single layer's tuning, that layer's `algorithm_revision` in the
+declaration table — and update the golden fixtures in
+[`crates/world-core/tests/determinism.rs`](crates/world-core/tests/determinism.rs)
+in the same commit. See [ADR 0003](docs/adr/0003-deterministic-integer-hashing.md)
+and [ADR 0008](docs/adr/0008-tiles-are-functions-of-their-dependency-hash.md).
 
 ## License
 

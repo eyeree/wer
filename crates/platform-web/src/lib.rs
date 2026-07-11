@@ -4,10 +4,15 @@
 //! `world-core` is exercised through a real `wasm32` entry point from the start,
 //! before native-only assumptions accumulate (section 19). The full runtime
 //! (Web Workers, browser storage, WebGPU tiers, suspend/resume) arrives in
-//! Phase 7.
+//! Phase 7. Phase 2 grew the shell only by two parity exports: the lithology
+//! seed and a drainage routing sample (phase-2-plan.md §12.5).
 
 use world_core::{
-    feature_hash, terrain, FeatureKey, PossibilityField, RegionCoord, WORLD_ALGORITHM_VERSION,
+    dephash::drainage_dep_hash_default,
+    drainage::{drainage, MACRO_APRON, MACRO_LEVEL},
+    feature_hash,
+    geology::lithology_seed,
+    terrain, FeatureKey, PossibilityField, RegionCoord, WORLD_ALGORITHM_VERSION,
 };
 
 /// A portable smoke computation: the deterministic hash of the origin feature.
@@ -26,7 +31,7 @@ pub fn origin_feature_hash() -> u64 {
     })
 }
 
-/// Parity sample for the Phase 1 terrain identity layer: the integer seed that
+/// Parity sample for the terrain identity layer: the integer seed that
 /// selects the gradient at lattice corner `(3, -2)` of octave 1
 /// (phase-1-plan.md section 11.2). Must equal the native value — float
 /// elevation is presentation state and is *not* asserted bit-equal, but the
@@ -41,6 +46,28 @@ pub fn terrain_gradient_seed_sample() -> u64 {
 #[must_use]
 pub fn control_point_seed_sample() -> u64 {
     PossibilityField::default().control_point_seed(-5, 9)
+}
+
+/// Parity sample for the geology identity layer: the lithology seed of cell
+/// `(3, -2)` (phase-2-plan.md §12.5).
+#[must_use]
+pub fn lithology_seed_sample() -> u64 {
+    lithology_seed(3, -2)
+}
+
+/// Parity sample for the drainage identity layer: flow direction and
+/// accumulation of a fixed cell of macro tile `(0, 0)`, packed as
+/// `(dir << 32) | accum`. Routing is all-integer topology, so **full**
+/// cross-platform equality is required here — not just seed equality
+/// (phase-2-plan.md §12.5, ADR 0009).
+#[must_use]
+pub fn drainage_routing_sample() -> u64 {
+    let field = PossibilityField::default();
+    let mc = RegionCoord::at_level(0, 0, MACRO_LEVEL);
+    let tile = drainage(mc, &field, drainage_dep_hash_default(mc));
+    let apron = MACRO_APRON as usize;
+    let (gx, gy) = (apron + 7, apron + 4);
+    (u64::from(tile.flow_dir_at(gx, gy)) << 32) | u64::from(tile.accum_at(gx, gy))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -78,6 +105,20 @@ mod wasm {
     pub fn control_point_seed_sample() -> u64 {
         super::control_point_seed_sample()
     }
+
+    /// Lithology identity sample (phase-2-plan.md §12.5).
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn lithology_seed_sample() -> u64 {
+        super::lithology_seed_sample()
+    }
+
+    /// Drainage routing sample — all-integer topology, full equality required.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn drainage_routing_sample() -> u64 {
+        super::drainage_routing_sample()
+    }
 }
 
 #[cfg(test)]
@@ -90,8 +131,10 @@ mod tests {
 
     #[test]
     fn parity_samples_match_goldens() {
-        assert_eq!(super::origin_feature_hash(), 0xC830_AF9C_636E_1510);
-        assert_eq!(super::terrain_gradient_seed_sample(), 0xB630_958A_7BD1_F867);
-        assert_eq!(super::control_point_seed_sample(), 0xEAFE_6C24_2F6B_03F3);
+        assert_eq!(super::origin_feature_hash(), 0x4C6C_A5DE_38F9_0B17);
+        assert_eq!(super::terrain_gradient_seed_sample(), 0x557D_9B95_E708_EDFF);
+        assert_eq!(super::control_point_seed_sample(), 0xAAF0_551F_3E6F_1A1C);
+        assert_eq!(super::lithology_seed_sample(), 0x61DD_60E4_EEF6_FD16);
+        assert_eq!(super::drainage_routing_sample(), 0x0000_0001_0000_000D);
     }
 }

@@ -1,11 +1,18 @@
-//! Unit tests for the Phase 1 streaming window (phase-1-plan.md section 11.4):
-//! load/evict hysteresis, stability ramp shape, budget enforcement, and the
-//! narrowed dirty-layer policy.
+//! Unit tests for the streaming window (phase-2-plan.md §12.4): load/evict
+//! hysteresis, stability ramp shape, cost-budget enforcement, topological
+//! dispatch, dep-hash staleness precision, and macro cache lifecycle.
 
-use world_core::layer::{layer_bit, LAYER_CLIMATE, LAYER_ECOLOGY, LAYER_TERRAIN};
-use world_core::{PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS, REGION_SIZE};
+use world_core::layer::{
+    LAYER_BIOME, LAYER_CLIMATE, LAYER_DRAINAGE, LAYER_GEOLOGY, LAYER_HYDROLOGY, LAYER_SOILS,
+    LAYER_TERRAIN, LAYER_VEGETATION,
+};
+use world_core::{
+    macro_coord_for, PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS,
+    REGION_SIZE,
+};
 use world_runtime::{
-    stability_for, Budget, GenerationStatus, InlineExecutor, RegionMap, RegionState, StreamConfig,
+    stability_for, Budget, GenerationStatus, InlineExecutor, RegionMap, StreamConfig,
+    CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER, CHANNEL_VEGETATION,
 };
 
 const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
@@ -22,8 +29,7 @@ fn small_config() -> StreamConfig {
     }
 }
 
-fn settled_map(player: (f64, f64)) -> RegionMap {
-    let mut map = RegionMap::new(small_config());
+fn settle(map: &mut RegionMap, player: (f64, f64)) {
     let field = PossibilityField::default();
     for _ in 0..8 {
         map.update(
@@ -36,6 +42,11 @@ fn settled_map(player: (f64, f64)) -> RegionMap {
             &InlineExecutor,
         );
     }
+}
+
+fn settled_map(player: (f64, f64)) -> RegionMap {
+    let mut map = RegionMap::new(small_config());
+    settle(&mut map, player);
     map
 }
 
@@ -62,7 +73,7 @@ fn stability_ramp_endpoints_and_monotonicity() {
 }
 
 #[test]
-fn window_loads_within_radius_and_snaps_fresh_regions() {
+fn window_loads_and_settles_every_layer_bottom_up() {
     let map = settled_map((0.0, 0.0));
     assert!(!map.is_empty());
     for region in map.iter_active() {
@@ -70,15 +81,37 @@ fn window_loads_within_radius_and_snaps_fresh_regions() {
         let d = ((ox + REGION_SIZE * 0.5).powi(2) + (oy + REGION_SIZE * 0.5).powi(2)).sqrt();
         assert!(d <= small_config().load_radius);
         // Fresh regions realize their target immediately (no initial pop) and
-        // finish generating under an unlimited budget.
+        // finish the whole eight-layer stack under an unlimited budget.
         assert_eq!(region.current, region.target);
         assert_eq!(region.status, GenerationStatus::Ready);
-        assert!(map.cache().get(region.coord).is_some());
+        assert_eq!(region.dirty_layers, 0);
+        let tiles = map.cache().get(region.coord).expect("cached");
+        for layer in [
+            LAYER_TERRAIN,
+            LAYER_GEOLOGY,
+            LAYER_CLIMATE,
+            LAYER_HYDROLOGY,
+            LAYER_SOILS,
+            LAYER_BIOME,
+            LAYER_VEGETATION,
+        ] {
+            assert!(
+                tiles.layer_hash(layer).is_some(),
+                "layer {layer} missing for region {:?}",
+                region.coord
+            );
+        }
+        // The covering macro drainage tile is resident and fresh.
+        assert!(map
+            .macro_cache()
+            .get(macro_coord_for(region.coord))
+            .is_some());
     }
+    assert_eq!(map.jobs_in_flight(), 0);
 }
 
 #[test]
-fn eviction_has_hysteresis() {
+fn eviction_has_hysteresis_and_sweeps_macro_orphans() {
     let cfg = small_config();
     let mut map = settled_map((0.0, 0.0));
     let field = PossibilityField::default();
@@ -106,27 +139,39 @@ fn eviction_has_hysteresis() {
         "hysteresis should retain the region"
     );
 
-    // Move well past unload_radius: now it must be evicted with its tiles.
-    let player = (-(4.0 * REGION_SIZE), 0.0);
-    map.update(
-        player,
-        0.0,
-        &field,
-        &[],
-        &NO_BIAS,
-        &Budget::unlimited(),
-        &InlineExecutor,
-    );
+    // Move far enough west that every region under macro tile (0,0) unloads:
+    // the macro tile must be swept with its last dependent.
+    let player = (-(8.0 * REGION_SIZE), 0.0);
+    for _ in 0..4 {
+        map.update(
+            player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+        );
+    }
     assert!(map.get(edge).is_none());
     assert!(map.cache().get(edge).is_none());
+    let mc = macro_coord_for(RegionCoord::new(0, 0));
+    assert!(
+        map.iter_active().all(|r| macro_coord_for(r.coord) != mc),
+        "test setup: no dependent regions should remain"
+    );
+    assert!(
+        map.macro_cache().get(mc).is_none(),
+        "orphaned macro tile must be evicted"
+    );
 }
 
 #[test]
-fn budgets_are_enforced_per_frame() {
+fn cost_budgets_are_enforced_per_frame() {
     let budget = Budget {
         max_loads: 5,
         max_converge_regions: 3,
-        max_regen_layers: 4,
+        max_regen_cost: 12,
     };
     let mut map = RegionMap::new(small_config());
     let field = PossibilityField::default();
@@ -140,8 +185,9 @@ fn budgets_are_enforced_per_frame() {
         &InlineExecutor,
     );
     assert!(stats.loaded <= 5);
-    assert!(stats.layers_dispatched <= 4);
+    assert!(stats.regen_cost_spent <= 12);
     assert!(stats.deferred_loads > 0, "small budget must defer loads");
+    assert!(stats.deferred_regens > 0, "small budget must defer regens");
     let stats = map.update(
         (0.0, 0.0),
         10.0,
@@ -153,56 +199,52 @@ fn budgets_are_enforced_per_frame() {
     );
     assert!(stats.loaded <= 5);
     assert!(stats.converged <= 3);
+    assert!(stats.regen_cost_spent <= 12);
+
+    // The budget throttles but never starves: the window must fully settle.
+    for _ in 0..600 {
+        let stats = map.update(
+            (0.0, 0.0),
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &budget,
+            &InlineExecutor,
+        );
+        assert!(stats.regen_cost_spent <= 12);
+        if stats.regen_cost_spent == 0 && stats.loaded == 0 && map.jobs_in_flight() == 0 {
+            break;
+        }
+    }
+    assert!(map
+        .iter_active()
+        .all(|r| r.status == GenerationStatus::Ready));
 }
 
 #[test]
-fn drift_dirties_climate_and_ecology_but_never_terrain() {
-    let mut region = RegionState::new(RegionCoord::new(0, 0));
-    region.stability = 0.0;
-    region.dirty_layers = 0;
-    region.target.set(PossibilityDomain::Climate, 0.9);
-    assert!(region.converge(0.5));
-    assert_ne!(region.dirty_layers & layer_bit(LAYER_CLIMATE), 0);
-    assert_ne!(region.dirty_layers & layer_bit(LAYER_ECOLOGY), 0);
-    assert_eq!(
-        region.dirty_layers & layer_bit(LAYER_TERRAIN),
-        0,
-        "possibility drift must never dirty terrain (phase-1-plan.md §6.4)"
-    );
-    assert_eq!(region.revision, 1);
-}
-
-#[test]
-fn pinned_regions_never_move() {
-    let mut region = RegionState::new(RegionCoord::new(0, 0));
-    region.stability = 1.0;
-    region.target.set(PossibilityDomain::Ecology, 1.0);
-    let before = region.current;
-    assert!(!region.converge(1.0));
-    assert_eq!(region.current, before);
-    assert_eq!(region.revision, 0);
-    assert_eq!(region.dirty_layers, 0);
-}
-
-#[test]
-fn distant_regions_converge_and_regenerate_only_drift_layers() {
+fn drift_regenerates_declared_readers_and_never_the_stable_trio() {
     let mut map = settled_map((0.0, 0.0));
     let field = PossibilityField::default();
 
-    // Snapshot the terrain tiles of a distant (unpinned) region, then push a
-    // strong global bias so its target moves.
+    // Snapshot the stable-trio and expression tiles of a distant (unpinned)
+    // region, then push a strong fast-domain bias so its target moves.
     let distant = RegionCoord::new(3, 1);
     let region = map.get(distant).expect("resident");
     assert!(region.stability < 1.0);
-    let terrain_before = map
-        .cache()
-        .channel(distant, world_runtime::CHANNEL_ELEVATION)
-        .expect("terrain generated")
-        .content_hash();
-    let veg_before = map
-        .cache()
-        .channel(distant, world_runtime::CHANNEL_VEGETATION)
-        .expect("vegetation generated")
+    let hash_of = |map: &RegionMap, channel: usize| {
+        map.cache()
+            .channel(distant, channel)
+            .expect("cached")
+            .content_hash()
+    };
+    let terrain_before = hash_of(&map, CHANNEL_ELEVATION);
+    let hardness_before = hash_of(&map, CHANNEL_HARDNESS);
+    let veg_before = hash_of(&map, CHANNEL_VEGETATION);
+    let macro_before = map
+        .macro_cache()
+        .get(macro_coord_for(distant))
+        .expect("macro tile")
         .content_hash();
 
     let mut bias = NO_BIAS;
@@ -247,40 +289,161 @@ fn distant_regions_converge_and_regenerate_only_drift_layers() {
 
     let region = map.get(distant).expect("resident");
     assert!(region.revision > 0);
-    // Ecology regenerated with the drifted state; terrain untouched.
-    let terrain_after = map
-        .cache()
-        .channel(distant, world_runtime::CHANNEL_ELEVATION)
-        .expect("terrain cached")
-        .content_hash();
-    let veg_after = map
-        .cache()
-        .channel(distant, world_runtime::CHANNEL_VEGETATION)
-        .expect("vegetation cached")
-        .content_hash();
+    // Expression layers regenerated with the drifted buckets; the stable trio
+    // never moved (section 9; ADR 0007/0009).
     assert_eq!(
-        terrain_before, terrain_after,
-        "terrain must not regenerate on drift"
+        terrain_before,
+        hash_of(&map, CHANNEL_ELEVATION),
+        "terrain must not regenerate on fast drift"
     );
-    assert_ne!(veg_before, veg_after, "ecology must regenerate on drift");
+    assert_eq!(
+        hardness_before,
+        hash_of(&map, CHANNEL_HARDNESS),
+        "geology must not regenerate on fast drift"
+    );
+    assert_eq!(
+        macro_before,
+        map.macro_cache()
+            .get(macro_coord_for(distant))
+            .expect("macro tile")
+            .content_hash(),
+        "drainage topology must never move"
+    );
+    assert_ne!(
+        veg_before,
+        hash_of(&map, CHANNEL_VEGETATION),
+        "vegetation must regenerate on ecology drift"
+    );
 }
 
 #[test]
-fn staleness_is_tracked_per_tile() {
+fn revision_bump_invalidates_the_layer_and_its_dependents_only() {
+    let mut map = settled_map((0.0, 0.0));
+
+    let probe = RegionCoord::new(1, 1);
+    let before: Vec<Option<u64>> = (0..world_core::LAYER_COUNT)
+        .map(|l| map.cache().get(probe).and_then(|t| t.layer_hash(l)))
+        .collect();
+
+    map.bump_layer_revision(LAYER_SOILS);
+    settle(&mut map, (0.0, 0.0));
+
+    let after: Vec<Option<u64>> = (0..world_core::LAYER_COUNT)
+        .map(|l| map.cache().get(probe).and_then(|t| t.layer_hash(l)))
+        .collect();
+    for layer in [LAYER_TERRAIN, LAYER_GEOLOGY, LAYER_CLIMATE, LAYER_HYDROLOGY] {
+        assert_eq!(
+            before[layer as usize], after[layer as usize],
+            "layer {layer} must not regenerate on a soils revision bump"
+        );
+    }
+    for layer in [LAYER_SOILS, LAYER_BIOME, LAYER_VEGETATION] {
+        assert_ne!(
+            before[layer as usize], after[layer as usize],
+            "layer {layer} must regenerate on a soils revision bump"
+        );
+    }
+}
+
+#[test]
+fn dispatch_is_topological_under_tiny_budgets() {
+    // With a budget so small only one job fits per frame, layers must still
+    // appear strictly bottom-up: no layer generates before its inputs.
+    let budget = Budget {
+        max_loads: usize::MAX,
+        max_converge_regions: usize::MAX,
+        max_regen_cost: 10, // one drainage job, or a few cheap layers
+    };
+    let mut map = RegionMap::new(StreamConfig {
+        load_radius: 1.0 * REGION_SIZE,
+        unload_radius: 2.0 * REGION_SIZE,
+        ..small_config()
+    });
+    let field = PossibilityField::default();
+    for _ in 0..200 {
+        map.update(
+            (0.0, 0.0),
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &budget,
+            &InlineExecutor,
+        );
+        // Invariant: whenever a layer's tiles exist, its inputs' tiles exist
+        // and carry exactly the hashes folded into the layer's dep hash —
+        // checked indirectly: an output present implies inputs present.
+        for region in map.iter_active() {
+            let Some(tiles) = map.cache().get(region.coord) else {
+                continue;
+            };
+            for layer in 0..world_core::LAYER_COUNT {
+                if tiles.layer_hash(layer).is_none() {
+                    continue;
+                }
+                for &dep in world_core::layer_decl(layer).deps {
+                    if dep == LAYER_DRAINAGE {
+                        assert!(
+                            map.macro_cache()
+                                .get(macro_coord_for(region.coord))
+                                .is_some(),
+                            "layer {layer} exists without its macro input"
+                        );
+                    } else {
+                        assert!(
+                            tiles.layer_hash(dep).is_some(),
+                            "layer {layer} exists without input {dep}"
+                        );
+                    }
+                }
+            }
+        }
+        if map.iter_active().count() > 0
+            && map
+                .iter_active()
+                .all(|r| r.status == GenerationStatus::Ready)
+        {
+            return; // settled bottom-up under the tiny budget
+        }
+    }
+    panic!("window never settled under the tiny budget");
+}
+
+#[test]
+fn river_expression_reads_the_macro_topology() {
+    // Hydrology tiles must exist and reflect drainage: somewhere in the window
+    // a river cell should express (the fixture window spans a full macro
+    // catchment, so a channel is statistically certain; if this ever flakes
+    // the window moved — pick a different origin).
+    let map = settled_map((0.0, 0.0));
+    let mut max_river = 0.0f32;
+    for region in map.iter_active() {
+        if let Some(tile) = map.cache().channel(region.coord, CHANNEL_RIVER) {
+            for &v in tile.samples() {
+                max_river = max_river.max(v);
+            }
+        }
+    }
+    assert!(
+        max_river > 0.05,
+        "no river expression anywhere in the window (max {max_river})"
+    );
+}
+
+#[test]
+fn staleness_is_tracked_per_tile_by_dep_hash() {
     let map = settled_map((0.0, 0.0));
     for region in map.iter_active() {
         if region.status != GenerationStatus::Ready {
             continue;
         }
         let tiles = map.cache().get(region.coord).expect("cached");
-        for tile in tiles.channels.iter().flatten() {
-            // Terrain tiles may carry an older revision (they are not
-            // regenerated on drift); drift-layer tiles must be current.
-            assert!(!tile.is_stale(world_core::WORLD_ALGORITHM_VERSION, tile.revision));
-        }
-        let veg = tiles.channels[world_runtime::CHANNEL_VEGETATION]
-            .as_ref()
-            .expect("vegetation cached");
-        assert!(!veg.is_stale(world_core::WORLD_ALGORITHM_VERSION, region.revision));
+        // A settled region's biome and channel tiles share their layer's
+        // dependency hash; different layers have different hashes.
+        let climate = tiles.layer_hash(LAYER_CLIMATE).unwrap();
+        let veg = tiles.layer_hash(LAYER_VEGETATION).unwrap();
+        assert_ne!(climate, veg);
+        let biome = tiles.biome.as_ref().expect("biome tile");
+        assert_eq!(tiles.layer_hash(LAYER_BIOME), Some(biome.dep_hash));
     }
 }

@@ -15,5 +15,8 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0002](0002-workspace-crate-boundaries.md) | Workspace and crate boundaries | Accepted |
 | [0003](0003-deterministic-integer-hashing.md) | Deterministic integer hashing for identities | Accepted |
 | [0004](0004-terrain-noise-and-weak-possibility-coupling.md) | Terrain noise: hashed-gradient fBm with weak possibility coupling | Accepted |
-| [0005](0005-drift-dirties-only-possibility-dependent-layers.md) | Possibility drift dirties only possibility-dependent layers | Accepted |
+| [0005](0005-drift-dirties-only-possibility-dependent-layers.md) | Possibility drift dirties only possibility-dependent layers | Superseded by 0007 |
 | [0006](0006-travel-fueled-convergence.md) | Convergence is fueled by player travel, not wall-clock time | Accepted |
+| [0007](0007-declared-layer-dependencies.md) | Declared layer dependencies supersede the static drift mask | Accepted |
+| [0008](0008-tiles-are-functions-of-their-dependency-hash.md) | Tiles are functions of their dependency hash | Accepted |
+| [0009](0009-drainage-topology-from-quantized-elevation.md) | Drainage topology from quantized elevation at macro level | Accepted |

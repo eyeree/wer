@@ -1,5 +1,7 @@
-//! Criterion benchmark for a full `RegionMap::update` tick over a fixed window
-//! (phase-1-plan.md section 12) — the number that sizes the per-frame budgets.
+//! Criterion benchmarks for `RegionMap::update` (phase-2-plan.md §13) — the
+//! numbers that size the per-frame cost budget: the steady-state floor, the
+//! drifting worst case, a full window settle from cold, and the cost of a
+//! world-scale Climate flip rippling through the expression layers.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use world_core::{PossibilityDomain, PossibilityField, POSSIBILITY_DIMS};
@@ -28,7 +30,9 @@ fn bench_update(c: &mut Criterion) {
     let cfg = StreamConfig::default();
     let budget = Budget::per_frame(16.6);
 
-    // Steady state: player idle, targets unchanged — the per-frame floor.
+    // Steady state: player idle, targets unchanged — the per-frame floor
+    // (this is also where the dep-hash check cost would show up if it ever
+    // stopped being negligible, phase-2-plan.md §13).
     let mut map = settled_map(cfg, &field);
     let bias = [0.0f32; POSSIBILITY_DIMS];
     c.bench_function("region_map_update_steady", |b| {
@@ -46,7 +50,7 @@ fn bench_update(c: &mut Criterion) {
     });
 
     // Drifting: a standing bias plus walking-speed travel keeps distant
-    // regions converging and their climate/ecology layers regenerating — the
+    // regions converging and their expression layers regenerating — the
     // budgeted worst case (convergence is travel-fueled, ADR 0006).
     let mut map = settled_map(cfg, &field);
     let mut bias = [0.0f32; POSSIBILITY_DIMS];
@@ -64,6 +68,37 @@ fn bench_update(c: &mut Criterion) {
                 &InlineExecutor,
             ))
         })
+    });
+
+    // Full window settle from cold, unbudgeted (throughput of the whole
+    // eight-layer pipeline including macro drainage).
+    c.bench_function("region_map_settle_cold", |b| {
+        b.iter(|| black_box(settled_map(cfg, &field)))
+    });
+
+    // A world-scale Climate bucket flip over a settled window: the §12.3
+    // throughput scenario (climate → hydrology → soils → biome → vegetation).
+    c.bench_function("climate_flip_ripple", |b| {
+        b.iter_batched(
+            || settled_map(cfg, &field),
+            |mut map| {
+                let mut bias = [0.0f32; POSSIBILITY_DIMS];
+                bias[PossibilityDomain::Climate.index()] = 0.3;
+                for _ in 0..40 {
+                    map.update(
+                        (0.0, 0.0),
+                        25.0,
+                        &field,
+                        &[],
+                        &bias,
+                        &Budget::unlimited(),
+                        &InlineExecutor,
+                    );
+                }
+                black_box(map)
+            },
+            criterion::BatchSize::LargeInput,
+        )
     });
 }
 

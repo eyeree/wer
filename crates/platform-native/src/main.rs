@@ -44,12 +44,13 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 use world_core::{
-    domain_mask, Anchor, AnchorKind, PossibilityDomain, PossibilityField, RegionCoord,
-    POSSIBILITY_DIMS, REGION_SIZE,
+    domain_mask, Anchor, AnchorKind, Biome, PossibilityDomain, PossibilityField, RegionCoord,
+    LAYER_COUNT, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    Budget, FrameStats, GenerationStatus, RegionMap, StreamConfig, CHANNEL_ELEVATION,
-    CHANNEL_MOISTURE, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+    Budget, FrameStats, GenerationStatus, RegionMap, StreamConfig, CHANNEL_CANOPY,
+    CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER,
+    CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
 use executor::RayonExecutor;
@@ -127,6 +128,8 @@ struct App {
     modifiers: ModifiersState,
     /// Mouse position in window physical pixels, when over the window.
     cursor_pos: Option<(f64, f64)>,
+    /// Cumulative regenerated-tile counts per layer (panel telemetry).
+    regen_totals: [u64; LAYER_COUNT as usize],
     last_frame: Instant,
     // Rolling telemetry (phase-1-plan.md section 12), displayed by the info
     // panel; per-second counters are no longer logged.
@@ -150,11 +153,12 @@ impl App {
             world: World::new(),
             composer,
             hud,
-            channel: Channel::Biome,
+            channel: Channel::Composite,
             overlays: Overlays::default(),
             keys_down: HashSet::new(),
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
+            regen_totals: [0; LAYER_COUNT as usize],
             last_frame: Instant::now(),
             stats_frames: 0,
             update_time_accum: 0.0,
@@ -289,25 +293,26 @@ impl App {
         let cx = (((world.0 - ox) / cell) as u16).min(res - 1);
         let cy = (((world.1 - oy) / cell) as u16).min(res - 1);
         let sample = |channel: usize| map.cache().channel(coord, channel).map(|t| t.get(cx, cy));
-        let elevation = sample(CHANNEL_ELEVATION);
-        let temperature = sample(CHANNEL_TEMPERATURE);
-        let moisture = sample(CHANNEL_MOISTURE);
-        let vegetation = sample(CHANNEL_VEGETATION);
-        let biome = match (elevation, temperature, moisture, vegetation) {
-            (Some(e), Some(t), Some(m), Some(v)) => Some(viz::biome_name(e, t, m, v)),
-            _ => None,
-        };
         CursorInfo {
             world,
             region: (coord.x, coord.y),
             stability,
             revision,
             status,
-            elevation,
-            temperature,
-            moisture,
-            vegetation,
-            biome,
+            elevation: sample(CHANNEL_ELEVATION),
+            temperature: sample(CHANNEL_TEMPERATURE),
+            moisture: sample(CHANNEL_MOISTURE),
+            hardness: sample(CHANNEL_HARDNESS),
+            river: sample(CHANNEL_RIVER),
+            wetness: sample(CHANNEL_WETNESS),
+            soil_depth: sample(CHANNEL_SOIL_DEPTH),
+            fertility: sample(CHANNEL_FERTILITY),
+            vegetation: sample(CHANNEL_VEGETATION),
+            canopy: sample(CHANNEL_CANOPY),
+            biome: map
+                .cache()
+                .biome(coord)
+                .map(|t| Biome::from_id(t.get(cx, cy)).name()),
         }
     }
 
@@ -351,6 +356,13 @@ impl App {
         let update_start = Instant::now();
         let stats = self.world.update();
         let update_seconds = update_start.elapsed().as_secs_f64();
+        for (total, &count) in self
+            .regen_totals
+            .iter_mut()
+            .zip(&stats.regenerated_by_layer)
+        {
+            *total += count as u64;
+        }
 
         let cursor = self
             .cursor_world()
@@ -366,6 +378,8 @@ impl App {
             fps: self.fps,
             update_ms: self.update_ms,
             stats,
+            regen_totals: &self.regen_totals,
+            macro_tiles: self.world.map.macro_cache().len(),
             jobs_in_flight: self.world.map.jobs_in_flight(),
             pinned_violations: self.composer.pinned_violations,
             channel: self.channel,
@@ -480,6 +494,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
     let mut map = RegionMap::new(cfg);
     // Unbudgeted warm-up with the inline executor: fully loaded and generated.
     let mut stats = FrameStats::default();
+    let mut regen_totals = [0u64; LAYER_COUNT as usize];
     for _ in 0..8 {
         // Zero travel: fresh regions snap to target at load, and regeneration
         // is not gated on movement, so the window still settles fully.
@@ -492,6 +507,9 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
             &Budget::unlimited(),
             &world_runtime::InlineExecutor,
         );
+        for (total, &count) in regen_totals.iter_mut().zip(&stats.regenerated_by_layer) {
+            *total += count as u64;
+        }
     }
 
     let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
@@ -510,6 +528,8 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         fps: 0,
         update_ms: 0.0,
         stats,
+        regen_totals: &regen_totals,
+        macro_tiles: map.macro_cache().len(),
         jobs_in_flight: map.jobs_in_flight(),
         pinned_violations: composer.pinned_violations,
         channel,
@@ -574,7 +594,7 @@ fn main() {
     {
         let usage = "usage: wer --screenshot <out.ppm> [channel] [x y]";
         let (path, channel, pos) = match rest {
-            [path] => (path, Channel::Biome, (0.0, 0.0)),
+            [path] => (path, Channel::Composite, (0.0, 0.0)),
             [path, channel] => match Channel::parse(channel) {
                 Some(c) => (path, c, (0.0, 0.0)),
                 None => {

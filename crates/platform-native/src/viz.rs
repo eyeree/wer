@@ -1,29 +1,42 @@
 //! CPU composition of the top-down false-color debug map
-//! (phase-1-plan.md section 10, milestone M5).
+//! (phase-1-plan.md section 10; phase-2-plan.md §11).
 //!
 //! Composing on the CPU keeps the GPU surface area minimal (the renderer just
 //! presents one texture) and makes every overlay trivial to draw. A continuous
 //! field renders as smooth gradients; a chunk-replacement bug renders as a
-//! visible seam or a flickering tile — precisely what this map exists to catch.
+//! visible seam or a flickering tile. Rivers are the Phase 2
+//! popping-detector-in-chief: a drainage discontinuity is instantly visible as
+//! a broken river line across a macro boundary.
 
 use std::collections::BTreeMap;
 
-use world_core::{splitmix64, RegionCoord, REGION_SIZE, SEA_LEVEL};
+use world_core::{splitmix64, Biome, RegionCoord, REGION_SIZE, SEA_LEVEL};
 use world_runtime::{
-    RegionMap, CHANNEL_ELEVATION, CHANNEL_MOISTURE, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+    RegionMap, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE,
+    CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
 /// Which scalar the map paints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
-    /// Composite: water depth, vegetation/moisture-shaded land, snowline.
-    Biome,
-    /// Terrain elevation (the stable layer — must never move under drift).
+    /// Composite: water depth, biome palette, river/wetness darkening.
+    Composite,
+    /// Terrain elevation (stable — must never move under drift).
     Elevation,
+    /// Rock: lithology tint shaded by hardness (stable).
+    Geology,
     /// Air temperature.
     Temperature,
     /// Surface moisture.
     Moisture,
+    /// River expression over the (stable) drainage topology.
+    River,
+    /// Surface wetness.
+    Wetness,
+    /// Soil: fertility hue, depth brightness.
+    Soil,
+    /// Biome classification (categorical palette).
+    Biome,
     /// Aggregate vegetation density.
     Vegetation,
     /// The streaming stability ramp (white = pinned, black = free).
@@ -37,13 +50,18 @@ impl Channel {
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Channel::Biome => Channel::Elevation,
-            Channel::Elevation => Channel::Temperature,
+            Channel::Composite => Channel::Elevation,
+            Channel::Elevation => Channel::Geology,
+            Channel::Geology => Channel::Temperature,
             Channel::Temperature => Channel::Moisture,
-            Channel::Moisture => Channel::Vegetation,
+            Channel::Moisture => Channel::River,
+            Channel::River => Channel::Wetness,
+            Channel::Wetness => Channel::Soil,
+            Channel::Soil => Channel::Biome,
+            Channel::Biome => Channel::Vegetation,
             Channel::Vegetation => Channel::Stability,
             Channel::Stability => Channel::Revision,
-            Channel::Revision => Channel::Biome,
+            Channel::Revision => Channel::Composite,
         }
     }
 
@@ -51,10 +69,15 @@ impl Channel {
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name {
-            "biome" => Some(Channel::Biome),
+            "composite" => Some(Channel::Composite),
             "elevation" => Some(Channel::Elevation),
+            "geology" => Some(Channel::Geology),
             "temperature" => Some(Channel::Temperature),
             "moisture" => Some(Channel::Moisture),
+            "river" => Some(Channel::River),
+            "wetness" => Some(Channel::Wetness),
+            "soil" => Some(Channel::Soil),
+            "biome" => Some(Channel::Biome),
             "vegetation" => Some(Channel::Vegetation),
             "stability" => Some(Channel::Stability),
             "revision" => Some(Channel::Revision),
@@ -66,10 +89,15 @@ impl Channel {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Channel::Biome => "biome",
+            Channel::Composite => "composite",
             Channel::Elevation => "elevation",
+            Channel::Geology => "geology",
             Channel::Temperature => "temperature",
             Channel::Moisture => "moisture",
+            Channel::River => "river",
+            Channel::Wetness => "wetness",
+            Channel::Soil => "soil",
+            Channel::Biome => "biome",
             Channel::Vegetation => "vegetation",
             Channel::Stability => "stability",
             Channel::Revision => "revision",
@@ -140,46 +168,81 @@ fn moisture_color(m: f32) -> [u8; 3] {
     lerp_rgb([150, 110, 70], [40, 90, 200], m)
 }
 
+fn river_color(r: f32) -> [u8; 3] {
+    lerp_rgb([20, 20, 26], [80, 170, 255], r)
+}
+
+fn wetness_color(w: f32) -> [u8; 3] {
+    lerp_rgb([120, 100, 70], [30, 120, 160], w)
+}
+
+fn soil_color(depth: f32, fertility: f32) -> [u8; 3] {
+    let hue = lerp_rgb([190, 170, 130], [80, 60, 30], fertility);
+    let brightness = 0.35 + 0.65 * depth;
+    [
+        (f32::from(hue[0]) * brightness) as u8,
+        (f32::from(hue[1]) * brightness) as u8,
+        (f32::from(hue[2]) * brightness) as u8,
+    ]
+}
+
 fn vegetation_color(v: f32) -> [u8; 3] {
     lerp_rgb([190, 175, 130], [20, 110, 40], v)
 }
 
-/// Human-readable classification matching the [`biome_color`] rules — shown in
-/// the info panel for the cell under the cursor.
+/// Distinct tints per lithology class (geology channel), shaded by hardness.
+const LITHOLOGY_TINTS: [[u8; 3]; 8] = [
+    [188, 143, 122],
+    [140, 150, 170],
+    [172, 165, 120],
+    [120, 160, 140],
+    [180, 130, 160],
+    [150, 140, 100],
+    [110, 140, 175],
+    [165, 120, 100],
+];
+
+fn geology_color(world_x: f64, world_y: f64, hardness: f32) -> [u8; 3] {
+    let tint = LITHOLOGY_TINTS[world_core::lithology_id(world_x, world_y) as usize];
+    let shade = 0.45 + 0.55 * hardness;
+    [
+        (f32::from(tint[0]) * shade) as u8,
+        (f32::from(tint[1]) * shade) as u8,
+        (f32::from(tint[2]) * shade) as u8,
+    ]
+}
+
+/// The categorical biome palette (phase-2-plan.md §11).
 #[must_use]
-pub fn biome_name(e: f32, t: f32, m: f32, v: f32) -> &'static str {
-    if e < SEA_LEVEL {
-        if e < -300.0 {
-            "deep water"
-        } else {
-            "shallow water"
-        }
-    } else if t < -2.0 {
-        "snow"
-    } else if e > 700.0 {
-        "alpine rock"
-    } else if v > 0.55 {
-        "forest"
-    } else if v > 0.25 {
-        "grassland"
-    } else if m < 0.25 {
-        "desert"
-    } else {
-        "shrubland"
+pub const fn biome_color(biome: Biome) -> [u8; 3] {
+    match biome {
+        Biome::Ocean => [24, 44, 110],
+        Biome::River => [58, 120, 216],
+        Biome::Wetland => [70, 120, 110],
+        Biome::Desert => [225, 200, 140],
+        Biome::Grassland => [150, 180, 90],
+        Biome::Shrubland => [170, 160, 100],
+        Biome::TemperateForest => [45, 120, 55],
+        Biome::Rainforest => [15, 95, 45],
+        Biome::Taiga => [60, 100, 80],
+        Biome::Tundra => [160, 160, 140],
+        Biome::Bare => [130, 125, 120],
+        Biome::Ice => [235, 240, 248],
     }
 }
 
-fn biome_color(e: f32, t: f32, m: f32, v: f32) -> [u8; 3] {
+/// Composite: real biomes over water depth, with river/wetness expression
+/// blended in so drift visibly breathes without moving the network.
+fn composite_color(e: f32, biome: Biome, river: f32, wetness: f32) -> [u8; 3] {
     if e < SEA_LEVEL {
         return elevation_color(e);
     }
-    if t < -2.0 {
-        return [235, 240, 248]; // snow
-    }
-    let ground = lerp_rgb([200, 185, 140], [90, 80, 60], m);
-    let land = lerp_rgb(ground, [25, 105, 45], v);
+    let mut rgb = biome_color(biome);
+    // Rivers draw as blue veins; wetness darkens the ground toward marsh.
+    rgb = lerp_rgb(rgb, [58, 120, 216], river * 0.8);
+    rgb = lerp_rgb(rgb, [35, 60, 70], wetness * 0.25);
     // High rock fades in above the vegetation line.
-    lerp_rgb(land, [130, 125, 120], ((e - 500.0) / 400.0).clamp(0.0, 1.0))
+    lerp_rgb(rgb, [130, 125, 120], ((e - 500.0) / 400.0).clamp(0.0, 1.0))
 }
 
 /// Composes the active window into an RGBA8 image, one pixel per field cell,
@@ -308,27 +371,51 @@ impl MapComposer {
         let tiles = map.cache().get(coord);
         let flashing = overlays.pinned_flash && self.flash.contains_key(&coord);
 
-        let tile = |channel_index: usize| tiles.and_then(|t| t.channels[channel_index].as_ref());
+        let tile = |channel_index: usize| tiles.and_then(|t| t.channels[channel_index].as_deref());
         let elevation = tile(CHANNEL_ELEVATION);
+        let hardness = tile(CHANNEL_HARDNESS);
         let temperature = tile(CHANNEL_TEMPERATURE);
         let moisture = tile(CHANNEL_MOISTURE);
+        let river = tile(CHANNEL_RIVER);
+        let wetness = tile(CHANNEL_WETNESS);
+        let soil_depth = tile(CHANNEL_SOIL_DEPTH);
+        let fertility = tile(CHANNEL_FERTILITY);
         let vegetation = tile(CHANNEL_VEGETATION);
+        let biome = tiles.and_then(|t| t.biome.as_deref());
+
+        let (origin_x, origin_y) = coord.origin();
+        let cell = REGION_SIZE / f64::from(res);
 
         for cy in 0..res {
             for cx in 0..res {
+                let scalar = |t: Option<&world_core::FieldTile<f32>>,
+                              paint: &dyn Fn(f32) -> [u8; 3]| {
+                    t.map(|t| paint(t.get(cx, cy)))
+                        .unwrap_or_else(|| missing_color(cx, cy))
+                };
                 let mut rgb = match channel {
-                    Channel::Elevation => elevation
-                        .map(|t| elevation_color(t.get(cx, cy)))
-                        .unwrap_or_else(|| missing_color(cx, cy)),
-                    Channel::Temperature => temperature
-                        .map(|t| temperature_color(t.get(cx, cy)))
-                        .unwrap_or_else(|| missing_color(cx, cy)),
-                    Channel::Moisture => moisture
-                        .map(|t| moisture_color(t.get(cx, cy)))
-                        .unwrap_or_else(|| missing_color(cx, cy)),
-                    Channel::Vegetation => vegetation
-                        .map(|t| vegetation_color(t.get(cx, cy)))
-                        .unwrap_or_else(|| missing_color(cx, cy)),
+                    Channel::Elevation => scalar(elevation, &elevation_color),
+                    Channel::Temperature => scalar(temperature, &temperature_color),
+                    Channel::Moisture => scalar(moisture, &moisture_color),
+                    Channel::River => scalar(river, &river_color),
+                    Channel::Wetness => scalar(wetness, &wetness_color),
+                    Channel::Vegetation => scalar(vegetation, &vegetation_color),
+                    Channel::Geology => match hardness {
+                        Some(h) => {
+                            let wx = origin_x + (f64::from(cx) + 0.5) * cell;
+                            let wy = origin_y + (f64::from(cy) + 0.5) * cell;
+                            geology_color(wx, wy, h.get(cx, cy))
+                        }
+                        None => missing_color(cx, cy),
+                    },
+                    Channel::Soil => match (soil_depth, fertility) {
+                        (Some(d), Some(f)) => soil_color(d.get(cx, cy), f.get(cx, cy)),
+                        _ => missing_color(cx, cy),
+                    },
+                    Channel::Biome => match biome {
+                        Some(b) => biome_color(Biome::from_id(b.get(cx, cy))),
+                        None => missing_color(cx, cy),
+                    },
                     Channel::Stability => match state {
                         Some(r) => {
                             let s = (r.stability * 255.0) as u8;
@@ -343,10 +430,13 @@ impl MapComposer {
                         }
                         None => missing_color(cx, cy),
                     },
-                    Channel::Biome => match (elevation, temperature, moisture, vegetation) {
-                        (Some(e), Some(t), Some(m), Some(v)) => {
-                            biome_color(e.get(cx, cy), t.get(cx, cy), m.get(cx, cy), v.get(cx, cy))
-                        }
+                    Channel::Composite => match (elevation, biome, river, wetness) {
+                        (Some(e), Some(b), Some(r), Some(w)) => composite_color(
+                            e.get(cx, cy),
+                            Biome::from_id(b.get(cx, cy)),
+                            r.get(cx, cy),
+                            w.get(cx, cy),
+                        ),
                         _ => missing_color(cx, cy),
                     },
                 };
