@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 
 use world_core::{splitmix64, Biome, RegionCoord, REGION_SIZE, SEA_LEVEL};
 use world_runtime::{
-    RegionMap, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE,
-    CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    RegionMap, CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
+    CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH,
+    CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
 /// Which scalar the map paints.
@@ -39,6 +40,14 @@ pub enum Channel {
     Biome,
     /// Aggregate vegetation density.
     Vegetation,
+    /// Herbivore pressure (aggregate ecology, L8).
+    Herbivore,
+    /// Predator pressure (aggregate ecology, L8).
+    Predator,
+    /// Species diversity (aggregate ecology, L8).
+    Diversity,
+    /// Dominant species (categorical palette by species-id hash).
+    DominantSpecies,
     /// The streaming stability ramp (white = pinned, black = free).
     Stability,
     /// Realized-state revision, hashed to a color: convergence churn flickers.
@@ -59,7 +68,11 @@ impl Channel {
             Channel::Wetness => Channel::Soil,
             Channel::Soil => Channel::Biome,
             Channel::Biome => Channel::Vegetation,
-            Channel::Vegetation => Channel::Stability,
+            Channel::Vegetation => Channel::Herbivore,
+            Channel::Herbivore => Channel::Predator,
+            Channel::Predator => Channel::Diversity,
+            Channel::Diversity => Channel::DominantSpecies,
+            Channel::DominantSpecies => Channel::Stability,
             Channel::Stability => Channel::Revision,
             Channel::Revision => Channel::Composite,
         }
@@ -79,6 +92,10 @@ impl Channel {
             "soil" => Some(Channel::Soil),
             "biome" => Some(Channel::Biome),
             "vegetation" => Some(Channel::Vegetation),
+            "herbivore" => Some(Channel::Herbivore),
+            "predator" => Some(Channel::Predator),
+            "diversity" => Some(Channel::Diversity),
+            "dominant" => Some(Channel::DominantSpecies),
             "stability" => Some(Channel::Stability),
             "revision" => Some(Channel::Revision),
             _ => None,
@@ -99,6 +116,10 @@ impl Channel {
             Channel::Soil => "soil",
             Channel::Biome => "biome",
             Channel::Vegetation => "vegetation",
+            Channel::Herbivore => "herbivore",
+            Channel::Predator => "predator",
+            Channel::Diversity => "diversity",
+            Channel::DominantSpecies => "dominant",
             Channel::Stability => "stability",
             Channel::Revision => "revision",
         }
@@ -114,6 +135,9 @@ pub struct Overlays {
     pub rings: bool,
     /// Flash regions whose revision advanced while pinned (a continuity bug).
     pub pinned_flash: bool,
+    /// Near-field organism markers, coloured by expressed appearance
+    /// (phase-3-plan.md §11 — the popping/coherence detector for Tier B).
+    pub organisms: bool,
 }
 
 impl Default for Overlays {
@@ -122,6 +146,7 @@ impl Default for Overlays {
             grid: true,
             rings: true,
             pinned_flash: true,
+            organisms: true,
         }
     }
 }
@@ -188,6 +213,59 @@ fn soil_color(depth: f32, fertility: f32) -> [u8; 3] {
 
 fn vegetation_color(v: f32) -> [u8; 3] {
     lerp_rgb([190, 175, 130], [20, 110, 40], v)
+}
+
+fn herbivore_color(h: f32) -> [u8; 3] {
+    // Pressures are ecologically small (~10% steps down the pyramid); amplify
+    // for legibility so a debug map still reads.
+    lerp_rgb([20, 24, 20], [210, 200, 60], (h * 8.0).clamp(0.0, 1.0))
+}
+
+fn predator_color(p: f32) -> [u8; 3] {
+    lerp_rgb([22, 18, 20], [220, 70, 60], (p * 40.0).clamp(0.0, 1.0))
+}
+
+fn diversity_color(d: f32) -> [u8; 3] {
+    lerp_rgb([30, 20, 45], [90, 220, 200], d)
+}
+
+/// A categorical colour for a species id: hash to a vivid, well-separated hue.
+fn species_color(species_id: u64) -> [u8; 3] {
+    let h = splitmix64(species_id);
+    // Bias toward saturated, mid-bright colours so distinct species read apart.
+    [
+        96 + (h & 0x7F) as u8,
+        96 + ((h >> 20) & 0x7F) as u8,
+        96 + ((h >> 40) & 0x7F) as u8,
+    ]
+}
+
+/// Convert an HSV triple (all `[0, 1]`) to RGB — for organism markers coloured
+/// by expressed appearance (hue, brightness from luminance).
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let h6 = (h.rem_euclid(1.0)) * 6.0;
+    let c = v * s;
+    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h6 as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    ]
+}
+
+/// The marker colour for an organism's expressed appearance (hue from the
+/// Aesthetics-biased genome, brightness from luminance).
+fn expressed_color(expressed: &world_core::Expressed) -> [u8; 3] {
+    hsv_to_rgb(expressed.hue, 0.75, 0.45 + 0.55 * expressed.luminance)
 }
 
 /// Distinct tints per lithology class (geology channel), shaded by hardness.
@@ -313,11 +391,29 @@ impl MapComposer {
             }
         }
 
+        if overlays.organisms {
+            self.draw_organisms(map, player);
+        }
         if overlays.rings {
             self.draw_rings(map, player);
         }
         self.draw_player_marker(player);
         &self.pixels
+    }
+
+    /// Near-field organism markers, coloured by expressed appearance. A marker
+    /// that contradicts its cell's aggregate tint is instantly visible — the
+    /// Tier-B popping/coherence detector (phase-3-plan.md §11).
+    fn draw_organisms(&mut self, map: &RegionMap, player: (f64, f64)) {
+        let cell = REGION_SIZE / f64::from(self.resolution);
+        let (west, north) = self.view_origin(player);
+        for organism in map.organisms() {
+            let (wx, wy) = organism.world_pos;
+            let px = ((wx - west) / cell) as i64;
+            let py = ((north - wy) / cell) as i64;
+            let rgb = expressed_color(&organism.expressed);
+            self.plot(px, py, rgb);
+        }
     }
 
     /// The most recently composed RGBA buffer (valid after [`Self::compose`]).
@@ -381,6 +477,9 @@ impl MapComposer {
         let soil_depth = tile(CHANNEL_SOIL_DEPTH);
         let fertility = tile(CHANNEL_FERTILITY);
         let vegetation = tile(CHANNEL_VEGETATION);
+        let herbivore = tile(CHANNEL_HERBIVORE);
+        let predator = tile(CHANNEL_PREDATOR);
+        let diversity = tile(CHANNEL_DIVERSITY);
         let biome = tiles.and_then(|t| t.biome.as_deref());
 
         let (origin_x, origin_y) = coord.origin();
@@ -400,6 +499,13 @@ impl MapComposer {
                     Channel::River => scalar(river, &river_color),
                     Channel::Wetness => scalar(wetness, &wetness_color),
                     Channel::Vegetation => scalar(vegetation, &vegetation_color),
+                    Channel::Herbivore => scalar(herbivore, &herbivore_color),
+                    Channel::Predator => scalar(predator, &predator_color),
+                    Channel::Diversity => scalar(diversity, &diversity_color),
+                    Channel::DominantSpecies => match map.dominant_species_id(coord, cx, cy) {
+                        Some(id) => species_color(id),
+                        None => missing_color(cx, cy),
+                    },
                     Channel::Geology => match hardness {
                         Some(h) => {
                             let wx = origin_x + (f64::from(cx) + 0.5) * cell;
@@ -431,12 +537,23 @@ impl MapComposer {
                         None => missing_color(cx, cy),
                     },
                     Channel::Composite => match (elevation, biome, river, wetness) {
-                        (Some(e), Some(b), Some(r), Some(w)) => composite_color(
-                            e.get(cx, cy),
-                            Biome::from_id(b.get(cx, cy)),
-                            r.get(cx, cy),
-                            w.get(cx, cy),
-                        ),
+                        (Some(e), Some(b), Some(r), Some(w)) => {
+                            let elev = e.get(cx, cy);
+                            let mut rgb = composite_color(
+                                elev,
+                                Biome::from_id(b.get(cx, cy)),
+                                r.get(cx, cy),
+                                w.get(cx, cy),
+                            );
+                            // Tint land by dominant-species colour so ecosystem
+                            // zonation reads at a glance (phase-3-plan.md §11).
+                            if elev >= SEA_LEVEL {
+                                if let Some(id) = map.dominant_species_id(coord, cx, cy) {
+                                    rgb = lerp_rgb(rgb, species_color(id), 0.18);
+                                }
+                            }
+                            rgb
+                        }
                         _ => missing_color(cx, cy),
                     },
                 };

@@ -26,13 +26,18 @@ pub mod coord;
 pub mod dephash;
 pub mod drainage;
 pub mod field;
+pub mod foodweb;
+pub mod genome;
 pub mod geology;
+pub mod habitat;
 pub mod hash;
 pub mod hydrology;
 pub mod layer;
+pub mod population;
 pub mod possibility;
 pub mod possibility_field;
 pub mod soils;
+pub mod species;
 pub mod terrain;
 pub mod vegetation;
 
@@ -43,16 +48,25 @@ pub use coord::{LocalPos, RegionCoord, REGION_SIZE};
 pub use dephash::{drainage_dep_hash, drainage_dep_hash_default, layer_dep_hash};
 pub use drainage::{drainage, macro_coord_for, DrainageTile, MACRO_GRID, MACRO_LEVEL};
 pub use field::{FieldTile, FIELD_RES};
+pub use foodweb::{food_web, max_body_size, species_biomass, FoodWeb};
+pub use genome::{
+    size_class_units, AppearanceGenes, BehaviorGenes, Expressed, Genome, GenomeBias, NicheGenes,
+};
 pub use geology::{geology, lithology_id, lithology_seed, Geology};
+pub use habitat::HabitatSignature;
 pub use hash::{feature_hash, mix, splitmix64, FeatureKey, Rng};
 pub use hydrology::{hydrology, Hydrology};
 pub use layer::{
     all_layers_mask, dependents_closure, domain_dirty_mask, domain_readers, layer_bit, layer_decl,
     LayerDecl, LAYERS, LAYER_COUNT,
 };
+pub use population::{diversity_of, population, signature_productivity, PopulationSample};
 pub use possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS, POSSIBILITY_QUANT};
 pub use possibility_field::PossibilityField;
 pub use soils::{soils, Soils};
+pub use species::{
+    species_roster, species_seed, Species, SpeciesRoster, Trophic, ROSTER_MAX, TROPHIC_TIERS,
+};
 pub use terrain::{elevation, is_water, SEA_LEVEL};
 pub use vegetation::{vegetation, Vegetation};
 

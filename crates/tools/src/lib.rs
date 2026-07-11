@@ -6,15 +6,17 @@
 //! `wer-replay` (the headless continuity replay), and `wer-ledger` (the
 //! invalidation-precision harness of phase-2-plan.md §12.3).
 
+pub mod ecology;
 pub mod ledger;
 pub mod replay;
 
+pub use ecology::{run_ecology_harness, EcologyReport};
 pub use ledger::{run_invalidation_ledger, ScenarioReport};
 pub use replay::{run_continuity_replay, ReplayConfig, ReplayReport};
 
 use world_core::{feature_hash, Biome, FeatureKey, RegionCoord, WORLD_ALGORITHM_VERSION};
 use world_runtime::{
-    Budget, InlineExecutor, LayerDiagnostic, RegionMap, StreamConfig, CHANNEL_CANOPY,
+    Budget, CellEcology, InlineExecutor, LayerDiagnostic, RegionMap, StreamConfig, CHANNEL_CANOPY,
     CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER,
     CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
@@ -77,9 +79,15 @@ pub struct PositionReport {
 ///
 /// Runs the real streaming pipeline over a small window with the inline
 /// executor, so what it reports is exactly what the app would realize.
+/// Settle a small streaming window around a position and return it with the
+/// covering region and the cell `(cx, cy)` the position falls in — the shared
+/// setup behind [`inspect_world_position`] and [`inspect_ecology`].
+///
+/// The near radius pins the center region so it fully realizes its organisms,
+/// so `--species` / `--ecology` report exactly what the app would.
 #[must_use]
-pub fn inspect_world_position(world_x: f64, world_y: f64) -> PositionReport {
-    let (region, hash) = probe_world_position(world_x, world_y);
+fn settled_inspection(world_x: f64, world_y: f64) -> (RegionMap, RegionCoord, u16, u16) {
+    let region = RegionCoord::from_world(world_x, world_y);
     let cfg = StreamConfig {
         near_radius: 1.0 * world_core::REGION_SIZE,
         far_radius: 2.0 * world_core::REGION_SIZE,
@@ -101,13 +109,28 @@ pub fn inspect_world_position(world_x: f64, world_y: f64) -> PositionReport {
             &InlineExecutor,
         );
     }
-
-    let state = map.get(region).expect("center region resident");
     let res = cfg.field_resolution;
     let (ox, oy) = region.origin();
     let cell = world_core::REGION_SIZE / f64::from(res);
     let cx = (((world_x - ox) / cell) as u16).min(res - 1);
     let cy = (((world_y - oy) / cell) as u16).min(res - 1);
+    (map, region, cx, cy)
+}
+
+/// The aggregate ecology and full roster readout at a world position — the data
+/// behind `wer-inspect --species` and `--ecology` (phase-3-plan.md §11).
+/// `None` if the ecology layer has not settled for the cell.
+#[must_use]
+pub fn inspect_ecology(world_x: f64, world_y: f64) -> Option<CellEcology> {
+    let (map, region, cx, cy) = settled_inspection(world_x, world_y);
+    map.cell_ecology(region, cx, cy)
+}
+
+#[must_use]
+pub fn inspect_world_position(world_x: f64, world_y: f64) -> PositionReport {
+    let (_, hash) = probe_world_position(world_x, world_y);
+    let (map, region, cx, cy) = settled_inspection(world_x, world_y);
+    let state = map.get(region).expect("center region resident");
     let sample = |channel: usize| {
         map.cache()
             .channel(region, channel)

@@ -19,6 +19,11 @@ pub struct Budget {
     pub max_converge_regions: usize,
     /// Generation cost units dispatched per frame (phase-2-plan.md §8.2).
     pub max_regen_cost: u32,
+    /// Near-field organisms instantiated per frame, so entering a dense biome
+    /// amortizes realization over a few frames rather than hitching
+    /// (phase-3-plan.md §8.4). Budgeted by whole regions: a region realizes
+    /// fully once started, and the pass stops starting new regions past the cap.
+    pub max_realize_organisms: usize,
 }
 
 impl Budget {
@@ -36,6 +41,9 @@ impl Budget {
             max_loads: ((48.0 * scale) as usize).max(1),
             max_converge_regions: ((512.0 * scale) as usize).max(1),
             max_regen_cost: ((96.0 * scale) as u32).max(1),
+            // A few hundred organisms/frame keeps entering a dense biome smooth
+            // while still filling the near window in a handful of frames.
+            max_realize_organisms: ((400.0 * scale) as usize).max(1),
         }
     }
 
@@ -46,6 +54,7 @@ impl Budget {
             max_loads: usize::MAX,
             max_converge_regions: usize::MAX,
             max_regen_cost: u32::MAX,
+            max_realize_organisms: usize::MAX,
         }
     }
 }

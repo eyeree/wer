@@ -34,8 +34,12 @@ pub const LAYER_SOILS: u16 = 5;
 pub const LAYER_BIOME: u16 = 6;
 /// Aggregate vegetation: density and canopy height (phase-2-plan.md §7.7).
 pub const LAYER_VEGETATION: u16 = 7;
-/// Number of layers in the Phase 2 stack.
-pub const LAYER_COUNT: u16 = 8;
+/// Aggregate ecology: herbivore/predator pressure, diversity, dominant species
+/// (phase-3-plan.md §4.1, §7.5). The first reader of the Morphology, Behavior,
+/// and Aesthetics domains, appended to the Phase 2 graph with no id churn (§3).
+pub const LAYER_ECOLOGY: u16 = 8;
+/// Number of layers in the stack (Phase 2's eight + Phase 3's L8).
+pub const LAYER_COUNT: u16 = 9;
 
 /// The dirty-bitset bit for a layer id.
 #[inline]
@@ -86,6 +90,9 @@ const P: u8 = domain_bit(PossibilityDomain::Planetary);
 const C: u8 = domain_bit(PossibilityDomain::Climate);
 const H: u8 = domain_bit(PossibilityDomain::Hydrology);
 const E: u8 = domain_bit(PossibilityDomain::Ecology);
+const M: u8 = domain_bit(PossibilityDomain::Morphology);
+const B: u8 = domain_bit(PossibilityDomain::Behavior);
+const A: u8 = domain_bit(PossibilityDomain::Aesthetics);
 
 /// The static layer declaration table (phase-2-plan.md §4.1).
 ///
@@ -161,6 +168,23 @@ pub const LAYERS: [LayerDecl; LAYER_COUNT as usize] = [
         name: "vegetation",
         deps: &[LAYER_CLIMATE, LAYER_SOILS, LAYER_BIOME],
         domains: E,
+        algorithm_revision: 0,
+        cost: 2,
+    },
+    LayerDecl {
+        id: LAYER_ECOLOGY,
+        name: "ecology",
+        // Aggregate populations: rosters key off biome + banded climate/soil,
+        // pressure scales with vegetation density (primary productivity). L8 is
+        // the first — and only — reader of Morphology, Behavior, and Aesthetics:
+        // the aggregate fields are Ecology-driven, while M/B/A fold into the
+        // dependency hash because near-field realization (L8's transient
+        // consumer, §7.6) expresses genomes under them, so steering M/B/A must
+        // regenerate L8 and re-realize its organisms (phase-3-plan.md §5.1, §7.5).
+        deps: &[LAYER_CLIMATE, LAYER_SOILS, LAYER_BIOME, LAYER_VEGETATION],
+        domains: E | M | B | A,
+        // Roster-backed but per-cell arithmetic over four input tiles; the §13
+        // benches calibrate this (mid-cost, comparable to hydrology).
         algorithm_revision: 0,
         cost: 2,
     },
@@ -302,12 +326,14 @@ mod tests {
 
     #[test]
     fn domain_dirty_masks_match_the_declared_graph() {
-        // Ecology drives vegetation only.
+        // Ecology drives vegetation (since Phase 2) and now L8; L8 is downstream
+        // of vegetation, so an Ecology flip reaches exactly {Vegetation, L8}.
         assert_eq!(
             domain_dirty_mask(domain_bit(PossibilityDomain::Ecology)),
-            layer_bit(LAYER_VEGETATION)
+            layer_bit(LAYER_VEGETATION) | layer_bit(LAYER_ECOLOGY)
         );
-        // A Climate flip re-checks climate and everything downstream of it.
+        // A Climate flip re-checks climate and everything downstream of it —
+        // now including L8, which depends on climate through several paths.
         assert_eq!(
             domain_dirty_mask(domain_bit(PossibilityDomain::Climate)),
             layer_bit(LAYER_CLIMATE)
@@ -315,12 +341,21 @@ mod tests {
                 | layer_bit(LAYER_SOILS)
                 | layer_bit(LAYER_BIOME)
                 | layer_bit(LAYER_VEGETATION)
+                | layer_bit(LAYER_ECOLOGY)
         );
-        // Morphology/Behavior/Aesthetics reach nothing in Phase 2.
-        let unused = domain_bit(PossibilityDomain::Morphology)
-            | domain_bit(PossibilityDomain::Behavior)
-            | domain_bit(PossibilityDomain::Aesthetics);
-        assert_eq!(domain_dirty_mask(unused), 0);
+        // Morphology/Behavior/Aesthetics now reach exactly L8 (Phase 3 wired
+        // them in; they invalidate nothing upstream).
+        for domain in [
+            PossibilityDomain::Morphology,
+            PossibilityDomain::Behavior,
+            PossibilityDomain::Aesthetics,
+        ] {
+            assert_eq!(
+                domain_dirty_mask(domain_bit(domain)),
+                layer_bit(LAYER_ECOLOGY),
+                "{domain:?} must reach exactly L8"
+            );
+        }
     }
 
     #[test]

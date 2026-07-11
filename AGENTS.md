@@ -12,16 +12,23 @@ browser/WebAssembly/WebGPU target) for an exploration game built around
 [`Infinite_World_Exploration_Project_Overview.md`](Infinite_World_Exploration_Project_Overview.md);
 the phased technical plan is in [`implementation-plan.md`](implementation-plan.md).
 
-The repository is at **Phase 2** (layered environmental generation, see
-[`phase-2-plan.md`](phase-2-plan.md)): an eight-layer declared dependency
-graph — terrain, geology, macro drainage, climate, hydrology, soils, biome,
-vegetation — with dependency-hash staleness (ADR 0008), topological
-cost-budgeted dispatch, stable integer river topology (ADR 0009), the
-continuity replay, and the invalidation-precision harness (`wer-ledger`).
-The renderer still only presents one CPU-composed debug texture, the
-possibility vector is still one scalar per domain, and the `Storage` trait is
-still unused — those grow in later phases; do not mistake them for finished
-subsystems.
+The repository is at **Phase 3** (procedural genetics and ecology, see
+[`phase-3-plan.md`](phase-3-plan.md)), built on the landed Phase 2 stack. Phase 2
+is a nine-layer declared dependency graph — terrain, geology, macro drainage,
+climate, hydrology, soils, biome, vegetation, and now **ecology (L8)** — with
+dependency-hash staleness (ADR 0008), topological cost-budgeted dispatch, stable
+integer river topology (ADR 0009), the continuity replay, and the
+invalidation-precision harness (`wer-ledger`). Phase 3 adds procedural genomes,
+species rosters, food webs, the aggregate-ecology layer L8 (the first reader of
+the Morphology/Behavior/Aesthetics domains), a signature-keyed roster cache, and
+near-field organism realization from the aggregate fields — species identity is
+presentation-grade until the atlas needs otherwise (ADR 0010), and its coherence
+and diversity are machine-checked by the ecology harness. The renderer still only
+presents one CPU-composed debug texture (near-field organisms surface as debug
+markers, not meshes), the possibility vector is still one scalar per domain
+(Phase 3 *reads* its last four domains, it does not grow them), and the `Storage`
+trait is still unused — those grow in later phases; do not mistake them for
+finished subsystems.
 
 ## Toolchain
 
@@ -110,9 +117,13 @@ Non-negotiable rules when touching generation code:
   return the identical value as native `cargo run --bin wer-inspect -- 0 0`
   (currently `0x4c6ca5de38f90b17` at algorithm version 2). The same applies to
   every parity export (terrain gradient seed, control-point seed, lithology
-  seed, and the drainage routing sample — routing is all-integer topology, so
-  full direction+accumulation equality is required, ADR 0009). This equality
-  is the determinism guarantee the browser port depends on.
+  seed, the drainage routing sample — routing is all-integer topology, so
+  full direction+accumulation equality is required, ADR 0009 — and the Phase 3
+  `genome_sample` and `food_web_sample`, the portable genetics surface: a
+  genome and food-web tier biomass are pure functions of an integer seed, so
+  they are cross-platform, but the *habitat signature a cell derives* is
+  presentation-grade and deliberately not a parity export, ADR 0010). This
+  equality is the determinism guarantee the browser port depends on.
 - A portable PRNG (`Rng`) may be seeded *from* a stable hash for approximate
   sampling; its float outputs are not sources of identity.
 

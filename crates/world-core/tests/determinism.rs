@@ -15,11 +15,15 @@ use world_core::{
     dephash::{drainage_dep_hash_default, layer_dep_hash},
     drainage::{drainage, tiebreak_hash, MACRO_APRON, MACRO_LEVEL},
     elevation, feature_hash,
+    foodweb::food_web,
+    genome::Genome,
     geology::{geology, lithology_seed},
+    habitat::HabitatSignature,
     hydrology::hydrology,
     layer::LAYER_CLIMATE,
     possibility_field::PossibilityField,
     soils::soils,
+    species::{species_roster, species_seed, Trophic},
     splitmix64,
     terrain::gradient_seed,
     vegetation::vegetation,
@@ -338,6 +342,102 @@ fn layer_dep_hash_golden() {
         drainage_dep_hash_default(RegionCoord::at_level(0, 0, MACRO_LEVEL)),
         0x1902_F38A_1E6A_30A6
     );
+}
+
+// --- Phase 3 golden fixtures (phase-3-plan.md §12.1) ------------------------
+
+/// A fixed habitat signature used across the genetics/roster fixtures.
+fn golden_signature() -> HabitatSignature {
+    HabitatSignature {
+        biome: Biome::TemperateForest.id(),
+        temperature_band: 3,
+        moisture_band: 3,
+        fertility_band: 2,
+    }
+}
+
+#[test]
+fn habitat_and_species_seed_golden() {
+    // Integer identities behind species rosters: portable given a signature
+    // (the signature *derivation* is presentation-grade, §9.3, ADR 0010).
+    let sig = golden_signature();
+    assert_eq!(sig.seed(), 0x4204_1386_32E9_C315);
+    assert_eq!(species_seed(sig, 0), 0x2340_6061_75CD_D2D2);
+    assert_eq!(species_seed(sig, 5), 0x8FFA_4BC8_DED4_E2BF);
+}
+
+#[test]
+fn genome_from_seed_golden() {
+    // The portable, cross-platform genome surface (§9.3): integer trait words
+    // for a fixed seed, plus the fold-order fingerprint parity-tested on wasm.
+    let g = Genome::from_seed(0x1234_5678_9ABC_DEF0);
+    assert_eq!(g.appearance.hue, 201);
+    assert_eq!(g.appearance.luminance, 242);
+    assert_eq!(g.appearance.size_class, 0);
+    assert_eq!(g.appearance.form, 11);
+    assert_eq!(g.behavior.activity, 76);
+    assert_eq!(g.behavior.aggression, 9);
+    assert_eq!(g.behavior.sociality, 162);
+    assert_eq!(g.niche.trophic_tendency, 54);
+    assert_eq!(g.niche.diet_breadth, 15);
+    assert_eq!(g.niche.temperature_tolerance, 50);
+    assert_eq!(g.niche.moisture_tolerance, 50);
+    assert_eq!(g.fingerprint(), 0xE76D_2D5A_4C1F_C16B);
+}
+
+#[test]
+fn species_roster_composition_golden() {
+    // Roster size and each species' trophic role for a fixed signature
+    // (phase-3-plan.md §12.1). Roles are trophic-sorted: Producer(0),
+    // Herbivore(1), Omnivore(2), Carnivore(3), Decomposer(4).
+    let roster = species_roster(golden_signature());
+    assert_eq!(roster.len(), 10);
+    let roles: Vec<u8> = roster.species.iter().map(|s| s.trophic as u8).collect();
+    assert_eq!(
+        roles,
+        vec![
+            Trophic::Producer as u8,
+            Trophic::Producer as u8,
+            Trophic::Producer as u8,
+            Trophic::Producer as u8,
+            Trophic::Herbivore as u8,
+            Trophic::Herbivore as u8,
+            Trophic::Herbivore as u8,
+            Trophic::Omnivore as u8,
+            Trophic::Carnivore as u8,
+            Trophic::Decomposer as u8,
+        ]
+    );
+    // Each species' genome derives from its own species seed.
+    assert_eq!(roster.species[0].id, species_seed(golden_signature(), 0));
+    assert_eq!(
+        roster.species[0].genome,
+        Genome::from_seed(roster.species[0].id)
+    );
+}
+
+#[test]
+fn food_web_golden() {
+    // Tier biomass for a fixed roster is portable `f32` (pure IEEE arithmetic
+    // over integer-derived inputs), so it is a cross-platform identity
+    // (phase-3-plan.md §12.5). The rainforest roster is the richest, so this
+    // exercises a full four-tier web.
+    let sig = HabitatSignature {
+        biome: Biome::Rainforest.id(),
+        temperature_band: 5,
+        moisture_band: 4,
+        fertility_band: 3,
+    };
+    let roster = species_roster(sig);
+    let web = food_web(&roster, 0.8);
+    assert_eq!(
+        web.tier_biomass,
+        [0.7936508, 0.07936508, 0.007936508, 0.11904762]
+    );
+    assert_eq!(web.tier_biomass_fingerprint(), 0xDD32_EC75_48F5_38A6);
+    assert_eq!(web.edges.len(), 15);
+    assert!(web.pruned.is_empty());
+    assert_eq!(web.max_body_size, 10.34);
 }
 
 #[test]

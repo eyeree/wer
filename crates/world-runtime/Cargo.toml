@@ -19,3 +19,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "update"
 harness = false
+
+[[bench]]
+name = "ecology"
+harness = false

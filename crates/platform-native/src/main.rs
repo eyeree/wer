@@ -54,7 +54,7 @@ use world_runtime::{
 };
 
 use executor::RayonExecutor;
-use panel::{CursorInfo, Hud, PanelInfo};
+use panel::{CursorInfo, EcologyInfo, Hud, PanelInfo};
 use viz::{Channel, MapComposer, Overlays};
 
 /// Letterbox color around the square map (linear RGBA).
@@ -266,6 +266,9 @@ impl App {
             KeyCode::KeyX => {
                 self.overlays.pinned_flash = !self.overlays.pinned_flash;
             }
+            KeyCode::KeyM => {
+                self.overlays.organisms = !self.overlays.organisms;
+            }
             KeyCode::Escape => event_loop.exit(),
             _ => {}
         }
@@ -313,6 +316,14 @@ impl App {
                 .cache()
                 .biome(coord)
                 .map(|t| Biome::from_id(t.get(cx, cy)).name()),
+            ecology: map.cell_ecology(coord, cx, cy).map(|e| EcologyInfo {
+                roster_size: e.roster.roster.species.len(),
+                dominant_id: e.dominant_id,
+                trophic_counts: e.trophic_counts,
+                herbivore: e.herbivore.unwrap_or(0.0),
+                predator: e.predator.unwrap_or(0.0),
+                diversity: e.diversity.unwrap_or(0.0),
+            }),
         }
     }
 
@@ -380,6 +391,8 @@ impl App {
             stats,
             regen_totals: &self.regen_totals,
             macro_tiles: self.world.map.macro_cache().len(),
+            rosters: self.world.map.roster_cache().len(),
+            organisms: self.world.map.organism_count(),
             jobs_in_flight: self.world.map.jobs_in_flight(),
             pinned_violations: self.composer.pinned_violations,
             channel: self.channel,
@@ -518,6 +531,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         grid: false,
         rings: false,
         pinned_flash: false,
+        organisms: true,
     };
     composer.compose(&map, pos, channel, overlays);
 
@@ -530,6 +544,8 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         stats,
         regen_totals: &regen_totals,
         macro_tiles: map.macro_cache().len(),
+        rosters: map.roster_cache().len(),
+        organisms: map.organism_count(),
         jobs_in_flight: map.jobs_in_flight(),
         pinned_violations: composer.pinned_violations,
         channel,

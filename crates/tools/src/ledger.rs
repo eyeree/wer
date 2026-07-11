@@ -314,6 +314,7 @@ fn budget_ripple_scenario() -> ScenarioReport {
         max_loads: usize::MAX,
         max_converge_regions: usize::MAX,
         max_regen_cost: 24,
+        max_realize_organisms: usize::MAX,
     };
     let mut violations = Vec::new();
     let mut frames_with_regen = 0u32;
@@ -374,33 +375,41 @@ pub fn run_invalidation_ledger() -> Vec<ScenarioReport> {
     let mut bias;
     let mut reports = Vec::new();
 
-    // Aesthetics/Morphology/Behavior: buckets flip, nothing reads them.
+    // Aesthetics/Morphology/Behavior: buckets flip; L8 is their only reader, so
+    // exactly ecology regenerates (its aggregate fields are Ecology-driven, but
+    // its dependency hash folds M/B/A because near-field realization expresses
+    // genomes under them — phase-3-plan.md §7.5).
     bias = [0.0f32; POSSIBILITY_DIMS];
     bias[PossibilityDomain::Aesthetics.index()] = 0.4;
     bias[PossibilityDomain::Morphology.index()] = 0.4;
     bias[PossibilityDomain::Behavior.index()] = -0.4;
     reports.push(drift_scenario(
-        "aesthetics/morphology/behavior bias -> nothing",
+        "aesthetics/morphology/behavior bias -> ecology (L8) only",
         bias,
         true,
-        Some(0),
+        Some(layer_bit(world_core::layer::LAYER_ECOLOGY)),
     ));
 
-    // Ecology: vegetation only.
+    // Ecology: vegetation and L8 (Ecology has driven vegetation density since
+    // Phase 2; L8 is the new reader downstream of it).
     bias = [0.0f32; POSSIBILITY_DIMS];
     bias[PossibilityDomain::Ecology.index()] = 0.3;
     reports.push(drift_scenario(
-        "ecology bucket flip -> vegetation only",
+        "ecology bucket flip -> vegetation + ecology (L8)",
         bias,
         true,
-        Some(layer_bit(world_core::layer::LAYER_VEGETATION)),
+        Some(
+            layer_bit(world_core::layer::LAYER_VEGETATION)
+                | layer_bit(world_core::layer::LAYER_ECOLOGY),
+        ),
     ));
 
-    // Climate: climate and downstream; never the stable trio.
+    // Climate: climate and everything downstream (now including L8); never the
+    // stable trio.
     bias = [0.0f32; POSSIBILITY_DIMS];
     bias[PossibilityDomain::Climate.index()] = -0.3;
     reports.push(drift_scenario(
-        "climate bucket flip -> climate..vegetation, stable trio untouched",
+        "climate bucket flip -> climate..ecology, stable trio untouched",
         bias,
         true,
         Some(
@@ -408,7 +417,8 @@ pub fn run_invalidation_ledger() -> Vec<ScenarioReport> {
                 | layer_bit(world_core::layer::LAYER_HYDROLOGY)
                 | layer_bit(world_core::layer::LAYER_SOILS)
                 | layer_bit(world_core::layer::LAYER_BIOME)
-                | layer_bit(world_core::layer::LAYER_VEGETATION),
+                | layer_bit(world_core::layer::LAYER_VEGETATION)
+                | layer_bit(world_core::layer::LAYER_ECOLOGY),
         ),
     ));
 

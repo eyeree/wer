@@ -33,7 +33,7 @@ use world_core::{
 };
 use world_runtime::{
     Budget, FrameStats, InlineExecutor, RegionMap, StreamConfig, CHANNEL_CANOPY, CHANNEL_COUNT,
-    CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER, CHANNEL_TEMPERATURE,
+    CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
 };
 
 /// Script + thresholds for one replay run.
@@ -84,6 +84,7 @@ impl Default for ReplayConfig {
                 max_loads: 64,
                 max_converge_regions: 512,
                 max_regen_cost: 2048,
+                max_realize_organisms: usize::MAX,
             },
             velocity: (37.0, 23.0),
             // One converge step moves a dimension ≤ converge_rate; generation
@@ -232,9 +233,26 @@ fn state_hash(map: &RegionMap) -> u64 {
         if let Some(biome) = &tiles.biome {
             h = mix(h, biome.content_hash());
         }
+        // Phase 3: the dominant-species u16 tile is part of the L8 output.
+        if let Some(dominant) = &tiles.dominant {
+            h = mix(h, dominant.content_hash());
+        }
     }
     for (_, tile) in map.macro_cache().iter() {
         h = mix(h, tile.content_hash());
+    }
+    // Phase 3: two runs must produce the same roster cache and the same
+    // near-field organisms (phase-3-plan.md §12.2).
+    for (sig, entry) in map.roster_cache().iter() {
+        h = mix(h, sig.seed());
+        for sp in &entry.roster.species {
+            h = mix(h, sp.id);
+        }
+        h = mix(h, entry.web.tier_biomass_fingerprint());
+    }
+    for organism in map.organisms() {
+        h = mix(h, organism.id);
+        h = mix(h, organism.species);
     }
     h
 }
@@ -266,6 +284,9 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
     // macro-tile content hashes, fixed for as long as the entry is resident.
     let mut trio_hashes: BTreeMap<RegionCoord, (Option<u64>, Option<u64>)> = BTreeMap::new();
     let mut macro_hashes: BTreeMap<RegionCoord, u64> = BTreeMap::new();
+    // Near-field organism ids per region from the previous frame, for the
+    // identity-stability check (phase-3-plan.md §12.2).
+    let mut prev_organisms: BTreeMap<RegionCoord, Vec<u64>> = BTreeMap::new();
 
     // Travel per frame fuels convergence (ADR 0006); the scripted camera
     // moves at constant velocity except frame 0 (nothing traveled yet).
@@ -431,6 +452,52 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
                 }
             }
         }
+
+        // -- Near-field realization (phase-3-plan.md §12.2):
+        //    aggregate preservation and pinned organism-identity stability.
+        let mut organisms_now: BTreeMap<RegionCoord, Vec<u64>> = BTreeMap::new();
+        for region in map.iter_active() {
+            let coord = region.coord;
+            let Some(organisms) = map.organisms_in(coord) else {
+                continue;
+            };
+            organisms_now.insert(coord, organisms.iter().map(|o| o.id).collect());
+
+            // Coverage preserves the aggregate: organism count ≈ Σ vegetation
+            // density over the region's cells (section 10).
+            if let Some(veg) = map.cache().channel(coord, CHANNEL_VEGETATION) {
+                let expected: f32 = veg.samples().iter().sum();
+                let realized = organisms.len() as f32;
+                if (realized - expected).abs() > expected.max(4.0) * 0.7 + 16.0 {
+                    record(
+                        &mut violations,
+                        format!(
+                            "frame {frame}: region ({}, {}) realized {realized} organisms, aggregate {expected}",
+                            coord.x, coord.y
+                        ),
+                    );
+                }
+            }
+
+            // Identity stability: a region pinned across this frame and the last
+            // realizes bit-identical organism ids (no flicker while visible).
+            let pinned_now = region.stability >= 1.0;
+            let was_pinned = prev_state.get(&coord).is_some_and(|&(_, p)| p);
+            if pinned_now && was_pinned {
+                if let Some(before) = prev_organisms.get(&coord) {
+                    if before != organisms_now.get(&coord).unwrap() {
+                        record(
+                            &mut violations,
+                            format!(
+                                "frame {frame}: pinned region ({}, {}) organism ids changed",
+                                coord.x, coord.y
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        prev_organisms = organisms_now;
 
         prev_state = map
             .iter_active()

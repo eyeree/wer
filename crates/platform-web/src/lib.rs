@@ -11,8 +11,23 @@ use world_core::{
     dephash::drainage_dep_hash_default,
     drainage::{drainage, MACRO_APRON, MACRO_LEVEL},
     feature_hash,
+    foodweb::food_web,
+    genome::Genome,
     geology::lithology_seed,
+    habitat::HabitatSignature,
+    species::{species_roster, species_seed},
     terrain, FeatureKey, PossibilityField, RegionCoord, WORLD_ALGORITHM_VERSION,
+};
+
+/// The fixed habitat used by the Phase 3 parity exports. Only the (portable)
+/// integer signature → seed → genome / roster / web chain is asserted
+/// cross-platform; how a cell arrives at this signature is presentation-grade
+/// (§9.3, ADR 0010).
+const PARITY_SIGNATURE: HabitatSignature = HabitatSignature {
+    biome: 6, // Biome::TemperateForest
+    temperature_band: 3,
+    moisture_band: 3,
+    fertility_band: 2,
 };
 
 /// A portable smoke computation: the deterministic hash of the origin feature.
@@ -70,6 +85,27 @@ pub fn drainage_routing_sample() -> u64 {
     (u64::from(tile.flow_dir_at(gx, gy)) << 32) | u64::from(tile.accum_at(gx, gy))
 }
 
+/// Parity sample for the procedural-genetics identity layer (phase-3-plan.md
+/// §12.5): the fingerprint of the genome of a fixed species seed. `genome(seed)`
+/// is the *portable* Phase 3 surface — pure integer→integer hashing — so **full**
+/// cross-platform equality is required. Signature derivation is deliberately not
+/// exported: it reads `f32` tiles and is presentation-grade by decision
+/// (§9.3, ADR 0010).
+#[must_use]
+pub fn genome_sample() -> u64 {
+    Genome::from_seed(species_seed(PARITY_SIGNATURE, 0)).fingerprint()
+}
+
+/// Parity sample for the food-web layer (phase-3-plan.md §12.5): the tier
+/// biomass of the fixed roster's web at a fixed productivity, folded to a
+/// fingerprint. Tier biomass is portable `f32`, so full cross-platform equality
+/// is required (§9.3). Signature derivation is not exported.
+#[must_use]
+pub fn food_web_sample() -> u64 {
+    let roster = species_roster(PARITY_SIGNATURE);
+    food_web(&roster, 0.7).tier_biomass_fingerprint()
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -119,6 +155,20 @@ mod wasm {
     pub fn drainage_routing_sample() -> u64 {
         super::drainage_routing_sample()
     }
+
+    /// Procedural-genome identity sample (phase-3-plan.md §12.5).
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn genome_sample() -> u64 {
+        super::genome_sample()
+    }
+
+    /// Food-web tier-biomass identity sample (phase-3-plan.md §12.5).
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn food_web_sample() -> u64 {
+        super::food_web_sample()
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +186,7 @@ mod tests {
         assert_eq!(super::control_point_seed_sample(), 0xAAF0_551F_3E6F_1A1C);
         assert_eq!(super::lithology_seed_sample(), 0x61DD_60E4_EEF6_FD16);
         assert_eq!(super::drainage_routing_sample(), 0x0000_0001_0000_000D);
+        assert_eq!(super::genome_sample(), 0x6023_7E3E_43E5_2590);
+        assert_eq!(super::food_web_sample(), 0x6272_09D2_6720_001B);
     }
 }

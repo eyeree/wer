@@ -172,6 +172,7 @@ fn cost_budgets_are_enforced_per_frame() {
         max_loads: 5,
         max_converge_regions: 3,
         max_regen_cost: 12,
+        max_realize_organisms: usize::MAX,
     };
     let mut map = RegionMap::new(small_config());
     let field = PossibilityField::default();
@@ -353,6 +354,7 @@ fn dispatch_is_topological_under_tiny_budgets() {
         max_loads: usize::MAX,
         max_converge_regions: usize::MAX,
         max_regen_cost: 10, // one drainage job, or a few cheap layers
+        max_realize_organisms: usize::MAX,
     };
     let mut map = RegionMap::new(StreamConfig {
         load_radius: 1.0 * REGION_SIZE,
@@ -428,6 +430,81 @@ fn river_expression_reads_the_macro_topology() {
         max_river > 0.05,
         "no river expression anywhere in the window (max {max_river})"
     );
+}
+
+#[test]
+fn near_field_organisms_are_stable_and_preserve_the_aggregate() {
+    // M4 exit (phase-3-plan.md §16): near-field organism counts preserve the
+    // aggregate, and organism ids are stable across frames and a two-run replay.
+    let field = PossibilityField::default();
+    let run = || {
+        let mut map = RegionMap::new(small_config());
+        for _ in 0..8 {
+            map.update(
+                (0.0, 0.0),
+                0.0,
+                &field,
+                &[],
+                &NO_BIAS,
+                &Budget::unlimited(),
+                &InlineExecutor,
+            );
+        }
+        map
+    };
+    let map = run();
+    // The pinned near region hosts organisms.
+    let near = RegionCoord::new(0, 0);
+    let organisms = map.organisms_in(near).expect("near region realized");
+    assert!(!organisms.is_empty(), "near region should host organisms");
+
+    // Coverage preserves the aggregate: organism count ≈ sum of vegetation
+    // density over the region's cells (one per cell with probability = density).
+    let res = small_config().field_resolution;
+    let veg = map
+        .cache()
+        .channel(near, CHANNEL_VEGETATION)
+        .expect("veg tile");
+    let expected: f32 = (0..res)
+        .flat_map(|cy| (0..res).map(move |cx| (cx, cy)))
+        .map(|(cx, cy)| veg.get(cx, cy))
+        .sum();
+    let realized = organisms.len() as f32;
+    assert!(
+        (realized - expected).abs() <= expected.max(4.0) * 0.6 + 8.0,
+        "realized {realized} far from aggregate {expected}"
+    );
+
+    // Ids are stable across further frames while the region stays pinned.
+    let ids_before: Vec<u64> = organisms.iter().map(|o| o.id).collect();
+    let mut map = map;
+    for _ in 0..5 {
+        map.update(
+            (0.0, 0.0),
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+        );
+    }
+    let ids_after: Vec<u64> = map
+        .organisms_in(near)
+        .unwrap()
+        .iter()
+        .map(|o| o.id)
+        .collect();
+    assert_eq!(
+        ids_before, ids_after,
+        "pinned organism ids must not flicker"
+    );
+
+    // Two-run replay: an independent run realizes bit-identical organisms.
+    let other = run();
+    let a: Vec<_> = map.organisms_in(near).unwrap().to_vec();
+    let b: Vec<_> = other.organisms_in(near).unwrap().to_vec();
+    assert_eq!(a, b, "two runs must realize identical organisms");
 }
 
 #[test]

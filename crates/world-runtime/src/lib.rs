@@ -15,7 +15,9 @@
 pub mod budget;
 pub mod generate;
 pub mod macrocache;
+pub mod realize;
 pub mod region;
+pub mod rostercache;
 pub mod storage;
 pub mod stream;
 pub mod task;
@@ -23,12 +25,16 @@ pub mod task;
 pub use budget::Budget;
 pub use generate::{
     generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache, RegionTiles,
-    CHANNEL_CANOPY, CHANNEL_COUNT, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
-    CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
-    CHANNEL_WETNESS,
+    CHANNEL_CANOPY, CHANNEL_COUNT, CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY,
+    CHANNEL_HARDNESS, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER,
+    CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 pub use macrocache::MacroCache;
+pub use realize::{realize_region, Organism};
 pub use region::{GenerationStatus, RegionState};
+pub use rostercache::{RosterCache, RosterEntry, RosterSnapshot};
 pub use storage::{Storage, StorageError};
-pub use stream::{stability_for, FrameStats, LayerDiagnostic, RegionMap, StreamConfig};
+pub use stream::{
+    stability_for, CellEcology, FrameStats, LayerDiagnostic, RegionMap, StreamConfig,
+};
 pub use task::{InlineExecutor, TaskExecutor, TaskPriority};

@@ -105,6 +105,20 @@ impl FieldTile<u8> {
     }
 }
 
+impl FieldTile<u16> {
+    /// Order-stable hash of a categorical (dominant-species index) tile's
+    /// contents and provenance — same replay role as the `u8`/`f32` variants
+    /// (phase-3-plan.md §6.1, §12.4).
+    #[must_use]
+    pub fn content_hash(&self) -> u64 {
+        let mut h = self.provenance_hash();
+        for s in &self.samples {
+            h = mix(h, *s as u64);
+        }
+        h
+    }
+}
+
 impl<T> FieldTile<T> {
     fn provenance_hash(&self) -> u64 {
         let mut h: u64 = 0xF1E1_D000_C0FF_EE00;

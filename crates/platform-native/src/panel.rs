@@ -67,6 +67,27 @@ pub struct CursorInfo {
     pub canopy: Option<f32>,
     /// Biome classification of the cell (from the biome id tile).
     pub biome: Option<&'static str>,
+    /// Aggregate ecology readout at the cell (from L8), when settled.
+    pub ecology: Option<EcologyInfo>,
+}
+
+/// The aggregate-ecology facts the panel shows for the cell under the cursor
+/// (phase-3-plan.md §11).
+#[derive(Debug, Clone)]
+pub struct EcologyInfo {
+    /// Roster size for the cell's habitat signature.
+    pub roster_size: usize,
+    /// Dominant species id.
+    pub dominant_id: u64,
+    /// Species count per trophic role: producer, herbivore, omnivore,
+    /// carnivore, decomposer.
+    pub trophic_counts: [usize; 5],
+    /// Herbivore pressure.
+    pub herbivore: f32,
+    /// Predator pressure.
+    pub predator: f32,
+    /// Species diversity.
+    pub diversity: f32,
 }
 
 /// One frame's worth of panel content.
@@ -83,6 +104,10 @@ pub struct PanelInfo<'a> {
     pub regen_totals: &'a [u64; LAYER_COUNT as usize],
     /// Resident macro drainage tiles.
     pub macro_tiles: usize,
+    /// Resident roster-cache entries (distinct habitat signatures).
+    pub rosters: usize,
+    /// Realized near-field organisms currently resident.
+    pub organisms: usize,
     /// Generation jobs dispatched but not yet integrated.
     pub jobs_in_flight: usize,
     /// Changed-while-pinned events observed so far (0 = continuity holds).
@@ -157,7 +182,7 @@ impl Hud {
         let x = self.map_side + MARGIN;
         let mut cur = PanelCursor { x, y: MARGIN };
 
-        cur.line(self, "INFINITE WORLD  PHASE 2", TITLE);
+        cur.line(self, "INFINITE WORLD  PHASE 3", TITLE);
         cur.rule(self);
 
         cur.pair(
@@ -193,13 +218,17 @@ impl Hud {
         );
         cur.pair(
             self,
+            "organisms",
+            &format!("{}", info.organisms),
+            "realized",
+            &format!("{}", info.stats.organisms_realized),
+        );
+        cur.pair(
+            self,
             "macro tiles",
             &format!("{}", info.macro_tiles),
-            "macro regen",
-            &format!(
-                "{}",
-                info.regen_totals[world_core::layer::LAYER_DRAINAGE as usize]
-            ),
+            "rosters",
+            &format!("{}", info.rosters),
         );
         let viol_color = if info.pinned_violations == 0 {
             VALUE
@@ -362,6 +391,32 @@ impl Hud {
                     }
                     _ => cur.line(self, "(tiles not generated yet)", LABEL),
                 }
+                if let Some(e) = &c.ecology {
+                    cur.pair(
+                        self,
+                        "species",
+                        &format!("{}", e.roster_size),
+                        "domspp",
+                        &format!("{:04x}", e.dominant_id & 0xFFFF),
+                    );
+                    cur.pair(
+                        self,
+                        "herb",
+                        &format!("{:.3}", e.herbivore),
+                        "pred",
+                        &format!("{:.3}", e.predator),
+                    );
+                    cur.pair(
+                        self,
+                        "diversity",
+                        &format!("{:.2}", e.diversity),
+                        "P/H/C",
+                        &format!(
+                            "{}/{}/{}",
+                            e.trophic_counts[0], e.trophic_counts[1], e.trophic_counts[3]
+                        ),
+                    );
+                }
             }
         }
         cur.rule(self);
@@ -370,7 +425,7 @@ impl Hud {
         for (keys, action) in [
             ("WASD 1-8 Z", "move, bias, reset"),
             ("E / Q / C", "anchors, clear"),
-            ("V G N X", "channel,overlays"),
+            ("V G N X M", "channel,overlays"),
         ] {
             let row_y = cur.y;
             self.text(cur.x, row_y, keys, KEY);

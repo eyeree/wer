@@ -34,17 +34,23 @@ use std::sync::Arc;
 
 use world_core::layer::{
     all_layers_mask, dependents_closure, domain_dirty_mask, layer_bit, layer_decl, LAYER_COUNT,
-    LAYER_DRAINAGE,
+    LAYER_DRAINAGE, LAYER_ECOLOGY,
 };
 use world_core::{
-    drainage_dep_hash, layer_dep_hash, macro_coord_for, project_plausible, steer, Anchor,
-    DrainageTile, PossibilityField, PossibilityVector, RegionCoord, POSSIBILITY_DIMS, REGION_SIZE,
+    drainage_dep_hash, layer_dep_hash, macro_coord_for, project_plausible, steer, Anchor, Biome,
+    Climate, DrainageTile, GenomeBias, HabitatSignature, PossibilityDomain, PossibilityField,
+    PossibilityVector, RegionCoord, Soils, POSSIBILITY_DIMS, REGION_SIZE,
 };
 
 use crate::budget::Budget;
-use crate::generate::{generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache};
+use crate::generate::{
+    generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache, CHANNEL_DIVERSITY,
+    CHANNEL_FERTILITY, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_TEMPERATURE,
+};
 use crate::macrocache::MacroCache;
+use crate::realize::{realize_region, Organism};
 use crate::region::{GenerationStatus, RegionState};
+use crate::rostercache::{RosterCache, RosterEntry, RosterSnapshot};
 use crate::task::{TaskExecutor, TaskPriority};
 
 /// Distance thresholds and rates for the streaming window. All radii are world
@@ -125,6 +131,16 @@ pub struct FrameStats {
     pub cache_bytes: usize,
     /// Heap bytes held by the macro drainage cache after this frame.
     pub macro_cache_bytes: usize,
+    /// `(roster, food web)` entries built (not cache-served) this frame
+    /// (phase-3-plan.md §8.4).
+    pub rosters_built: usize,
+    /// Heap bytes held by the roster cache after this frame.
+    pub roster_cache_bytes: usize,
+    /// Near-field organisms instantiated this frame (≤ `max_realize_organisms`
+    /// modulo a final region overshoot, phase-3-plan.md §8.4).
+    pub organisms_realized: usize,
+    /// Total near-field organisms resident after this frame.
+    pub organisms: usize,
 }
 
 /// Distance from the player to a region's center.
@@ -185,6 +201,31 @@ impl LayerDiagnostic {
     }
 }
 
+/// The ecology readout for one cell (phase-3-plan.md §11): the habitat
+/// signature, its memoized roster/web, the dominant species, the trophic
+/// breakdown, and the aggregate L8 field values. Behind `wer-inspect
+/// --species` / `--ecology` and the info panel.
+#[derive(Debug, Clone)]
+pub struct CellEcology {
+    /// The cell's habitat signature.
+    pub signature: HabitatSignature,
+    /// The memoized roster and food web for the signature.
+    pub roster: Arc<RosterEntry>,
+    /// Index of the dominant species within the roster.
+    pub dominant_index: u16,
+    /// Stable id of the dominant species (`0` if the roster is empty).
+    pub dominant_id: u64,
+    /// Species count per [`world_core::Trophic`] variant (indexed by its
+    /// discriminant).
+    pub trophic_counts: [usize; 5],
+    /// Herbivore pressure at the cell, if the L8 tile exists.
+    pub herbivore: Option<f32>,
+    /// Predator pressure at the cell.
+    pub predator: Option<f32>,
+    /// Species diversity at the cell.
+    pub diversity: Option<f32>,
+}
+
 /// A finished job flowing back to the integrator.
 #[derive(Debug)]
 enum JobResult {
@@ -210,6 +251,18 @@ pub struct RegionMap {
     regions: BTreeMap<RegionCoord, RegionState>,
     cache: RegionCache,
     macro_cache: MacroCache,
+    /// Memoized `(roster, food web)` per habitat signature (phase-3-plan.md §6.3).
+    roster_cache: RosterCache,
+    /// The signatures each region's L8 tile currently uses, recorded at L8
+    /// dispatch — the dependent set the roster cache evicts against.
+    region_signatures: BTreeMap<RegionCoord, BTreeSet<HabitatSignature>>,
+    /// Realized near-field organisms per pinned near region (Tier B, transient
+    /// and un-cached, phase-3-plan.md §8.3). Rebuilt when a region's L8 tile
+    /// changes, dropped when it leaves the near window.
+    organisms: BTreeMap<RegionCoord, Vec<Organism>>,
+    /// The L8 dependency hash each region's organisms were realized from, so
+    /// re-realization triggers exactly when the aggregate changes.
+    organism_keys: BTreeMap<RegionCoord, u64>,
     /// Run-local additions to each layer's declared `algorithm_revision`
     /// (see [`RegionMap::bump_layer_revision`]).
     revision_bumps: [u16; LAYER_COUNT as usize],
@@ -237,6 +290,10 @@ impl RegionMap {
             regions: BTreeMap::new(),
             cache: RegionCache::default(),
             macro_cache: MacroCache::default(),
+            roster_cache: RosterCache::default(),
+            region_signatures: BTreeMap::new(),
+            organisms: BTreeMap::new(),
+            organism_keys: BTreeMap::new(),
             revision_bumps: [0; LAYER_COUNT as usize],
             results_tx,
             results_rx,
@@ -264,6 +321,100 @@ impl RegionMap {
     #[must_use]
     pub const fn macro_cache(&self) -> &MacroCache {
         &self.macro_cache
+    }
+
+    /// The roster cache (memoized `(roster, food web)` per signature).
+    #[inline]
+    #[must_use]
+    pub const fn roster_cache(&self) -> &RosterCache {
+        &self.roster_cache
+    }
+
+    /// All realized near-field organisms in the window (phase-3-plan.md §8.3).
+    pub fn organisms(&self) -> impl Iterator<Item = &Organism> {
+        self.organisms.values().flatten()
+    }
+
+    /// A pinned near region's realized organisms, if any.
+    #[inline]
+    #[must_use]
+    pub fn organisms_in(&self, coord: RegionCoord) -> Option<&[Organism]> {
+        self.organisms.get(&coord).map(Vec::as_slice)
+    }
+
+    /// Total near-field organisms currently resident.
+    #[inline]
+    #[must_use]
+    pub fn organism_count(&self) -> usize {
+        self.organisms.values().map(Vec::len).sum()
+    }
+
+    /// Classify a cell's habitat signature from its settled biome/climate/soil
+    /// tiles — the same classification L8 runs (phase-3-plan.md §7.1). `None`
+    /// until those input tiles exist.
+    #[must_use]
+    pub fn cell_signature(&self, coord: RegionCoord, cx: u16, cy: u16) -> Option<HabitatSignature> {
+        let tiles = self.cache.get(coord)?;
+        let temperature = tiles.channels[CHANNEL_TEMPERATURE].as_ref()?;
+        let moisture = tiles.channels[CHANNEL_MOISTURE].as_ref()?;
+        let fertility = tiles.channels[CHANNEL_FERTILITY].as_ref()?;
+        let biome = tiles.biome.as_ref()?;
+        let c = Climate {
+            temperature: temperature.get(cx, cy),
+            moisture: moisture.get(cx, cy),
+        };
+        let s = Soils {
+            depth: 0.0,
+            fertility: fertility.get(cx, cy),
+        };
+        Some(HabitatSignature::of(
+            Biome::from_id(biome.get(cx, cy)),
+            &c,
+            &s,
+        ))
+    }
+
+    /// The stable id of a cell's dominant species — its signature classified,
+    /// then `species_seed(signature, dominant_index)`. Cheap (no roster cache
+    /// lookup), for the categorical dominant-species map channel. `None` until
+    /// the ecology tile and its inputs exist.
+    #[must_use]
+    pub fn dominant_species_id(&self, coord: RegionCoord, cx: u16, cy: u16) -> Option<u64> {
+        let index = self.cache.dominant(coord)?.get(cx, cy);
+        let signature = self.cell_signature(coord, cx, cy)?;
+        Some(world_core::species_seed(signature, u32::from(index)))
+    }
+
+    /// The full ecology readout for a cell: signature, roster, dominant species,
+    /// trophic breakdown, and the aggregate L8 field values — the data behind
+    /// `wer-inspect --species` / `--ecology` and the info panel
+    /// (phase-3-plan.md §11). `None` until L8 has settled for the cell.
+    #[must_use]
+    pub fn cell_ecology(&self, coord: RegionCoord, cx: u16, cy: u16) -> Option<CellEcology> {
+        let signature = self.cell_signature(coord, cx, cy)?;
+        let entry = Arc::clone(self.roster_cache.get(signature)?);
+        let dominant_index = self.cache.dominant(coord)?.get(cx, cy);
+        let tiles = self.cache.get(coord)?;
+        let sample = |channel: usize| tiles.channels[channel].as_ref().map(|t| t.get(cx, cy));
+        let dominant_id = entry
+            .roster
+            .species
+            .get(dominant_index as usize)
+            .map_or(0, |s| s.id);
+        let mut trophic_counts = [0usize; 5];
+        for s in &entry.roster.species {
+            trophic_counts[s.trophic as usize] += 1;
+        }
+        Some(CellEcology {
+            signature,
+            roster: entry,
+            dominant_index,
+            dominant_id,
+            trophic_counts,
+            herbivore: sample(CHANNEL_HERBIVORE),
+            predator: sample(CHANNEL_PREDATOR),
+            diversity: sample(CHANNEL_DIVERSITY),
+        })
     }
 
     /// A resident region's state.
@@ -395,9 +546,15 @@ impl RegionMap {
         // job dispatched above; integrating again here keeps the headless
         // replay settled within a single frame.
         self.integrate_finished(&mut stats);
+        // Near-field realization: a pure read of the settled caches over the
+        // pinned near window only (phase-3-plan.md §8.3), run after dispatch
+        // settles so it never sees a stale L8 tile.
+        self.realize_near_window(player, budget, &mut stats);
         stats.active_regions = self.regions.len();
         stats.cache_bytes = self.cache.bytes();
         stats.macro_cache_bytes = self.macro_cache.bytes();
+        stats.rosters_built = self.roster_cache.take_builds();
+        stats.roster_cache_bytes = self.roster_cache.bytes();
         stats
     }
 
@@ -525,6 +682,9 @@ impl RegionMap {
                     if let Some(biome) = result.biome {
                         self.cache.insert_biome(result.coord, Arc::new(biome));
                     }
+                    if let Some(dominant) = result.dominant {
+                        self.cache.insert_dominant(result.coord, Arc::new(dominant));
+                    }
                     // Downstream layers' expected hashes changed the moment the
                     // new tile landed: mark every transitive dependent.
                     region.dirty_layers |=
@@ -573,6 +733,9 @@ impl RegionMap {
         for coord in gone {
             self.regions.remove(&coord);
             self.cache.remove_region(coord);
+            self.region_signatures.remove(&coord);
+            self.organisms.remove(&coord);
+            self.organism_keys.remove(&coord);
             let keys: Vec<(RegionCoord, u16)> = self
                 .in_flight
                 .range((coord, 0)..=(coord, u16::MAX))
@@ -588,6 +751,11 @@ impl RegionMap {
             self.regions.keys().map(|&c| macro_coord_for(c)).collect();
         self.in_flight
             .retain(|(c, _), _| c.level == 0 || needed.contains(c));
+        // Sweep roster entries no resident region's L8 tile references any more
+        // (dependent-tracked, the macro cache's shape, §6.3).
+        let needed_signatures: BTreeSet<HabitatSignature> =
+            self.region_signatures.values().flatten().copied().collect();
+        self.roster_cache.evict_unused(&needed_signatures);
     }
 
     /// Insert missing regions within `load_radius`, nearest-first, up to the
@@ -875,6 +1043,115 @@ impl RegionMap {
         self.refresh_status(coord);
     }
 
+    /// Classify every cell of a region's settled inputs into a habitat
+    /// signature, ensure each signature's `(roster, food web)` is cached, and
+    /// snapshot them for the L8 job (phase-3-plan.md §6.3, §8.2). Records the
+    /// region's signature set for dependent-tracked roster eviction. The
+    /// classification here must match `generate_layer`'s exactly, so the
+    /// snapshot covers every signature the job will look up.
+    fn build_ecology_rosters(&mut self, coord: RegionCoord) -> Option<Arc<RosterSnapshot>> {
+        let tiles = self.cache.get(coord)?;
+        // Clone the input Arcs so the immutable cache borrow ends before we
+        // mutate the roster cache below.
+        let temperature = tiles.channels[CHANNEL_TEMPERATURE].clone()?;
+        let moisture = tiles.channels[CHANNEL_MOISTURE].clone()?;
+        let fertility = tiles.channels[CHANNEL_FERTILITY].clone()?;
+        let biome = tiles.biome.clone()?;
+
+        let res = self.cfg.field_resolution;
+        let mut signatures = BTreeSet::new();
+        for cy in 0..res {
+            for cx in 0..res {
+                let c = Climate {
+                    temperature: temperature.get(cx, cy),
+                    moisture: moisture.get(cx, cy),
+                };
+                // Only fertility feeds the signature (matches generate_layer).
+                let s = Soils {
+                    depth: 0.0,
+                    fertility: fertility.get(cx, cy),
+                };
+                let b = Biome::from_id(biome.get(cx, cy));
+                signatures.insert(HabitatSignature::of(b, &c, &s));
+            }
+        }
+
+        let mut snapshot: RosterSnapshot = BTreeMap::new();
+        for &signature in &signatures {
+            snapshot.insert(signature, self.roster_cache.ensure(signature));
+        }
+        self.region_signatures.insert(coord, signatures);
+        Some(Arc::new(snapshot))
+    }
+
+    /// The near-field realization pass (phase-3-plan.md §8.3): (re)build the
+    /// organism list of each pinned near region whose L8 tile is fresh, drop the
+    /// lists of regions that left the near window, and cap per-frame organism
+    /// instantiation by whole regions. A pure read of the settled caches — it
+    /// never mutates tiles and never enters the results channel.
+    ///
+    /// Re-realization is keyed on a region's L8 dependency hash: an organism
+    /// list is rebuilt exactly when the aggregate it was sampled from changes
+    /// (distance-based regeneration, §7.6), and is otherwise reused untouched,
+    /// so a pinned region's organism ids hold still across frames.
+    fn realize_near_window(&mut self, player: (f64, f64), budget: &Budget, stats: &mut FrameStats) {
+        let near_radius = self.cfg.near_radius;
+        let near: BTreeSet<RegionCoord> = self
+            .regions
+            .keys()
+            .copied()
+            .filter(|&c| center_distance(c, player) <= near_radius)
+            .collect();
+        // Offscreen replacement: discard organisms of regions no longer near.
+        self.organisms.retain(|c, _| near.contains(c));
+        self.organism_keys.retain(|c, _| near.contains(c));
+
+        // Nearest-first, deterministic order.
+        let mut order: Vec<(u64, RegionCoord)> = near
+            .iter()
+            .map(|&c| (center_distance(c, player).to_bits(), c))
+            .collect();
+        order.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
+
+        let resolution = self.cfg.field_resolution;
+        for (_, coord) in order {
+            // L8 must be fresh: present, dirty bit clear, no job in flight.
+            let Some(l8_hash) = self
+                .cache
+                .get(coord)
+                .and_then(|t| t.layer_hash(LAYER_ECOLOGY))
+            else {
+                continue;
+            };
+            let region = &self.regions[&coord];
+            if region.dirty_layers & layer_bit(LAYER_ECOLOGY) != 0
+                || self.in_flight.contains_key(&(coord, LAYER_ECOLOGY))
+            {
+                continue;
+            }
+            if self.organism_keys.get(&coord) == Some(&l8_hash) {
+                continue; // organisms already reflect the current aggregate
+            }
+            if stats.organisms_realized >= budget.max_realize_organisms {
+                break; // defer the rest to a later frame (§8.4)
+            }
+            let bias = GenomeBias {
+                morphology: region.current.get(PossibilityDomain::Morphology),
+                behavior: region.current.get(PossibilityDomain::Behavior),
+                aesthetics: region.current.get(PossibilityDomain::Aesthetics),
+            };
+            let revision = region.revision;
+            let organisms = {
+                let tiles = self.cache.get(coord).expect("l8 hash implies tiles");
+                realize_region(coord, tiles, &self.roster_cache, bias, revision, resolution)
+            };
+            stats.organisms_realized += organisms.len();
+            self.organisms.insert(coord, organisms);
+            self.organism_keys.insert(coord, l8_hash);
+        }
+        stats.organisms = self.organisms.values().map(Vec::len).sum();
+    }
+
     /// Snapshot a layer's inputs and submit its generation job. Clears the
     /// dirty bit at dispatch: anything that re-dirties the layer while the job
     /// flies thereby marks the result superseded (see `integrate_finished`).
@@ -886,6 +1163,17 @@ impl RegionMap {
         priority: TaskPriority,
         executor: &dyn TaskExecutor,
     ) {
+        // L8 resolves the rosters for the signatures its cells will produce
+        // (from the settled biome/climate/soil tiles) before the mutable
+        // borrows below, ensuring each is cached and snapshotting them into the
+        // job's inputs — exactly as hydrology snapshots the drainage macro tile
+        // (phase-3-plan.md §6.3, §8.2).
+        let rosters = if layer == LAYER_ECOLOGY {
+            self.build_ecology_rosters(coord)
+        } else {
+            None
+        };
+
         let decl = layer_decl(layer);
         let tiles = self.cache.get(coord);
         let mut input_tiles = Vec::new();
@@ -915,6 +1203,7 @@ impl RegionMap {
             tiles: input_tiles,
             biome,
             drainage,
+            rosters,
             dep_hash: expected,
         };
         region.dirty_layers &= !layer_bit(layer);

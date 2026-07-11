@@ -1,8 +1,8 @@
-//! `wer-inspect` — resolve a world position to its region, identity hash, and
-//! the full Phase 2 layer stack.
+//! `wer-inspect` — resolve a world position to its region, identity hash, the
+//! full layer stack, and its ecology.
 //!
 //! Usage:
-//!     wer-inspect <world_x> <world_y> [--layers]
+//!     wer-inspect <world_x> <world_y> [--layers] [--species] [--ecology]
 //!
 //! Prints the deterministic region coordinate and origin-feature hash for the
 //! given continuous world position, plus every layer's generated sample and
@@ -10,20 +10,31 @@
 //! spot-check. With `--layers`, also dumps the dependency-hash chain: each
 //! layer's declared inputs, the quantized buckets it consumed, expected vs
 //! stored hash, and the stale/fresh verdict (phase-2-plan.md §11) — the tool
-//! that makes invalidation *legible*.
+//! that makes invalidation *legible*. With `--species`, dumps the cell's
+//! habitat signature, full species roster (each species' id, genome, trophic
+//! role), and food-web edges. With `--ecology`, dumps the L8 aggregate values
+//! (phase-3-plan.md §11).
 
 use std::process::ExitCode;
 
-use tools::inspect_world_position;
+use tools::{inspect_ecology, inspect_world_position};
 use world_core::layer::{layer_decl, LAYERS};
 use world_core::{PossibilityDomain, WORLD_ALGORITHM_VERSION};
 
+fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
+    if let Some(i) = args.iter().position(|a| a == name) {
+        args.remove(i);
+        true
+    } else {
+        false
+    }
+}
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let layers_flag = args.iter().position(|a| a == "--layers");
-    if let Some(i) = layers_flag {
-        args.remove(i);
-    }
+    let layers_flag = take_flag(&mut args, "--layers");
+    let species_flag = take_flag(&mut args, "--species");
+    let ecology_flag = take_flag(&mut args, "--ecology");
     let (x, y) = match args.as_slice() {
         [x, y] => match (x.parse::<f64>(), y.parse::<f64>()) {
             (Ok(x), Ok(y)) => (x, y),
@@ -33,7 +44,7 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("usage: wer-inspect <world_x> <world_y> [--layers]");
+            eprintln!("usage: wer-inspect <world_x> <world_y> [--layers] [--species] [--ecology]");
             return ExitCode::FAILURE;
         }
     };
@@ -82,7 +93,7 @@ fn main() -> ExitCode {
         );
     }
 
-    if layers_flag.is_some() {
+    if layers_flag {
         println!();
         println!("dependency-hash chain (phase-2-plan.md §4.3):");
         for diag in &report.layers {
@@ -123,6 +134,83 @@ fn main() -> ExitCode {
                     ""
                 },
             );
+        }
+    }
+
+    if ecology_flag || species_flag {
+        match inspect_ecology(x, y) {
+            None => {
+                println!();
+                println!("ecology                 : (L8 not settled for this cell)");
+            }
+            Some(eco) => {
+                if ecology_flag {
+                    println!();
+                    println!("aggregate ecology (L8, phase-3-plan.md §7.5):");
+                    println!(
+                        "  herbivore   {}",
+                        eco.herbivore.map_or("-".into(), |v| format!("{v:.4}"))
+                    );
+                    println!(
+                        "  predator    {}",
+                        eco.predator.map_or("-".into(), |v| format!("{v:.4}"))
+                    );
+                    println!(
+                        "  diversity   {}",
+                        eco.diversity.map_or("-".into(), |v| format!("{v:.4}"))
+                    );
+                    println!(
+                        "  dominant    index {} id {:#018x}",
+                        eco.dominant_index, eco.dominant_id
+                    );
+                }
+                if species_flag {
+                    let sig = eco.signature;
+                    println!();
+                    println!(
+                        "habitat signature       : biome={} temp_band={} moist_band={} fert_band={} (seed {:#018x})",
+                        sig.biome().name(),
+                        sig.temperature_band,
+                        sig.moisture_band,
+                        sig.fertility_band,
+                        sig.seed(),
+                    );
+                    let roster = &eco.roster.roster;
+                    println!("species roster ({} species):", roster.species.len());
+                    for (i, sp) in roster.species.iter().enumerate() {
+                        let a = &sp.genome.appearance;
+                        let dominant = if i == eco.dominant_index as usize {
+                            " <- dominant"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "  [{i:2}] {:<10} id {:#018x}  hue {:3} size-class {} form {:2}{dominant}",
+                            sp.trophic.name(),
+                            sp.id,
+                            a.hue,
+                            a.size_class,
+                            a.form,
+                        );
+                    }
+                    let web = &eco.roster.web;
+                    println!(
+                        "food web ({} edges, max body size {:.2}):",
+                        web.edges.len(),
+                        web.max_body_size
+                    );
+                    for &(pred, prey) in &web.edges {
+                        println!(
+                            "  {} [{pred}] -> {} [{prey}]",
+                            roster.species[pred as usize].trophic.name(),
+                            roster.species[prey as usize].trophic.name(),
+                        );
+                    }
+                    if !web.pruned.is_empty() {
+                        println!("  pruned (unsustainable): {:?}", web.pruned);
+                    }
+                }
+            }
         }
     }
     ExitCode::SUCCESS

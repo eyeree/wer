@@ -14,14 +14,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use world_core::layer::{
-    LAYER_BIOME, LAYER_CLIMATE, LAYER_DRAINAGE, LAYER_GEOLOGY, LAYER_HYDROLOGY, LAYER_SOILS,
-    LAYER_TERRAIN, LAYER_VEGETATION,
+    LAYER_BIOME, LAYER_CLIMATE, LAYER_DRAINAGE, LAYER_ECOLOGY, LAYER_GEOLOGY, LAYER_HYDROLOGY,
+    LAYER_SOILS, LAYER_TERRAIN, LAYER_VEGETATION,
 };
 use world_core::{
-    classify, climate, elevation, geology, hydrology, soils, vegetation, Biome, Climate,
-    DrainageTile, FieldTile, Geology, Hydrology, PossibilityDomain, PossibilityVector, RegionCoord,
-    Soils, REGION_SIZE,
+    classify, climate, elevation, geology, hydrology, population, soils, vegetation, Biome,
+    Climate, DrainageTile, FieldTile, Geology, HabitatSignature, Hydrology, PossibilityDomain,
+    PossibilityVector, RegionCoord, Soils, REGION_SIZE,
 };
+
+use crate::rostercache::RosterSnapshot;
 
 /// Elevation channel (world units), produced by the terrain layer.
 pub const CHANNEL_ELEVATION: usize = 0;
@@ -43,10 +45,17 @@ pub const CHANNEL_FERTILITY: usize = 7;
 pub const CHANNEL_VEGETATION: usize = 8;
 /// Canopy height channel (world units), produced by the vegetation layer.
 pub const CHANNEL_CANOPY: usize = 9;
-/// Number of cached `f32` channels per region. Biome ids are small integers
-/// and live in an honest `FieldTile<u8>` beside the channels, not smuggled
-/// through f32 (phase-2-plan.md §6.1).
-pub const CHANNEL_COUNT: usize = 10;
+/// Herbivore-pressure channel (`[0, 1]`), produced by the ecology layer
+/// (phase-3-plan.md §6.1).
+pub const CHANNEL_HERBIVORE: usize = 10;
+/// Predator-pressure channel (`[0, 1]`), produced by the ecology layer.
+pub const CHANNEL_PREDATOR: usize = 11;
+/// Species-diversity channel (`[0, 1]`), produced by the ecology layer.
+pub const CHANNEL_DIVERSITY: usize = 12;
+/// Number of cached `f32` channels per region. Biome ids (`u8`) and the
+/// dominant-species index (`u16`) live in honest integer tiles beside the
+/// channels, not smuggled through f32 (phase-2-plan.md §6.1, phase-3-plan.md §6.1).
+pub const CHANNEL_COUNT: usize = 13;
 
 /// The `f32` channels a layer produces (empty for drainage, which produces a
 /// macro tile, and for biome, which produces the u8 tile).
@@ -59,18 +68,23 @@ pub const fn layer_channels(layer: u16) -> &'static [usize] {
         LAYER_HYDROLOGY => &[CHANNEL_RIVER, CHANNEL_WETNESS],
         LAYER_SOILS => &[CHANNEL_SOIL_DEPTH, CHANNEL_FERTILITY],
         LAYER_VEGETATION => &[CHANNEL_VEGETATION, CHANNEL_CANOPY],
+        LAYER_ECOLOGY => &[CHANNEL_HERBIVORE, CHANNEL_PREDATOR, CHANNEL_DIVERSITY],
         _ => &[],
     }
 }
 
 /// The cached sample tiles for one region: one optional shared tile per `f32`
-/// channel plus the biome id tile.
+/// channel, the biome id tile, and the dominant-species index tile.
 #[derive(Debug, Default, Clone)]
 pub struct RegionTiles {
     /// Indexed by the `CHANNEL_*` constants.
     pub channels: [Option<Arc<FieldTile<f32>>>; CHANNEL_COUNT],
     /// Biome classification ids (produced by the biome layer).
     pub biome: Option<Arc<FieldTile<u8>>>,
+    /// Dominant-species index into the cell's roster (produced by the ecology
+    /// layer). An index, not a global id — `--species` reconstructs the full
+    /// identity via the signature (phase-3-plan.md §6.1).
+    pub dominant: Option<Arc<FieldTile<u16>>>,
 }
 
 impl RegionTiles {
@@ -83,6 +97,7 @@ impl RegionTiles {
             .map(|t| t.bytes())
             .sum::<usize>()
             + self.biome.as_ref().map_or(0, |t| t.bytes())
+            + self.dominant.as_ref().map_or(0, |t| t.bytes())
     }
 
     /// The stored dependency hash of a layer's output tiles, or `None` if any
@@ -136,6 +151,13 @@ impl RegionCache {
         self.tiles.get(&coord)?.biome.as_ref()
     }
 
+    /// A region's dominant-species index tile.
+    #[inline]
+    #[must_use]
+    pub fn dominant(&self, coord: RegionCoord) -> Option<&Arc<FieldTile<u16>>> {
+        self.tiles.get(&coord)?.dominant.as_ref()
+    }
+
     /// Store one channel's tile, creating the region entry as needed.
     pub fn insert_channel(
         &mut self,
@@ -149,6 +171,11 @@ impl RegionCache {
     /// Store a region's biome tile.
     pub fn insert_biome(&mut self, coord: RegionCoord, tile: Arc<FieldTile<u8>>) {
         self.tiles.entry(coord).or_default().biome = Some(tile);
+    }
+
+    /// Store a region's dominant-species index tile.
+    pub fn insert_dominant(&mut self, coord: RegionCoord, tile: Arc<FieldTile<u16>>) {
+        self.tiles.entry(coord).or_default().dominant = Some(tile);
     }
 
     /// Drop every tile for a region (eviction).
@@ -195,6 +222,11 @@ pub struct LayerInputs {
     pub biome: Option<Arc<FieldTile<u8>>>,
     /// The macro drainage input tile, where declared.
     pub drainage: Option<Arc<DrainageTile>>,
+    /// The rosters (and food webs) for the signatures this tile will encounter,
+    /// resolved by the scheduler at L8 dispatch and keyed by signature — the
+    /// Tier-A analogue of the drainage macro input (phase-3-plan.md §5.2, §6.3).
+    /// The job looks each cell's signature up in it.
+    pub rosters: Option<Arc<RosterSnapshot>>,
     /// The tile's provenance-to-be: the dependency hash the scheduler computed
     /// from exactly these inputs (ADR 0008).
     pub dep_hash: u64,
@@ -227,6 +259,8 @@ pub struct GeneratedTile {
     pub channels: Vec<(usize, FieldTile<f32>)>,
     /// The biome tile, when the biome layer generated.
     pub biome: Option<FieldTile<u8>>,
+    /// The dominant-species index tile, when the ecology layer generated.
+    pub dominant: Option<FieldTile<u16>>,
 }
 
 /// World-space center of the `(cx, cy)` cell of a region sampled at
@@ -288,6 +322,7 @@ pub fn generate_layer(
     let p = PossibilityVector::from_quantized(decl.domains, &inputs.quantized);
     let mut channels = Vec::new();
     let mut biome_tile = None;
+    let mut dominant_tile = None;
     let new_tile = || FieldTile::<f32>::new(resolution, inputs.dep_hash);
 
     match layer {
@@ -481,6 +516,75 @@ pub fn generate_layer(
             channels.push((CHANNEL_VEGETATION, density));
             channels.push((CHANNEL_CANOPY, canopy));
         }
+        LAYER_ECOLOGY => {
+            let (
+                Some(temperature),
+                Some(moisture),
+                Some(fertility),
+                Some(vegetation),
+                Some(biome_input),
+                Some(rosters),
+            ) = (
+                inputs.channel(CHANNEL_TEMPERATURE),
+                inputs.channel(CHANNEL_MOISTURE),
+                inputs.channel(CHANNEL_FERTILITY),
+                inputs.channel(CHANNEL_VEGETATION),
+                inputs.biome.as_deref(),
+                inputs.rosters.as_deref(),
+            )
+            else {
+                return missing_inputs(coord, layer, inputs.dep_hash);
+            };
+            // Ecology is the sole direct reader of E/M/B/A. The aggregate fields
+            // are Ecology-driven; M/B/A fold into the dependency hash (via
+            // `decl.domains`) because near-field realization expresses genomes
+            // under them, so steering M/B/A regenerates L8 and re-realizes its
+            // organisms with new expression (phase-3-plan.md §7.5).
+            let p_ecology = p.get(PossibilityDomain::Ecology);
+            let mut herbivore = new_tile();
+            let mut predator = new_tile();
+            let mut diversity = new_tile();
+            let mut dominant = FieldTile::<u16>::new(resolution, inputs.dep_hash);
+            for cy in 0..resolution {
+                for cx in 0..resolution {
+                    let c = climate_at(temperature, moisture, cx, cy);
+                    // Only fertility feeds the signature; soil depth is not read
+                    // by the classifier, so a zero-depth placeholder is exact.
+                    let s = Soils {
+                        depth: 0.0,
+                        fertility: fertility.get(cx, cy),
+                    };
+                    let biome = Biome::from_id(biome_input.get(cx, cy));
+                    let signature = HabitatSignature::of(biome, &c, &s);
+                    let productivity = vegetation.get(cx, cy);
+                    let sample = match rosters.get(&signature) {
+                        Some(entry) => {
+                            population(&entry.roster, &entry.web, productivity, p_ecology)
+                        }
+                        // The scheduler snapshots every signature a cell will
+                        // encounter (§8.2); a miss is a scheduler bug, kept
+                        // non-fatal on worker threads by emitting a barren cell.
+                        None => {
+                            debug_assert!(false, "ecology cell signature not in snapshot");
+                            world_core::PopulationSample {
+                                dominant: 0,
+                                herbivore: 0.0,
+                                predator: 0.0,
+                                diversity: 0.0,
+                            }
+                        }
+                    };
+                    herbivore.set(cx, cy, sample.herbivore);
+                    predator.set(cx, cy, sample.predator);
+                    diversity.set(cx, cy, sample.diversity);
+                    dominant.set(cx, cy, sample.dominant);
+                }
+            }
+            channels.push((CHANNEL_HERBIVORE, herbivore));
+            channels.push((CHANNEL_PREDATOR, predator));
+            channels.push((CHANNEL_DIVERSITY, diversity));
+            dominant_tile = Some(dominant);
+        }
         other => {
             // Drainage generates through the macro path, never here; anything
             // else is a programmer error, kept non-fatal on worker threads.
@@ -497,6 +601,7 @@ pub fn generate_layer(
         job_id: 0,
         channels,
         biome: biome_tile,
+        dominant: dominant_tile,
     }
 }
 
@@ -512,6 +617,7 @@ fn missing_inputs(coord: RegionCoord, layer: u16, dep_hash: u64) -> GeneratedTil
         job_id: 0,
         channels: Vec::new(),
         biome: None,
+        dominant: None,
     }
 }
 
@@ -527,6 +633,7 @@ mod tests {
             tiles: Vec::new(),
             biome: None,
             drainage: None,
+            rosters: None,
             dep_hash: 42,
         }
     }
@@ -568,6 +675,7 @@ mod tests {
             tiles: vec![(CHANNEL_ELEVATION, Arc::new(elevation_tile.clone()))],
             biome: None,
             drainage: None,
+            rosters: None,
             dep_hash: 7,
         };
         let out = generate_layer(coord, LAYER_CLIMATE, &inputs, 8);
