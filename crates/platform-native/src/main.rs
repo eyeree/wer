@@ -76,6 +76,9 @@ struct World {
     anchors: Vec<Anchor>,
     bias: [f32; POSSIBILITY_DIMS],
     player: (f64, f64),
+    /// Player position at the previous update; the distance to the current
+    /// position is the travel that fuels convergence (ADR 0006).
+    last_player: (f64, f64),
     executor: RayonExecutor,
     budget: Budget,
 }
@@ -88,14 +91,21 @@ impl World {
             anchors: Vec::new(),
             bias: [0.0; POSSIBILITY_DIMS],
             player: (0.0, 0.0),
+            last_player: (0.0, 0.0),
             executor: RayonExecutor,
             budget: Budget::per_frame(16.6),
         }
     }
 
     fn update(&mut self) -> FrameStats {
+        let travel = f64::hypot(
+            self.player.0 - self.last_player.0,
+            self.player.1 - self.last_player.1,
+        );
+        self.last_player = self.player;
         self.map.update(
             self.player,
+            travel,
             &self.field,
             &self.anchors,
             &self.bias,
@@ -118,12 +128,11 @@ struct App {
     /// Mouse position in window physical pixels, when over the window.
     cursor_pos: Option<(f64, f64)>,
     last_frame: Instant,
-    // Rolling telemetry (phase-1-plan.md section 12).
-    frame_count: u64,
-    stats_accum: FrameStats,
+    // Rolling telemetry (phase-1-plan.md section 12), displayed by the info
+    // panel; per-second counters are no longer logged.
     stats_frames: u32,
     update_time_accum: f64,
-    last_stats_log: Instant,
+    last_telemetry: Instant,
     /// Snapshot of the last completed telemetry second, for the HUD.
     fps: u32,
     update_ms: f64,
@@ -147,11 +156,9 @@ impl App {
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
             last_frame: Instant::now(),
-            frame_count: 0,
-            stats_accum: FrameStats::default(),
             stats_frames: 0,
             update_time_accum: 0.0,
-            last_stats_log: Instant::now(),
+            last_telemetry: Instant::now(),
             fps: 0,
             update_ms: 0.0,
         }
@@ -317,42 +324,20 @@ impl App {
         self.composer.pixel_to_world(self.world.player, ix, iy)
     }
 
-    /// Accumulate and periodically log the per-frame counters
-    /// (phase-1-plan.md section 12).
-    fn log_stats(&mut self, stats: FrameStats, update_seconds: f64) {
-        self.stats_accum.loaded += stats.loaded;
-        self.stats_accum.evicted += stats.evicted;
-        self.stats_accum.converged += stats.converged;
-        self.stats_accum.layers_dispatched += stats.layers_dispatched;
-        self.stats_accum.layers_regenerated += stats.layers_regenerated;
-        self.stats_accum.deferred_regens += stats.deferred_regens;
+    /// Roll per-frame timings into the once-a-second fps / update-time
+    /// snapshot the info panel displays (phase-1-plan.md section 12). The
+    /// panel replaced the old periodic telemetry log line; continuity
+    /// violations still warn via the composer's detector.
+    fn update_telemetry(&mut self, update_seconds: f64) {
         self.stats_frames += 1;
         self.update_time_accum += update_seconds;
 
-        if self.last_stats_log.elapsed().as_secs_f64() >= 1.0 && self.stats_frames > 0 {
+        if self.last_telemetry.elapsed().as_secs_f64() >= 1.0 && self.stats_frames > 0 {
             self.fps = self.stats_frames;
             self.update_ms = 1000.0 * self.update_time_accum / f64::from(self.stats_frames);
-            let a = &self.stats_accum;
-            log::info!(
-                "{} fps | update {:.2} ms avg | regions {} | cache {:.1} MB | \
-                 +{} -{} regions/s | converged {}/s | regen {} dispatched {} integrated/s \
-                 (deferred {}) | pinned violations {}",
-                self.stats_frames,
-                1000.0 * self.update_time_accum / f64::from(self.stats_frames),
-                stats.active_regions,
-                stats.cache_bytes as f64 / (1024.0 * 1024.0),
-                a.loaded,
-                a.evicted,
-                a.converged,
-                a.layers_dispatched,
-                a.layers_regenerated,
-                a.deferred_regens,
-                self.composer.pinned_violations,
-            );
-            self.stats_accum = FrameStats::default();
             self.stats_frames = 0;
             self.update_time_accum = 0.0;
-            self.last_stats_log = Instant::now();
+            self.last_telemetry = Instant::now();
         }
     }
 
@@ -360,7 +345,6 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f64().min(0.1);
         self.last_frame = now;
-        self.frame_count += 1;
 
         self.apply_movement(dt);
 
@@ -396,7 +380,7 @@ impl App {
             renderer.render_map(pixels, width, height, CLEAR_COLOR);
         }
 
-        self.log_stats(stats, update_seconds);
+        self.update_telemetry(update_seconds);
     }
 }
 
@@ -497,8 +481,11 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
     // Unbudgeted warm-up with the inline executor: fully loaded and generated.
     let mut stats = FrameStats::default();
     for _ in 0..8 {
+        // Zero travel: fresh regions snap to target at load, and regeneration
+        // is not gated on movement, so the window still settles fully.
         stats = map.update(
             pos,
+            0.0,
             &field,
             &[],
             &bias,

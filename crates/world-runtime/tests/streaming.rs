@@ -16,7 +16,8 @@ fn small_config() -> StreamConfig {
         far_radius: 3.0 * REGION_SIZE,
         load_radius: 4.0 * REGION_SIZE,
         unload_radius: 5.0 * REGION_SIZE,
-        converge_rate: 0.25,
+        converge_per_unit: 0.01,
+        converge_rate_cap: 0.25,
         field_resolution: 4,
     }
 }
@@ -27,6 +28,7 @@ fn settled_map(player: (f64, f64)) -> RegionMap {
     for _ in 0..8 {
         map.update(
             player,
+            0.0,
             &field,
             &[],
             &NO_BIAS,
@@ -92,6 +94,7 @@ fn eviction_has_hysteresis() {
     let player = (-240.0, 0.0);
     map.update(
         player,
+        0.0,
         &field,
         &[],
         &NO_BIAS,
@@ -107,6 +110,7 @@ fn eviction_has_hysteresis() {
     let player = (-(4.0 * REGION_SIZE), 0.0);
     map.update(
         player,
+        0.0,
         &field,
         &[],
         &NO_BIAS,
@@ -126,11 +130,27 @@ fn budgets_are_enforced_per_frame() {
     };
     let mut map = RegionMap::new(small_config());
     let field = PossibilityField::default();
-    let stats = map.update((0.0, 0.0), &field, &[], &NO_BIAS, &budget, &InlineExecutor);
+    let stats = map.update(
+        (0.0, 0.0),
+        10.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &budget,
+        &InlineExecutor,
+    );
     assert!(stats.loaded <= 5);
     assert!(stats.layers_dispatched <= 4);
     assert!(stats.deferred_loads > 0, "small budget must defer loads");
-    let stats = map.update((0.0, 0.0), &field, &[], &NO_BIAS, &budget, &InlineExecutor);
+    let stats = map.update(
+        (0.0, 0.0),
+        10.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &budget,
+        &InlineExecutor,
+    );
     assert!(stats.loaded <= 5);
     assert!(stats.converged <= 3);
 }
@@ -188,10 +208,30 @@ fn distant_regions_converge_and_regenerate_only_drift_layers() {
     let mut bias = NO_BIAS;
     bias[PossibilityDomain::Ecology.index()] = 0.4;
     bias[PossibilityDomain::Hydrology.index()] = 0.4;
+
+    // Convergence is travel-fueled (ADR 0006): with the player stationary,
+    // the new target must not be realized anywhere.
+    for _ in 0..3 {
+        let stats = map.update(
+            (0.0, 0.0),
+            0.0,
+            &field,
+            &[],
+            &bias,
+            &Budget::unlimited(),
+            &InlineExecutor,
+        );
+        assert_eq!(stats.converged, 0, "no travel, no convergence");
+    }
+    assert_eq!(map.get(distant).expect("resident").revision, 0);
+
+    // Travel (without net displacement — pacing in place still counts as
+    // movement to the runtime; the app derives travel from real motion).
     let mut moved = false;
     for _ in 0..6 {
         let stats = map.update(
             (0.0, 0.0),
+            25.0,
             &field,
             &[],
             &bias,

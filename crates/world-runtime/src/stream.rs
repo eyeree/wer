@@ -43,8 +43,17 @@ pub struct StreamConfig {
     /// Regions beyond this radius are evicted. Must exceed `load_radius`; the
     /// gap is the hysteresis that prevents thrashing at the boundary.
     pub unload_radius: f64,
-    /// Per-frame convergence fraction fed to [`RegionState::converge`].
-    pub converge_rate: f32,
+    /// Convergence fraction per world unit of player travel. Transformation is
+    /// fueled by the journey, not by wall-clock time: a stationary player's
+    /// world holds perfectly still, so change can never silently bank up into
+    /// an old/new cliff at the pinned boundary while they stand and look
+    /// (ADR 0006). The per-update rate is `converge_per_unit * travel`,
+    /// clamped to `converge_rate_cap`.
+    pub converge_per_unit: f32,
+    /// Upper bound on the effective per-update convergence rate, so sprinting
+    /// (or a scripted fast camera) accelerates transformation only up to a
+    /// still-smooth step size.
+    pub converge_rate_cap: f32,
     /// Samples per region edge for generated field tiles.
     pub field_resolution: u16,
 }
@@ -56,7 +65,10 @@ impl Default for StreamConfig {
             far_radius: 9.0 * REGION_SIZE,
             load_radius: 12.0 * REGION_SIZE,
             unload_radius: 14.0 * REGION_SIZE,
-            converge_rate: 0.15,
+            // Walking speed (~8 units/frame at 60 fps) yields a rate ≈ 0.08;
+            // a 4× sprint saturates at the cap.
+            converge_per_unit: 0.01,
+            converge_rate_cap: 0.2,
             field_resolution: world_core::FIELD_RES,
         }
     }
@@ -202,11 +214,20 @@ impl RegionMap {
 
     /// One frame of streaming work (see module docs for the step order).
     ///
+    /// `travel` is how far, in world units, the player moved since the
+    /// previous update. It fuels convergence (ADR 0006): zero travel means no
+    /// realized state moves anywhere, so a stationary player's world is
+    /// perfectly still and change can never bank up out of sight. Streaming,
+    /// retargeting, and regeneration of already-dirty layers are *not* gated
+    /// on travel — only the act of drifting `current` toward `target` is.
+    ///
     /// `bias` is a per-dimension offset the player steers directly (the
     /// keyboard "nudge" input), applied to the field sample before anchors.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         player: (f64, f64),
+        travel: f64,
         field: &PossibilityField,
         anchors: &[Anchor],
         bias: &[f32; POSSIBILITY_DIMS],
@@ -218,7 +239,7 @@ impl RegionMap {
         self.evict(player, &mut stats);
         self.load(player, field, anchors, bias, budget, &mut stats);
         self.retarget(player, field, anchors, bias);
-        self.converge(player, budget, &mut stats);
+        self.converge(player, travel, budget, &mut stats);
         self.dispatch_regen(player, budget, executor, &mut stats);
         // A synchronous executor (InlineExecutor) has already finished every
         // job dispatched above; integrating again here keeps the headless
@@ -372,7 +393,22 @@ impl RegionMap {
     /// Step unpinned regions toward their targets, farthest-first (near
     /// regions are pinned anyway, and the far field is where transformation
     /// should visibly happen), up to the budget.
-    fn converge(&mut self, player: (f64, f64), budget: &Budget, stats: &mut FrameStats) {
+    ///
+    /// The rate is fueled by `travel` (ADR 0006): proportional to distance
+    /// moved this update, capped so fast movement stays smooth, and exactly
+    /// zero for a stationary player.
+    fn converge(
+        &mut self,
+        player: (f64, f64),
+        travel: f64,
+        budget: &Budget,
+        stats: &mut FrameStats,
+    ) {
+        let rate =
+            (self.cfg.converge_per_unit * travel.max(0.0) as f32).min(self.cfg.converge_rate_cap);
+        if rate <= 0.0 {
+            return;
+        }
         let mut eligible: Vec<(u64, RegionCoord)> = self
             .regions
             .iter()
@@ -381,7 +417,6 @@ impl RegionMap {
             .collect();
         // Farthest first: descending distance, coord tiebreak for determinism.
         eligible.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        let rate = self.cfg.converge_rate;
         for &(_, coord) in eligible.iter().take(budget.max_converge_regions) {
             let region = self.regions.get_mut(&coord).expect("resident");
             if region.converge(rate) {

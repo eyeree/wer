@@ -58,7 +58,10 @@ impl Default for ReplayConfig {
                 far_radius: 6.0 * world_core::REGION_SIZE,
                 load_radius: 8.0 * world_core::REGION_SIZE,
                 unload_radius: 9.5 * world_core::REGION_SIZE,
-                converge_rate: 0.15,
+                // The scripted camera moves ~43.6 units/frame, saturating the
+                // rate cap — the worst-case sustained transformation speed.
+                converge_per_unit: 0.01,
+                converge_rate_cap: 0.2,
                 field_resolution: 8,
             },
             budget: Budget {
@@ -215,16 +218,22 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
     let mut prev_state: BTreeMap<RegionCoord, (u32, bool)> = BTreeMap::new();
     let mut prev_tiles = TileSnapshot::new();
 
+    // Travel per frame fuels convergence (ADR 0006); the scripted camera
+    // moves at constant velocity except frame 0 (nothing traveled yet).
+    let frame_travel = f64::hypot(cfg.velocity.0, cfg.velocity.1);
+
     for frame in 0..cfg.frames {
         let player = (
             f64::from(frame) * cfg.velocity.0,
             f64::from(frame) * cfg.velocity.1,
         );
+        let travel = if frame == 0 { 0.0 } else { frame_travel };
         let bias = scripted_bias(frame, cfg.frames);
         let anchors = scripted_anchors(frame, cfg.frames, cfg.velocity);
 
         final_stats = map.update(
             player,
+            travel,
             &field,
             &anchors,
             &bias,

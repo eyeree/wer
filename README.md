@@ -79,6 +79,11 @@ world/region coordinates, streaming state, field samples, and biome of the
 cell under the cursor. Watch the distance transform while the ground near you
 stays put.
 
+Transformation is fueled by travel
+([ADR 0006](docs/adr/0006-travel-fueled-convergence.md)): stand still and the
+world holds steady — bias nudges and anchors set the *destination*, and the
+world drifts toward it only as you move (sprinting drifts it faster).
+
 | Input | Effect |
 |-------|--------|
 | `WASD` / arrows (+`Shift`) | Move (sprint) |

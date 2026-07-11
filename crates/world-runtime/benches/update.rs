@@ -12,6 +12,7 @@ fn settled_map(cfg: StreamConfig, field: &PossibilityField) -> RegionMap {
     for _ in 0..8 {
         map.update(
             (0.0, 0.0),
+            0.0,
             field,
             &[],
             &bias,
@@ -27,21 +28,42 @@ fn bench_update(c: &mut Criterion) {
     let cfg = StreamConfig::default();
     let budget = Budget::per_frame(16.6);
 
-    // Steady state: nothing moves, targets unchanged — the per-frame floor.
+    // Steady state: player idle, targets unchanged — the per-frame floor.
     let mut map = settled_map(cfg, &field);
     let bias = [0.0f32; POSSIBILITY_DIMS];
     c.bench_function("region_map_update_steady", |b| {
-        b.iter(|| black_box(map.update((0.0, 0.0), &field, &[], &bias, &budget, &InlineExecutor)))
+        b.iter(|| {
+            black_box(map.update(
+                (0.0, 0.0),
+                0.0,
+                &field,
+                &[],
+                &bias,
+                &budget,
+                &InlineExecutor,
+            ))
+        })
     });
 
-    // Drifting: a standing bias keeps distant regions converging and their
-    // climate/ecology layers regenerating — the budgeted worst case.
+    // Drifting: a standing bias plus walking-speed travel keeps distant
+    // regions converging and their climate/ecology layers regenerating — the
+    // budgeted worst case (convergence is travel-fueled, ADR 0006).
     let mut map = settled_map(cfg, &field);
     let mut bias = [0.0f32; POSSIBILITY_DIMS];
     bias[PossibilityDomain::Ecology.index()] = 0.4;
     bias[PossibilityDomain::Climate.index()] = -0.3;
     c.bench_function("region_map_update_drifting", |b| {
-        b.iter(|| black_box(map.update((0.0, 0.0), &field, &[], &bias, &budget, &InlineExecutor)))
+        b.iter(|| {
+            black_box(map.update(
+                (0.0, 0.0),
+                8.0,
+                &field,
+                &[],
+                &bias,
+                &budget,
+                &InlineExecutor,
+            ))
+        })
     });
 }
 
