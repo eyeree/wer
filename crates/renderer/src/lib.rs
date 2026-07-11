@@ -16,6 +16,21 @@ use core::fmt;
 /// The debug-map presentation shader (fullscreen textured triangle).
 pub const SHADER_DEBUG_MAP: &str = include_str!("../shaders/debug_map.wgsl");
 
+/// The `(x, y, width, height)` of the largest centered viewport that fits an
+/// `image`-sized picture inside a `surface`-sized window without distortion.
+///
+/// Used by [`Renderer::render_map`] for presentation; exposed so callers can
+/// run the same mapping in reverse to translate mouse coordinates back into
+/// image pixels.
+#[must_use]
+pub fn letterbox_viewport(surface: (u32, u32), image: (u32, u32)) -> (f32, f32, f32, f32) {
+    let (sw, sh) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
+    let (iw, ih) = (image.0.max(1) as f32, image.1.max(1) as f32);
+    let scale = (sw / iw).min(sh / ih);
+    let (w, h) = (iw * scale, ih * scale);
+    ((sw - w) * 0.5, (sh - h) * 0.5, w, h)
+}
+
 /// Errors that can occur bringing the renderer up.
 #[derive(Debug)]
 pub enum RendererError {
@@ -421,10 +436,10 @@ impl Renderer {
         true
     }
 
-    /// Upload a CPU-composed RGBA8 debug map (`width`×`height`, row-major,
-    /// row 0 = north edge) and present it, letterboxed to a centered square so
-    /// world cells stay square regardless of window shape
-    /// (phase-1-plan.md section 10). Returns `false` when no frame was drawn.
+    /// Upload a CPU-composed RGBA8 image (`width`×`height`, row-major) and
+    /// present it, letterboxed to preserve its aspect ratio regardless of
+    /// window shape (phase-1-plan.md section 10). Returns `false` when no
+    /// frame was drawn.
     pub fn render_map(&mut self, rgba: &[u8], width: u32, height: u32, clear: [f64; 4]) -> bool {
         self.debug_map
             .upload(&self.device, &self.queue, rgba, width, height);
@@ -467,11 +482,12 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // Centered square viewport: the map is square in world space.
-            let side = self.config.width.min(self.config.height) as f32;
-            let x = (self.config.width as f32 - side) * 0.5;
-            let y = (self.config.height as f32 - side) * 0.5;
-            pass.set_viewport(x, y, side, side, 0.0, 1.0);
+            // Aspect-preserving viewport: world cells stay square, HUD text
+            // stays undistorted. `letterbox_viewport` is public so input code
+            // can invert the same mapping for mouse picking.
+            let (x, y, w, h) =
+                letterbox_viewport((self.config.width, self.config.height), (width, height));
+            pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_pipeline(&self.debug_map.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);

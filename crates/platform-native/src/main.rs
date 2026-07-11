@@ -18,26 +18,42 @@
 //! - `V` — cycle the visualized channel; `G` grid, `N` rings, `X`
 //!   changed-while-pinned flash
 //! - `Esc` — quit
+//! - Mouse over the map — the info panel shows the cell under the cursor
+//!   (world/region coordinates, streaming state, field samples, biome)
+//!
+//! An information panel to the right of the map shows frame/streaming
+//! telemetry, the selected channel, bias and anchor state, cursor data, and
+//! the key bindings ([`panel`]).
+//!
+//! Headless screenshot mode (no window, for debugging the generators):
+//! `wer --screenshot <out.ppm> [channel] [x y]` settles the streaming window
+//! at the given position and writes the composed map + panel as a binary PPM.
 
 mod executor;
+mod panel;
 mod viz;
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use renderer::Renderer;
+use renderer::{letterbox_viewport, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 use world_core::{
-    domain_mask, Anchor, AnchorKind, PossibilityDomain, PossibilityField, POSSIBILITY_DIMS,
+    domain_mask, Anchor, AnchorKind, PossibilityDomain, PossibilityField, RegionCoord,
+    POSSIBILITY_DIMS, REGION_SIZE,
 };
-use world_runtime::{Budget, FrameStats, RegionMap, StreamConfig};
+use world_runtime::{
+    Budget, FrameStats, GenerationStatus, RegionMap, StreamConfig, CHANNEL_ELEVATION,
+    CHANNEL_MOISTURE, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+};
 
 use executor::RayonExecutor;
+use panel::{CursorInfo, Hud, PanelInfo};
 use viz::{Channel, MapComposer, Overlays};
 
 /// Letterbox color around the square map (linear RGBA).
@@ -94,10 +110,13 @@ struct App {
     renderer: Option<Renderer>,
     world: World,
     composer: MapComposer,
+    hud: Hud,
     channel: Channel,
     overlays: Overlays,
     keys_down: HashSet<KeyCode>,
     modifiers: ModifiersState,
+    /// Mouse position in window physical pixels, when over the window.
+    cursor_pos: Option<(f64, f64)>,
     last_frame: Instant,
     // Rolling telemetry (phase-1-plan.md section 12).
     frame_count: u64,
@@ -105,27 +124,36 @@ struct App {
     stats_frames: u32,
     update_time_accum: f64,
     last_stats_log: Instant,
+    /// Snapshot of the last completed telemetry second, for the HUD.
+    fps: u32,
+    update_ms: f64,
 }
 
 impl App {
     fn new() -> Self {
         let cfg = StreamConfig::default();
-        let half_regions = (cfg.load_radius / world_core::REGION_SIZE).ceil() as i32;
+        let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
+        let composer = MapComposer::new(half_regions, cfg.field_resolution);
+        let hud = Hud::new(composer.side() as usize);
         Self {
             window: None,
             renderer: None,
             world: World::new(),
-            composer: MapComposer::new(half_regions, cfg.field_resolution),
+            composer,
+            hud,
             channel: Channel::Biome,
             overlays: Overlays::default(),
             keys_down: HashSet::new(),
             modifiers: ModifiersState::empty(),
+            cursor_pos: None,
             last_frame: Instant::now(),
             frame_count: 0,
             stats_accum: FrameStats::default(),
             stats_frames: 0,
             update_time_accum: 0.0,
             last_stats_log: Instant::now(),
+            fps: 0,
+            update_ms: 0.0,
         }
     }
 
@@ -232,6 +260,63 @@ impl App {
         }
     }
 
+    /// Everything the panel shows for the map cell at `world`.
+    fn sample_cursor(map: &RegionMap, world: (f64, f64)) -> CursorInfo {
+        let coord = RegionCoord::from_world(world.0, world.1);
+        let (stability, revision, status) = match map.get(coord) {
+            Some(r) => (
+                r.stability,
+                r.revision,
+                match r.status {
+                    GenerationStatus::Unloaded => "unloaded",
+                    GenerationStatus::Generating => "generating",
+                    GenerationStatus::Ready => "ready",
+                },
+            ),
+            None => (0.0, 0, "not resident"),
+        };
+        let res = map.config().field_resolution;
+        let (ox, oy) = coord.origin();
+        let cell = REGION_SIZE / f64::from(res);
+        // Negative float→int casts saturate to 0, so the clamp is total.
+        let cx = (((world.0 - ox) / cell) as u16).min(res - 1);
+        let cy = (((world.1 - oy) / cell) as u16).min(res - 1);
+        let sample = |channel: usize| map.cache().channel(coord, channel).map(|t| t.get(cx, cy));
+        let elevation = sample(CHANNEL_ELEVATION);
+        let temperature = sample(CHANNEL_TEMPERATURE);
+        let moisture = sample(CHANNEL_MOISTURE);
+        let vegetation = sample(CHANNEL_VEGETATION);
+        let biome = match (elevation, temperature, moisture, vegetation) {
+            (Some(e), Some(t), Some(m), Some(v)) => Some(viz::biome_name(e, t, m, v)),
+            _ => None,
+        };
+        CursorInfo {
+            world,
+            region: (coord.x, coord.y),
+            stability,
+            revision,
+            status,
+            elevation,
+            temperature,
+            moisture,
+            vegetation,
+            biome,
+        }
+    }
+
+    /// Map the mouse (window physical pixels) through the letterbox viewport
+    /// onto the composed image, then onto the world.
+    fn cursor_world(&self) -> Option<(f64, f64)> {
+        let (mx, my) = self.cursor_pos?;
+        let surface = self.renderer.as_ref()?.size();
+        let image = self.hud.size();
+        let (vx, vy, vw, _) = letterbox_viewport(surface, image);
+        let scale = f64::from(vw) / f64::from(image.0);
+        let ix = (mx - f64::from(vx)) / scale;
+        let iy = (my - f64::from(vy)) / scale;
+        self.composer.pixel_to_world(self.world.player, ix, iy)
+    }
+
     /// Accumulate and periodically log the per-frame counters
     /// (phase-1-plan.md section 12).
     fn log_stats(&mut self, stats: FrameStats, update_seconds: f64) {
@@ -245,6 +330,8 @@ impl App {
         self.update_time_accum += update_seconds;
 
         if self.last_stats_log.elapsed().as_secs_f64() >= 1.0 && self.stats_frames > 0 {
+            self.fps = self.stats_frames;
+            self.update_ms = 1000.0 * self.update_time_accum / f64::from(self.stats_frames);
             let a = &self.stats_accum;
             log::info!(
                 "{} fps | update {:.2} ms avg | regions {} | cache {:.1} MB | \
@@ -281,15 +368,32 @@ impl App {
         let stats = self.world.update();
         let update_seconds = update_start.elapsed().as_secs_f64();
 
-        let side = self.composer.side();
-        let pixels = self.composer.compose(
+        let cursor = self
+            .cursor_world()
+            .map(|world| Self::sample_cursor(&self.world.map, world));
+
+        self.composer.compose(
             &self.world.map,
             self.world.player,
             self.channel,
             self.overlays,
         );
+        let info = PanelInfo {
+            fps: self.fps,
+            update_ms: self.update_ms,
+            stats,
+            jobs_in_flight: self.world.map.jobs_in_flight(),
+            pinned_violations: self.composer.pinned_violations,
+            channel: self.channel,
+            player: self.world.player,
+            bias: &self.world.bias,
+            anchors: &self.world.anchors,
+            cursor,
+        };
+        let (width, height) = self.hud.size();
+        let pixels = self.hud.compose(self.composer.pixels(), &info);
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.render_map(pixels, side, side, CLEAR_COLOR);
+            renderer.render_map(pixels, width, height, CLEAR_COLOR);
         }
 
         self.log_stats(stats, update_seconds);
@@ -344,6 +448,12 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = Some((position.x, position.y));
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_pos = None;
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -373,6 +483,70 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// Headless screenshot: settle the streaming window at `pos` and write the
+/// composed false-color map as a binary PPM (P6). No window, no GPU — the map
+/// is CPU-composed, which is exactly what makes it inspectable in tests and
+/// from the command line.
+fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), String> {
+    let cfg = StreamConfig::default();
+    let field = PossibilityField::default();
+    let bias = [0.0f32; POSSIBILITY_DIMS];
+    let mut map = RegionMap::new(cfg);
+    // Unbudgeted warm-up with the inline executor: fully loaded and generated.
+    let mut stats = FrameStats::default();
+    for _ in 0..8 {
+        stats = map.update(
+            pos,
+            &field,
+            &[],
+            &bias,
+            &Budget::unlimited(),
+            &world_runtime::InlineExecutor,
+        );
+    }
+
+    let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
+    let mut composer = MapComposer::new(half_regions, cfg.field_resolution);
+    let overlays = Overlays {
+        grid: false,
+        rings: false,
+        pinned_flash: false,
+    };
+    composer.compose(&map, pos, channel, overlays);
+
+    // Include the info panel (cursor pinned at the given position) so HUD
+    // rendering is inspectable headlessly too.
+    let mut hud = Hud::new(composer.side() as usize);
+    let info = PanelInfo {
+        fps: 0,
+        update_ms: 0.0,
+        stats,
+        jobs_in_flight: map.jobs_in_flight(),
+        pinned_violations: composer.pinned_violations,
+        channel,
+        player: pos,
+        bias: &bias,
+        anchors: &[],
+        cursor: Some(App::sample_cursor(&map, pos)),
+    };
+    let (width, height) = hud.size();
+    let pixels = hud.compose(composer.pixels(), &info);
+
+    let mut out = Vec::with_capacity(pixels.len() / 4 * 3 + 32);
+    out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+    for px in pixels.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    std::fs::write(path, out).map_err(|e| format!("write {path}: {e}"))?;
+    log::info!(
+        "wrote {width}x{height} {} map+panel at ({}, {}) to {path}",
+        channel.name(),
+        pos.0,
+        pos.1
+    );
+    Ok(())
 }
 
 /// Build the event loop, preferring X11 over Wayland under WSL.
@@ -405,6 +579,42 @@ fn build_event_loop() -> EventLoop<()> {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(rest) = args
+        .split_first()
+        .and_then(|(first, rest)| (first == "--screenshot").then_some(rest))
+    {
+        let usage = "usage: wer --screenshot <out.ppm> [channel] [x y]";
+        let (path, channel, pos) = match rest {
+            [path] => (path, Channel::Biome, (0.0, 0.0)),
+            [path, channel] => match Channel::parse(channel) {
+                Some(c) => (path, c, (0.0, 0.0)),
+                None => {
+                    eprintln!("unknown channel {channel:?}\n{usage}");
+                    std::process::exit(1);
+                }
+            },
+            [path, channel, x, y] => {
+                match (Channel::parse(channel), x.parse::<f64>(), y.parse::<f64>()) {
+                    (Some(c), Ok(x), Ok(y)) => (path, c, (x, y)),
+                    _ => {
+                        eprintln!("bad channel or coordinates\n{usage}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {
+                eprintln!("{usage}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(err) = run_screenshot(path, channel, pos) {
+            eprintln!("screenshot failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let event_loop = build_event_loop();
     event_loop.set_control_flow(ControlFlow::Poll);

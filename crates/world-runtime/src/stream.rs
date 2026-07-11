@@ -192,6 +192,14 @@ impl RegionMap {
         self.regions.values()
     }
 
+    /// Number of generation jobs currently dispatched but not yet integrated
+    /// (the live task-queue depth; telemetry, phase-1-plan.md section 12).
+    #[inline]
+    #[must_use]
+    pub fn jobs_in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
     /// One frame of streaming work (see module docs for the step order).
     ///
     /// `bias` is a per-dimension offset the player steers directly (the

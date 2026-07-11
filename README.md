@@ -50,6 +50,9 @@ cargo run --bin wer-inspect -- 300 -10
 # Headless continuity replay: scripted path + anchors, machine-checked.
 cargo run --bin wer-replay
 
+# Headless map screenshot (no window/GPU): settle the world and dump a PPM.
+cargo run --release --bin wer -- --screenshot map.ppm biome 0 0
+
 # Test everything, including determinism goldens and the continuity replay.
 cargo test --workspace
 
@@ -68,8 +71,13 @@ cargo clippy --workspace --all-targets
 ## Driving the prototype
 
 `cargo run --release --bin wer` opens a top-down false-color map of the
-streaming window centered on the player. Watch the distance transform while the
-ground near you stays put.
+streaming window centered on the player, with an information panel on the
+right: frame and streaming telemetry (fps, update time, active regions, cache
+size, generation-job queue), the selected channel, current possibility nudges,
+active anchors, the key bindings, and — when the mouse is over the map — the
+world/region coordinates, streaming state, field samples, and biome of the
+cell under the cursor. Watch the distance transform while the ground near you
+stays put.
 
 | Input | Effect |
 |-------|--------|

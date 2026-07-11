@@ -47,6 +47,21 @@ impl Channel {
         }
     }
 
+    /// Parse a channel name (as printed by [`Channel::name`]).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "biome" => Some(Channel::Biome),
+            "elevation" => Some(Channel::Elevation),
+            "temperature" => Some(Channel::Temperature),
+            "moisture" => Some(Channel::Moisture),
+            "vegetation" => Some(Channel::Vegetation),
+            "stability" => Some(Channel::Stability),
+            "revision" => Some(Channel::Revision),
+            _ => None,
+        }
+    }
+
     /// Display name for logs.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -127,6 +142,31 @@ fn moisture_color(m: f32) -> [u8; 3] {
 
 fn vegetation_color(v: f32) -> [u8; 3] {
     lerp_rgb([190, 175, 130], [20, 110, 40], v)
+}
+
+/// Human-readable classification matching the [`biome_color`] rules — shown in
+/// the info panel for the cell under the cursor.
+#[must_use]
+pub fn biome_name(e: f32, t: f32, m: f32, v: f32) -> &'static str {
+    if e < SEA_LEVEL {
+        if e < -300.0 {
+            "deep water"
+        } else {
+            "shallow water"
+        }
+    } else if t < -2.0 {
+        "snow"
+    } else if e > 700.0 {
+        "alpine rock"
+    } else if v > 0.55 {
+        "forest"
+    } else if v > 0.25 {
+        "grassland"
+    } else if m < 0.25 {
+        "desert"
+    } else {
+        "shrubland"
+    }
 }
 
 fn biome_color(e: f32, t: f32, m: f32, v: f32) -> [u8; 3] {
@@ -214,6 +254,12 @@ impl MapComposer {
             self.draw_rings(map, player);
         }
         self.draw_player_marker(player);
+        &self.pixels
+    }
+
+    /// The most recently composed RGBA buffer (valid after [`Self::compose`]).
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
@@ -323,6 +369,19 @@ impl MapComposer {
                 self.pixels[offset + 3] = 255;
             }
         }
+    }
+
+    /// World position at the center of image pixel `(px, py)` — the inverse of
+    /// the compose mapping, for mouse picking. Returns `None` outside the map.
+    #[must_use]
+    pub fn pixel_to_world(&self, player: (f64, f64), px: f64, py: f64) -> Option<(f64, f64)> {
+        let side = f64::from(self.side());
+        if px < 0.0 || py < 0.0 || px >= side || py >= side {
+            return None;
+        }
+        let cell = REGION_SIZE / f64::from(self.resolution);
+        let (west, north) = self.view_origin(player);
+        Some((west + (px + 0.5) * cell, north - (py + 0.5) * cell))
     }
 
     /// World position of the view's north-west pixel corner.
