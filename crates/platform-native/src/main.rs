@@ -311,8 +311,16 @@ impl ApplicationHandler for App {
         );
 
         let size = window.inner_size();
-        let renderer = pollster::block_on(Renderer::new(window.clone(), size.width, size.height))
-            .expect("failed to initialize renderer");
+        // The renderer gets a source of fresh surface targets (not a single
+        // surface) so it can rebuild the swapchain if the platform loses it —
+        // which WSLg does routinely.
+        let surface_window = window.clone();
+        let renderer = pollster::block_on(Renderer::new(
+            move || surface_window.clone().into(),
+            size.width,
+            size.height,
+        ))
+        .expect("failed to initialize renderer");
 
         log::info!(
             "world algorithm version {} | streaming {:?}",
@@ -367,10 +375,38 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Build the event loop, preferring X11 over Wayland under WSL.
+///
+/// WSLg's Wayland compositor resets the client connection a few seconds after
+/// a Vulkan swapchain comes up on the llvmpipe adapter (observed as
+/// `ERROR_SURFACE_LOST_KHR` followed by "Connection reset by peer"), killing
+/// the app. The same session is stable through XWayland, so under WSL we force
+/// the X11 backend; set `WER_FORCE_WAYLAND=1` to opt back in.
+fn build_event_loop() -> EventLoop<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let on_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"));
+        let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let x11_available = std::env::var_os("DISPLAY").is_some();
+        let overridden = std::env::var_os("WER_FORCE_WAYLAND").is_some();
+        if on_wsl && wayland_session && x11_available && !overridden {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            log::info!("WSL detected: using the X11 backend (WER_FORCE_WAYLAND=1 to override)");
+            match EventLoop::builder().with_x11().build() {
+                Ok(event_loop) => return event_loop,
+                Err(err) => log::warn!("X11 event loop failed ({err}); using default backend"),
+            }
+        }
+    }
+    EventLoop::new().expect("failed to create event loop")
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = build_event_loop();
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new();

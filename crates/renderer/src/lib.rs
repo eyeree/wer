@@ -205,9 +205,17 @@ impl DebugMapPipeline {
     }
 }
 
+/// Produces a fresh surface target on demand — typically a clone of an
+/// `Arc<winit::window::Window>`. The renderer keeps it so a *lost* surface
+/// (compositor restart, WSLg/driver hiccup) can be recreated from scratch
+/// instead of crashing the app: reconfiguring a dead `VkSurfaceKHR` is a fatal
+/// validation error, recreating it is routine.
+type SurfaceSource = Box<dyn Fn() -> wgpu::SurfaceTarget<'static> + Send + Sync>;
+
 /// Owns the GPU objects needed to present frames to a single surface.
-#[derive(Debug)]
 pub struct Renderer {
+    instance: wgpu::Instance,
+    surface_source: SurfaceSource,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -215,22 +223,38 @@ pub struct Renderer {
     debug_map: DebugMapPipeline,
 }
 
+impl fmt::Debug for Renderer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Renderer")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Renderer {
-    /// Bring up the renderer for a window-like `target` of the given pixel size.
+    /// Bring up the renderer for a window of the given pixel size.
     ///
-    /// `target` is anything wgpu can build a `'static` surface from — typically an
-    /// `Arc<winit::window::Window>` on native. This is async because adapter and
-    /// device acquisition are async on WebGPU; native callers can drive it with
+    /// `source` must return a fresh surface target for the same window each
+    /// time it is called — e.g. `move || window.clone().into()` for an
+    /// `Arc<winit::window::Window>` — so the surface can be recreated if the
+    /// platform loses it. This is async because adapter and device acquisition
+    /// are async on WebGPU; native callers can drive it with
     /// `pollster::block_on`.
+    ///
+    /// Backend selection honors the standard wgpu environment variables
+    /// (`WGPU_BACKEND=vulkan|gl|dx12|metal`, `WGPU_POWER_PREF`, ...), which is
+    /// the escape hatch for platforms with a flaky default driver.
     pub async fn new(
-        target: impl Into<wgpu::SurfaceTarget<'static>>,
+        source: impl Fn() -> wgpu::SurfaceTarget<'static> + Send + Sync + 'static,
         width: u32,
         height: u32,
     ) -> Result<Self, RendererError> {
-        let instance = wgpu::Instance::default();
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let surface_source: SurfaceSource = Box::new(source);
 
         let surface = instance
-            .create_surface(target)
+            .create_surface(surface_source())
             .map_err(RendererError::Surface)?;
 
         let adapter = instance
@@ -241,6 +265,15 @@ impl Renderer {
             .await
             .map_err(|_| RendererError::NoAdapter)?;
 
+        let info = adapter.get_info();
+        log::info!(
+            "adapter: {} ({:?}, driver: {} {})",
+            info.name,
+            info.backend,
+            info.driver,
+            info.driver_info
+        );
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("wer-device"),
@@ -248,6 +281,14 @@ impl Renderer {
             })
             .await
             .map_err(RendererError::Device)?;
+
+        // This is a debug shell: a driver error should be loud in the log but
+        // must not abort the app (wgpu's default handler panics). Surface loss
+        // in particular is expected on WSLg and is recovered in
+        // `acquire_frame` by recreating the surface.
+        device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+            log::error!("wgpu uncaptured error: {error}");
+        }));
 
         let config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
@@ -257,12 +298,32 @@ impl Renderer {
         let debug_map = DebugMapPipeline::new(&device, config.format);
 
         Ok(Self {
+            instance,
+            surface_source,
             surface,
             device,
             queue,
             config,
             debug_map,
         })
+    }
+
+    /// Replace a lost surface with a freshly created one and configure it.
+    /// Returns `false` if the platform refused to create a surface (nothing to
+    /// draw to this frame; retried on the next).
+    fn recreate_surface(&mut self) -> bool {
+        match self.instance.create_surface((self.surface_source)()) {
+            Ok(surface) => {
+                log::warn!("surface lost; recreated");
+                surface.configure(&self.device, &self.config);
+                self.surface = surface;
+                true
+            }
+            Err(err) => {
+                log::error!("failed to recreate lost surface: {err}");
+                false
+            }
+        }
     }
 
     /// Current surface size in pixels.
@@ -294,8 +355,17 @@ impl Renderer {
                 self.surface.configure(&self.device, &self.config);
                 Some(frame)
             }
-            Cst::Outdated | Cst::Lost => {
+            Cst::Outdated => {
+                // The surface itself is alive; the swapchain just needs a
+                // reconfigure (resize race, mode change).
                 self.surface.configure(&self.device, &self.config);
+                None
+            }
+            Cst::Lost => {
+                // The underlying platform surface is gone (compositor
+                // restart, WSLg hiccup). Reconfiguring a dead surface is a
+                // validation error — build a new one instead.
+                self.recreate_surface();
                 None
             }
             Cst::Timeout | Cst::Occluded => None,

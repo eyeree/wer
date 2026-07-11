@@ -86,6 +86,16 @@ The white and orange rings are the near (pinned) and far (free) stability
 radii. Any region that flashes red changed while pinned — that is a continuity
 bug by definition; the same condition fails `wer-replay` and CI.
 
+### WSL2 / WSLg note
+
+Under WSL the app automatically uses the X11 backend: WSLg's Wayland compositor
+drops the connection a few seconds after a Vulkan swapchain starts presenting
+(`ERROR_SURFACE_LOST_KHR`, then `Connection reset by peer`). Set
+`WER_FORCE_WAYLAND=1` to opt back into Wayland, and `WGPU_BACKEND=vulkan|gl|...`
+to override the graphics backend (the renderer honors the standard wgpu
+environment variables). Rendering may run on Mesa's `llvmpipe` software
+rasterizer in WSL — the debug map is a single texture blit, so it stays fast.
+
 ## Browser smoke test
 
 `platform-web` compiles the deterministic core to `wasm32` and logs the origin
