@@ -47,17 +47,42 @@ fn feature_hash_is_pure() {
 fn feature_hash_separates_every_field() {
     let base = sample_key();
     let variants = [
-        FeatureKey { world_version: base.world_version + 1, ..base },
-        FeatureKey { region: RegionCoord::new(base.region.x + 1, base.region.y), ..base },
-        FeatureKey { region: RegionCoord::new(base.region.x, base.region.y + 1), ..base },
-        FeatureKey { region: RegionCoord::at_level(base.region.x, base.region.y, 1), ..base },
-        FeatureKey { layer: base.layer + 1, ..base },
-        FeatureKey { feature_index: base.feature_index + 1, ..base },
-        FeatureKey { possibility_revision: base.possibility_revision + 1, ..base },
+        FeatureKey {
+            world_version: base.world_version + 1,
+            ..base
+        },
+        FeatureKey {
+            region: RegionCoord::new(base.region.x + 1, base.region.y),
+            ..base
+        },
+        FeatureKey {
+            region: RegionCoord::new(base.region.x, base.region.y + 1),
+            ..base
+        },
+        FeatureKey {
+            region: RegionCoord::at_level(base.region.x, base.region.y, 1),
+            ..base
+        },
+        FeatureKey {
+            layer: base.layer + 1,
+            ..base
+        },
+        FeatureKey {
+            feature_index: base.feature_index + 1,
+            ..base
+        },
+        FeatureKey {
+            possibility_revision: base.possibility_revision + 1,
+            ..base
+        },
     ];
     let base_hash = feature_hash(&base);
     for v in variants {
-        assert_ne!(feature_hash(&v), base_hash, "field change did not affect hash: {v:?}");
+        assert_ne!(
+            feature_hash(&v),
+            base_hash,
+            "field change did not affect hash: {v:?}"
+        );
     }
 }
 
@@ -98,15 +123,27 @@ fn from_world_floors_toward_negative_infinity() {
         RegionCoord::from_world(REGION_SIZE - 0.5, 0.5),
         RegionCoord::new(0, 0)
     );
-    assert_eq!(RegionCoord::from_world(REGION_SIZE, 0.0), RegionCoord::new(1, 0));
+    assert_eq!(
+        RegionCoord::from_world(REGION_SIZE, 0.0),
+        RegionCoord::new(1, 0)
+    );
     // Negative positions must not round toward zero.
-    assert_eq!(RegionCoord::from_world(-0.5, -REGION_SIZE), RegionCoord::new(-1, -1));
+    assert_eq!(
+        RegionCoord::from_world(-0.5, -REGION_SIZE),
+        RegionCoord::new(-1, -1)
+    );
 }
 
 #[test]
 fn parent_rounds_toward_negative_infinity() {
-    assert_eq!(RegionCoord::new(2, 3).parent(), RegionCoord::at_level(1, 1, 1));
-    assert_eq!(RegionCoord::new(-1, -1).parent(), RegionCoord::at_level(-1, -1, 1));
+    assert_eq!(
+        RegionCoord::new(2, 3).parent(),
+        RegionCoord::at_level(1, 1, 1)
+    );
+    assert_eq!(
+        RegionCoord::new(-1, -1).parent(),
+        RegionCoord::at_level(-1, -1, 1)
+    );
 }
 
 // --- Possibility vector -----------------------------------------------------

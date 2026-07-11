@@ -31,7 +31,10 @@ fn main() -> ExitCode {
     let (region, hash) = probe_world_position(x, y);
     println!("world algorithm version : {WORLD_ALGORITHM_VERSION}");
     println!("world position          : ({x}, {y})");
-    println!("region                  : x={} y={} level={}", region.x, region.y, region.level);
+    println!(
+        "region                  : x={} y={} level={}",
+        region.x, region.y, region.level
+    );
     println!("origin feature hash     : {hash:#018x}");
     ExitCode::SUCCESS
 }

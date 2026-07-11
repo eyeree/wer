@@ -22,7 +22,7 @@ pub mod possibility;
 
 pub use coord::{LocalPos, RegionCoord, REGION_SIZE};
 pub use hash::{feature_hash, mix, splitmix64, FeatureKey, Rng};
-pub use possibility::{PossibilityVector, PossibilityDomain};
+pub use possibility::{PossibilityDomain, PossibilityVector};
 
 /// Version of the world-generation algorithms. Any change that alters generated
 /// output for the same inputs MUST bump this so persisted worlds can detect that

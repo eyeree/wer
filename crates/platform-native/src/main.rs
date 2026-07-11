@@ -30,8 +30,8 @@ impl ApplicationHandler for App {
             return; // already initialized (e.g. resume after suspend)
         }
 
-        let attributes = Window::default_attributes()
-            .with_title("Infinite World Exploration — Phase 0 shell");
+        let attributes =
+            Window::default_attributes().with_title("Infinite World Exploration — Phase 0 shell");
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -39,12 +39,8 @@ impl ApplicationHandler for App {
         );
 
         let size = window.inner_size();
-        let renderer = pollster::block_on(Renderer::new(
-            window.clone(),
-            size.width,
-            size.height,
-        ))
-        .expect("failed to initialize renderer");
+        let renderer = pollster::block_on(Renderer::new(window.clone(), size.width, size.height))
+            .expect("failed to initialize renderer");
 
         // Prove the platform-neutral crates are wired in: hash a sample feature
         // and converge a demo region. This is throwaway scaffolding.
@@ -54,12 +50,7 @@ impl ApplicationHandler for App {
         self.renderer = Some(renderer);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {

@@ -46,6 +46,6 @@ pub trait Storage {
 
     /// Whether `key` currently has a value.
     fn contains(&self, key: &[u8]) -> bool {
-        matches!(self.load(key), Ok(_))
+        self.load(key).is_ok()
     }
 }
