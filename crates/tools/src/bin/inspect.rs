@@ -13,11 +13,13 @@
 //! that makes invalidation *legible*. With `--species`, dumps the cell's
 //! habitat signature, full species roster (each species' id, genome, trophic
 //! role), and food-web edges. With `--ecology`, dumps the L8 aggregate values
-//! (phase-3-plan.md §11).
+//! (phase-3-plan.md §11). With `--steer`, dumps the base / steered / projected
+//! possibility vectors for a scripted anchor set and which domains moved — the
+//! steering analogue of `--layers` (phase-4-plan.md §11).
 
 use std::process::ExitCode;
 
-use tools::{inspect_ecology, inspect_world_position};
+use tools::{inspect_ecology, inspect_steer, inspect_world_position};
 use world_core::layer::{layer_decl, LAYERS};
 use world_core::{PossibilityDomain, WORLD_ALGORITHM_VERSION};
 
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
     let layers_flag = take_flag(&mut args, "--layers");
     let species_flag = take_flag(&mut args, "--species");
     let ecology_flag = take_flag(&mut args, "--ecology");
+    let steer_flag = take_flag(&mut args, "--steer");
     let (x, y) = match args.as_slice() {
         [x, y] => match (x.parse::<f64>(), y.parse::<f64>()) {
             (Ok(x), Ok(y)) => (x, y),
@@ -44,7 +47,7 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("usage: wer-inspect <world_x> <world_y> [--layers] [--species] [--ecology]");
+            eprintln!("usage: wer-inspect <world_x> <world_y> [--layers] [--species] [--ecology] [--steer]");
             return ExitCode::FAILURE;
         }
     };
@@ -213,5 +216,59 @@ fn main() -> ExitCode {
             }
         }
     }
+
+    if steer_flag {
+        let steer = inspect_steer(x, y);
+        println!();
+        println!("steering (phase-4-plan.md §11, scripted demo anchor set):");
+        for anchor in &steer.anchors {
+            let kind = match anchor.kind {
+                world_core::AnchorKind::Emphasize => "emphasize",
+                world_core::AnchorKind::Suppress => "suppress",
+            };
+            let domains: Vec<&str> = PossibilityDomain::ALL
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| anchor.mask & (1 << i) != 0)
+                .map(|(_, d)| domain_short(*d))
+                .collect();
+            println!(
+                "  {kind:<9} mask [{}] strength {:.2} radius {:.0}",
+                domains.join(", "),
+                anchor.strength,
+                anchor.falloff_radius,
+            );
+        }
+        println!(
+            "  {:<12} {:>9} {:>9} {:>9}",
+            "domain", "base", "steered", "projected"
+        );
+        for domain in PossibilityDomain::ALL {
+            let b = steer.base.get(domain);
+            let s = steer.steered.get(domain);
+            let p = steer.projected.get(domain);
+            let moved = if (b - p).abs() > 1e-4 { " *" } else { "" };
+            println!(
+                "  {:<12} {b:>9.4} {s:>9.4} {p:>9.4}{moved}",
+                format!("{domain:?}")
+            );
+        }
+        println!("  (* = domain moved from base to projected target)");
+    }
+
     ExitCode::SUCCESS
+}
+
+/// Four-letter domain tags for the compact steering mask listing.
+fn domain_short(domain: PossibilityDomain) -> &'static str {
+    match domain {
+        PossibilityDomain::Planetary => "plan",
+        PossibilityDomain::Climate => "clim",
+        PossibilityDomain::Geology => "geol",
+        PossibilityDomain::Hydrology => "hydr",
+        PossibilityDomain::Ecology => "ecol",
+        PossibilityDomain::Morphology => "morp",
+        PossibilityDomain::Behavior => "behv",
+        PossibilityDomain::Aesthetics => "aest",
+    }
 }

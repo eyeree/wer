@@ -73,7 +73,16 @@ fn settled_map(budget: &Budget) -> RegionMap {
     let field = PossibilityField::default();
     let bias = [0.0f32; POSSIBILITY_DIMS];
     for _ in 0..10 {
-        map.update(PLAYER, 0.0, &field, &[], &bias, budget, &InlineExecutor);
+        map.update(
+            PLAYER,
+            0.0,
+            &field,
+            &[],
+            &bias,
+            budget,
+            &InlineExecutor,
+            false,
+        );
     }
     map
 }
@@ -415,12 +424,22 @@ fn realization_budget_scenario() -> EcologyReport {
         max_converge_regions: usize::MAX,
         max_regen_cost: u32::MAX,
         max_realize_organisms: cap,
+        max_resonance_nodes: usize::MAX,
     };
 
     let mut map = RegionMap::new(harness_config());
     let mut frames_with_realization = 0u32;
     for _ in 0..80 {
-        let stats = map.update(PLAYER, 0.0, &field, &[], &bias, &budget, &InlineExecutor);
+        let stats = map.update(
+            PLAYER,
+            0.0,
+            &field,
+            &[],
+            &bias,
+            &budget,
+            &InlineExecutor,
+            false,
+        );
         // Whole-region budgeting may overshoot by at most one region's worth.
         if stats.organisms_realized > cap + per_region_max {
             record(

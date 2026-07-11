@@ -9,8 +9,11 @@
 //! bump 1 → 2 (phase-2-plan.md §9.1).
 
 use world_core::{
-    anchor::{domain_mask, project_plausible, steer, Anchor, AnchorKind},
+    anchor::{
+        bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind, AnchorSource,
+    },
     biome::{classify, Biome},
+    capture::{capture_target, category_mask, TraitCategory, TraitDeviation},
     climate::climate,
     dephash::{drainage_dep_hash_default, layer_dep_hash},
     drainage::{drainage, tiebreak_hash, MACRO_APRON, MACRO_LEVEL},
@@ -139,23 +142,33 @@ fn possibility_field_golden() {
 
 #[test]
 fn steer_and_project_golden() {
+    let mask_a = domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Hydrology]);
+    let mask_b = domain_mask(&[PossibilityDomain::Climate]);
     let anchors = [
         Anchor {
             world_pos: (100.0, 100.0),
-            mask: domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Hydrology]),
+            target: bound_target(mask_a, 1.0),
+            mask: mask_a,
             kind: AnchorKind::Emphasize,
             strength: 0.8,
             falloff_radius: 2048.0,
+            source: AnchorSource::Manual,
         },
         Anchor {
             world_pos: (-500.0, 300.0),
-            mask: domain_mask(&[PossibilityDomain::Climate]),
+            target: bound_target(mask_b, 1.0),
+            mask: mask_b,
             kind: AnchorKind::Suppress,
             strength: 0.6,
             falloff_radius: 1024.0,
+            source: AnchorSource::Manual,
         },
     ];
     let steered = steer(PossibilityVector::neutral(), &anchors, (0.0, 0.0));
+    // Order-independent combination golden (ADR 0011). For one anchor per domain
+    // the saturating blend reduces to the Phase 1 values, so this fixture is
+    // stable across the M1 `steer` rewrite (a presentation fixture, not a world
+    // identity, §9.1); the order-independence property itself is unit-tested.
     assert_eq!(
         steered.dims,
         [0.5, 0.36300826, 0.5, 0.8961944, 0.8961944, 0.5, 0.5, 0.5]
@@ -165,10 +178,28 @@ fn steer_and_project_golden() {
     wild.set(PossibilityDomain::Planetary, 0.1);
     wild.set(PossibilityDomain::Hydrology, 0.9);
     wild.set(PossibilityDomain::Ecology, 1.0);
+    // Section-8 rule set (phase-4-plan.md §7.3): rule 1 caps Hydrology by ocean
+    // supply (0.56) then rule 5 tightens it to 0.49 in this cool ocean-poor
+    // world; rule 2 then caps Ecology by the now-final moisture. A Phase 4
+    // presentation fixture (§9.1), not a re-blessed world identity.
     assert_eq!(
         project_plausible(wild).dims,
-        [0.1, 0.5, 0.5, 0.56, 0.81, 0.5, 0.5, 0.5]
+        [0.1, 0.5, 0.5, 0.48999998, 0.596, 0.5, 0.5, 0.5]
     );
+}
+
+#[test]
+fn capture_target_golden() {
+    // Phase 4 M1 (phase-4-plan.md §12.1): the pure capture math is
+    // float-deterministic and parity-exported (via `steer_sample`). A capture
+    // nudges the baseline toward the deviation on the masked domains only.
+    let baseline = PossibilityVector::neutral();
+    let mut deviation = TraitDeviation::zero();
+    deviation.set(PossibilityDomain::Morphology, 0.8);
+    deviation.set(PossibilityDomain::Aesthetics, -0.4);
+    let mask = category_mask(&[TraitCategory::Morphology, TraitCategory::Coloration]);
+    let target = capture_target(baseline, deviation, mask, 0.5);
+    assert_eq!(target.dims, [0.5, 0.5, 0.5, 0.5, 0.5, 0.9, 0.5, 0.3]);
 }
 
 // --- Phase 2 golden fixtures (phase-2-plan.md §12.1) -------------------------

@@ -28,8 +28,8 @@
 use std::collections::BTreeMap;
 
 use world_core::{
-    domain_mask, macro_coord_for, mix, Anchor, AnchorKind, PossibilityDomain, PossibilityField,
-    RegionCoord, POSSIBILITY_DIMS,
+    bound_target, domain_mask, macro_coord_for, mix, Anchor, AnchorKind, AnchorSource,
+    PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS,
 };
 use world_runtime::{
     Budget, FrameStats, InlineExecutor, RegionMap, StreamConfig, CHANNEL_CANOPY, CHANNEL_COUNT,
@@ -85,6 +85,7 @@ impl Default for ReplayConfig {
                 max_converge_regions: 512,
                 max_regen_cost: 2048,
                 max_realize_organisms: usize::MAX,
+                max_resonance_nodes: usize::MAX,
             },
             velocity: (37.0, 23.0),
             // One converge step moves a dimension ≤ converge_rate; generation
@@ -170,21 +171,27 @@ fn scripted_anchors(frame: u32, frames: u32, velocity: (f64, f64)) -> Vec<Anchor
         return anchors;
     }
     if frame >= drop_a {
+        let mask = domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Hydrology]);
         anchors.push(Anchor {
             world_pos: position_at(drop_a),
-            mask: domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Hydrology]),
+            target: bound_target(mask, 1.0),
+            mask,
             kind: AnchorKind::Emphasize,
             strength: 0.6,
             falloff_radius: 1500.0,
+            source: AnchorSource::Manual,
         });
     }
     if frame >= drop_b {
+        let mask = domain_mask(&[PossibilityDomain::Climate]);
         anchors.push(Anchor {
             world_pos: position_at(drop_b),
-            mask: domain_mask(&[PossibilityDomain::Climate]),
+            target: bound_target(mask, 1.0),
+            mask,
             kind: AnchorKind::Suppress,
             strength: 0.5,
             falloff_radius: 1200.0,
+            source: AnchorSource::Manual,
         });
     }
     anchors
@@ -309,6 +316,7 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
             &bias,
             &cfg.budget,
             &InlineExecutor,
+            false,
         );
         peak_regions = peak_regions.max(final_stats.active_regions);
         peak_cache_bytes =

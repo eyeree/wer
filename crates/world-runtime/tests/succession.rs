@@ -33,6 +33,7 @@ fn step(map: &mut RegionMap, player: (f64, f64), travel: f64, bias: &[f32; POSSI
         bias,
         &Budget::unlimited(),
         &InlineExecutor,
+        false,
     );
 }
 

@@ -25,3 +25,7 @@ path = "src/bin/replay.rs"
 [[bin]]
 name = "wer-ledger"
 path = "src/bin/ledger.rs"
+
+[[bin]]
+name = "wer-anchor"
+path = "src/bin/anchor.rs"

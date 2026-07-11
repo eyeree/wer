@@ -21,6 +21,7 @@
 
 pub mod anchor;
 pub mod biome;
+pub mod capture;
 pub mod climate;
 pub mod coord;
 pub mod dephash;
@@ -41,8 +42,13 @@ pub mod species;
 pub mod terrain;
 pub mod vegetation;
 
-pub use anchor::{domain_mask, project_plausible, steer, Anchor, AnchorKind};
+pub use anchor::{
+    bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind, AnchorSource,
+};
 pub use biome::{classify, Biome, BIOME_COUNT};
+pub use capture::{
+    capture_target, category_mask, organism_trait_deviation, TraitCategory, TraitDeviation,
+};
 pub use climate::{climate, Climate};
 pub use coord::{LocalPos, RegionCoord, REGION_SIZE};
 pub use dephash::{drainage_dep_hash, drainage_dep_hash_default, layer_dep_hash};

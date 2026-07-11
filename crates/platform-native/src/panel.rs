@@ -6,7 +6,7 @@
 //! is testable without a window (phase-1-plan.md section 10).
 
 use font8x8::legacy::BASIC_LEGACY;
-use world_core::{Anchor, AnchorKind, LAYER_COUNT, POSSIBILITY_DIMS};
+use world_core::{Anchor, AnchorKind, AnchorSource, LAYER_COUNT, POSSIBILITY_DIMS};
 use world_runtime::FrameStats;
 
 use crate::viz::Channel;
@@ -120,6 +120,12 @@ pub struct PanelInfo<'a> {
     pub bias: &'a [f32; POSSIBILITY_DIMS],
     /// Active anchors, in placement order.
     pub anchors: &'a [Anchor],
+    /// The trait category a capture (`K`) will anchor.
+    pub capture_category: &'static str,
+    /// Whether a capture emphasizes or suppresses.
+    pub capture_polarity: AnchorKind,
+    /// Whether the shell is in deliberate transition-movement mode.
+    pub transition_mode: bool,
     /// Data under the mouse, when it is over the map.
     pub cursor: Option<CursorInfo>,
 }
@@ -182,7 +188,7 @@ impl Hud {
         let x = self.map_side + MARGIN;
         let mut cur = PanelCursor { x, y: MARGIN };
 
-        cur.line(self, "INFINITE WORLD  PHASE 3", TITLE);
+        cur.line(self, "INFINITE WORLD  PHASE 4", TITLE);
         cur.rule(self);
 
         cur.pair(
@@ -222,6 +228,17 @@ impl Hud {
             &format!("{}", info.organisms),
             "realized",
             &format!("{}", info.stats.organisms_realized),
+        );
+        cur.pair(
+            self,
+            "resonance",
+            &format!("{:.2}", info.stats.resonance_strength),
+            "mode",
+            if info.transition_mode {
+                "trans"
+            } else {
+                "free"
+            },
         );
         cur.pair(
             self,
@@ -294,9 +311,20 @@ impl Hud {
         }
         cur.rule(self);
 
-        cur.line(self, "ANCHORS  E/Q drop, C clear", HEADER);
+        cur.line(self, "ANCHORS  E/Q drop, K capture", HEADER);
+        // The capture selection (T cycles category, Y toggles polarity, K fires).
+        let polarity = match info.capture_polarity {
+            AnchorKind::Emphasize => "emph",
+            AnchorKind::Suppress => "supp",
+        };
+        cur.label_value(
+            self,
+            "capture",
+            &format!("{} {}", polarity, info.capture_category),
+            ACTIVE,
+        );
         if info.anchors.is_empty() {
-            cur.line(self, "none", LABEL);
+            cur.line(self, "none active", LABEL);
         } else {
             const SHOWN: usize = 2;
             for anchor in info.anchors.iter().take(SHOWN) {
@@ -304,15 +332,18 @@ impl Hud {
                     AnchorKind::Emphasize => "EMPH",
                     AnchorKind::Suppress => "SUPP",
                 };
+                let source = match anchor.source {
+                    AnchorSource::Organism { .. } => "org",
+                    AnchorSource::Landform => "land",
+                    AnchorSource::River => "river",
+                    AnchorSource::Atmosphere => "atmo",
+                    AnchorSource::Manual => "man",
+                };
                 cur.line(
                     self,
                     &format!(
-                        "{} {:.0},{:.0} s{:.1} r{:.0}",
-                        kind,
-                        anchor.world_pos.0,
-                        anchor.world_pos.1,
-                        anchor.strength,
-                        anchor.falloff_radius
+                        "{} {} {:.0},{:.0} s{:.1}",
+                        kind, source, anchor.world_pos.0, anchor.world_pos.1, anchor.strength
                     ),
                     VALUE,
                 );
@@ -425,6 +456,8 @@ impl Hud {
         for (keys, action) in [
             ("WASD 1-8 Z", "move, bias, reset"),
             ("E / Q / C", "anchors, clear"),
+            ("T Y K", "categ,polar,capture"),
+            ("R", "transition mode"),
             ("V G N X M", "channel,overlays"),
         ] {
             let row_y = cur.y;

@@ -8,6 +8,9 @@
 //! seed and a drainage routing sample (phase-2-plan.md §12.5).
 
 use world_core::{
+    anchor::{
+        bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind, AnchorSource,
+    },
     dephash::drainage_dep_hash_default,
     drainage::{drainage, MACRO_APRON, MACRO_LEVEL},
     feature_hash,
@@ -15,8 +18,10 @@ use world_core::{
     genome::Genome,
     geology::lithology_seed,
     habitat::HabitatSignature,
+    hash::mix,
+    possibility::PossibilityDomain,
     species::{species_roster, species_seed},
-    terrain, FeatureKey, PossibilityField, RegionCoord, WORLD_ALGORITHM_VERSION,
+    terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, WORLD_ALGORITHM_VERSION,
 };
 
 /// The fixed habitat used by the Phase 3 parity exports. Only the (portable)
@@ -106,6 +111,47 @@ pub fn food_web_sample() -> u64 {
     food_web(&roster, 0.7).tier_biomass_fingerprint()
 }
 
+/// Parity sample for the Phase 4 steering math (phase-4-plan.md §12.5): the
+/// steered-and-projected possibility vector for a fixed base and a fixed
+/// scripted anchor set (an Emphasize and a Suppress, overlapping on one domain),
+/// folded to a fingerprint. `steer`/`project_plausible` are pure float-
+/// deterministic functions of `(base, anchor set, position)`, so full
+/// cross-platform equality is required. Live capture and resonance are *not*
+/// exported — they read `f32` tiles/organisms and are presentation-grade by
+/// decision (§9.2, ADR 0010/0011).
+#[must_use]
+pub fn steer_sample() -> u64 {
+    let mask_a = domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Aesthetics]);
+    let mask_b = domain_mask(&[PossibilityDomain::Aesthetics, PossibilityDomain::Morphology]);
+    let anchors = [
+        Anchor {
+            world_pos: (64.0, -32.0),
+            target: bound_target(mask_a, 0.9),
+            mask: mask_a,
+            kind: AnchorKind::Emphasize,
+            strength: 0.75,
+            falloff_radius: 1500.0,
+            source: AnchorSource::Manual,
+        },
+        Anchor {
+            world_pos: (-100.0, 40.0),
+            target: bound_target(mask_b, 0.2),
+            mask: mask_b,
+            kind: AnchorKind::Suppress,
+            strength: 0.5,
+            falloff_radius: 1200.0,
+            source: AnchorSource::Manual,
+        },
+    ];
+    let base = PossibilityVector::neutral();
+    let v = project_plausible(steer(base, &anchors, (0.0, 0.0)));
+    let mut h: u64 = 0x57EE_5000_0DE0_0004;
+    for d in v.dims {
+        h = mix(h, u64::from(d.to_bits()));
+    }
+    h
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -169,6 +215,13 @@ mod wasm {
     pub fn food_web_sample() -> u64 {
         super::food_web_sample()
     }
+
+    /// Phase 4 steering-math identity sample (phase-4-plan.md §12.5).
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn steer_sample() -> u64 {
+        super::steer_sample()
+    }
 }
 
 #[cfg(test)]
@@ -188,5 +241,6 @@ mod tests {
         assert_eq!(super::drainage_routing_sample(), 0x0000_0001_0000_000D);
         assert_eq!(super::genome_sample(), 0x6023_7E3E_43E5_2590);
         assert_eq!(super::food_web_sample(), 0x6272_09D2_6720_001B);
+        assert_eq!(super::steer_sample(), 0x9A4E_77F9_D151_9EC2);
     }
 }

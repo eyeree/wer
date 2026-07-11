@@ -17,6 +17,7 @@ pub mod generate;
 pub mod macrocache;
 pub mod realize;
 pub mod region;
+pub mod resonance;
 pub mod rostercache;
 pub mod storage;
 pub mod stream;
@@ -32,6 +33,7 @@ pub use generate::{
 pub use macrocache::MacroCache;
 pub use realize::{realize_region, Organism};
 pub use region::{GenerationStatus, RegionState};
+pub use resonance::{Resonance, ResonanceNode};
 pub use rostercache::{RosterCache, RosterEntry, RosterSnapshot};
 pub use storage::{Storage, StorageError};
 pub use stream::{

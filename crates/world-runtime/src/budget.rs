@@ -24,6 +24,10 @@ pub struct Budget {
     /// (phase-3-plan.md §8.4). Budgeted by whole regions: a region realizes
     /// fully once started, and the pass stops starting new regions past the cap.
     pub max_realize_organisms: usize,
+    /// Contributing nodes the per-frame resonance graph may hold, so a dense
+    /// biome does not build an unbounded graph (phase-4-plan.md §8.3) — the
+    /// analogue of `max_realize_organisms`.
+    pub max_resonance_nodes: usize,
 }
 
 impl Budget {
@@ -44,6 +48,9 @@ impl Budget {
             // A few hundred organisms/frame keeps entering a dense biome smooth
             // while still filling the near window in a handful of frames.
             max_realize_organisms: ((400.0 * scale) as usize).max(1),
+            // The resonance graph is cheap; a few dozen nearest nodes capture
+            // the local density/diversity without an unbounded scan.
+            max_resonance_nodes: 64,
         }
     }
 
@@ -55,6 +62,7 @@ impl Budget {
             max_converge_regions: usize::MAX,
             max_regen_cost: u32::MAX,
             max_realize_organisms: usize::MAX,
+            max_resonance_nodes: usize::MAX,
         }
     }
 }

@@ -40,6 +40,7 @@ fn settle(map: &mut RegionMap, player: (f64, f64)) {
             &NO_BIAS,
             &Budget::unlimited(),
             &InlineExecutor,
+            false,
         );
     }
 }
@@ -133,6 +134,7 @@ fn eviction_has_hysteresis_and_sweeps_macro_orphans() {
         &NO_BIAS,
         &Budget::unlimited(),
         &InlineExecutor,
+        false,
     );
     assert!(
         map.get(edge).is_some(),
@@ -151,6 +153,7 @@ fn eviction_has_hysteresis_and_sweeps_macro_orphans() {
             &NO_BIAS,
             &Budget::unlimited(),
             &InlineExecutor,
+            false,
         );
     }
     assert!(map.get(edge).is_none());
@@ -173,6 +176,7 @@ fn cost_budgets_are_enforced_per_frame() {
         max_converge_regions: 3,
         max_regen_cost: 12,
         max_realize_organisms: usize::MAX,
+        max_resonance_nodes: usize::MAX,
     };
     let mut map = RegionMap::new(small_config());
     let field = PossibilityField::default();
@@ -184,6 +188,7 @@ fn cost_budgets_are_enforced_per_frame() {
         &NO_BIAS,
         &budget,
         &InlineExecutor,
+        false,
     );
     assert!(stats.loaded <= 5);
     assert!(stats.regen_cost_spent <= 12);
@@ -197,6 +202,7 @@ fn cost_budgets_are_enforced_per_frame() {
         &NO_BIAS,
         &budget,
         &InlineExecutor,
+        false,
     );
     assert!(stats.loaded <= 5);
     assert!(stats.converged <= 3);
@@ -212,6 +218,7 @@ fn cost_budgets_are_enforced_per_frame() {
             &NO_BIAS,
             &budget,
             &InlineExecutor,
+            false,
         );
         assert!(stats.regen_cost_spent <= 12);
         if stats.regen_cost_spent == 0 && stats.loaded == 0 && map.jobs_in_flight() == 0 {
@@ -263,6 +270,7 @@ fn drift_regenerates_declared_readers_and_never_the_stable_trio() {
             &bias,
             &Budget::unlimited(),
             &InlineExecutor,
+            false,
         );
         assert_eq!(stats.converged, 0, "no travel, no convergence");
     }
@@ -280,6 +288,7 @@ fn drift_regenerates_declared_readers_and_never_the_stable_trio() {
             &bias,
             &Budget::unlimited(),
             &InlineExecutor,
+            false,
         );
         moved |= stats.converged > 0;
     }
@@ -355,6 +364,7 @@ fn dispatch_is_topological_under_tiny_budgets() {
         max_converge_regions: usize::MAX,
         max_regen_cost: 10, // one drainage job, or a few cheap layers
         max_realize_organisms: usize::MAX,
+        max_resonance_nodes: usize::MAX,
     };
     let mut map = RegionMap::new(StreamConfig {
         load_radius: 1.0 * REGION_SIZE,
@@ -371,6 +381,7 @@ fn dispatch_is_topological_under_tiny_budgets() {
             &NO_BIAS,
             &budget,
             &InlineExecutor,
+            false,
         );
         // Invariant: whenever a layer's tiles exist, its inputs' tiles exist
         // and carry exactly the hashes folded into the layer's dep hash —
@@ -448,6 +459,7 @@ fn near_field_organisms_are_stable_and_preserve_the_aggregate() {
                 &NO_BIAS,
                 &Budget::unlimited(),
                 &InlineExecutor,
+                false,
             );
         }
         map
@@ -487,6 +499,7 @@ fn near_field_organisms_are_stable_and_preserve_the_aggregate() {
             &NO_BIAS,
             &Budget::unlimited(),
             &InlineExecutor,
+            false,
         );
     }
     let ids_after: Vec<u64> = map

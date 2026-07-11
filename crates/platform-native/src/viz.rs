@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use world_core::{splitmix64, Biome, RegionCoord, REGION_SIZE, SEA_LEVEL};
+use world_core::{
+    splitmix64, Anchor, Biome, RegionCoord, POSSIBILITY_DIMS, REGION_SIZE, SEA_LEVEL,
+};
 use world_runtime::{
     RegionMap, CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
     CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH,
@@ -48,6 +50,9 @@ pub enum Channel {
     Diversity,
     /// Dominant species (categorical palette by species-id hash).
     DominantSpecies,
+    /// Summed anchor influence, tinted by the dominant steered domain
+    /// (phase-4-plan.md §11 — an anchor's reach and which trait it pushes).
+    Influence,
     /// The streaming stability ramp (white = pinned, black = free).
     Stability,
     /// Realized-state revision, hashed to a color: convergence churn flickers.
@@ -72,7 +77,8 @@ impl Channel {
             Channel::Herbivore => Channel::Predator,
             Channel::Predator => Channel::Diversity,
             Channel::Diversity => Channel::DominantSpecies,
-            Channel::DominantSpecies => Channel::Stability,
+            Channel::DominantSpecies => Channel::Influence,
+            Channel::Influence => Channel::Stability,
             Channel::Stability => Channel::Revision,
             Channel::Revision => Channel::Composite,
         }
@@ -96,6 +102,7 @@ impl Channel {
             "predator" => Some(Channel::Predator),
             "diversity" => Some(Channel::Diversity),
             "dominant" => Some(Channel::DominantSpecies),
+            "influence" => Some(Channel::Influence),
             "stability" => Some(Channel::Stability),
             "revision" => Some(Channel::Revision),
             _ => None,
@@ -120,6 +127,7 @@ impl Channel {
             Channel::Predator => "predator",
             Channel::Diversity => "diversity",
             Channel::DominantSpecies => "dominant",
+            Channel::Influence => "influence",
             Channel::Stability => "stability",
             Channel::Revision => "revision",
         }
@@ -268,6 +276,48 @@ fn expressed_color(expressed: &world_core::Expressed) -> [u8; 3] {
     hsv_to_rgb(expressed.hue, 0.75, 0.45 + 0.55 * expressed.luminance)
 }
 
+/// Distinct tints per possibility domain, indexed like
+/// [`world_core::PossibilityDomain::ALL`] — used to colour the anchor-influence
+/// channel by which trait an anchor steers (phase-4-plan.md §11).
+const DOMAIN_TINTS: [[u8; 3]; POSSIBILITY_DIMS] = [
+    [90, 150, 230],  // Planetary
+    [230, 120, 90],  // Climate
+    [170, 140, 110], // Geology
+    [80, 170, 220],  // Hydrology
+    [110, 200, 90],  // Ecology
+    [210, 150, 220], // Morphology
+    [230, 200, 90],  // Behavior
+    [240, 120, 180], // Aesthetics
+];
+
+/// Summed anchor influence at a cell, coloured by the dominant steered domain
+/// and brightened by total influence over a dark base (phase-4-plan.md §11).
+fn influence_color(anchors: &[Anchor], world: (f64, f64)) -> [u8; 3] {
+    let mut per_domain = [0.0f32; POSSIBILITY_DIMS];
+    let mut total = 0.0f32;
+    for anchor in anchors {
+        let inf = anchor.influence(world);
+        if inf <= 0.0 {
+            continue;
+        }
+        total += inf;
+        for (i, slot) in per_domain.iter_mut().enumerate() {
+            if anchor.mask & (1 << i as u8) != 0 {
+                *slot += inf;
+            }
+        }
+    }
+    if total <= 0.0 {
+        return [18, 18, 22];
+    }
+    let dominant = per_domain
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map_or(0, |(i, _)| i);
+    lerp_rgb([18, 18, 22], DOMAIN_TINTS[dominant], total.clamp(0.0, 1.0))
+}
+
 /// Distinct tints per lithology class (geology channel), shaded by hardness.
 const LITHOLOGY_TINTS: [[u8; 3]; 8] = [
     [188, 143, 122],
@@ -376,6 +426,7 @@ impl MapComposer {
         player: (f64, f64),
         channel: Channel,
         overlays: Overlays,
+        anchors: &[Anchor],
     ) -> &[u8] {
         self.detect_pinned_changes(map);
 
@@ -387,7 +438,9 @@ impl MapComposer {
             for col_region in 0..=(2 * self.half_regions) {
                 let rx = center.x - self.half_regions + col_region;
                 let coord = RegionCoord::new(rx, ry);
-                self.paint_region(map, coord, channel, row_region, col_region, overlays);
+                self.paint_region(
+                    map, coord, channel, row_region, col_region, overlays, anchors,
+                );
             }
         }
 
@@ -460,6 +513,7 @@ impl MapComposer {
         row_region: i32,
         col_region: i32,
         overlays: Overlays,
+        anchors: &[Anchor],
     ) {
         let res = self.resolution;
         let side = self.side() as usize;
@@ -506,6 +560,11 @@ impl MapComposer {
                         Some(id) => species_color(id),
                         None => missing_color(cx, cy),
                     },
+                    Channel::Influence => {
+                        let wx = origin_x + (f64::from(cx) + 0.5) * cell;
+                        let wy = origin_y + (f64::from(cy) + 0.5) * cell;
+                        influence_color(anchors, (wx, wy))
+                    }
                     Channel::Geology => match hardness {
                         Some(h) => {
                             let wx = origin_x + (f64::from(cx) + 0.5) * cell;

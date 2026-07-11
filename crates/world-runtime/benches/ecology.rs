@@ -30,6 +30,7 @@ fn settled_map(cfg: StreamConfig, field: &PossibilityField) -> RegionMap {
             &bias,
             &Budget::unlimited(),
             &InlineExecutor,
+            false,
         );
     }
     map
@@ -70,6 +71,7 @@ fn bench_ecology(c: &mut Criterion) {
                         &bias,
                         &Budget::unlimited(),
                         &InlineExecutor,
+                        false,
                     );
                 }
                 black_box(map)

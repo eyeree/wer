@@ -21,3 +21,5 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0008](0008-tiles-are-functions-of-their-dependency-hash.md) | Tiles are functions of their dependency hash | Accepted |
 | [0009](0009-drainage-topology-from-quantized-elevation.md) | Drainage topology from quantized elevation at macro level | Accepted |
 | [0010](0010-species-identity-presentation-grade-until-atlas.md) | Species identity is presentation-grade until the atlas needs otherwise | Accepted |
+| [0011](0011-anchors-capture-trait-targets-combine-order-independently.md) | Anchors capture trait targets and combine order-independently | Accepted |
+| [0012](0012-resonance-gates-transition.md) | Resonance gates transition; it multiplies the travel-fueled rate | Accepted |

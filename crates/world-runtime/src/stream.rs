@@ -37,21 +37,38 @@ use world_core::layer::{
     LAYER_DRAINAGE, LAYER_ECOLOGY,
 };
 use world_core::{
-    drainage_dep_hash, layer_dep_hash, macro_coord_for, project_plausible, steer, Anchor, Biome,
-    Climate, DrainageTile, GenomeBias, HabitatSignature, PossibilityDomain, PossibilityField,
-    PossibilityVector, RegionCoord, Soils, POSSIBILITY_DIMS, REGION_SIZE,
+    capture_target, domain_mask, drainage_dep_hash, layer_dep_hash, macro_coord_for,
+    organism_trait_deviation, project_plausible, steer, Anchor, AnchorKind, AnchorSource, Biome,
+    Climate, DrainageTile, Genome, GenomeBias, HabitatSignature, PossibilityDomain,
+    PossibilityField, PossibilityVector, RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS,
+    REGION_SIZE,
 };
 
 use crate::budget::Budget;
 use crate::generate::{
     generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache, CHANNEL_DIVERSITY,
-    CHANNEL_FERTILITY, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_TEMPERATURE,
+    CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR,
+    CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 use crate::macrocache::MacroCache;
 use crate::realize::{realize_region, Organism};
 use crate::region::{GenerationStatus, RegionState};
+use crate::resonance::{
+    combine_resonance, density_term, gated_rate, species_entropy, Resonance, ResonanceNode,
+};
 use crate::rostercache::{RosterCache, RosterEntry, RosterSnapshot};
 use crate::task::{TaskExecutor, TaskPriority};
+
+/// How far a capture may pull the world past its habitat baseline
+/// (phase-4-plan.md §7.1). Bounds the "distinctiveness" of a captured anchor:
+/// even a wildly atypical discovery moves the target a bounded step, so steering
+/// stays inside the plausibility projection's reach.
+const CAPTURE_GAIN: f32 = 0.5;
+
+/// Convergence-rate scale in transition mode versus free movement
+/// (phase-4-plan.md §7.6, §8.2): deliberate reality-transition travel steers
+/// slowly and precisely; free exploration surveys at the full rate.
+const TRANSITION_CONVERGE_SCALE: f32 = 0.35;
 
 /// Distance thresholds and rates for the streaming window. All radii are world
 /// units measured from the player to a region's center.
@@ -101,7 +118,7 @@ impl Default for StreamConfig {
 
 /// Per-frame counters (phase-2-plan.md §8.2, §13). `deferred_*` report budget
 /// backpressure — expected and healthy, not an error.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FrameStats {
     /// Regions inserted this frame.
     pub loaded: usize,
@@ -141,6 +158,14 @@ pub struct FrameStats {
     pub organisms_realized: usize,
     /// Total near-field organisms resident after this frame.
     pub organisms: usize,
+    /// Transition capability at the player this frame, `0..=1` — the resonance
+    /// gate multiplier folded into convergence (phase-4-plan.md §8.3, ADR 0012).
+    pub resonance_strength: f32,
+    /// Contributing nodes in this frame's resonance graph (≤
+    /// `max_resonance_nodes`).
+    pub resonance_nodes: usize,
+    /// Active anchors this frame.
+    pub anchors_active: usize,
 }
 
 /// Distance from the player to a region's center.
@@ -417,6 +442,283 @@ impl RegionMap {
         })
     }
 
+    /// Capture the feature at a world position into a run-local
+    /// [`Anchor`](world_core::Anchor) (phase-4-plan.md §4.2, §7.1). The runtime
+    /// gatherer for the pure `world-core` capture math: it reads the covering
+    /// region's `current` possibility vector (the habitat baseline), the nearest
+    /// realized organism (for an organism capture) or the terrain/hydrology/
+    /// climate channels (for an environmental capture), builds a bounded
+    /// [`TraitDeviation`](world_core::TraitDeviation), and calls
+    /// [`capture_target`](world_core::capture_target). `None` if nothing
+    /// capturable is resident there or the mask is empty.
+    ///
+    /// Presentation-grade throughout (reads `f32` tiles/organisms, ADR 0010/0011);
+    /// a pure read of the resident caches — it never mutates the map.
+    #[must_use]
+    pub fn capture_at(
+        &self,
+        world_pos: (f64, f64),
+        category_mask: u8,
+        kind: AnchorKind,
+        strength: f32,
+        falloff_radius: f64,
+    ) -> Option<Anchor> {
+        if category_mask == 0 {
+            return None;
+        }
+        let coord = RegionCoord::from_world(world_pos.0, world_pos.1);
+        let baseline = self.regions.get(&coord)?.current;
+        let res = self.cfg.field_resolution;
+        let (ox, oy) = coord.origin();
+        let cell = REGION_SIZE / f64::from(res);
+        let cx = (((world_pos.0 - ox) / cell) as u16).min(res - 1);
+        let cy = (((world_pos.1 - oy) / cell) as u16).min(res - 1);
+        let tiles = self.cache.get(coord);
+        let sample = |channel: usize| {
+            tiles
+                .and_then(|t| t.channels[channel].as_ref())
+                .map(|t| t.get(cx, cy))
+        };
+
+        let organism_mask = domain_mask(&[
+            PossibilityDomain::Morphology,
+            PossibilityDomain::Behavior,
+            PossibilityDomain::Aesthetics,
+            PossibilityDomain::Ecology,
+        ]);
+
+        let mut deviation = TraitDeviation::zero();
+        let mut organism_species = None;
+
+        // Organism capture: the nearest realized organism drives the M/B/A/E
+        // deviation (§7.1). Its genome is reconstructed from its species id
+        // (`Genome::from_seed`, the same derivation realization used).
+        if category_mask & organism_mask != 0 {
+            if let Some(org) = self.nearest_organism(coord, world_pos) {
+                let genome = Genome::from_seed(org.species);
+                deviation = organism_trait_deviation(org.expressed, genome, baseline);
+                organism_species = Some(org.species);
+            } else if category_mask & (1 << PossibilityDomain::Ecology.index() as u8) != 0 {
+                // No organism: read Ecology distinctiveness from aggregate
+                // vegetation density instead.
+                if let Some(v) = sample(CHANNEL_VEGETATION) {
+                    deviation.set(
+                        PossibilityDomain::Ecology,
+                        v - baseline.get(PossibilityDomain::Ecology),
+                    );
+                }
+            }
+        }
+
+        // Environmental deviations: each masked landscape/water/climate domain
+        // departs from the baseline by its channel value.
+        if category_mask & (1 << PossibilityDomain::Geology.index() as u8) != 0 {
+            if let Some(h) = sample(CHANNEL_HARDNESS) {
+                deviation.set(
+                    PossibilityDomain::Geology,
+                    h - baseline.get(PossibilityDomain::Geology),
+                );
+            }
+        }
+        if category_mask & (1 << PossibilityDomain::Hydrology.index() as u8) != 0 {
+            let river = sample(CHANNEL_RIVER).unwrap_or(0.0);
+            let wetness = sample(CHANNEL_WETNESS).unwrap_or(0.0);
+            deviation.set(
+                PossibilityDomain::Hydrology,
+                river.max(wetness) - baseline.get(PossibilityDomain::Hydrology),
+            );
+        }
+        if category_mask & (1 << PossibilityDomain::Climate.index() as u8) != 0 {
+            if let Some(t) = sample(CHANNEL_TEMPERATURE) {
+                let norm = ((t + 15.0) / 50.0).clamp(0.0, 1.0);
+                deviation.set(
+                    PossibilityDomain::Climate,
+                    norm - baseline.get(PossibilityDomain::Climate),
+                );
+            }
+        }
+
+        // Source metadata: organism if one drove the capture, else the dominant
+        // masked environmental category (legibility only in Phase 4).
+        let source = if let Some(species) = organism_species {
+            AnchorSource::Organism { species }
+        } else if category_mask & (1 << PossibilityDomain::Hydrology.index() as u8) != 0 {
+            AnchorSource::River
+        } else if category_mask
+            & ((1 << PossibilityDomain::Climate.index() as u8)
+                | (1 << PossibilityDomain::Planetary.index() as u8))
+            != 0
+        {
+            AnchorSource::Atmosphere
+        } else if category_mask & (1 << PossibilityDomain::Geology.index() as u8) != 0 {
+            AnchorSource::Landform
+        } else {
+            AnchorSource::Manual
+        };
+
+        let target = capture_target(baseline, deviation, category_mask, CAPTURE_GAIN);
+        Some(Anchor {
+            world_pos,
+            target,
+            mask: category_mask,
+            kind,
+            strength,
+            falloff_radius,
+            source,
+        })
+    }
+
+    /// The realized organism nearest a world position within its region, if any
+    /// are resident there (the near window only).
+    fn nearest_organism(&self, coord: RegionCoord, world_pos: (f64, f64)) -> Option<&Organism> {
+        let dist2 = |p: (f64, f64)| {
+            let dx = p.0 - world_pos.0;
+            let dy = p.1 - world_pos.1;
+            dx * dx + dy * dy
+        };
+        self.organisms.get(&coord)?.iter().min_by(|a, b| {
+            dist2(a.world_pos)
+                .partial_cmp(&dist2(b.world_pos))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+
+    /// Build the transient resonance graph at the player and its gate strength
+    /// (phase-4-plan.md §7.5). A pure read of the settled near-window caches:
+    /// the realized organisms within `near_radius` become nodes (nearest-first,
+    /// capped at `max_resonance_nodes`), and their count/diversity/distance,
+    /// the local anchor compatibility, and a canopy occlusion proxy combine into
+    /// a bounded `strength`. Order-independent and deterministic; never stored.
+    #[must_use]
+    pub fn resonance_at(
+        &self,
+        player: (f64, f64),
+        anchors: &[Anchor],
+        budget: &Budget,
+    ) -> Resonance {
+        let radius = self.cfg.near_radius;
+        if radius <= 0.0 {
+            return Resonance::empty();
+        }
+        let radius2 = radius * radius;
+        // Collect near organisms with their squared distance for a stable sort.
+        let mut candidates: Vec<(u64, ResonanceNode)> = Vec::new();
+        for org in self.organisms() {
+            let dx = org.world_pos.0 - player.0;
+            let dy = org.world_pos.1 - player.1;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= radius2 {
+                candidates.push((
+                    d2.to_bits(),
+                    ResonanceNode {
+                        world_pos: org.world_pos,
+                        species: org.species,
+                        distance: d2.sqrt(),
+                    },
+                ));
+            }
+        }
+        // Nearest-first, with a total deterministic tiebreak so the capped set
+        // is order-independent (§7.5).
+        candidates.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.species.cmp(&b.1.species))
+                .then_with(|| a.1.world_pos.0.to_bits().cmp(&b.1.world_pos.0.to_bits()))
+                .then_with(|| a.1.world_pos.1.to_bits().cmp(&b.1.world_pos.1.to_bits()))
+        });
+        candidates.truncate(budget.max_resonance_nodes);
+        let nodes: Vec<ResonanceNode> = candidates.into_iter().map(|(_, n)| n).collect();
+        if nodes.is_empty() {
+            return Resonance::empty();
+        }
+
+        let density = density_term(nodes.len());
+        let diversity = species_entropy(&nodes);
+        // Distance term: mean smooth falloff of the nodes' reach.
+        let distance = {
+            let sum: f32 = nodes
+                .iter()
+                .map(|n| {
+                    let t = (1.0 - (n.distance / radius) as f32).clamp(0.0, 1.0);
+                    t * t
+                })
+                .sum();
+            sum / nodes.len() as f32
+        };
+        let anchor_compatibility = self.anchor_compatibility(player, anchors);
+        let occlusion = self.occlusion_proxy(player);
+        let strength = combine_resonance(
+            density,
+            diversity,
+            distance,
+            anchor_compatibility,
+            occlusion,
+        );
+        Resonance {
+            strength,
+            nodes,
+            anchor_compatibility,
+        }
+    }
+
+    /// How well the local ecology at the player matches the active anchor set,
+    /// `0..=1` — steering toward a world the player is *near an example of*
+    /// resonates more strongly (phase-4-plan.md §7.5). The influence-weighted
+    /// mean agreement between the player cell's realized possibility vector and
+    /// each anchor's masked target. Neutral (`1.0`) when no anchor reaches here.
+    fn anchor_compatibility(&self, player: (f64, f64), anchors: &[Anchor]) -> f32 {
+        if anchors.is_empty() {
+            return 1.0;
+        }
+        let coord = RegionCoord::from_world(player.0, player.1);
+        let Some(region) = self.regions.get(&coord) else {
+            return 1.0;
+        };
+        let current = region.current;
+        let mut weight_sum = 0.0f32;
+        let mut diff_sum = 0.0f32;
+        for anchor in anchors {
+            let w = anchor.influence(player);
+            if w <= 0.0 {
+                continue;
+            }
+            let mut masked = 0u32;
+            let mut diff = 0.0f32;
+            for i in 0..POSSIBILITY_DIMS {
+                if anchor.mask & (1 << i as u8) != 0 {
+                    diff += (current.dims[i] - anchor.target.dims[i]).abs();
+                    masked += 1;
+                }
+            }
+            if masked > 0 {
+                diff_sum += w * (diff / masked as f32);
+                weight_sum += w;
+            }
+        }
+        if weight_sum <= 0.0 {
+            return 1.0;
+        }
+        (1.0 - diff_sum / weight_sum).clamp(0.0, 1.0)
+    }
+
+    /// The line-of-sight occlusion proxy at the player (phase-4-plan.md §7.5):
+    /// dense canopy attenuates resonance. A mild factor from the player cell's
+    /// vegetation density, floored so it never dominates.
+    fn occlusion_proxy(&self, player: (f64, f64)) -> f32 {
+        let coord = RegionCoord::from_world(player.0, player.1);
+        let res = self.cfg.field_resolution;
+        let (ox, oy) = coord.origin();
+        let cell = REGION_SIZE / f64::from(res);
+        let cx = (((player.0 - ox) / cell) as u16).min(res - 1);
+        let cy = (((player.1 - oy) / cell) as u16).min(res - 1);
+        let veg = self
+            .cache
+            .get(coord)
+            .and_then(|t| t.channels[CHANNEL_VEGETATION].as_ref())
+            .map_or(0.0, |t| t.get(cx, cy));
+        (1.0 - 0.25 * veg).clamp(0.7, 1.0)
+    }
+
     /// A resident region's state.
     #[inline]
     #[must_use]
@@ -524,6 +826,14 @@ impl RegionMap {
     ///
     /// `bias` is a per-dimension offset the player steers directly (the
     /// keyboard "nudge" input), applied to the field sample before anchors.
+    ///
+    /// `transition_mode` selects the deliberate slow-steering movement mode over
+    /// fast free exploration (phase-4-plan.md §8.2): it scales the convergence
+    /// coefficient down so transition travel shapes the world precisely while
+    /// free travel surveys it. Convergence is additionally **resonance-gated**
+    /// (ADR 0012): the rate is multiplied by the transition capability at the
+    /// player, so barren surroundings hold the world still no matter how far the
+    /// player travels.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
@@ -534,13 +844,34 @@ impl RegionMap {
         bias: &[f32; POSSIBILITY_DIMS],
         budget: &Budget,
         executor: &dyn TaskExecutor,
+        transition_mode: bool,
     ) -> FrameStats {
         let mut stats = FrameStats::default();
         self.integrate_finished(&mut stats);
         self.evict(player, &mut stats);
         self.load(player, field, anchors, bias, budget, &mut stats);
         self.retarget(player, field, anchors, bias);
-        self.converge(player, travel, budget, &mut stats);
+        // Resonance is a pure read of the settled near-window caches, computed
+        // between retarget and converge so the rate sees the current frame's
+        // gate (phase-4-plan.md §8.2). It reads the previous frame's realized
+        // organisms — a transient one-frame view, never stored.
+        let resonance = self.resonance_at(player, anchors, budget);
+        let transition_scale = if transition_mode {
+            TRANSITION_CONVERGE_SCALE
+        } else {
+            1.0
+        };
+        self.converge(
+            player,
+            travel,
+            resonance.strength,
+            transition_scale,
+            budget,
+            &mut stats,
+        );
+        stats.resonance_strength = resonance.strength;
+        stats.resonance_nodes = resonance.nodes.len();
+        stats.anchors_active = anchors.len();
         self.dispatch_regen(player, field, budget, executor, &mut stats);
         // A synchronous executor (InlineExecutor) has already finished every
         // job dispatched above; integrating again here keeps the headless
@@ -833,11 +1164,21 @@ impl RegionMap {
         &mut self,
         player: (f64, f64),
         travel: f64,
+        resonance: f32,
+        transition_scale: f32,
         budget: &Budget,
         stats: &mut FrameStats,
     ) {
-        let rate =
-            (self.cfg.converge_per_unit * travel.max(0.0) as f32).min(self.cfg.converge_rate_cap);
+        // Resonance-gated, travel-fueled rate (ADR 0012): zero when either
+        // travel or resonance is zero, so a stationary player or a barren
+        // neighbourhood holds the world perfectly still.
+        let rate = gated_rate(
+            self.cfg.converge_per_unit,
+            travel,
+            resonance,
+            transition_scale,
+            self.cfg.converge_rate_cap,
+        );
         if rate <= 0.0 {
             return;
         }
@@ -1224,5 +1565,99 @@ impl RegionMap {
                 let _ = tx.send(JobResult::Tile(out));
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::budget::Budget;
+    use crate::InlineExecutor;
+    use world_core::{category_mask, TraitCategory};
+
+    fn settled_map() -> RegionMap {
+        let cfg = StreamConfig {
+            near_radius: 1.5 * REGION_SIZE,
+            far_radius: 3.0 * REGION_SIZE,
+            load_radius: 3.0 * REGION_SIZE,
+            unload_radius: 4.0 * REGION_SIZE,
+            field_resolution: 16,
+            ..StreamConfig::default()
+        };
+        let field = PossibilityField::default();
+        let bias = [0.0f32; POSSIBILITY_DIMS];
+        let mut map = RegionMap::new(cfg);
+        for _ in 0..6 {
+            map.update(
+                (0.0, 0.0),
+                0.0,
+                &field,
+                &[],
+                &bias,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn capture_outside_the_window_is_none() {
+        let map = settled_map();
+        assert!(map
+            .capture_at((1.0e9, 1.0e9), 0xFF, AnchorKind::Emphasize, 0.8, 1000.0)
+            .is_none());
+    }
+
+    #[test]
+    fn empty_mask_captures_nothing() {
+        let map = settled_map();
+        assert!(map
+            .capture_at((0.0, 0.0), 0, AnchorKind::Emphasize, 0.8, 1000.0)
+            .is_none());
+    }
+
+    #[test]
+    fn capture_targets_only_masked_domains_and_is_bounded() {
+        let map = settled_map();
+        let mask = category_mask(&[TraitCategory::Morphology, TraitCategory::Coloration]);
+        let anchor = map
+            .capture_at((0.0, 0.0), mask, AnchorKind::Emphasize, 0.8, 2000.0)
+            .expect("center region resident");
+        assert_eq!(anchor.mask, mask);
+        // Unmasked domains stay neutral (never read by `steer`).
+        assert_eq!(anchor.target.get(PossibilityDomain::Hydrology), 0.5);
+        assert_eq!(anchor.target.get(PossibilityDomain::Climate), 0.5);
+        // Masked domains are a bounded nudge of the baseline, in range.
+        for domain in [PossibilityDomain::Morphology, PossibilityDomain::Aesthetics] {
+            let v = anchor.target.get(domain);
+            assert!((0.0..=1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn organism_capture_records_its_species() {
+        let map = settled_map();
+        // Find a near region that realized organisms, and capture at one.
+        let with_org = map
+            .iter_active()
+            .map(|r| r.coord)
+            .find(|&c| map.organisms_in(c).is_some_and(|o| !o.is_empty()));
+        let Some(coord) = with_org else {
+            return; // no organisms in this tiny window; nothing to assert
+        };
+        let org = map.organisms_in(coord).unwrap()[0];
+        let mask = category_mask(&[TraitCategory::Morphology]);
+        let anchor = map
+            .capture_at(org.world_pos, mask, AnchorKind::Emphasize, 0.8, 2000.0)
+            .expect("resident");
+        match anchor.source {
+            AnchorSource::Organism { species } => {
+                // The nearest organism to its own position is itself.
+                assert_eq!(species, org.species);
+            }
+            other => panic!("expected an organism capture, got {other:?}"),
+        }
     }
 }

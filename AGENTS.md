@@ -12,23 +12,31 @@ browser/WebAssembly/WebGPU target) for an exploration game built around
 [`Infinite_World_Exploration_Project_Overview.md`](Infinite_World_Exploration_Project_Overview.md);
 the phased technical plan is in [`implementation-plan.md`](implementation-plan.md).
 
-The repository is at **Phase 3** (procedural genetics and ecology, see
-[`phase-3-plan.md`](phase-3-plan.md)), built on the landed Phase 2 stack. Phase 2
-is a nine-layer declared dependency graph — terrain, geology, macro drainage,
-climate, hydrology, soils, biome, vegetation, and now **ecology (L8)** — with
-dependency-hash staleness (ADR 0008), topological cost-budgeted dispatch, stable
-integer river topology (ADR 0009), the continuity replay, and the
-invalidation-precision harness (`wer-ledger`). Phase 3 adds procedural genomes,
-species rosters, food webs, the aggregate-ecology layer L8 (the first reader of
-the Morphology/Behavior/Aesthetics domains), a signature-keyed roster cache, and
-near-field organism realization from the aggregate fields — species identity is
-presentation-grade until the atlas needs otherwise (ADR 0010), and its coherence
-and diversity are machine-checked by the ecology harness. The renderer still only
-presents one CPU-composed debug texture (near-field organisms surface as debug
-markers, not meshes), the possibility vector is still one scalar per domain
-(Phase 3 *reads* its last four domains, it does not grow them), and the `Storage`
-trait is still unused — those grow in later phases; do not mistake them for
-finished subsystems.
+The repository is at **Phase 4** (anchors and player steering, see
+[`phase-4-plan.md`](phase-4-plan.md)), built on the landed Phase 2 and Phase 3
+stacks. Phase 2 is a nine-layer declared dependency graph — terrain, geology,
+macro drainage, climate, hydrology, soils, biome, vegetation, and **ecology
+(L8)** — with dependency-hash staleness (ADR 0008), topological cost-budgeted
+dispatch, stable integer river topology (ADR 0009), the continuity replay, and
+the invalidation-precision harness (`wer-ledger`). Phase 3 adds procedural
+genomes, species rosters, food webs, the aggregate-ecology layer L8 (the first
+reader of the Morphology/Behavior/Aesthetics domains), a signature-keyed roster
+cache, and near-field organism realization — species identity is
+presentation-grade until the atlas needs otherwise (ADR 0010), machine-checked by
+the ecology harness. Phase 4 turns the possibility machinery into the game: anchors
+capture the *traits* of discoveries into a possibility `target` and combine
+**order-independently** (ADR 0011), `project_plausible` grows into the full
+section-8 rule set as an idempotent relaxation, and a transient **resonance**
+graph gates convergence so change is travel-fueled *and* resonance-gated — dense,
+diverse, anchor-compatible surroundings let the player steer, barren ones hold the
+world still (ADR 0012). Steering is machine-checked by the anchor harness
+(`wer-anchor`). Steering is all presentation-side (it moves a region's target
+vector, never a generated identity), so `WORLD_ALGORITHM_VERSION` stays at 2. The
+renderer still only presents one CPU-composed debug texture (organisms and
+resonance arcs surface as debug markers/overlays, not meshes), the possibility
+vector is still one scalar per domain (several in-fiction trait categories collapse
+onto one scalar), and the `Storage` trait is still unused — those grow in later
+phases; do not mistake them for finished subsystems.
 
 ## Toolchain
 
@@ -45,7 +53,14 @@ finished subsystems.
 cargo run --bin wer
 
 # Deterministic inspector: world position -> region + origin feature hash.
-cargo run --bin wer-inspect -- 300 -10
+# Add --layers / --species / --ecology / --steer for the dependency-hash chain,
+# the roster + food web, the L8 aggregates, or the capture->steer->project chain.
+cargo run --bin wer-inspect -- 300 -10 --steer
+
+# Phase sign-off harnesses (headless, CI gates): invalidation precision, and
+# Phase 4 steering (intentional/selective/coherent/resonance-gated).
+cargo run --bin wer-ledger
+cargo run --bin wer-anchor
 
 # Run everything, including the determinism golden fixtures.
 cargo test --workspace
@@ -118,12 +133,16 @@ Non-negotiable rules when touching generation code:
   (currently `0x4c6ca5de38f90b17` at algorithm version 2). The same applies to
   every parity export (terrain gradient seed, control-point seed, lithology
   seed, the drainage routing sample — routing is all-integer topology, so
-  full direction+accumulation equality is required, ADR 0009 — and the Phase 3
+  full direction+accumulation equality is required, ADR 0009 — the Phase 3
   `genome_sample` and `food_web_sample`, the portable genetics surface: a
   genome and food-web tier biomass are pure functions of an integer seed, so
   they are cross-platform, but the *habitat signature a cell derives* is
-  presentation-grade and deliberately not a parity export, ADR 0010). This
-  equality is the determinism guarantee the browser port depends on.
+  presentation-grade and deliberately not a parity export, ADR 0010 — and the
+  Phase 4 `steer_sample`, the portable steering-math surface: `steer` and
+  `project_plausible` are float-deterministic functions of the anchor set, so a
+  fixed scripted steer is cross-platform, but a *live capture* reads `f32`
+  organisms/tiles and is presentation-grade, deliberately not exported, ADR
+  0011). This equality is the determinism guarantee the browser port depends on.
 - A portable PRNG (`Rng`) may be seeded *from* a stable hash for approximate
   sampling; its float outputs are not sources of identity.
 

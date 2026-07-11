@@ -23,3 +23,7 @@ harness = false
 [[bench]]
 name = "ecology"
 harness = false
+
+[[bench]]
+name = "steering"
+harness = false

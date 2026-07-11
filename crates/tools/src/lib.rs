@@ -6,10 +6,12 @@
 //! `wer-replay` (the headless continuity replay), and `wer-ledger` (the
 //! invalidation-precision harness of phase-2-plan.md §12.3).
 
+pub mod anchor;
 pub mod ecology;
 pub mod ledger;
 pub mod replay;
 
+pub use anchor::{run_anchor_harness, AnchorReport};
 pub use ecology::{run_ecology_harness, EcologyReport};
 pub use ledger::{run_invalidation_ledger, ScenarioReport};
 pub use replay::{run_continuity_replay, ReplayConfig, ReplayReport};
@@ -107,6 +109,7 @@ fn settled_inspection(world_x: f64, world_y: f64) -> (RegionMap, RegionCoord, u1
             &bias,
             &Budget::unlimited(),
             &InlineExecutor,
+            false,
         );
     }
     let res = cfg.field_resolution;
@@ -124,6 +127,74 @@ fn settled_inspection(world_x: f64, world_y: f64) -> (RegionMap, RegionCoord, u1
 pub fn inspect_ecology(world_x: f64, world_y: f64) -> Option<CellEcology> {
     let (map, region, cx, cy) = settled_inspection(world_x, world_y);
     map.cell_ecology(region, cx, cy)
+}
+
+/// The steering readout at a world position for a scripted anchor set — the data
+/// behind `wer-inspect --steer` (phase-4-plan.md §11): the base field sample,
+/// the order-independent steered vector, the plausibility-projected target, and
+/// which domains moved. Makes the capture→steer→project chain *legible*, the
+/// steering analogue of `--layers`.
+#[derive(Debug)]
+pub struct SteerReport {
+    /// The anchor-free base possibility vector at the position.
+    pub base: world_core::PossibilityVector,
+    /// The steered vector after combining the scripted anchor set.
+    pub steered: world_core::PossibilityVector,
+    /// The plausibility-projected target (what the region converges toward).
+    pub projected: world_core::PossibilityVector,
+    /// The scripted anchor set used, for legibility.
+    pub anchors: Vec<world_core::Anchor>,
+}
+
+/// Steer the base field at a position with a scripted demo anchor set (an
+/// Emphasize toward large, glowing life on Morphology+Aesthetics, and a Suppress
+/// on Ecology), and report base / steered / projected. Deterministic; the anchor
+/// set is fixed so the tool is a scriptable steering spot-check.
+#[must_use]
+pub fn inspect_steer(world_x: f64, world_y: f64) -> SteerReport {
+    use world_core::{
+        bound_target, category_mask, project_plausible, steer, Anchor, AnchorKind, AnchorSource,
+        TraitCategory,
+    };
+    let field = world_core::PossibilityField::default();
+    let region = RegionCoord::from_world(world_x, world_y);
+    let base = field.sample(region);
+
+    let emphasize_mask = category_mask(&[TraitCategory::Morphology, TraitCategory::Coloration]);
+    let suppress_mask = category_mask(&[TraitCategory::Ecological]);
+    let anchors = vec![
+        Anchor {
+            world_pos: (world_x, world_y),
+            target: bound_target(emphasize_mask, 0.9),
+            mask: emphasize_mask,
+            kind: AnchorKind::Emphasize,
+            strength: 0.8,
+            falloff_radius: 3.0 * world_core::REGION_SIZE,
+            source: AnchorSource::Manual,
+        },
+        Anchor {
+            world_pos: (world_x, world_y),
+            target: bound_target(suppress_mask, 1.0),
+            mask: suppress_mask,
+            kind: AnchorKind::Suppress,
+            strength: 0.5,
+            falloff_radius: 3.0 * world_core::REGION_SIZE,
+            source: AnchorSource::Manual,
+        },
+    ];
+    let (ox, oy) = region.origin();
+    let center = (
+        ox + world_core::REGION_SIZE * 0.5,
+        oy + world_core::REGION_SIZE * 0.5,
+    );
+    let steered = steer(base, &anchors, center);
+    let projected = project_plausible(steered);
+    SteerReport {
+        base,
+        steered,
+        projected,
+        anchors,
+    }
 }
 
 #[must_use]

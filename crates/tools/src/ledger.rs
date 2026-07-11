@@ -68,7 +68,16 @@ const PLAYER: (f64, f64) = (128.0, 128.0);
 
 fn update(map: &mut RegionMap, travel: f64, bias: &[f32; POSSIBILITY_DIMS], budget: &Budget) {
     let field = PossibilityField::default();
-    map.update(PLAYER, travel, &field, &[], bias, budget, &InlineExecutor);
+    map.update(
+        PLAYER,
+        travel,
+        &field,
+        &[],
+        bias,
+        budget,
+        &InlineExecutor,
+        false,
+    );
 }
 
 /// A settled window: fully loaded and generated, nothing in flight.
@@ -315,13 +324,23 @@ fn budget_ripple_scenario() -> ScenarioReport {
         max_converge_regions: usize::MAX,
         max_regen_cost: 24,
         max_realize_organisms: usize::MAX,
+        max_resonance_nodes: usize::MAX,
     };
     let mut violations = Vec::new();
     let mut frames_with_regen = 0u32;
     let mut regenerated = 0usize;
     for _ in 0..600 {
         let field = PossibilityField::default();
-        let stats = map.update(PLAYER, 25.0, &field, &[], &bias, &budget, &InlineExecutor);
+        let stats = map.update(
+            PLAYER,
+            25.0,
+            &field,
+            &[],
+            &bias,
+            &budget,
+            &InlineExecutor,
+            false,
+        );
         if stats.regen_cost_spent > budget.max_regen_cost {
             record(
                 &mut violations,
@@ -354,6 +373,7 @@ fn budget_ripple_scenario() -> ScenarioReport {
         &bias,
         &Budget::unlimited(),
         &InlineExecutor,
+        false,
     );
     if map.jobs_in_flight() != 0 || stats.layers_dispatched > 0 {
         record(

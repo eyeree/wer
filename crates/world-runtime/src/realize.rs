@@ -198,6 +198,7 @@ mod tests {
                 &bias,
                 &Budget::unlimited(),
                 &InlineExecutor,
+                false,
             );
         }
         (map, RegionCoord::new(0, 0))

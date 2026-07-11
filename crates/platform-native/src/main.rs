@@ -13,10 +13,13 @@
 //!   Planetary, Climate, Geology, Hydrology, Ecology, Morphology, Behavior,
 //!   Aesthetics
 //! - `Z` — reset all nudges
-//! - `E` / `Q` — drop an Emphasize / Suppress anchor at the player
+//! - `E` / `Q` — drop a manual Emphasize / Suppress anchor at the player
+//! - `T` / `Y` / `K` — cycle the capture trait category / toggle polarity /
+//!   capture the feature under the player into an anchor (phase-4-plan.md §7.1)
+//! - `R` — toggle transition movement mode (slow, resonance-gated steering)
 //! - `C` — clear anchors
-//! - `V` — cycle the visualized channel; `G` grid, `N` rings, `X`
-//!   changed-while-pinned flash
+//! - `V` — cycle the visualized channel (includes the anchor `influence`
+//!   field); `G` grid, `N` rings, `X` changed-while-pinned flash
 //! - `Esc` — quit
 //! - Mouse over the map — the info panel shows the cell under the cursor
 //!   (world/region coordinates, streaming state, field samples, biome)
@@ -44,8 +47,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 use world_core::{
-    domain_mask, Anchor, AnchorKind, Biome, PossibilityDomain, PossibilityField, RegionCoord,
-    LAYER_COUNT, POSSIBILITY_DIMS, REGION_SIZE,
+    bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, Biome, PossibilityDomain,
+    PossibilityField, RegionCoord, TraitCategory, LAYER_COUNT, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
     Budget, FrameStats, GenerationStatus, RegionMap, StreamConfig, CHANNEL_CANOPY,
@@ -80,6 +83,9 @@ struct World {
     /// Player position at the previous update; the distance to the current
     /// position is the travel that fuels convergence (ADR 0006).
     last_player: (f64, f64),
+    /// Deliberate slow-steering movement mode vs fast free exploration
+    /// (phase-4-plan.md §8.2). Toggled with `R`.
+    transition_mode: bool,
     executor: RayonExecutor,
     budget: Budget,
 }
@@ -93,6 +99,7 @@ impl World {
             bias: [0.0; POSSIBILITY_DIMS],
             player: (0.0, 0.0),
             last_player: (0.0, 0.0),
+            transition_mode: false,
             executor: RayonExecutor,
             budget: Budget::per_frame(16.6),
         }
@@ -112,6 +119,7 @@ impl World {
             &self.bias,
             &self.budget,
             &self.executor,
+            self.transition_mode,
         )
     }
 }
@@ -124,6 +132,10 @@ struct App {
     hud: Hud,
     channel: Channel,
     overlays: Overlays,
+    /// The trait category a capture (`K`) anchors, cycled with `T`.
+    capture_category: TraitCategory,
+    /// Whether a capture emphasizes or suppresses, toggled with `Y`.
+    capture_polarity: AnchorKind,
     keys_down: HashSet<KeyCode>,
     modifiers: ModifiersState,
     /// Mouse position in window physical pixels, when over the window.
@@ -155,6 +167,8 @@ impl App {
             hud,
             channel: Channel::Composite,
             overlays: Overlays::default(),
+            capture_category: TraitCategory::Morphology,
+            capture_polarity: AnchorKind::Emphasize,
             keys_down: HashSet::new(),
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
@@ -231,22 +245,81 @@ impl App {
                 } else {
                     AnchorKind::Suppress
                 };
+                // Manual debug anchor: the Phase 1 behaviour is the bound-target
+                // special case — Emphasize pulls the masked domains toward 1.0,
+                // Suppress pushes them away from it (phase-4-plan.md §4.1).
+                let mask = domain_mask(&[
+                    PossibilityDomain::Climate,
+                    PossibilityDomain::Hydrology,
+                    PossibilityDomain::Ecology,
+                ]);
                 self.world.anchors.push(Anchor {
                     world_pos: self.world.player,
-                    mask: domain_mask(&[
-                        PossibilityDomain::Climate,
-                        PossibilityDomain::Hydrology,
-                        PossibilityDomain::Ecology,
-                    ]),
+                    target: bound_target(mask, 1.0),
+                    mask,
                     kind,
                     strength: ANCHOR_STRENGTH,
                     falloff_radius: ANCHOR_RADIUS,
+                    source: AnchorSource::Manual,
                 });
                 log::info!(
                     "dropped {kind:?} anchor at ({:.0}, {:.0}) ({} total)",
                     self.world.player.0,
                     self.world.player.1,
                     self.world.anchors.len()
+                );
+            }
+            KeyCode::KeyK => {
+                // Capture the feature under the player into a run-local anchor
+                // (phase-4-plan.md §7.1): reads the covering region's baseline,
+                // the nearest realized organism or the environment channels, and
+                // nudges the target toward what makes the discovery distinctive.
+                let mask = self.capture_category.mask_bit();
+                match self.world.map.capture_at(
+                    self.world.player,
+                    mask,
+                    self.capture_polarity,
+                    ANCHOR_STRENGTH,
+                    ANCHOR_RADIUS,
+                ) {
+                    Some(anchor) => {
+                        log::info!(
+                            "captured {} {:?} from {:?} ({} anchors)",
+                            self.capture_category.name(),
+                            self.capture_polarity,
+                            anchor.source,
+                            self.world.anchors.len() + 1,
+                        );
+                        self.world.anchors.push(anchor);
+                    }
+                    None => log::info!("nothing capturable under the player yet"),
+                }
+            }
+            KeyCode::KeyT => {
+                let all = TraitCategory::ALL;
+                let i = all
+                    .iter()
+                    .position(|&c| c == self.capture_category)
+                    .unwrap_or(0);
+                self.capture_category = all[(i + 1) % all.len()];
+                log::info!("capture category: {}", self.capture_category.name());
+            }
+            KeyCode::KeyY => {
+                self.capture_polarity = match self.capture_polarity {
+                    AnchorKind::Emphasize => AnchorKind::Suppress,
+                    AnchorKind::Suppress => AnchorKind::Emphasize,
+                };
+                log::info!("capture polarity: {:?}", self.capture_polarity);
+            }
+            KeyCode::KeyR => {
+                self.world.transition_mode = !self.world.transition_mode;
+                log::info!(
+                    "movement mode: {}",
+                    if self.world.transition_mode {
+                        "transition (slow, deliberate steering)"
+                    } else {
+                        "free exploration"
+                    }
                 );
             }
             KeyCode::KeyC => {
@@ -384,6 +457,7 @@ impl App {
             self.world.player,
             self.channel,
             self.overlays,
+            &self.world.anchors,
         );
         let info = PanelInfo {
             fps: self.fps,
@@ -399,6 +473,9 @@ impl App {
             player: self.world.player,
             bias: &self.world.bias,
             anchors: &self.world.anchors,
+            capture_category: self.capture_category.name(),
+            capture_polarity: self.capture_polarity,
+            transition_mode: self.world.transition_mode,
             cursor,
         };
         let (width, height) = self.hud.size();
@@ -519,6 +596,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
             &bias,
             &Budget::unlimited(),
             &world_runtime::InlineExecutor,
+            false,
         );
         for (total, &count) in regen_totals.iter_mut().zip(&stats.regenerated_by_layer) {
             *total += count as u64;
@@ -533,7 +611,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         pinned_flash: false,
         organisms: true,
     };
-    composer.compose(&map, pos, channel, overlays);
+    composer.compose(&map, pos, channel, overlays, &[]);
 
     // Include the info panel (cursor pinned at the given position) so HUD
     // rendering is inspectable headlessly too.
@@ -552,6 +630,9 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         player: pos,
         bias: &bias,
         anchors: &[],
+        capture_category: world_core::TraitCategory::Morphology.name(),
+        capture_polarity: AnchorKind::Emphasize,
+        transition_mode: false,
         cursor: Some(App::sample_cursor(&map, pos)),
     };
     let (width, height) = hud.size();
