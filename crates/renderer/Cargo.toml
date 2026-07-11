@@ -1,0 +1,16 @@
+[package]
+name = "renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "wgpu/WGSL renderer. Owns the GPU device, surface, and render graph."
+
+[lints]
+workspace = true
+
+[dependencies]
+world-core = { path = "../world-core" }
+wgpu = { workspace = true }
+log = { workspace = true }

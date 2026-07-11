@@ -1,0 +1,17 @@
+[package]
+name = "world-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Platform-neutral deterministic world model: hashing, coordinates, possibility space."
+
+[lints]
+workspace = true
+
+[dependencies]
+glam = { workspace = true }
+
+[dev-dependencies]
+# (none yet — determinism tests use only the public API)

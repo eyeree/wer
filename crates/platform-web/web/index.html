@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wer — wasm smoke test</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 40rem; line-height: 1.5; }
+      code { background: #f0f0f3; padding: 0.1em 0.3em; border-radius: 4px; }
+      .ok { color: #1a7f37; } .warn { color: #b35900; } .err { color: #b3261e; }
+      pre { background: #f0f0f3; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>Infinite World Exploration — wasm smoke test</h1>
+    <p>
+      This page loads the <code>platform-web</code> wasm module and confirms that
+      the deterministic core computes the expected value in the browser.
+      See the build steps in the repository <code>README.md</code>.
+    </p>
+    <pre id="out">loading wasm module…</pre>
+
+    <script type="module">
+      const out = document.getElementById("out");
+      const line = (cls, msg) => {
+        const span = document.createElement("span");
+        span.className = cls;
+        span.textContent = msg + "\n";
+        out.appendChild(span);
+      };
+
+      // WebGPU availability (the eventual renderer target; not required for the
+      // core smoke computation).
+      if ("gpu" in navigator) line("ok", "WebGPU: available");
+      else line("warn", "WebGPU: not available (fine for the core smoke test)");
+
+      try {
+        // Produced by `wasm-bindgen ... --target web` (see README).
+        const mod = await import("./generated/platform_web.js");
+        await mod.default();
+        const hash = mod.origin_feature_hash();
+        const hex = "0x" + hash.toString(16).padStart(16, "0");
+        line("ok", "core loaded — origin feature hash: " + hex);
+        line("ok", "this must equal native `wer-inspect 0 0`.");
+      } catch (e) {
+        out.textContent = "";
+        line("err", "failed to load wasm module:");
+        line("err", String(e));
+        line("warn", "did you run the wasm-bindgen build step from the README?");
+      }
+    </script>
+  </body>
+</html>

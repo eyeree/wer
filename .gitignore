@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo may generate this for binaries; keep Cargo.lock committed for apps
+# (it is committed at the workspace root).
+
+# Web build output
+/crates/platform-web/pkg
+/crates/platform-web/dist
+/crates/platform-web/web/generated
+node_modules
+
+# Profiling / capture output
+*.tracy
+/captures
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp

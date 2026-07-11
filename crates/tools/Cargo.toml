@@ -1,0 +1,19 @@
+[package]
+name = "tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Developer tools: world inspectors, procedural visualizers, validation and replay tools."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wer-inspect"
+path = "src/bin/inspect.rs"
+
+[dependencies]
+world-core = { path = "../world-core" }
+world-runtime = { path = "../world-runtime" }

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Native: format, lint, build, and run the determinism/unit tests.
+  native:
+    name: native (check, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
+      - name: check
+        run: cargo check --workspace
+      - name: test
+        run: cargo test --workspace
+
+  # Browser portability: the platform-neutral crates must keep compiling for wasm
+  # continuously (implementation-plan.md section 19).
+  wasm:
+    name: wasm32 check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain + target
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: check world-core (wasm32)
+        run: cargo check -p world-core --target wasm32-unknown-unknown
+      - name: check world-runtime (wasm32)
+        run: cargo check -p world-runtime --target wasm32-unknown-unknown
+      - name: check platform-web (wasm32)
+        run: cargo check -p platform-web --target wasm32-unknown-unknown

@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# The wasm32 target is required so `world-core` can be checked for the browser
+# runtime continuously (see docs/adr/0002 and the CI workflow).
+targets = ["wasm32-unknown-unknown"]

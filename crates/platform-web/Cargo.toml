@@ -1,0 +1,26 @@
+[package]
+name = "platform-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Browser/wasm application shell: wasm-bindgen glue, canvas, workers, browser storage."
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+world-core = { path = "../world-core" }
+log = { workspace = true }
+
+# Browser-only dependencies. Gating them to the wasm target keeps a native
+# `cargo check` of the whole workspace fast and free of browser bindings, while
+# the real build target (`wasm32-unknown-unknown`) still gets everything.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true }
+web-sys = { workspace = true, features = ["console"] }

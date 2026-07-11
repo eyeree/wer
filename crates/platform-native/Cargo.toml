@@ -1,0 +1,25 @@
+[package]
+name = "platform-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Native desktop application shell: windowing, event loop, and native platform services."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wer"
+path = "src/main.rs"
+
+[dependencies]
+world-core = { path = "../world-core" }
+world-runtime = { path = "../world-runtime" }
+renderer = { path = "../renderer" }
+winit = { workspace = true }
+pollster = { workspace = true }
+rayon = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
