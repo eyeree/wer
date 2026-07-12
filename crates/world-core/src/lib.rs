@@ -46,7 +46,8 @@ pub mod terrain;
 pub mod vegetation;
 
 pub use anchor::{
-    bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind, AnchorSource,
+    anchor_set_signature, bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind,
+    AnchorSource,
 };
 pub use biome::{classify, Biome, BIOME_COUNT};
 pub use capture::{
@@ -82,8 +83,8 @@ pub use record::{
     StoreMeta, RECORD_FORMAT_VERSION, SEEN_CHUNK_LEVEL,
 };
 pub use route::{
-    anchor_set_signature, attraction_anchors, route_difficulty, route_pull, RouteGraph,
-    RouteGraphHit, ROUTE_ATTRACTION_MASK, ROUTE_CORRIDOR_RADIUS, ROUTE_PULL_CAP,
+    attraction_anchors, route_difficulty, route_pull, RouteGraph, RouteGraphHit,
+    ROUTE_ATTRACTION_MASK, ROUTE_CORRIDOR_RADIUS, ROUTE_PULL_CAP,
 };
 pub use soils::{soils, Soils};
 pub use species::{

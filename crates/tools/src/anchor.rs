@@ -25,9 +25,9 @@
 
 use world_core::foodweb::{CARNIVORE_EFFICIENCY, HERBIVORE_EFFICIENCY};
 use world_core::{
-    bound_target, category_mask, project_plausible, Anchor, AnchorKind, AnchorSource,
-    PossibilityDomain, PossibilityField, PossibilityVector, RegionCoord, TraitCategory,
-    POSSIBILITY_DIMS, REGION_SIZE,
+    anchor_set_signature, bound_target, category_mask, project_plausible, steer, Anchor,
+    AnchorKind, AnchorSource, PossibilityDomain, PossibilityField, PossibilityVector, RegionCoord,
+    TraitCategory, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
     Budget, InlineExecutor, RegionMap, StreamConfig, CHANNEL_ELEVATION, CHANNEL_HARDNESS,
@@ -329,6 +329,95 @@ fn combination_scenario() -> AnchorReport {
         name: "two anchors blend emergently and order-independently",
         violations,
         summary: format!("a {only_a:.3}, b {only_b:.3}, a+b {ab:.3}, b+a {ba:.3}"),
+    }
+}
+
+/// ADR 0025's exact numerical contract: a multiset has one raw-bit reduction
+/// order, duplicates remain influential, and Suppress is the final blend.
+fn canonical_multiset_scenario() -> AnchorReport {
+    let mut violations = Vec::new();
+    let mask = 1 << PossibilityDomain::Ecology.index() as u8;
+    let make = |kind, target, strength, x| Anchor {
+        world_pos: (x, 0.0),
+        target: bound_target(mask, target),
+        mask,
+        kind,
+        strength,
+        falloff_radius: 1000.0,
+        source: AnchorSource::Manual,
+    };
+    let a = make(AnchorKind::Emphasize, 0.91, 0.500_000_06, -30.0);
+    let b = make(AnchorKind::Suppress, 0.83, 0.37, 80.0);
+    let c = make(AnchorKind::Emphasize, 0.07, 0.000_976_562_5, 0.25);
+    let fixture = [a, b, a, c];
+    let base = PossibilityVector::neutral();
+    let expected = steer(base, &fixture, PLAYER).dims.map(f32::to_bits);
+    let expected_sig = anchor_set_signature(&fixture);
+    let permutations = [
+        [a, b, a, c],
+        [c, a, b, a],
+        [b, a, c, a],
+        [a, c, a, b],
+        [a, a, b, c],
+        [c, b, a, a],
+    ];
+    for (index, permutation) in permutations.iter().enumerate() {
+        if steer(base, permutation, PLAYER).dims.map(f32::to_bits) != expected {
+            record(
+                &mut violations,
+                format!("permutation {index} changed steering bits"),
+            );
+        }
+        if anchor_set_signature(permutation) != expected_sig {
+            record(
+                &mut violations,
+                format!("permutation {index} changed anchor signature"),
+            );
+        }
+    }
+    if anchor_set_signature(&[a]) == anchor_set_signature(&[a, a]) {
+        record(
+            &mut violations,
+            "duplicate anchor occurrence vanished from signature".into(),
+        );
+    }
+    let once = steer(base, &[a], a.world_pos).get(PossibilityDomain::Ecology);
+    let twice = steer(base, &[a, a], a.world_pos).get(PossibilityDomain::Ecology);
+    if twice <= once {
+        record(
+            &mut violations,
+            "duplicate anchor occurrence did not strengthen steering".into(),
+        );
+    }
+
+    let emphasize_target = 0.9f32;
+    let suppress_target = 0.8f32;
+    let polarity_base_i = 0.4f32;
+    let emphasize = make(AnchorKind::Emphasize, emphasize_target, 0.5, 0.0);
+    let suppress = make(AnchorKind::Suppress, suppress_target, 0.25, 0.0);
+    let mut polarity_base = PossibilityVector::neutral();
+    polarity_base.set(PossibilityDomain::Ecology, polarity_base_i);
+    let actual =
+        steer(polarity_base, &[suppress, emphasize], (0.0, 0.0)).get(PossibilityDomain::Ecology);
+    let emphasized = polarity_base_i + (emphasize_target - polarity_base_i) * 0.5;
+    let reflected = (2.0 * polarity_base_i - suppress_target).clamp(0.0, 1.0);
+    let suppress_final = emphasized + (reflected - emphasized) * 0.25;
+    if actual.to_bits() != suppress_final.to_bits() {
+        record(
+            &mut violations,
+            "polarity blend was not Emphasize-first/Suppress-final".into(),
+        );
+    }
+
+    AnchorReport {
+        name: "canonical anchor multiset (exact permutations/duplicates/polarity)",
+        violations,
+        summary: format!(
+            "{} permutations, signature {expected_sig:#018x}, duplicate pull {:.3}->{:.3}",
+            permutations.len(),
+            once,
+            twice
+        ),
     }
 }
 
@@ -659,6 +748,7 @@ pub fn run_anchor_harness() -> Vec<AnchorReport> {
         intentional_selective_scenario(),
         suppress_scenario(),
         combination_scenario(),
+        canonical_multiset_scenario(),
         falloff_scenario(),
         plausible_target_scenario(),
         coherence_and_diversity_scenario(),

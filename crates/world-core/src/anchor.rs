@@ -19,7 +19,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::hash::mix;
 use crate::possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS};
+
+/// Fixed basis separating canonical anchor-multiset signatures from every
+/// other stable hash domain (ADR 0025).
+const ANCHOR_SET_BASIS: u64 = 0xA5E7_51B0_39C4_D6F2;
 
 /// What an anchor does to the masked dimensions relative to its captured target.
 ///
@@ -103,6 +108,78 @@ impl Anchor {
     }
 }
 
+/// The complete steering-semantic projection of an anchor (ADR 0025).
+///
+/// Field order is both the raw-bit lexicographic reduction order and the
+/// signature fold order. Source metadata and unmasked target storage are
+/// deliberately normalized out because steering never reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AnchorSteeringKey {
+    world_x_bits: u64,
+    world_y_bits: u64,
+    mask: u8,
+    kind_tag: u8,
+    strength_bits: u32,
+    falloff_radius_bits: u64,
+    masked_target_bits: [u32; POSSIBILITY_DIMS],
+}
+
+impl AnchorSteeringKey {
+    fn of(anchor: &Anchor) -> Self {
+        let mut masked_target_bits = [0; POSSIBILITY_DIMS];
+        for (i, bits) in masked_target_bits.iter_mut().enumerate() {
+            if anchor.mask & (1 << i as u8) != 0 {
+                *bits = anchor.target.dims[i].to_bits();
+            }
+        }
+        Self {
+            world_x_bits: anchor.world_pos.0.to_bits(),
+            world_y_bits: anchor.world_pos.1.to_bits(),
+            mask: anchor.mask,
+            kind_tag: match anchor.kind {
+                AnchorKind::Emphasize => 0,
+                AnchorKind::Suppress => 1,
+            },
+            strength_bits: anchor.strength.to_bits(),
+            falloff_radius_bits: anchor.falloff_radius.to_bits(),
+            masked_target_bits,
+        }
+    }
+}
+
+/// Project and sort every occurrence without deduplicating equal keys.
+fn canonical_anchors(anchors: &[Anchor]) -> Vec<(AnchorSteeringKey, &Anchor)> {
+    let mut canonical: Vec<_> = anchors
+        .iter()
+        .map(|anchor| (AnchorSteeringKey::of(anchor), anchor))
+        .collect();
+    canonical.sort_unstable_by_key(|(key, _)| *key);
+    canonical
+}
+
+/// A canonical signature of an anchor steering multiset (ADR 0025).
+///
+/// Every occurrence is folded in raw-bit key order after the cardinality, so
+/// duplicate anchors retain their steering multiplicity. Fields that steering
+/// does not read—source metadata and unmasked target values—are excluded.
+#[must_use]
+pub fn anchor_set_signature(anchors: &[Anchor]) -> u64 {
+    let canonical = canonical_anchors(anchors);
+    let mut h = mix(ANCHOR_SET_BASIS, canonical.len() as u64);
+    for (key, _) in canonical {
+        h = mix(h, key.world_x_bits);
+        h = mix(h, key.world_y_bits);
+        h = mix(h, u64::from(key.mask));
+        h = mix(h, u64::from(key.kind_tag));
+        h = mix(h, u64::from(key.strength_bits));
+        h = mix(h, key.falloff_radius_bits);
+        for target_bits in key.masked_target_bits {
+            h = mix(h, u64::from(target_bits));
+        }
+    }
+    h
+}
+
 /// A target that carries `value` on every domain in `mask` and neutral
 /// elsewhere — the Phase 1 "bound" target (`value = 1.0`) and the shape a
 /// debug/manual anchor uses when it has no captured discovery (§4.1).
@@ -130,19 +207,22 @@ pub fn domain_mask(domains: &[PossibilityDomain]) -> u8 {
 
 /// Combine a base field sample with every nearby anchor into a steered vector.
 ///
-/// Order-independent (ADR 0011): the result is a pure function of the *set* of
-/// anchors and `at`, not of slice order. For each masked domain, the emphasize
+/// Bitwise order-independent (ADR 0011, refined by ADR 0025): every occurrence
+/// is sorted by its complete raw-bit steering key, so the result is a pure
+/// function of the anchor *multiset* and `at`, not of slice order. For each
+/// masked domain, the emphasize
 /// anchors that reach `at` contribute a total-influence-weighted pull toward
 /// their combined target, and the suppress anchors a weighted push away from
 /// theirs (a reflection of the target about the base); the base is then blended
 /// toward each combined desired value by a *saturating* weight `1 - ∏(1 - wₐ)`,
 /// which keeps the result in `[0, 1]` without the Phase 1 sequential
 /// contraction and prevents a single strong anchor from being diluted by many
-/// weak far ones. Both the weighted means and the saturating products are
-/// symmetric functions of the anchor set, so order cannot perturb the result
-/// (§7.2, machine-checked by [`tests::steer_is_order_independent`]).
+/// weak far ones. Emphasize is blended first; Suppress is deliberately blended
+/// last, while its reflected targets remain relative to the unsteered base.
+/// This fixed polarity priority is not a simultaneous solve (§7.2, ADR 0025).
 #[must_use]
 pub fn steer(base: PossibilityVector, anchors: &[Anchor], at: (f64, f64)) -> PossibilityVector {
+    let canonical = canonical_anchors(anchors);
     let mut out = base;
     for i in 0..POSSIBILITY_DIMS {
         let base_i = base.dims[i];
@@ -154,7 +234,7 @@ pub fn steer(base: PossibilityVector, anchors: &[Anchor], at: (f64, f64)) -> Pos
         let mut sup_num = 0.0f32;
         let mut sup_den = 0.0f32;
         let mut sup_keep = 1.0f32;
-        for anchor in anchors {
+        for (_, anchor) in &canonical {
             if anchor.mask & (1 << i as u8) == 0 {
                 continue;
             }
@@ -315,8 +395,8 @@ mod tests {
 
     #[test]
     fn steer_is_order_independent() {
-        // The ADR 0011 property: the steered vector is a pure function of the
-        // *set* of anchors, not slice order.
+        // The ADR 0011/0025 property: the steered vector is a pure function of
+        // the anchor multiset, not slice order.
         let mask_a = domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Aesthetics]);
         let mask_b = domain_mask(&[PossibilityDomain::Aesthetics, PossibilityDomain::Morphology]);
         let a = Anchor {
@@ -353,6 +433,242 @@ mod tests {
         let shuffled = steer(base, &[b, a, c], at);
         assert_eq!(forward.dims, reversed.dims);
         assert_eq!(forward.dims, shuffled.dims);
+    }
+
+    fn adversarial_anchors() -> [Anchor; 6] {
+        let ecology = domain_mask(&[PossibilityDomain::Ecology]);
+        let ecology_aesthetics =
+            domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Aesthetics]);
+        let morphology_aesthetics =
+            domain_mask(&[PossibilityDomain::Morphology, PossibilityDomain::Aesthetics]);
+        let mut first_target = PossibilityVector::neutral();
+        first_target.set(PossibilityDomain::Ecology, f32::from_bits(0x3f6c_cccd));
+        // This unmasked value is deliberately non-neutral and must be inert.
+        first_target.set(PossibilityDomain::Climate, 0.91);
+        let first = Anchor {
+            world_pos: (-17.25, 9.5),
+            target: first_target,
+            mask: ecology,
+            kind: AnchorKind::Emphasize,
+            strength: f32::from_bits(0x3e80_0001),
+            falloff_radius: 911.125,
+            source: AnchorSource::Landform,
+        };
+        let mut equivalent = first;
+        equivalent.source = AnchorSource::River;
+        equivalent.target.set(PossibilityDomain::Climate, 0.03);
+
+        let mut second_target = PossibilityVector::neutral();
+        second_target.set(PossibilityDomain::Ecology, f32::from_bits(0x3d00_0001));
+        second_target.set(PossibilityDomain::Aesthetics, 0.77);
+        let second = Anchor {
+            world_pos: (81.0, -63.5),
+            target: second_target,
+            mask: ecology_aesthetics,
+            kind: AnchorKind::Suppress,
+            strength: f32::from_bits(0x3f19_999a),
+            falloff_radius: 1200.25,
+            source: AnchorSource::Atmosphere,
+        };
+
+        let mut third_target = PossibilityVector::neutral();
+        third_target.set(PossibilityDomain::Morphology, 0.88);
+        third_target.set(PossibilityDomain::Aesthetics, f32::from_bits(0x3e4c_cccd));
+        let third = Anchor {
+            world_pos: (-400.0, -11.0),
+            target: third_target,
+            mask: morphology_aesthetics,
+            kind: AnchorKind::Emphasize,
+            strength: f32::from_bits(0x3580_0001),
+            falloff_radius: 777.75,
+            source: AnchorSource::Manual,
+        };
+
+        let mut fourth_target = PossibilityVector::neutral();
+        fourth_target.set(PossibilityDomain::Ecology, f32::from_bits(0x3f7f_fffe));
+        let fourth = Anchor {
+            world_pos: (0.125, 0.25),
+            target: fourth_target,
+            mask: ecology,
+            kind: AnchorKind::Emphasize,
+            strength: f32::from_bits(0x3a80_0001),
+            falloff_radius: 32.0,
+            source: AnchorSource::Manual,
+        };
+
+        let mut fifth_target = PossibilityVector::neutral();
+        fifth_target.set(PossibilityDomain::Ecology, 0.31);
+        fifth_target.set(PossibilityDomain::Aesthetics, 0.69);
+        let fifth = Anchor {
+            world_pos: (2048.0, -1024.0),
+            target: fifth_target,
+            mask: ecology_aesthetics,
+            kind: AnchorKind::Suppress,
+            strength: 0.42,
+            falloff_radius: 2500.0,
+            source: AnchorSource::Manual,
+        };
+
+        [first, equivalent, second, third, fourth, fifth]
+    }
+
+    fn for_each_permutation(values: &mut [Anchor], start: usize, f: &mut impl FnMut(&[Anchor])) {
+        if start == values.len() {
+            f(values);
+            return;
+        }
+        for i in start..values.len() {
+            values.swap(start, i);
+            for_each_permutation(values, start + 1, f);
+            values.swap(start, i);
+        }
+    }
+
+    #[test]
+    fn adversarial_multiset_is_bitwise_equal_across_all_permutations() {
+        let fixture = adversarial_anchors();
+        let base = PossibilityVector {
+            dims: [0.17, 0.29, 0.43, 0.59, 0.61, 0.73, 0.83, 0.97],
+        };
+        let positions = [(0.0, 0.0), (300.0, -100.0), (3000.0, 3000.0)];
+        let expected: Vec<[u32; POSSIBILITY_DIMS]> = positions
+            .iter()
+            .map(|&at| steer(base, &fixture, at).dims.map(f32::to_bits))
+            .collect();
+        let expected_signature = anchor_set_signature(&fixture);
+        let mut permutation = fixture;
+        let mut count = 0;
+        for_each_permutation(&mut permutation, 0, &mut |anchors| {
+            count += 1;
+            assert_eq!(anchor_set_signature(anchors), expected_signature);
+            for (&at, expected_bits) in positions.iter().zip(&expected) {
+                assert_eq!(
+                    steer(base, anchors, at).dims.map(f32::to_bits),
+                    *expected_bits
+                );
+            }
+        });
+        assert_eq!(count, 720);
+    }
+
+    #[test]
+    fn canonical_signature_tracks_semantics_and_multiplicity() {
+        let [a, equivalent, ..] = adversarial_anchors();
+        assert_eq!(
+            AnchorSteeringKey::of(&a),
+            AnchorSteeringKey::of(&equivalent)
+        );
+        assert_eq!(
+            anchor_set_signature(&[a]),
+            anchor_set_signature(&[equivalent])
+        );
+        assert_eq!(
+            steer(PossibilityVector::neutral(), &[a], a.world_pos)
+                .dims
+                .map(f32::to_bits),
+            steer(
+                PossibilityVector::neutral(),
+                &[equivalent],
+                equivalent.world_pos
+            )
+            .dims
+            .map(f32::to_bits)
+        );
+
+        let empty = anchor_set_signature(&[]);
+        let singleton = anchor_set_signature(&[a]);
+        let pair = anchor_set_signature(&[a, equivalent]);
+        let triple = anchor_set_signature(&[a, equivalent, a]);
+        assert_ne!(empty, singleton);
+        assert_ne!(singleton, pair);
+        assert_ne!(pair, triple);
+
+        let base = PossibilityVector::neutral();
+        let once = steer(base, &[a], a.world_pos).get(PossibilityDomain::Ecology);
+        let twice = steer(base, &[a, equivalent], a.world_pos).get(PossibilityDomain::Ecology);
+        assert!(
+            twice > once,
+            "a duplicate occurrence must strengthen the pull"
+        );
+
+        let mut changed = a;
+        changed.target.dims[PossibilityDomain::Ecology.index()] = 0.25;
+        assert_ne!(singleton, anchor_set_signature(&[changed]));
+        changed = a;
+        changed.mask |= 1 << PossibilityDomain::Climate.index() as u8;
+        assert_ne!(singleton, anchor_set_signature(&[changed]));
+        changed = a;
+        changed.kind = AnchorKind::Suppress;
+        assert_ne!(singleton, anchor_set_signature(&[changed]));
+        changed = a;
+        changed.world_pos.0 = f64::from_bits(changed.world_pos.0.to_bits() + 1);
+        assert_ne!(singleton, anchor_set_signature(&[changed]));
+        changed = a;
+        changed.world_pos.1 = f64::from_bits(changed.world_pos.1.to_bits() + 1);
+        assert_ne!(singleton, anchor_set_signature(&[changed]));
+        changed = a;
+        changed.strength = f32::from_bits(changed.strength.to_bits() + 1);
+        assert_ne!(singleton, anchor_set_signature(&[changed]));
+        changed = a;
+        changed.falloff_radius = f64::from_bits(changed.falloff_radius.to_bits() + 1);
+        assert_ne!(singleton, anchor_set_signature(&[changed]));
+
+        let mut all_masked = a;
+        all_masked.mask = u8::MAX;
+        all_masked.target = PossibilityVector {
+            dims: [0.11, 0.22, 0.33, 0.44, 0.55, 0.66, 0.77, 0.88],
+        };
+        let all_signature = anchor_set_signature(&[all_masked]);
+        for i in 0..POSSIBILITY_DIMS {
+            let mut one_target_changed = all_masked;
+            one_target_changed.target.dims[i] =
+                f32::from_bits(one_target_changed.target.dims[i].to_bits() + 1);
+            assert_ne!(
+                all_signature,
+                anchor_set_signature(&[one_target_changed]),
+                "masked target {i} must be covered"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_float_bit_keys_sort_without_partial_comparisons() {
+        let mut anchors = adversarial_anchors();
+        anchors[0].world_pos.0 = -0.0;
+        anchors[1].world_pos.0 = 0.0;
+        anchors[2].strength = f32::from_bits(0x7fc0_0001);
+        anchors[3].falloff_radius = f64::from_bits(0x7ff8_0000_0000_0001);
+        let canonical = canonical_anchors(&anchors);
+        assert_eq!(canonical.len(), anchors.len());
+        let _ = anchor_set_signature(&anchors);
+    }
+
+    #[test]
+    fn suppress_has_final_blend_priority() {
+        let mask = domain_mask(&[PossibilityDomain::Ecology]);
+        let make = |kind, target, strength| Anchor {
+            world_pos: (0.0, 0.0),
+            target: bound_target(mask, target),
+            mask,
+            kind,
+            strength,
+            falloff_radius: 100.0,
+            source: AnchorSource::Manual,
+        };
+        let base_i = 0.4f32;
+        let mut base = PossibilityVector::neutral();
+        base.set(PossibilityDomain::Ecology, base_i);
+        let emphasize = make(AnchorKind::Emphasize, 0.9, 0.5);
+        let suppress = make(AnchorKind::Suppress, 0.8, 0.25);
+        let actual =
+            steer(base, &[suppress, emphasize], (0.0, 0.0)).get(PossibilityDomain::Ecology);
+        let emphasized = base_i + (0.9 - base_i) * 0.5;
+        let reflected = (2.0 * base_i - 0.8).clamp(0.0, 1.0);
+        let suppress_final = emphasized + (reflected - emphasized) * 0.25;
+        let suppressed = base_i + (reflected - base_i) * 0.25;
+        let emphasize_final = suppressed + (0.9 - suppressed) * 0.5;
+        assert_eq!(actual.to_bits(), suppress_final.to_bits());
+        assert_ne!(actual.to_bits(), emphasize_final.to_bits());
     }
 
     #[test]

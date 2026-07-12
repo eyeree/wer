@@ -9,7 +9,8 @@
 
 use world_core::{
     anchor::{
-        bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind, AnchorSource,
+        anchor_set_signature, bound_target, domain_mask, project_plausible, steer, Anchor,
+        AnchorKind, AnchorSource,
     },
     dephash::drainage_dep_hash_default,
     drainage::{drainage, MACRO_APRON, MACRO_LEVEL},
@@ -153,6 +154,48 @@ pub fn steer_sample() -> u64 {
     h
 }
 
+/// Parity sample for ADR 0025's canonical anchor-multiset signature. It
+/// includes both polarities, different masks, an exact duplicate, and inert
+/// unmasked target storage. Identical IEEE inputs must hash equally on native
+/// and wasm regardless of slice order.
+fn canonical_anchor_sample_anchors() -> [Anchor; 3] {
+    let ecology = domain_mask(&[PossibilityDomain::Ecology]);
+    let living = domain_mask(&[
+        PossibilityDomain::Ecology,
+        PossibilityDomain::Morphology,
+        PossibilityDomain::Aesthetics,
+    ]);
+    let mut first_target = bound_target(ecology, 0.875);
+    first_target.set(PossibilityDomain::Climate, 0.9375);
+    let first = Anchor {
+        world_pos: (-320.5, 144.25),
+        target: first_target,
+        mask: ecology,
+        kind: AnchorKind::Emphasize,
+        strength: 0.625,
+        falloff_radius: 1536.0,
+        source: AnchorSource::Landform,
+    };
+    let mut second_target = bound_target(living, 0.1875);
+    second_target.set(PossibilityDomain::Climate, 0.03125);
+    let second = Anchor {
+        world_pos: (96.0, -48.0),
+        target: second_target,
+        mask: living,
+        kind: AnchorKind::Suppress,
+        strength: 0.3125,
+        falloff_radius: 768.5,
+        source: AnchorSource::Atmosphere,
+    };
+    [first, second, first]
+}
+
+/// Return the fixed canonical anchor-multiset signature parity probe.
+#[must_use]
+pub fn canonical_anchor_signature_sample() -> u64 {
+    anchor_set_signature(&canonical_anchor_sample_anchors())
+}
+
 /// The fixed shareable record used by the Phase 5 parity exports: a discovery
 /// of the parity habitat's first species, built entirely from integers, so it
 /// is bit-identical on every platform (ADR 0013).
@@ -290,6 +333,13 @@ mod wasm {
         super::steer_sample()
     }
 
+    /// ADR 0025 canonical anchor-multiset signature sample.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn canonical_anchor_signature_sample() -> u64 {
+        super::canonical_anchor_signature_sample()
+    }
+
     /// Phase 5 record-codec byte-identity sample (phase-5-plan.md §12.5).
     #[wasm_bindgen]
     #[must_use]
@@ -323,7 +373,20 @@ mod tests {
         assert_eq!(super::genome_sample(), 0x6023_7E3E_43E5_2590);
         assert_eq!(super::food_web_sample(), 0x6272_09D2_6720_001B);
         assert_eq!(super::steer_sample(), 0x9A4E_77F9_D151_9EC2);
+        assert_eq!(
+            super::canonical_anchor_signature_sample(),
+            0xBDAA_C72D_CA08_3AF7
+        );
         assert_eq!(super::record_codec_sample(), 0xFA7F_9032_2BAF_D7FB);
         assert_eq!(super::shared_steer_sample(), 0xF0FB_820F_2030_1752);
+    }
+
+    #[test]
+    fn canonical_anchor_signature_is_permutation_invariant() {
+        let mut anchors = super::canonical_anchor_sample_anchors();
+        let forward = world_core::anchor_set_signature(&anchors);
+        anchors.reverse();
+        assert_eq!(forward, world_core::anchor_set_signature(&anchors));
+        assert_eq!(forward, super::canonical_anchor_signature_sample());
     }
 }

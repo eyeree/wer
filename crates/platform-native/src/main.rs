@@ -329,14 +329,14 @@ impl World {
             self.executor.as_ref(),
             self.transition_mode,
         );
-        // Expedition recording samples the frame the map just produced (§7.3);
-        // the node remembers the player's own anchors, not the derived ones.
+        // Expedition recording samples the frame the map just produced (§7.3,
+        // ADR 0025), including the exact route-derived anchors that steered it.
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.observe(
                 &self.map,
                 self.player,
                 travel,
-                &self.anchors,
+                &effective,
                 stats.resonance_strength,
             );
         }
@@ -2270,5 +2270,82 @@ mod preserve_lifecycle_tests {
             ids[1..],
             "tracking survives for every retained route"
         );
+    }
+
+    #[test]
+    fn route_recording_signs_the_effective_explicit_and_derived_anchors() {
+        let path =
+            std::env::temp_dir().join(format!("wer-a6-effective-route-{}", std::process::id()));
+        let storage = FileStorage::open(&path).unwrap();
+        let mut vault = Vault::open(storage).unwrap();
+        vault
+            .record_route(
+                vec![world_core::RouteNode {
+                    pos_q: (0, 0),
+                    signature: PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+                    cost_q: 10,
+                    stability_q: 200,
+                    anchor_sig: 0,
+                }],
+                vec![],
+                "nearby source route".into(),
+            )
+            .unwrap();
+
+        let tier = ResourceTier::Low;
+        let mask = domain_mask(&[PossibilityDomain::Ecology]);
+        let explicit = Anchor {
+            world_pos: (32.0, -16.0),
+            target: bound_target(mask, 0.88),
+            mask,
+            kind: AnchorKind::Emphasize,
+            strength: 0.7,
+            falloff_radius: 1400.0,
+            source: AnchorSource::Landform,
+        };
+        let mut world = World {
+            map: RegionMap::new(tier.stream_config()),
+            field: PossibilityField::default(),
+            anchors: vec![explicit],
+            bias: [0.0; POSSIBILITY_DIMS],
+            player: (0.0, 0.0),
+            last_player: (0.0, 0.0),
+            transition_mode: false,
+            vault: Some(vault),
+            vault_stats: VaultStats::default(),
+            vault_failure_logged: false,
+            recorder: Some(RouteRecorder::new()),
+            tracker: RouteTracker::new(),
+            path_tracking: true,
+            route_attraction: true,
+            executor: Box::new(world_runtime::InlineExecutor),
+            budget: tier.budget(),
+        };
+
+        let mut expected = world.anchors.clone();
+        let vault = world.vault.as_ref().unwrap();
+        let derived = world_core::attraction_anchors(
+            vault.routes().values(),
+            world.player,
+            world.budget.max_route_attraction_nodes,
+        );
+        assert!(!derived.is_empty());
+        expected.extend(derived);
+        let explicit_only = world_core::anchor_set_signature(&world.anchors);
+        let expected_signature = world_core::anchor_set_signature(&expected);
+        assert_ne!(expected_signature, explicit_only);
+
+        world.update();
+        let (nodes, _) = world.recorder.take().unwrap().finish();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].anchor_sig, expected_signature);
+        expected.reverse();
+        assert_eq!(
+            nodes[0].anchor_sig,
+            world_core::anchor_set_signature(&expected)
+        );
+
+        drop(world);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

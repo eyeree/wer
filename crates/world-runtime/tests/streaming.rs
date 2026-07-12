@@ -1138,9 +1138,15 @@ fn staleness_is_tracked_per_tile_by_dep_hash() {
     }
 }
 
-/// Phase 6 (§6.4) plus ADR 0023: unchanged steering round-robins target
-/// calculation, while stability remains current for every resident and any
-/// steering change refreshes the whole target window immediately.
+/// Phase 6 (§6.4) plus ADR 0023/0025: unchanged canonical steering multisets
+/// round-robin target calculation, while semantic changes refresh the whole
+/// target window immediately.
+fn target_bits(map: &RegionMap) -> Vec<(RegionCoord, [u32; POSSIBILITY_DIMS])> {
+    map.iter_active()
+        .map(|region| (region.coord, region.target.dims.map(f32::to_bits)))
+        .collect()
+}
+
 #[test]
 fn retarget_amortizes_and_refreshes_on_steering_change() {
     use world_runtime::InlineExecutor;
@@ -1151,6 +1157,27 @@ fn retarget_amortizes_and_refreshes_on_steering_change() {
         max_retarget_regions: 1,
         ..Budget::unlimited()
     };
+    let ecology = world_core::domain_mask(&[world_core::PossibilityDomain::Ecology]);
+    let aesthetics = world_core::domain_mask(&[world_core::PossibilityDomain::Aesthetics]);
+    let a = world_core::Anchor {
+        world_pos: (-64.0, 32.0),
+        target: world_core::bound_target(ecology, 0.91),
+        mask: ecology,
+        kind: world_core::AnchorKind::Emphasize,
+        strength: 0.63,
+        falloff_radius: 1800.0,
+        source: world_core::AnchorSource::Landform,
+    };
+    let b = world_core::Anchor {
+        world_pos: (150.0, -90.0),
+        target: world_core::bound_target(aesthetics, 0.17),
+        mask: aesthetics,
+        kind: world_core::AnchorKind::Suppress,
+        strength: 0.41,
+        falloff_radius: 1400.0,
+        source: world_core::AnchorSource::Atmosphere,
+    };
+    let anchors = [a, b];
     // Settle a window (steering unchanged after the first frame).
     let mut stats = world_runtime::FrameStats::default();
     for _ in 0..6 {
@@ -1158,7 +1185,7 @@ fn retarget_amortizes_and_refreshes_on_steering_change() {
             (0.0, 0.0),
             0.0,
             &field,
-            &[],
+            &anchors,
             &neutral,
             &budget,
             &InlineExecutor,
@@ -1168,6 +1195,104 @@ fn retarget_amortizes_and_refreshes_on_steering_change() {
     // Amortized: all but one region deferred.
     assert!(stats.active_regions > 2);
     assert_eq!(stats.retarget_deferred, stats.active_regions - 1);
+    let before_reorder = target_bits(&map);
+
+    // Reordering the identical multiset stays amortized and cannot move a bit.
+    let stats = map.update(
+        (0.0, 0.0),
+        0.0,
+        &field,
+        &[b, a],
+        &neutral,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    assert_eq!(stats.retarget_deferred, stats.active_regions - 1);
+    assert_eq!(target_bits(&map), before_reorder);
+
+    // Source and unmasked target storage are metadata, not steering inputs.
+    let mut metadata_only = a;
+    metadata_only.source = world_core::AnchorSource::River;
+    metadata_only
+        .target
+        .set(world_core::PossibilityDomain::Climate, 0.99);
+    let stats = map.update(
+        (0.0, 0.0),
+        0.0,
+        &field,
+        &[metadata_only, b],
+        &neutral,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    assert_eq!(stats.retarget_deferred, stats.active_regions - 1);
+    assert_eq!(target_bits(&map), before_reorder);
+
+    // Multiplicity is semantic: adding an exact duplicate refreshes all
+    // authoritative targets immediately, then unchanged frames amortize again.
+    let duplicate = [a, b, a];
+    let stats = map.update(
+        (0.0, 0.0),
+        0.0,
+        &field,
+        &duplicate,
+        &neutral,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    assert_eq!(stats.retarget_deferred, 0);
+    let stats = map.update(
+        (0.0, 0.0),
+        0.0,
+        &field,
+        &duplicate,
+        &neutral,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    assert_eq!(stats.retarget_deferred, stats.active_regions - 1);
+
+    // One raw-bit radius change and one masked-target bit change are each full
+    // semantic refreshes even when the quantized presentation might agree.
+    let mut radius_changed = a;
+    radius_changed.falloff_radius = f64::from_bits(a.falloff_radius.to_bits() + 1);
+    let stats = map.update(
+        (0.0, 0.0),
+        0.0,
+        &field,
+        &[radius_changed, b, a],
+        &neutral,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    assert_eq!(stats.retarget_deferred, 0);
+    let mut target_changed = radius_changed;
+    target_changed.target.set(
+        world_core::PossibilityDomain::Ecology,
+        f32::from_bits(
+            target_changed
+                .target
+                .get(world_core::PossibilityDomain::Ecology)
+                .to_bits()
+                + 1,
+        ),
+    );
+    let stats = map.update(
+        (0.0, 0.0),
+        0.0,
+        &field,
+        &[target_changed, b, a],
+        &neutral,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    assert_eq!(stats.retarget_deferred, 0);
 
     // A bias change forces a full refresh this frame: no deferral.
     let mut bias = neutral;
@@ -1176,7 +1301,7 @@ fn retarget_amortizes_and_refreshes_on_steering_change() {
         (0.0, 0.0),
         0.0,
         &field,
-        &[],
+        &[target_changed, b, a],
         &bias,
         &budget,
         &InlineExecutor,

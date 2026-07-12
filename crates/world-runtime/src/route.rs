@@ -70,8 +70,10 @@ impl RouteRecorder {
     /// region's steered *target* (the possibility-space coordinate), the
     /// frame's authoritative transition cost (`1 − resonance` — difficulty
     /// falls out of canonical slot-0 gameplay under ADR 0024), the region's
-    /// stability, and the order-independent
-    /// signature of the active anchor set (section 13's node shape).
+    /// stability, and the canonical signature of the effective anchor
+    /// multiset (section 13's node shape). `effective_anchors` must be the
+    /// exact explicit-plus-derived slice supplied to the immediately preceding
+    /// map update; passing a different slice violates this API contract.
     /// `resonance_strength` must be the canonical [`crate::FrameStats`] value
     /// returned by the immediately preceding map update for this observation,
     /// never a separately sampled visual-density statistic.
@@ -80,7 +82,7 @@ impl RouteRecorder {
         map: &RegionMap,
         player: (f64, f64),
         travel: f64,
-        anchors: &[Anchor],
+        effective_anchors: &[Anchor],
         resonance_strength: f32,
     ) {
         if self.nodes.len() >= MAX_ROUTE_NODES {
@@ -105,7 +107,7 @@ impl RouteRecorder {
             signature: PossibilitySignature::of(region.target),
             cost_q: (((1.0 - resonance_strength.clamp(0.0, 1.0)) * 255.0) as u8),
             stability_q: ((region.stability.clamp(0.0, 1.0) * 255.0) as u8),
-            anchor_sig: anchor_set_signature(anchors),
+            anchor_sig: anchor_set_signature(effective_anchors),
         });
     }
 

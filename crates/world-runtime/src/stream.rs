@@ -39,11 +39,11 @@ use world_core::layer::{
     LAYER_DRAINAGE, LAYER_ECOLOGY,
 };
 use world_core::{
-    capture_target, domain_mask, drainage_dep_hash, layer_dep_hash, macro_coord_for, mix,
-    organism_trait_deviation, project_plausible, steer, Anchor, AnchorKind, AnchorSource, Biome,
-    Climate, DrainageTile, Genome, GenomeBias, HabitatSignature, PossibilityDomain,
-    PossibilityField, PossibilitySignature, PossibilityVector, RegionCoord, Soils, TraitDeviation,
-    POSSIBILITY_DIMS, REGION_SIZE,
+    anchor_set_signature, capture_target, domain_mask, drainage_dep_hash, layer_dep_hash,
+    macro_coord_for, mix, organism_trait_deviation, project_plausible, steer, Anchor, AnchorKind,
+    AnchorSource, Biome, Climate, DrainageTile, Genome, GenomeBias, HabitatSignature,
+    PossibilityDomain, PossibilityField, PossibilitySignature, PossibilityVector, RegionCoord,
+    Soils, TraitDeviation, POSSIBILITY_DIMS, REGION_SIZE,
 };
 
 use crate::budget::Budget;
@@ -241,32 +241,16 @@ pub struct FrameStats {
     pub retarget_deferred: usize,
 }
 
-/// Order-stable hash of the steering inputs (bias + anchors) — a change
+/// Canonical hash of the steering inputs (bias + anchor multiset) — a change
 /// forces a full retarget instead of the amortized round-robin
-/// (phase-6-plan.md §6.4). Bit-exact over every field an anchor steers with.
+/// (phase-6-plan.md §6.4; ADR 0025). The core signature owns the one complete
+/// steering-field list, retains duplicate occurrences, and ignores metadata.
 fn steering_signature(anchors: &[Anchor], bias: &[f32; POSSIBILITY_DIMS]) -> u64 {
     let mut h: u64 = 0x5EED_5163_0000_0006;
     for b in bias {
         h = mix(h, u64::from(b.to_bits()));
     }
-    for anchor in anchors {
-        h = mix(h, anchor.world_pos.0.to_bits());
-        h = mix(h, anchor.world_pos.1.to_bits());
-        for d in anchor.target.dims {
-            h = mix(h, u64::from(d.to_bits()));
-        }
-        h = mix(h, u64::from(anchor.mask));
-        h = mix(
-            h,
-            match anchor.kind {
-                AnchorKind::Emphasize => 1,
-                AnchorKind::Suppress => 2,
-            },
-        );
-        h = mix(h, u64::from(anchor.strength.to_bits()));
-        h = mix(h, anchor.falloff_radius.to_bits());
-    }
-    h
+    mix(h, anchor_set_signature(anchors))
 }
 
 /// Distance from the player to a region's center.

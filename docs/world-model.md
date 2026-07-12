@@ -293,9 +293,18 @@ $$
 v_2=v_1+W_s(\mu_s-v_1).
 $$
 
-Only masked dimensions participate. The intention is that each mean and
-product is a symmetric function of the anchor set; a numerical caveat is
-discussed in the review section.
+Only masked dimensions participate. Before any `f32` reduction, every anchor
+occurrence is sorted by one lexicographic raw-bit key: world-position bits,
+mask, polarity, strength bits, falloff-radius bits, then masked target bits in
+domain order. Source and unmasked target storage are excluded. Equal keys are
+not deduplicated, so composition is a multiset operation and duplicates retain
+their saturating influence. This canonical operation order makes every slice
+permutation bitwise equal for identical IEEE inputs (ADR 0025).
+
+The displayed polarity order is deliberate: Emphasize blends first and
+Suppress blends last, although Suppress reflection remains relative to the
+original unsteered base. Suppress therefore has final-blend priority; the model
+does not use a simultaneous polarity solve.
 
 The result is projected through an ordered plausibility map $\Pi$. After all
 dimensions are clamped, the implemented constraints are:
@@ -569,7 +578,10 @@ contracts:
 2. **Same-platform exact content.** Float field tiles, habitat classifications,
    live captures, resonance, and realized organisms reproduce bit-for-bit for
    the same inputs and schedule on one target, but are generally classified as
-   presentation-grade across targets.
+   presentation-grade across targets. Canonical anchor reduction and its
+   signature have a narrower portable contract: identical input IEEE fields,
+   base, bias, and evaluation position execute one raw-bit-sorted sequence on
+   native and wasm.
 3. **Settled schedule independence.** Pure jobs and dependency keys make a
    quiescent scripted endpoint independent of executor, worker count, budgets,
    cancellation, and retarget amortization. Mid-journey state is explicitly
@@ -698,6 +710,13 @@ debug placement. Anchor falloff is compactly supported and continuously reaches
 zero at its radius. Steering evaluates anchors at region centers; it is not a
 per-cell influence field.
 
+The steering-semantic fields are position, mask, polarity, strength, falloff
+radius, and target values selected by the mask. `AnchorSource` is discovery and
+legibility metadata, and target storage outside the mask is inert. The shared
+canonical projection in [`anchor.rs`](crates/world-core/src/anchor.rs) sorts
+those semantic fields and supplies both floating-point reduction order and the
+multiset signature; callers do not maintain parallel field lists.
+
 Trait capture is split between pure math in
 [`capture.rs`](crates/world-core/src/capture.rs) and cache gathering in
 [`RegionMap::capture_at`](crates/world-runtime/src/stream.rs). A capture target
@@ -810,6 +829,12 @@ and convergence but never dispatches generation. The convergence formula is
 first-order frame-slicing invariant only approximately: two half-distance
 lerps do not have exactly the same transient result as one full-distance lerp.
 
+Target-refresh invalidation folds raw bias bits and the core canonical anchor
+multiset signature. Reordering the same occurrences, changing source, or
+changing an unmasked target slot stays on the configured round-robin path.
+Changing cardinality or any steering-semantic bit refreshes every authoritative
+target immediately; the budget resumes on the next unchanged frame.
+
 Possibility bucket flips use the declared domain-reader closure to mark dirty
 layers. Revisions still record any material float-state movement, including
 sub-bucket movement, but no longer determine tile staleness. Applying a newly
@@ -848,23 +873,25 @@ Each node stores:
 * the covering region's quantized *target* vector;
 * transition cost `floor(255 * (1 - resonance))`;
 * stability in an 8-bit band; and
-* an order-independent summary of active anchors.
+* a canonical multiset signature of the effective anchors.
 
 Transition cost uses the canonical `FrameStats::resonance_strength` from the
 immediately preceding map update. Higher visual organism slots therefore do
 not change route nodes, content ids, or encoded shared bytes.
 
-The anchor summary covers the player's explicit anchor slice. Route-derived
-anchors are excluded even though their effects may already appear in the
-recorded target and resonance cost. Route records also contain discovery ids,
-a usage count, name, and journal. Difficulty is the arithmetic mean of node
-costs divided by 255.
+The anchor summary folds cardinality and the complete raw-bit steering key for
+every occurrence, retaining duplicates and excluding source/unmasked target
+metadata. It covers the exact effective slice used by the immediately
+preceding map update: the player's explicit anchors plus any selected route-
+derived anchors when attraction is active. Route records also contain
+discovery ids, a usage count, name, and journal. Difficulty is the arithmetic
+mean of node costs divided by 255.
 
 The stored target is not necessarily the world then visible to the player.
 Near regions can remain pinned at `current` while their target retargets, so a
 node may pair an aspirational possibility signature with a cost measured from
 the currently realized ecology. Recording while old-route attraction is active
-can also bake that attraction into the target while omitting it from the anchor
+includes that attraction in both the resulting target and the node's anchor
 summary.
 
 When route attraction is enabled, nodes from every route in the open vault that
@@ -1696,6 +1723,9 @@ and a discrete adapter selects High; other configurations select Mid.
 `max_realize_organisms` controls only expansion beyond the already-published
 canonical slot-0 vector. The one-region canonical admission and 64-node
 resonance ceiling are fixed semantics, not tier capacity knobs.
+Tier `max_retarget_regions` limits apply only while the canonical bias/anchor
+fingerprint is unchanged; any cardinality or steering-semantic anchor change
+refreshes all authoritative targets immediately.
 
 The streaming data structures are:
 
@@ -1758,8 +1788,10 @@ computes them once instead of scanning the roster for every cell. The per-cell
 loop becomes table lookup plus pressure scaling, preserving operation order and
 output bits.
 
-Target refresh is amortized on Mid and High. A steering-input hash over bias and
-anchor fields forces a full-authority target refresh when controls change.
+Target refresh is amortized on Mid and High. A steering-input hash folds bias
+plus ADR 0025's canonical, cardinality-preserving anchor signature. Reordering
+an unchanged multiset or editing source/unmasked target metadata does not force
+work; count or steering-field changes force a full-authority target refresh.
 Otherwise the runtime walks all authoritative coordinates, parked entries
 included, round-robin under `max_retarget_regions`. Geometric stability is not
 part of that budget: every authoritative region refreshes it every frame before
@@ -1802,7 +1834,8 @@ storage, or the renderer.
 
 The repository uses several complementary checks:
 
-* fixed golden hashes and record bytes in `world-core`;
+* fixed golden hashes and record bytes in `world-core`, including an additive
+  canonical-anchor-signature fixture;
 * same-platform SIMD-versus-scalar differential tests;
 * the continuity replay for pinned stability and bounded seams;
 * `wer-ledger` for declared invalidation precision;
@@ -1825,7 +1858,8 @@ The repository uses several complementary checks:
   barriers, and every staged failure/retry boundary;
 * the Phase 3 ecology harness (run as an integration test) for diversity and
   trophic bounds;
-* `wer-anchor` for selective, coherent steering and resonance gating;
+* `wer-anchor` for selective, coherent steering, resonance gating, and exact
+  canonical-multiset permutation/duplicate/polarity checks;
 * `wer-vault` for persistence, merge laws, preserves, routes, save/load, and an
   explicit 70-retry failure/ordering/delete/import-sequence scenario; and
 * `wer-scale` for executor/budget/cancellation/amortization settled hashes,
@@ -1833,6 +1867,14 @@ The repository uses several complementary checks:
   field/pool plateaus, additive realization density, and exact Low/Mid/High
   canonical organism, anchored capture/resonance, actual route-record id/node,
   and encoded-byte equality.
+
+Focused anchor tests exhaust all 720 permutations of an adversarial six-anchor
+multiset at center, partial-falloff, and zero-influence positions, comparing
+exact output bits. Runtime tests prove reorder and irrelevant metadata remain
+amortized while duplicate/radius/masked-target edits refresh fully. A native
+`World::update` regression proves a recorded node signs explicit plus selected
+route-derived anchors. The web parity surface adds a fixed duplicate-containing
+canonical signature probe and compiles the identical core implementation.
 
 CI formats, lints, checks, and tests the native workspace and compile-checks
 the three neutral/web crates for `wasm32-unknown-unknown`. The parity exports
@@ -1906,11 +1948,13 @@ into one implementation unit.
    and focused plus `wer-scale` gates require exact Low/Mid/High capture,
    resonance, actual route records, and encoded route bytes.
 
-6. **Canonicalize all anchor reductions and signatures** (findings 1 and 21).
-   Sort anchors by a complete bitwise key before floating-point reduction, make
-   the polarity rule explicit, and sign the count plus every
-   steering-relevant field. The steering calculation and its signature must
-   describe exactly the same multiset.
+6. **Completed: Canonicalize all anchor reductions and signatures**
+   ([Improvement A.6](plans/prototype/improvement_A_6_canonical_anchor_reductions_signatures.md);
+   findings 1 and 21). A complete raw-bit key now sorts every duplicate-
+   retaining occurrence before reduction and supplies the cardinality/full-
+   field signature. Suppress-final priority is explicit, runtime reorder-only
+   changes remain amortized, and native route recording signs the exact
+   explicit-plus-derived effective slice.
 
 7. **Enforce the intended semantics of route and suppress influences**
    (findings 7 and 17). Cap total route attraction after combining nodes, and
@@ -2048,7 +2092,10 @@ into one implementation unit.
 
 ### 4.1 Correctness and architectural contract concerns
 
-#### 1. Anchor combination is not bitwise order-independent
+#### 1. Resolved: anchor combination was not bitwise order-independent
+
+**Status:** Resolved by
+[Improvement A.6](plans/prototype/improvement_A_6_canonical_anchor_reductions_signatures.md).
 
 The steering equations are symmetric over real numbers, but the code accumulates
 weighted sums, denominators, and products sequentially in `f32`. Float addition
@@ -2063,9 +2110,16 @@ symmetric, also replace the fixed "Emphasize, then Suppress" application order
 with one simultaneous solve; otherwise document that Suppress has the final
 blend priority.
 
-The related runtime steering signature folds anchors in slice order, so a mere
-reorder forces an unnecessary whole-window retarget even when steering output
-is unchanged.
+The related runtime steering signature folded anchors in slice order, so a mere
+reorder forced an unnecessary whole-window retarget even when steering output
+was unchanged.
+
+ADR 0025 now projects every occurrence to one complete integer key, sorts the
+multiset once before all domain reductions, and shares that projection with a
+counted ordered signature. Source and unmasked target storage normalize out;
+duplicates remain meaningful. Emphasize blends first and Suppress deliberately
+blends last. Exhaustive 720-permutation exact-bit tests and runtime deferred-
+counter regressions enforce both output and invalidation behavior.
 
 #### 2. Macro-cache capacity eviction can strand Hydrology forever
 
@@ -2395,7 +2449,10 @@ approaches half its root/temperature-adjusted biome maximum.
 
 ### 4.3 Routes, records, and distributed-state concerns
 
-#### 21. Anchor-set signatures do not describe actual steering sets
+#### 21. Resolved: anchor-set signatures did not describe actual steering sets
+
+**Status:** Resolved by
+[Improvement A.6](plans/prototype/improvement_A_6_canonical_anchor_reductions_signatures.md).
 
 The route-node anchor signature omits falloff radius even though it changes
 steering, includes unmasked target components that do not change steering, and
@@ -2408,6 +2465,13 @@ from this summary.
 Use a canonical sorted fold over count and every steering-relevant field. If
 duplicates are intended to collapse, deduplicate before both steering and
 signing rather than only in the signature.
+
+The corrected signature folds exact cardinality and every occurrence's shared
+steering key in canonical order, including falloff and only masked target bits;
+duplicate occurrences never cancel. Native `World::update` keeps its effective
+explicit-plus-selected-route vector alive through `RouteRecorder::observe`.
+Field-sensitivity/multiplicity tests and a real native update/recording gate
+prove the summary matches the inputs that produced target and resonance.
 
 #### 22. Route recording and traversal depend on frame sampling
 

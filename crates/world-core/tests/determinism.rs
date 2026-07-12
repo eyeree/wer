@@ -10,7 +10,8 @@
 
 use world_core::{
     anchor::{
-        bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind, AnchorSource,
+        anchor_set_signature, bound_target, domain_mask, project_plausible, steer, Anchor,
+        AnchorKind, AnchorSource,
     },
     biome::{classify, Biome},
     capture::{capture_target, category_mask, TraitCategory, TraitDeviation},
@@ -185,6 +186,44 @@ fn steer_and_project_golden() {
     assert_eq!(
         project_plausible(wild).dims,
         [0.1, 0.5, 0.5, 0.48999998, 0.596, 0.5, 0.5, 0.5]
+    );
+}
+
+#[test]
+fn canonical_anchor_set_signature_golden() {
+    // Additive ADR 0025 fixture: the exact live steering fields, cardinality,
+    // duplicate occurrence, and canonical fold—not a generator or wire golden.
+    let ecology = domain_mask(&[PossibilityDomain::Ecology]);
+    let living = domain_mask(&[
+        PossibilityDomain::Ecology,
+        PossibilityDomain::Morphology,
+        PossibilityDomain::Aesthetics,
+    ]);
+    let mut first_target = bound_target(ecology, 0.875);
+    first_target.set(PossibilityDomain::Climate, 0.9375);
+    let first = Anchor {
+        world_pos: (-320.5, 144.25),
+        target: first_target,
+        mask: ecology,
+        kind: AnchorKind::Emphasize,
+        strength: 0.625,
+        falloff_radius: 1536.0,
+        source: AnchorSource::Landform,
+    };
+    let mut second_target = bound_target(living, 0.1875);
+    second_target.set(PossibilityDomain::Climate, 0.03125);
+    let second = Anchor {
+        world_pos: (96.0, -48.0),
+        target: second_target,
+        mask: living,
+        kind: AnchorKind::Suppress,
+        strength: 0.3125,
+        falloff_radius: 768.5,
+        source: AnchorSource::Atmosphere,
+    };
+    assert_eq!(
+        anchor_set_signature(&[first, second, first]),
+        0xBDAA_C72D_CA08_3AF7
     );
 }
 

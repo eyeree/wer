@@ -15,11 +15,11 @@
 //! (ADR 0013), so the same record attracts identically on every platform.
 
 use crate::anchor::{Anchor, AnchorKind, AnchorSource};
-use crate::hash::{mix, splitmix64};
 use crate::record::{PossibilitySignature, RouteNode, RouteRecord};
 
-/// Fixed basis separating anchor-set signatures from every other hash domain.
-const ANCHOR_SET_BASIS: u64 = 0xA5E7_51B0_39C4_D6F2;
+// Preserve the Phase 5 public module path while `anchor` owns the single
+// canonical steering projection and implementation (ADR 0025).
+pub use crate::anchor::anchor_set_signature;
 
 /// World-space radius of a route's attraction corridor: beyond this distance
 /// from a node the route has no influence at all (section 13's "soft
@@ -46,36 +46,6 @@ pub const ROUTE_ATTRACTION_MASK: u8 = {
     let planetary = 1u8 << crate::possibility::PossibilityDomain::Planetary.index();
     !geology & !planetary
 };
-
-/// An order-independent signature of an anchor *set* — recorded into route
-/// nodes so an expedition remembers what was steering it (section 13's
-/// "anchor signature"). XOR-folds a per-anchor hash of the quantized anchor
-/// fields, so slice order cannot perturb it (the ADR 0011 discipline) and the
-/// value is portable across platforms for anchors built from records.
-#[must_use]
-pub fn anchor_set_signature(anchors: &[Anchor]) -> u64 {
-    let mut acc = 0u64;
-    for anchor in anchors {
-        let mut h = ANCHOR_SET_BASIS;
-        let target = PossibilitySignature::of(anchor.target);
-        h = mix(h, target.seed());
-        h = mix(h, u64::from(anchor.mask));
-        h = mix(
-            h,
-            match anchor.kind {
-                AnchorKind::Emphasize => 0,
-                AnchorKind::Suppress => 1,
-            },
-        );
-        h = mix(h, u64::from(crate::record::quantize_unit(anchor.strength)));
-        h = mix(h, anchor.world_pos.0.round() as i64 as u64);
-        h = mix(h, anchor.world_pos.1.round() as i64 as u64);
-        // XOR is commutative: the set, not the order. splitmix64 finalizes so
-        // structurally similar anchors do not cancel.
-        acc ^= splitmix64(h);
-    }
-    acc
-}
 
 /// The attraction strength a route exerts, saturating in its usage count:
 /// monotone increasing, `route_pull(0) > 0` (a freshly shared route is
@@ -251,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn anchor_set_signature_is_order_independent_and_field_sensitive() {
+    fn canonical_anchor_signature_preserves_multiplicity_and_exact_fields() {
         let mask = crate::anchor::domain_mask(&[PossibilityDomain::Ecology]);
         let a = Anchor {
             world_pos: (10.0, 0.0),
@@ -278,7 +248,33 @@ mod tests {
             anchor_set_signature(&[a]),
             "adding an anchor must move the signature"
         );
-        assert_eq!(anchor_set_signature(&[]), 0);
+        assert_ne!(anchor_set_signature(&[]), anchor_set_signature(&[a]));
+        assert_ne!(anchor_set_signature(&[a]), anchor_set_signature(&[a, a]));
+        assert_ne!(
+            anchor_set_signature(&[a, a]),
+            anchor_set_signature(&[a, a, a])
+        );
+
+        let mut changed = a;
+        changed.falloff_radius = f64::from_bits(a.falloff_radius.to_bits() + 1);
+        assert_ne!(anchor_set_signature(&[a]), anchor_set_signature(&[changed]));
+        changed = a;
+        changed.world_pos.0 = f64::from_bits(a.world_pos.0.to_bits() + 1);
+        assert_ne!(anchor_set_signature(&[a]), anchor_set_signature(&[changed]));
+        changed = a;
+        changed.target.set(
+            PossibilityDomain::Ecology,
+            f32::from_bits(a.target.get(PossibilityDomain::Ecology).to_bits() + 1),
+        );
+        assert_ne!(anchor_set_signature(&[a]), anchor_set_signature(&[changed]));
+
+        let mut metadata_only = a;
+        metadata_only.source = AnchorSource::River;
+        metadata_only.target.set(PossibilityDomain::Climate, 0.99);
+        assert_eq!(
+            anchor_set_signature(&[a]),
+            anchor_set_signature(&[metadata_only])
+        );
     }
 
     #[test]
