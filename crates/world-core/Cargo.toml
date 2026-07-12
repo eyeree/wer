@@ -12,6 +12,10 @@ workspace = true
 
 [dependencies]
 glam = { workspace = true }
+# Phase 5 record schema + codec (phase-5-plan.md §4). Both are `no_std`-clean;
+# the wasm CI job enforces that they stay so.
+serde = { workspace = true }
+postcard = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -26,4 +30,8 @@ harness = false
 
 [[bench]]
 name = "steering"
+harness = false
+
+[[bench]]
+name = "records"
 harness = false

@@ -37,6 +37,8 @@ pub mod layer;
 pub mod population;
 pub mod possibility;
 pub mod possibility_field;
+pub mod record;
+pub mod route;
 pub mod soils;
 pub mod species;
 pub mod terrain;
@@ -69,6 +71,16 @@ pub use layer::{
 pub use population::{diversity_of, population, signature_productivity, PopulationSample};
 pub use possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS, POSSIBILITY_QUANT};
 pub use possibility_field::PossibilityField;
+pub use record::{
+    decode_record, dequantize_unit, encode_record, peek_envelope, quantize_unit, AnchorSnapshot,
+    AtlasBundle, DiscoveryRecord, Envelope, PossibilitySignature, PreserveRecord, RecordError,
+    RecordKind, RegionSnapshotRecord, RouteNode, RouteRecord, SeenRecord, SessionSnapshot,
+    StoreMeta, RECORD_FORMAT_VERSION, SEEN_CHUNK_LEVEL,
+};
+pub use route::{
+    anchor_set_signature, attraction_anchors, route_difficulty, route_pull, RouteGraph,
+    RouteGraphHit, ROUTE_ATTRACTION_MASK, ROUTE_CORRIDOR_RADIUS, ROUTE_PULL_CAP,
+};
 pub use soils::{soils, Soils};
 pub use species::{
     species_roster, species_seed, Species, SpeciesRoster, Trophic, ROSTER_MAX, TROPHIC_TIERS,

@@ -11,15 +11,18 @@ See the design and architecture documents:
 - [`implementation-plan.md`](implementation-plan.md) — the high-level technical plan.
 - [`docs/adr/`](docs/adr/) — architecture decision records.
 
-This repository is currently at **Phase 2** (layered environmental generation,
-see [`phase-2-plan.md`](phase-2-plan.md), building on the Phase 1 continuity
-prototype of [`phase-1-plan.md`](phase-1-plan.md)): an eight-layer declared
-dependency graph — terrain, geology, macro drainage, climate, hydrology,
-soils, biomes, vegetation — where staleness is a dependency-hash comparison,
-changes recompute exactly the layers that declare a dependency on them
-(machine-checked by `wer-ledger`), river networks are stable integer topology,
-and an interactive false-color debug map makes continuity — or its failure —
-visible.
+This repository is currently at **Phase 5** (routes, persistence, and the
+social model, see [`phase-5-plan.md`](phase-5-plan.md), building on the Phase
+1–4 stacks): the layered environmental generation and invalidation precision
+of Phase 2 (`wer-ledger`), the procedural genetics and ecosystems of Phase 3,
+the trait-capture anchors, plausibility projection, and resonance-gated
+steering of Phase 4 (`wer-anchor`) — and now durable, shareable exploration:
+sessions save and restore state-hash exact, discoveries/preserves/expedition
+routes persist as quantized records that merge lawfully across stores
+(`wer-atlas` bundles — no server), preserves reproduce whole landscapes from a
+few dozen bytes of possibility buckets, and well-worn routes softly attract
+the world toward their remembered character (`wer-vault` machine-checks all of
+it).
 
 ## Workspace layout
 
@@ -34,7 +37,7 @@ hold everything OS/browser-specific (see
 | [`renderer`](crates/renderer) | native/gpu lib | wgpu/WGSL renderer (debug-map presentation). |
 | [`platform-native`](crates/platform-native) | bin `wer` | winit window + event loop, input, Rayon executor. |
 | [`platform-web`](crates/platform-web) | cdylib | wasm-bindgen smoke shell (grows into the browser runtime). |
-| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay`, `wer-ledger` | Inspectors, the continuity replay, the invalidation-precision harness. |
+| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay`, `wer-ledger`, `wer-anchor`, `wer-atlas`, `wer-vault` | Inspectors, the continuity replay, the phase sign-off harnesses, atlas bundle tooling, and the shared native file-tree storage backend. |
 
 ## Prerequisites
 
@@ -58,6 +61,18 @@ cargo run --bin wer-replay
 # Invalidation-precision harness: asserts each scripted change regenerates
 # exactly the declared-dependent layers (phase-2-plan.md §12.3).
 cargo run --bin wer-ledger
+
+# Steering harness: intentional/selective/coherent/resonance-gated
+# (phase-4-plan.md §12.3).
+cargo run --bin wer-anchor
+
+# Persistence/sharing harness: durable, sparse, shareable, preserves, routes,
+# precision-preserved (phase-5-plan.md §12.3).
+cargo run --bin wer-vault
+
+# Atlas bundles: share discoveries/routes/preserves between record stores.
+cargo run --bin wer-atlas -- export wer-vault my.bundle
+cargo run --bin wer-atlas -- check my.bundle
 
 # Headless map screenshot (no window/GPU): settle the world and dump a PPM.
 cargo run --release --bin wer -- --screenshot map.ppm composite 0 0
@@ -99,9 +114,15 @@ world drifts toward it only as you move (sprinting drifts it faster).
 | `1`–`8` (+`Shift`) | Nudge a possibility dimension up (down): Planetary, Climate, Geology, Hydrology, Ecology, Morphology, Behavior, Aesthetics |
 | `Z` | Reset all nudges |
 | `E` / `Q` | Drop an Emphasize / Suppress anchor at the player |
+| `T` / `Y` / `K` | Cycle capture trait category / toggle polarity / capture the feature under the player |
+| `R` | Toggle transition movement mode (slow, resonance-gated steering) |
 | `C` | Clear anchors |
-| `V` | Cycle channel: composite → elevation → geology → temperature → moisture → river → wetness → soil → biome → vegetation → stability → revision |
-| `G` / `N` / `X` | Toggle region grid / stability rings / changed-while-pinned flash |
+| `O` / `L` | Save / load the session (store at `WER_VAULT_DIR`, default `./wer-vault`) |
+| `B` / `I` | Record the latest anchor as a named discovery / summon vault discoveries as anchors |
+| `P` | Preserve the pinned near window (or delete the preserve you stand in) |
+| `J` / `U` | Start/finish recording an expedition route / toggle route attraction |
+| `V` | Cycle the visualized channel (composite, layers, ecology, influence, stability, …) |
+| `G` / `N` / `X` / `M` / `F` | Toggle region grid / stability rings / changed-while-pinned flash / organism markers / discovered-region dimming |
 | `Esc` | Quit |
 
 The white and orange rings are the near (pinned) and far (free) stability

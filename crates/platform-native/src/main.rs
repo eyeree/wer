@@ -18,6 +18,14 @@
 //!   capture the feature under the player into an anchor (phase-4-plan.md §7.1)
 //! - `R` — toggle transition movement mode (slow, resonance-gated steering)
 //! - `C` — clear anchors
+//! - `O` / `L` — save / load the session through the vault (phase-5-plan.md
+//!   §5.3; store directory `WER_VAULT_DIR`, default `./wer-vault`)
+//! - `B` — record the most recent anchor into the vault as a named discovery
+//! - `I` — summon every vault discovery as an active anchor (shared steering)
+//! - `P` — preserve the pinned near window (or delete the preserve you stand in)
+//! - `J` — start / finish recording an expedition route
+//! - `U` — toggle the route attraction field (recorded corridors steer softly)
+//! - `F` — toggle the discovered-region dimming overlay
 //! - `V` — cycle the visualized channel (includes the anchor `influence`
 //!   field); `G` grid, `N` rings, `X` changed-while-pinned flash
 //! - `Esc` — quit
@@ -48,17 +56,20 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 use world_core::{
     bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, Biome, PossibilityDomain,
-    PossibilityField, RegionCoord, TraitCategory, LAYER_COUNT, POSSIBILITY_DIMS, REGION_SIZE,
+    PossibilityField, PossibilitySignature, RegionCoord, TraitCategory, LAYER_COUNT,
+    POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    Budget, FrameStats, GenerationStatus, RegionMap, StreamConfig, CHANNEL_CANOPY,
-    CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER,
-    CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    apply_session_regions, Budget, FrameStats, GenerationStatus, RegionMap, RouteRecorder,
+    RouteTracker, StreamConfig, Vault, VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION,
+    CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH,
+    CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
 use executor::RayonExecutor;
-use panel::{CursorInfo, EcologyInfo, Hud, PanelInfo};
-use viz::{Channel, MapComposer, Overlays};
+use panel::{CursorInfo, EcologyInfo, Hud, PanelInfo, VaultInfo};
+use tools::FileStorage;
+use viz::{Channel, MapComposer, MapDecor, Overlays};
 
 /// Letterbox color around the square map (linear RGBA).
 const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
@@ -86,13 +97,49 @@ struct World {
     /// Deliberate slow-steering movement mode vs fast free exploration
     /// (phase-4-plan.md §8.2). Toggled with `R`.
     transition_mode: bool,
+    /// The persistent record store (phase-5-plan.md §5.3): `O` saves the
+    /// session, `L` restores it. `None` if the store directory was unusable.
+    vault: Option<Vault<FileStorage>>,
+    /// The last flush's counters, for the panel.
+    vault_stats: VaultStats,
+    /// Live expedition recording (`J` starts/finishes; phase-5-plan.md §7.3).
+    recorder: Option<RouteRecorder>,
+    /// Traversal detection over the recorded routes (usage bumps, §7.4).
+    tracker: RouteTracker,
+    /// Whether recorded routes project their attraction field (`U` toggles).
+    route_attraction: bool,
     executor: RayonExecutor,
     budget: Budget,
 }
 
 impl World {
     fn new() -> Self {
-        Self {
+        // The store location: WER_VAULT_DIR, or ./wer-vault next to the cwd.
+        let vault_dir =
+            std::env::var("WER_VAULT_DIR").unwrap_or_else(|_| String::from("wer-vault"));
+        let vault = match FileStorage::open(&vault_dir)
+            .map_err(world_runtime::VaultError::from)
+            .and_then(Vault::open)
+        {
+            Ok(vault) => {
+                for issue in vault.issues() {
+                    log::warn!("vault: {issue}");
+                }
+                log::info!(
+                    "vault open at {vault_dir}: {} discoveries, {} routes, {} preserves, {} seen",
+                    vault.discoveries().len(),
+                    vault.routes().len(),
+                    vault.preserves().len(),
+                    vault.seen_count(),
+                );
+                Some(vault)
+            }
+            Err(err) => {
+                log::warn!("vault unavailable ({vault_dir}): {err}; running without persistence");
+                None
+            }
+        };
+        let mut world = Self {
             map: RegionMap::new(StreamConfig::default()),
             field: PossibilityField::default(),
             anchors: Vec::new(),
@@ -100,9 +147,18 @@ impl World {
             player: (0.0, 0.0),
             last_player: (0.0, 0.0),
             transition_mode: false,
+            vault,
+            vault_stats: VaultStats::default(),
+            recorder: None,
+            tracker: RouteTracker::new(),
+            route_attraction: true,
             executor: RayonExecutor,
             budget: Budget::per_frame(16.6),
-        }
+        };
+        // A preserved region realizes its recorded buckets from the very
+        // first frame, wherever the run begins (phase-5-plan.md §7.5).
+        world.apply_preserves();
+        world
     }
 
     fn update(&mut self) -> FrameStats {
@@ -111,16 +167,253 @@ impl World {
             self.player.1 - self.last_player.1,
         );
         self.last_player = self.player;
-        self.map.update(
+        // Route attraction (phase-5-plan.md §7.4): recorded corridors near the
+        // player contribute derived weak anchors, riding the same
+        // order-independent steer as the player's own.
+        let mut effective = self.anchors.clone();
+        if self.route_attraction {
+            if let Some(vault) = self.vault.as_ref() {
+                effective.extend(world_core::attraction_anchors(
+                    vault.routes().values(),
+                    self.player,
+                    self.budget.max_route_attraction_nodes,
+                ));
+            }
+        }
+        let stats = self.map.update(
             self.player,
             travel,
             &self.field,
-            &self.anchors,
+            &effective,
             &self.bias,
             &self.budget,
             &self.executor,
             self.transition_mode,
-        )
+        );
+        // Expedition recording samples the frame the map just produced (§7.3);
+        // the node remembers the player's own anchors, not the derived ones.
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.observe(
+                &self.map,
+                self.player,
+                travel,
+                &self.anchors,
+                stats.resonance_strength,
+            );
+        }
+        if let Some(vault) = self.vault.as_mut() {
+            // Seen-set recording (phase-5-plan.md §5.3): the region under the
+            // player is discovered. O(1) and idempotent.
+            vault.mark_seen(RegionCoord::from_world(self.player.0, self.player.1));
+            // Traversal detection: re-walking a recorded corridor bumps its
+            // usage once per leg (§7.4).
+            let traversed = self.tracker.observe(vault.routes().values(), self.player);
+            for id in traversed {
+                vault.bump_route_usage(id);
+                log::info!("route {id:#018x} traversed (usage bumped)");
+            }
+            // Budgeted trickle of dirty records (§7.7); saves marked by `O`
+            // and event-driven records drain here.
+            self.vault_stats = vault.flush(&self.budget);
+        }
+        stats
+    }
+
+    /// The `J` key: start recording an expedition, or finish and persist it.
+    fn toggle_route_recording(&mut self) {
+        match self.recorder.take() {
+            None => {
+                self.recorder = Some(RouteRecorder::new());
+                log::info!("route recording started (J again to finish)");
+            }
+            Some(recorder) => {
+                let (nodes, discoveries) = recorder.finish();
+                if nodes.len() < 2 {
+                    log::info!("route too short ({} nodes); discarded", nodes.len());
+                    return;
+                }
+                let Some(vault) = self.vault.as_mut() else {
+                    log::warn!("no vault open; route discarded");
+                    return;
+                };
+                let difficulty = world_core::route_difficulty(&nodes);
+                let name = format!("route-{}", vault.routes().len() + 1);
+                let count = nodes.len();
+                let id = vault.record_route(nodes, discoveries, name.clone());
+                log::info!(
+                    "recorded {name} ({id:#018x}): {count} nodes, difficulty {difficulty:.2}"
+                );
+            }
+        }
+    }
+
+    /// Record the most recent anchor into the vault as a named discovery
+    /// (the `B` key; phase-5-plan.md §7.1). Naming is a debug action with an
+    /// auto-generated placeholder name (§1.4); the record is the quantized
+    /// shareable shadow of the anchor (ADR 0013).
+    fn record_last_anchor(&mut self) {
+        let Some(anchor) = self.anchors.last().copied() else {
+            log::info!("no anchor to record; capture one first (K)");
+            return;
+        };
+        let Some(vault) = self.vault.as_mut() else {
+            log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
+            return;
+        };
+        // The capture cell's habitat identity (0 until its tiles settle).
+        let coord = RegionCoord::from_world(anchor.world_pos.0, anchor.world_pos.1);
+        let res = self.map.config().field_resolution;
+        let (ox, oy) = coord.origin();
+        let cell = REGION_SIZE / f64::from(res);
+        let cx = (((anchor.world_pos.0 - ox) / cell) as u16).min(res - 1);
+        let cy = (((anchor.world_pos.1 - oy) / cell) as u16).min(res - 1);
+        let signature_seed = self
+            .map
+            .cell_signature(coord, cx, cy)
+            .map_or(0, |s| s.seed());
+        let name = format!("discovery-{}", vault.discoveries().len() + 1);
+        let id = vault.record_discovery(&anchor, signature_seed, name.clone());
+        // A discovery made mid-expedition joins the route's journal (§7.3).
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.attach_discovery(id);
+        }
+        log::info!("recorded {name} ({id:#018x}) into the vault");
+    }
+
+    /// Pin every vault preserve's regions into the live map (startup and
+    /// session load): a preserved region always realizes its recorded buckets,
+    /// wherever the run begins (phase-5-plan.md §7.5).
+    fn apply_preserves(&mut self) {
+        let Some(vault) = self.vault.as_ref() else {
+            return;
+        };
+        let pairs: Vec<(RegionCoord, PossibilitySignature)> = vault
+            .preserves()
+            .values()
+            .flat_map(|p| p.regions.iter().copied())
+            .collect();
+        for (coord, sig) in pairs {
+            self.map.set_override(coord, sig);
+        }
+    }
+
+    /// The `P` key: standing inside a preserve deletes it (no snap — regions
+    /// resume steering from where the preserve held them); otherwise the
+    /// pinned near window is preserved — each region's possibility state,
+    /// quantized, a few dozen bytes per region and zero geometry
+    /// (phase-5-plan.md §7.5).
+    fn toggle_preserve(&mut self) {
+        let Some(vault) = self.vault.as_mut() else {
+            log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
+            return;
+        };
+        let player_region = RegionCoord::from_world(self.player.0, self.player.1);
+        let covering = vault
+            .preserves()
+            .iter()
+            .find(|(_, p)| p.regions.iter().any(|(c, _)| *c == player_region))
+            .map(|(&id, p)| (id, p.name.clone(), p.regions.clone()));
+        if let Some((id, name, regions)) = covering {
+            vault.remove_preserve(id);
+            for (coord, _) in regions {
+                self.map.clear_override(coord);
+            }
+            log::info!("deleted preserve {name} ({id:#018x}); regions resume steering, no snap");
+            return;
+        }
+
+        let regions: Vec<(RegionCoord, PossibilitySignature)> = self
+            .map
+            .iter_active()
+            .filter(|r| r.stability >= 1.0 && !self.map.is_overridden(r.coord))
+            .map(|r| (r.coord, PossibilitySignature::of(r.current)))
+            .collect();
+        if regions.is_empty() {
+            log::info!("nothing to preserve: no pinned regions here yet");
+            return;
+        }
+        let name = format!("preserve-{}", vault.preserves().len() + 1);
+        let id = vault.record_preserve(regions.clone(), name.clone());
+        let count = regions.len();
+        for (coord, sig) in regions {
+            self.map.set_override(coord, sig);
+        }
+        log::info!("created {name} ({id:#018x}): {count} regions pinned");
+    }
+
+    /// Add every vault discovery as an active anchor (the `I` key) — loaded
+    /// and imported records steering the live world through the unchanged
+    /// order-independent `steer` (phase-5-plan.md §7.1). Idempotent: anchors
+    /// already active are skipped.
+    fn summon_discoveries(&mut self) {
+        let Some(vault) = self.vault.as_ref() else {
+            log::warn!("no vault open");
+            return;
+        };
+        let mut added = 0;
+        for record in vault.discoveries().values() {
+            let anchor = record.to_anchor();
+            if !self.anchors.contains(&anchor) {
+                self.anchors.push(anchor);
+                added += 1;
+            }
+        }
+        log::info!(
+            "summoned {added} discovery anchors ({} active)",
+            self.anchors.len()
+        );
+    }
+
+    /// Snapshot the session tier and flush everything (the `O` key).
+    fn save_session(&mut self) {
+        let Some(vault) = self.vault.as_mut() else {
+            log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
+            return;
+        };
+        vault.snapshot_session(
+            &self.map,
+            self.player,
+            self.last_player,
+            &self.bias,
+            self.transition_mode,
+            &self.anchors,
+        );
+        let stats = vault.flush_all();
+        log::info!(
+            "session saved: {} records, {} bytes ({} regions, {} anchors)",
+            stats.flushed,
+            stats.bytes,
+            self.map.len(),
+            self.anchors.len()
+        );
+    }
+
+    /// Restore the saved session (the `L` key): rebuild the streaming window
+    /// from the snapshot's bit-exact region states; caches, rosters, and
+    /// organisms re-derive over the following frames. `last_player` snaps to
+    /// the restored position so the first update after a load is the zero-
+    /// travel settle — loading is not an event (phase-5-plan.md §12.2).
+    fn load_session(&mut self) {
+        let Some(snap) = self.vault.as_ref().and_then(|v| v.session().cloned()) else {
+            log::info!("no saved session in the vault");
+            return;
+        };
+        let mut map = RegionMap::new(*self.map.config());
+        apply_session_regions(&mut map, &snap);
+        self.map = map;
+        self.apply_preserves();
+        self.player = snap.player;
+        self.last_player = snap.player;
+        self.bias = snap.bias;
+        self.transition_mode = snap.transition_mode;
+        self.anchors = snap.anchors.iter().map(|a| a.to_anchor()).collect();
+        log::info!(
+            "session loaded: {} regions, {} anchors at ({:.0}, {:.0})",
+            snap.regions.len(),
+            snap.anchors.len(),
+            snap.player.0,
+            snap.player.1
+        );
     }
 }
 
@@ -326,6 +619,26 @@ impl App {
                 self.world.anchors.clear();
                 log::info!("anchors cleared");
             }
+            KeyCode::KeyO => self.world.save_session(),
+            KeyCode::KeyL => self.world.load_session(),
+            KeyCode::KeyB => self.world.record_last_anchor(),
+            KeyCode::KeyI => self.world.summon_discoveries(),
+            KeyCode::KeyP => self.world.toggle_preserve(),
+            KeyCode::KeyJ => self.world.toggle_route_recording(),
+            KeyCode::KeyU => {
+                self.world.route_attraction = !self.world.route_attraction;
+                log::info!(
+                    "route attraction {}",
+                    if self.world.route_attraction {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+            }
+            KeyCode::KeyF => {
+                self.overlays.discovered = !self.overlays.discovered;
+            }
             KeyCode::KeyV => {
                 self.channel = self.channel.next();
                 log::info!("channel: {}", self.channel.name());
@@ -344,6 +657,49 @@ impl App {
             }
             KeyCode::Escape => event_loop.exit(),
             _ => {}
+        }
+    }
+
+    /// The vault-derived map decorations for this frame (phase-5-plan.md
+    /// §11): the visible window's discovered set, preserve outlines, and
+    /// route polylines. Empty when no vault is open.
+    fn build_decor(&self) -> MapDecor {
+        let Some(vault) = self.world.vault.as_ref() else {
+            return MapDecor::default();
+        };
+        let center = RegionCoord::from_world(self.world.player.0, self.world.player.1);
+        let half = self.composer.half_regions();
+        let mut seen = std::collections::BTreeSet::new();
+        for dy in -half..=half {
+            for dx in -half..=half {
+                let coord = RegionCoord::new(center.x + dx, center.y + dy);
+                if vault.is_seen(coord) {
+                    seen.insert(coord);
+                }
+            }
+        }
+        let preserves = vault
+            .preserves()
+            .values()
+            .flat_map(|p| p.regions.iter().map(|(coord, _)| *coord))
+            .collect();
+        let routes = vault
+            .routes()
+            .values()
+            .map(|r| {
+                (
+                    r.nodes
+                        .iter()
+                        .map(|n| (n.pos_q.0 as f64, n.pos_q.1 as f64))
+                        .collect(),
+                    r.usage,
+                )
+            })
+            .collect();
+        MapDecor {
+            seen: Some(seen),
+            preserves,
+            routes,
         }
     }
 
@@ -452,12 +808,14 @@ impl App {
             .cursor_world()
             .map(|world| Self::sample_cursor(&self.world.map, world));
 
+        let decor = self.build_decor();
         self.composer.compose(
             &self.world.map,
             self.world.player,
             self.channel,
             self.overlays,
             &self.world.anchors,
+            &decor,
         );
         let info = PanelInfo {
             fps: self.fps,
@@ -476,6 +834,12 @@ impl App {
             capture_category: self.capture_category.name(),
             capture_polarity: self.capture_polarity,
             transition_mode: self.world.transition_mode,
+            vault: self.world.vault.as_ref().map(|v| VaultInfo {
+                records: v.discoveries().len() + v.routes().len() + v.preserves().len(),
+                dirty: v.dirty_records(),
+                seen: v.seen_count(),
+                issues: v.issues().len(),
+            }),
             cursor,
         };
         let (width, height) = self.hud.size();
@@ -610,8 +974,9 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         rings: false,
         pinned_flash: false,
         organisms: true,
+        discovered: false,
     };
-    composer.compose(&map, pos, channel, overlays, &[]);
+    composer.compose(&map, pos, channel, overlays, &[], &MapDecor::default());
 
     // Include the info panel (cursor pinned at the given position) so HUD
     // rendering is inspectable headlessly too.
@@ -633,6 +998,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         capture_category: world_core::TraitCategory::Morphology.name(),
         capture_polarity: AnchorKind::Emphasize,
         transition_mode: false,
+        vault: None,
         cursor: Some(App::sample_cursor(&map, pos)),
     };
     let (width, height) = hud.size();

@@ -177,6 +177,8 @@ fn cost_budgets_are_enforced_per_frame() {
         max_regen_cost: 12,
         max_realize_organisms: usize::MAX,
         max_resonance_nodes: usize::MAX,
+        max_persist_ops: usize::MAX,
+        max_route_attraction_nodes: usize::MAX,
     };
     let mut map = RegionMap::new(small_config());
     let field = PossibilityField::default();
@@ -365,6 +367,8 @@ fn dispatch_is_topological_under_tiny_budgets() {
         max_regen_cost: 10, // one drainage job, or a few cheap layers
         max_realize_organisms: usize::MAX,
         max_resonance_nodes: usize::MAX,
+        max_persist_ops: usize::MAX,
+        max_route_attraction_nodes: usize::MAX,
     };
     let mut map = RegionMap::new(StreamConfig {
         load_radius: 1.0 * REGION_SIZE,

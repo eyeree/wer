@@ -15,7 +15,12 @@ pub const REGION_SIZE: f64 = 256.0;
 /// cover exponentially larger areas), matching the macro/world/local layering in
 /// the plan. Coordinates are signed so the world extends infinitely in every
 /// direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Serialized inside Phase 5 records (preserves, session snapshots); the field
+/// order is part of the record format contract and is golden-fixtured.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct RegionCoord {
     /// Region column.
     pub x: i32,

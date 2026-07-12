@@ -38,6 +38,8 @@ fn main() -> ExitCode {
     let species_flag = take_flag(&mut args, "--species");
     let ecology_flag = take_flag(&mut args, "--ecology");
     let steer_flag = take_flag(&mut args, "--steer");
+    let vault_flag = take_flag(&mut args, "--vault");
+    let routes_flag = take_flag(&mut args, "--routes");
     let (x, y) = match args.as_slice() {
         [x, y] => match (x.parse::<f64>(), y.parse::<f64>()) {
             (Ok(x), Ok(y)) => (x, y),
@@ -47,7 +49,11 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("usage: wer-inspect <world_x> <world_y> [--layers] [--species] [--ecology] [--steer]");
+            eprintln!(
+                "usage: wer-inspect <world_x> <world_y> [--layers] [--species] [--ecology] \
+                 [--steer] [--vault] [--routes]\n\
+                 (--vault/--routes read the store at $WER_VAULT_DIR, default ./wer-vault)"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -254,6 +260,71 @@ fn main() -> ExitCode {
             );
         }
         println!("  (* = domain moved from base to projected target)");
+    }
+
+    if vault_flag || routes_flag {
+        let store_dir =
+            std::env::var("WER_VAULT_DIR").unwrap_or_else(|_| String::from("wer-vault"));
+        if vault_flag {
+            match tools::inspect_vault(&store_dir, x, y) {
+                Err(e) => {
+                    eprintln!("--vault: {e}");
+                    return ExitCode::FAILURE;
+                }
+                Ok(v) => {
+                    println!();
+                    println!("vault {store_dir} (phase-5-plan.md §11):");
+                    println!(
+                        "  totals      {} discoveries, {} routes, {} preserves, {} seen",
+                        v.totals.0, v.totals.1, v.totals.2, v.totals.3
+                    );
+                    println!(
+                        "  discovered  {}",
+                        if v.seen_here { "yes" } else { "not yet" }
+                    );
+                    match &v.covering_preserve {
+                        Some((id, name, sig)) => {
+                            println!("  preserve    {name} ({id:#018x}) pins this region");
+                            println!("              buckets {:?}", sig.buckets);
+                        }
+                        None => println!("  preserve    none covers this region"),
+                    }
+                    for (id, name, d) in &v.nearby_discoveries {
+                        println!("  discovery   {name} ({id:#018x}) {d:.0} units away");
+                    }
+                    for (route, node, d) in &v.nearby_route_nodes {
+                        println!(
+                            "  route node  {route:#018x}[{node}] {d:.0} units away (in corridor)"
+                        );
+                    }
+                    for issue in &v.issues {
+                        println!("  issue       {issue}");
+                    }
+                }
+            }
+        }
+        if routes_flag {
+            match tools::inspect_routes(&store_dir, x, y) {
+                Err(e) => {
+                    eprintln!("--routes: {e}");
+                    return ExitCode::FAILURE;
+                }
+                Ok(r) => {
+                    println!();
+                    println!("route graph query (possibility space, phase-5-plan.md §11):");
+                    println!("  here        buckets {:?}", r.signature.buckets);
+                    if r.hits.is_empty() {
+                        println!("  (no recorded routes in the store)");
+                    }
+                    for (hit, name, difficulty) in &r.hits {
+                        println!(
+                            "  {name} ({:#018x})[{}]  possibility distance {}  difficulty {difficulty:.2}",
+                            hit.route, hit.node, hit.distance
+                        );
+                    }
+                }
+            }
+        }
     }
 
     ExitCode::SUCCESS

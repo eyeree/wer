@@ -471,6 +471,103 @@ fn food_web_golden() {
     assert_eq!(web.max_body_size, 10.34);
 }
 
+// --- Phase 5 golden fixtures (phase-5-plan.md §12.1) ------------------------
+//
+// These pin the record format: the exact wire bytes (envelope + postcard body,
+// including every serde field/variant order), the content-id fold orders, and
+// the possibility-signature seed fold. They are NEW fixtures — no Phase 2–4
+// identity fixture re-blesses in Phase 5 (§9.1). Changing any of these values
+// is a format change and MUST bump RECORD_FORMAT_VERSION with a migration.
+
+/// The fixed discovery used across the record fixtures: a capture of the
+/// golden species in the golden habitat, quantized.
+fn golden_discovery() -> world_core::DiscoveryRecord {
+    use world_core::{bound_target, domain_mask, Anchor, DiscoveryRecord};
+    let mask = domain_mask(&[PossibilityDomain::Morphology, PossibilityDomain::Aesthetics]);
+    let anchor = Anchor {
+        world_pos: (300.0, -10.0),
+        target: bound_target(mask, 0.9),
+        mask,
+        kind: AnchorKind::Emphasize,
+        strength: 0.8,
+        falloff_radius: 1500.0,
+        source: AnchorSource::Organism {
+            species: species_seed(golden_signature(), 0),
+        },
+    };
+    DiscoveryRecord::from_anchor(
+        &anchor,
+        golden_signature().seed(),
+        7,
+        String::from("glowfin"),
+    )
+}
+
+#[test]
+fn possibility_signature_golden() {
+    use world_core::PossibilitySignature;
+    let sig = PossibilitySignature::of(skewed_vector());
+    // The quantized buckets of the skewed vector (the record vocabulary)…
+    assert_eq!(sig.buckets, [819, 3276, 3686, 1228, 2867, 2048, 2048, 2048]);
+    // …and the portable integer seed the route graph keys possibility space by.
+    assert_eq!(sig.seed(), 0x0F0B_E580_4857_720B);
+}
+
+#[test]
+fn record_content_id_golden() {
+    use world_core::{PossibilitySignature, PreserveRecord, RouteNode, RouteRecord};
+    let disc = golden_discovery();
+    assert_eq!(disc.id, 0x0414_A7BC_1E1E_F0B4);
+
+    let sig = PossibilitySignature::of(skewed_vector());
+    let node = RouteNode {
+        pos_q: (300, -10),
+        signature: sig,
+        cost_q: 40,
+        stability_q: 255,
+        anchor_sig: 0x1234_5678_9ABC_DEF0,
+    };
+    let route = RouteRecord::new(vec![node, node], vec![disc.id], 3, String::from("trek"));
+    assert_eq!(route.id, 0x5E9E_962B_E0DE_86D0);
+
+    let preserve = PreserveRecord::new(
+        vec![
+            (RegionCoord::new(-3, 7), sig),
+            (RegionCoord::new(-2, 7), sig),
+        ],
+        4,
+        String::from("glade"),
+    );
+    assert_eq!(preserve.id, 0x21EC_5BC1_8A38_95BC);
+}
+
+#[test]
+fn record_wire_bytes_golden() {
+    // The canonical encoded bytes of the golden discovery — the byte-level
+    // format contract (envelope, postcard varints, field order). If this fails
+    // the wire format changed: bump RECORD_FORMAT_VERSION and add a migration;
+    // never silently re-bless.
+    use world_core::{decode_record, encode_record, DiscoveryRecord, RecordKind};
+    let disc = golden_discovery();
+    let bytes = encode_record(RecordKind::Discovery, &disc);
+    assert_eq!(
+        bytes,
+        [
+            0x01, 0x02, 0x02, 0xB4, 0xE1, 0xFB, 0xF0, 0xC1, 0xF7, 0xA9, 0x8A, 0x04, 0x00, 0xD2,
+            0xA5, 0xB7, 0xAE, 0x97, 0x8C, 0x98, 0xA0, 0x23, 0x95, 0x86, 0xA7, 0x97, 0xE3, 0xF0,
+            0x84, 0x82, 0x42, 0x80, 0x10, 0x80, 0x10, 0x80, 0x10, 0x80, 0x10, 0x80, 0x10, 0xE6,
+            0x1C, 0x80, 0x10, 0xE6, 0x1C, 0xA0, 0x00, 0xCC, 0x19, 0xDC, 0x0B, 0xD8, 0x04, 0x13,
+            0x07, 0x07, 0x67, 0x6C, 0x6F, 0x77, 0x66, 0x69, 0x6E, 0x00,
+        ]
+    );
+    // The v1 archive floor (phase-5-plan.md §12.1): these exact bytes must
+    // decode forever, migrations included.
+    let (envelope, decoded): (world_core::Envelope, DiscoveryRecord) =
+        decode_record(&bytes, RecordKind::Discovery).expect("v1 archive bytes decode");
+    assert_eq!(envelope.format_version, 1);
+    assert_eq!(decoded, disc);
+}
+
 #[test]
 fn quantization_round_trips_at_bucket_edges() {
     use world_core::POSSIBILITY_QUANT;

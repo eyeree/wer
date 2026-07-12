@@ -20,6 +20,7 @@ use world_core::{
     habitat::HabitatSignature,
     hash::mix,
     possibility::PossibilityDomain,
+    record::{encode_record, DiscoveryRecord, PossibilitySignature, RecordKind},
     species::{species_roster, species_seed},
     terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, WORLD_ALGORITHM_VERSION,
 };
@@ -152,6 +153,72 @@ pub fn steer_sample() -> u64 {
     h
 }
 
+/// The fixed shareable record used by the Phase 5 parity exports: a discovery
+/// of the parity habitat's first species, built entirely from integers, so it
+/// is bit-identical on every platform (ADR 0013).
+fn parity_discovery() -> DiscoveryRecord {
+    let mask = domain_mask(&[PossibilityDomain::Morphology, PossibilityDomain::Aesthetics]);
+    let mut target = PossibilitySignature {
+        buckets: [2048; world_core::POSSIBILITY_DIMS],
+    };
+    target.buckets[PossibilityDomain::Morphology.index()] = 3600;
+    target.buckets[PossibilityDomain::Aesthetics.index()] = 3300;
+    DiscoveryRecord {
+        id: 0,
+        source: AnchorSource::Organism {
+            species: species_seed(PARITY_SIGNATURE, 0),
+        },
+        signature_seed: PARITY_SIGNATURE.seed(),
+        target,
+        mask,
+        kind: AnchorKind::Emphasize,
+        strength_q: 3277,
+        falloff_q: 1500,
+        pos_q: (300, -10),
+        sequence: 7,
+        name: String::from("glowfin"),
+        journal: String::new(),
+    }
+}
+
+/// Parity sample for the Phase 5 record codec (phase-5-plan.md §12.5): the
+/// byte fold of the canonical encoding of a fixed record. The wire format is
+/// the interoperability surface native-written bundles and the future browser
+/// runtime share, so **byte-level** cross-platform equality is required.
+#[must_use]
+pub fn record_codec_sample() -> u64 {
+    let mut record = parity_discovery();
+    record.id = record.content_id();
+    let bytes = encode_record(RecordKind::Discovery, &record);
+    let mut h: u64 = 0x5EC0_7D00_C0DE_0001;
+    h = mix(h, bytes.len() as u64);
+    for b in bytes {
+        h = mix(h, u64::from(b));
+    }
+    h
+}
+
+/// Parity sample for shared-anchor steering (phase-5-plan.md §12.5): the
+/// steered-and-projected vector produced by an anchor reconstructed from a
+/// fixed [`DiscoveryRecord`]. The record carries only quantized integers and
+/// `steer`/`project_plausible` are float-deterministic, so shared steering is
+/// portable **end-to-end** — the shared-anchor guarantee (ADR 0013). Live
+/// vault I/O is deliberately not exported (no browser storage until Phase 7).
+#[must_use]
+pub fn shared_steer_sample() -> u64 {
+    let mut record = parity_discovery();
+    record.id = record.content_id();
+    let anchor = record.to_anchor();
+    let base = PossibilityVector::neutral();
+    let v = project_plausible(steer(base, &[anchor], (256.0, 0.0)));
+    let mut h: u64 = 0x5A4E_D57E_E200_0005;
+    h = mix(h, record.id);
+    for d in v.dims {
+        h = mix(h, u64::from(d.to_bits()));
+    }
+    h
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -222,6 +289,20 @@ mod wasm {
     pub fn steer_sample() -> u64 {
         super::steer_sample()
     }
+
+    /// Phase 5 record-codec byte-identity sample (phase-5-plan.md §12.5).
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn record_codec_sample() -> u64 {
+        super::record_codec_sample()
+    }
+
+    /// Phase 5 shared-anchor steering identity sample (phase-5-plan.md §12.5).
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn shared_steer_sample() -> u64 {
+        super::shared_steer_sample()
+    }
 }
 
 #[cfg(test)]
@@ -242,5 +323,7 @@ mod tests {
         assert_eq!(super::genome_sample(), 0x6023_7E3E_43E5_2590);
         assert_eq!(super::food_web_sample(), 0x6272_09D2_6720_001B);
         assert_eq!(super::steer_sample(), 0x9A4E_77F9_D151_9EC2);
+        assert_eq!(super::record_codec_sample(), 0xFA7F_9032_2BAF_D7FB);
+        assert_eq!(super::shared_steer_sample(), 0xF0FB_820F_2030_1752);
     }
 }

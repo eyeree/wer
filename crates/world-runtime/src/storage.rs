@@ -31,9 +31,11 @@ impl core::error::Error for StorageError {}
 
 /// A versioned, sparse key/value store for persistent world overrides.
 ///
-/// Keys are opaque byte strings (callers namespace them, e.g. `region/…`,
-/// `route/…`). Implementations must be safe for partial loading and must not
-/// assume the whole store fits in memory.
+/// Keys are opaque byte strings (callers namespace them, e.g. `disc/…`,
+/// `route/…` — see `vault`). Implementations must be safe for partial loading
+/// and must not assume the whole store fits in memory. Each `store` call must
+/// be atomic: after a crash the key holds either its old or its new value,
+/// never a torn write (phase-5-plan.md §7.7).
 pub trait Storage {
     /// Read the bytes stored at `key`, or [`StorageError::NotFound`].
     fn load(&self, key: &[u8]) -> Result<Vec<u8>, StorageError>;
@@ -44,8 +46,111 @@ pub trait Storage {
     /// Remove `key`. Removing a missing key is not an error.
     fn remove(&mut self, key: &[u8]) -> Result<(), StorageError>;
 
+    /// Every stored key that starts with `prefix`, in ascending byte order —
+    /// how the vault enumerates a record namespace without an index record
+    /// (phase-5-plan.md §5.2). Maps onto a directory listing natively and a
+    /// key range in a browser object store.
+    fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StorageError>;
+
     /// Whether `key` currently has a value.
     fn contains(&self, key: &[u8]) -> bool {
         self.load(key).is_ok()
+    }
+}
+
+/// The in-memory reference [`Storage`]: a plain ordered map. Used by every
+/// headless harness and test (platform-free by construction); the native
+/// shell's file-tree implementation lives in `platform-native`, keeping the
+/// neutral crates off the filesystem (ADR 0002).
+#[derive(Debug, Default, Clone)]
+pub struct MemoryStorage {
+    entries: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl MemoryStorage {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of stored keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Total bytes held (keys + values) — the harness's sparsity gauge.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.entries.iter().map(|(k, v)| k.len() + v.len()).sum()
+    }
+
+    /// Iterate all entries in ascending key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+}
+
+impl Storage for MemoryStorage {
+    fn load(&self, key: &[u8]) -> Result<Vec<u8>, StorageError> {
+        self.entries.get(key).cloned().ok_or(StorageError::NotFound)
+    }
+
+    fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        self.entries.insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<(), StorageError> {
+        self.entries.remove(key);
+        Ok(())
+    }
+
+    fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(self
+            .entries
+            .range(prefix.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        self.entries.contains_key(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_storage_honours_the_contract() {
+        let mut s = MemoryStorage::new();
+        assert!(matches!(s.load(b"a"), Err(StorageError::NotFound)));
+        s.store(b"disc/2", b"two").unwrap();
+        s.store(b"disc/1", b"one").unwrap();
+        s.store(b"route/1", b"r").unwrap();
+        assert_eq!(s.load(b"disc/1").unwrap(), b"one");
+        assert!(s.contains(b"disc/2"));
+        assert_eq!(
+            s.keys_with_prefix(b"disc/").unwrap(),
+            vec![b"disc/1".to_vec(), b"disc/2".to_vec()]
+        );
+        assert_eq!(s.keys_with_prefix(b"zzz/").unwrap(), Vec::<Vec<u8>>::new());
+        s.remove(b"disc/1").unwrap();
+        assert!(!s.contains(b"disc/1"));
+        s.remove(b"disc/1").unwrap(); // removing a missing key is not an error
+        assert_eq!(s.len(), 2);
+        assert!(s.bytes() > 0);
     }
 }

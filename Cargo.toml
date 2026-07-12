@@ -28,6 +28,9 @@ publish = false
 [workspace.dependencies]
 # Platform-neutral.
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# Wire format for persisted records (phase-5-plan.md §4.1): `no_std`, compact,
+# and a stable specified encoding — pinned by golden byte fixtures regardless.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 glam = { version = "0.33", default-features = false, features = ["libm"] }
 bytemuck = { version = "1", features = ["derive"] }
 

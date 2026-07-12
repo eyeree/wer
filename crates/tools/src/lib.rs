@@ -7,14 +7,23 @@
 //! invalidation-precision harness of phase-2-plan.md §12.3).
 
 pub mod anchor;
+pub mod atlas;
 pub mod ecology;
+pub mod filestore;
 pub mod ledger;
 pub mod replay;
+pub mod vault;
 
 pub use anchor::{run_anchor_harness, AnchorReport};
+pub use atlas::{
+    check_bundle, decode_bundle, encode_bundle, inspect_routes, inspect_vault, BundleCheck,
+    RouteQueryReport, VaultPositionReport,
+};
 pub use ecology::{run_ecology_harness, EcologyReport};
+pub use filestore::FileStorage;
 pub use ledger::{run_invalidation_ledger, ScenarioReport};
-pub use replay::{run_continuity_replay, ReplayConfig, ReplayReport};
+pub use replay::{run_continuity_replay, state_hash, ReplayConfig, ReplayReport};
+pub use vault::{run_vault_harness, VaultReport};
 
 use world_core::{feature_hash, Biome, FeatureKey, RegionCoord, WORLD_ALGORITHM_VERSION};
 use world_runtime::{

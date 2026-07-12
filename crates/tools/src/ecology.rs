@@ -425,6 +425,8 @@ fn realization_budget_scenario() -> EcologyReport {
         max_regen_cost: u32::MAX,
         max_realize_organisms: cap,
         max_resonance_nodes: usize::MAX,
+        max_persist_ops: usize::MAX,
+        max_route_attraction_nodes: usize::MAX,
     };
 
     let mut map = RegionMap::new(harness_config());

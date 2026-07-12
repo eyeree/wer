@@ -23,3 +23,6 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0010](0010-species-identity-presentation-grade-until-atlas.md) | Species identity is presentation-grade until the atlas needs otherwise | Accepted |
 | [0011](0011-anchors-capture-trait-targets-combine-order-independently.md) | Anchors capture trait targets and combine order-independently | Accepted |
 | [0012](0012-resonance-gates-transition.md) | Resonance gates transition; it multiplies the travel-fueled rate | Accepted |
+| [0013](0013-shareable-records-quantized-at-persistence-boundary.md) | Shareable records are quantized at the persistence boundary | Accepted |
+| [0014](0014-vault-stores-deviations-with-crdt-merge.md) | The vault stores deviations, keyed by content-derived ids, with CRDT merge laws | Accepted |
+| [0015](0015-routes-attract-as-derived-anchors.md) | Routes attract as derived anchors; attraction is soft and saturating | Accepted |

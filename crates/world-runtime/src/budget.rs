@@ -28,6 +28,14 @@ pub struct Budget {
     /// biome does not build an unbounded graph (phase-4-plan.md §8.3) — the
     /// analogue of `max_realize_organisms`.
     pub max_resonance_nodes: usize,
+    /// Records the vault encodes and writes per [`crate::vault::Vault::flush`]
+    /// call, so persistence obeys temporal budgeting like every other
+    /// subsystem and a bulk import never stalls a frame (phase-5-plan.md §7.7).
+    pub max_persist_ops: usize,
+    /// Route nodes contributing derived attraction anchors per frame
+    /// (phase-5-plan.md §8.2) — the steering-side analogue of
+    /// `max_resonance_nodes`, so a dense recorded corridor stays bounded.
+    pub max_route_attraction_nodes: usize,
 }
 
 impl Budget {
@@ -51,6 +59,12 @@ impl Budget {
             // The resonance graph is cheap; a few dozen nearest nodes capture
             // the local density/diversity without an unbounded scan.
             max_resonance_nodes: 64,
+            // Records are ~100 bytes; a handful per frame drains any realistic
+            // dirty queue within a second without touching the frame budget.
+            max_persist_ops: ((8.0 * scale) as usize).max(1),
+            // A few dozen nearest corridor nodes bound route steering the same
+            // way the resonance graph is bounded.
+            max_route_attraction_nodes: 32,
         }
     }
 
@@ -63,6 +77,8 @@ impl Budget {
             max_regen_cost: u32::MAX,
             max_realize_organisms: usize::MAX,
             max_resonance_nodes: usize::MAX,
+            max_persist_ops: usize::MAX,
+            max_route_attraction_nodes: usize::MAX,
         }
     }
 }

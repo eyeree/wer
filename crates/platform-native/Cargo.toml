@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }
+# The shared native file-tree Storage backend (phase-5-plan.md §5.3) — the
+# tools crate has no windowing/GPU dependencies, so this stays lightweight.
+tools = { path = "../tools" }
 renderer = { path = "../renderer" }
 winit = { workspace = true }
 pollster = { workspace = true }

@@ -86,6 +86,8 @@ impl Default for ReplayConfig {
                 max_regen_cost: 2048,
                 max_realize_organisms: usize::MAX,
                 max_resonance_nodes: usize::MAX,
+                max_persist_ops: usize::MAX,
+                max_route_attraction_nodes: usize::MAX,
             },
             velocity: (37.0, 23.0),
             // One converge step moves a dimension ≤ converge_rate; generation
@@ -220,9 +222,15 @@ fn snapshot_tiles(map: &RegionMap) -> TileSnapshot {
     snap
 }
 
-/// Order-stable hash of the full end-of-run state (regions + field cache +
-/// biome tiles + macro cache).
-fn state_hash(map: &RegionMap) -> u64 {
+/// Order-stable hash of a map's full authoritative + derived state (regions,
+/// field cache, biome/dominant tiles, macro cache, roster cache, organisms).
+/// Two runs of the same script must produce the same value — and a
+/// save→load→settle run must reproduce the uninterrupted run's value
+/// (phase-5-plan.md §12.2), which is what makes durability *exact* rather than
+/// approximate. Public so the persistence tests and the vault harness share
+/// the one definition of "the same world".
+#[must_use]
+pub fn state_hash(map: &RegionMap) -> u64 {
     let mut h: u64 = 0xC017_1401_7CBE_11A5;
     for region in map.iter_active() {
         h = mix(h, region.coord.x as u32 as u64);

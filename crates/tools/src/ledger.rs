@@ -325,6 +325,8 @@ fn budget_ripple_scenario() -> ScenarioReport {
         max_regen_cost: 24,
         max_realize_organisms: usize::MAX,
         max_resonance_nodes: usize::MAX,
+        max_persist_ops: usize::MAX,
+        max_route_attraction_nodes: usize::MAX,
     };
     let mut violations = Vec::new();
     let mut frames_with_regen = 0u32;

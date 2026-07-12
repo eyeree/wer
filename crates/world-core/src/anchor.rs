@@ -17,10 +17,15 @@
 //! debug keys keep working by constructing `Anchor { target: bound, source:
 //! Manual, .. }`. The [`project_plausible`] rule set grows in Phase 4 M2.
 
+use serde::{Deserialize, Serialize};
+
 use crate::possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS};
 
 /// What an anchor does to the masked dimensions relative to its captured target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized inside Phase 5 records; the variant order is part of the record
+/// format contract (`record::RECORD_FORMAT_VERSION`) and is golden-fixtured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnchorKind {
     /// Pull masked dimensions toward `target` (make the remembered trait more
     /// present). Phase 1 "emphasize" is this with `target = 1.0`.
@@ -30,9 +35,11 @@ pub enum AnchorKind {
     Suppress,
 }
 
-/// Where an anchor was captured from — metadata for legibility now, and the
-/// seed of a persistent/shareable discovery record in Phase 5 (§1.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where an anchor was captured from — legibility metadata in Phase 4, and the
+/// identity core of a persistent/shareable [`crate::record::DiscoveryRecord`]
+/// in Phase 5. Serialized inside records; the variant order is part of the
+/// record format contract and is golden-fixtured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnchorSource {
     /// A captured creature, carrying its stable [`crate::species::Species::id`].
     Organism { species: u64 },

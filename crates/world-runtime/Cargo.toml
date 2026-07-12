@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 world-core = { path = "../world-core" }
+# The vault decodes generic record bodies (phase-5-plan.md §5.2).
+serde = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

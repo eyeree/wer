@@ -12,9 +12,9 @@ browser/WebAssembly/WebGPU target) for an exploration game built around
 [`Infinite_World_Exploration_Project_Overview.md`](Infinite_World_Exploration_Project_Overview.md);
 the phased technical plan is in [`implementation-plan.md`](implementation-plan.md).
 
-The repository is at **Phase 4** (anchors and player steering, see
-[`phase-4-plan.md`](phase-4-plan.md)), built on the landed Phase 2 and Phase 3
-stacks. Phase 2 is a nine-layer declared dependency graph — terrain, geology,
+The repository is at **Phase 5** (routes, persistence, and the social model, see
+[`phase-5-plan.md`](phase-5-plan.md)), built on the landed Phase 2–4 stacks.
+Phase 2 is a nine-layer declared dependency graph — terrain, geology,
 macro drainage, climate, hydrology, soils, biome, vegetation, and **ecology
 (L8)** — with dependency-hash staleness (ADR 0008), topological cost-budgeted
 dispatch, stable integer river topology (ADR 0009), the continuity replay, and
@@ -27,16 +27,26 @@ the ecology harness. Phase 4 turns the possibility machinery into the game: anch
 capture the *traits* of discoveries into a possibility `target` and combine
 **order-independently** (ADR 0011), `project_plausible` grows into the full
 section-8 rule set as an idempotent relaxation, and a transient **resonance**
-graph gates convergence so change is travel-fueled *and* resonance-gated — dense,
-diverse, anchor-compatible surroundings let the player steer, barren ones hold the
-world still (ADR 0012). Steering is machine-checked by the anchor harness
-(`wer-anchor`). Steering is all presentation-side (it moves a region's target
-vector, never a generated identity), so `WORLD_ALGORITHM_VERSION` stays at 2. The
-renderer still only presents one CPU-composed debug texture (organisms and
-resonance arcs surface as debug markers/overlays, not meshes), the possibility
-vector is still one scalar per domain (several in-fiction trait categories collapse
-onto one scalar), and the `Storage` trait is still unused — those grow in later
-phases; do not mistake them for finished subsystems.
+graph gates convergence (ADR 0012), machine-checked by the anchor harness
+(`wer-anchor`). Phase 5 makes exploration durable and shareable: the **vault**
+(the first and only user of the `Storage` trait) persists *deviations only* —
+named discoveries, expedition routes, preserves, the discovered-region set, and a
+bit-exact run-local session snapshot — through a versioned record codec
+(`RECORD_FORMAT_VERSION`, serde + postcard, golden byte fixtures). Shareable
+records are **quantized at the persistence boundary** (ADR 0013: integers only,
+so a shared anchor steers bit-identically everywhere), keyed by content-derived
+ids with CRDT merge laws (ADR 0014: union-by-id, commutative/associative/
+idempotent — the whole "server-compatible" claim, exercised by `wer-atlas`
+bundles, no server anywhere). Preserves pin regions to their quantized buckets
+(a few dozen bytes reproduce the whole landscape via ADR 0008); routes attract
+as derived weak anchors on the fast domains only (ADR 0015: soft, saturating in
+usage, never steering the stable topology). Save→load→settle is state-hash
+exact, machine-checked by the vault harness (`wer-vault`). Persistence changes
+no generated output, so `WORLD_ALGORITHM_VERSION` stays at 2. The renderer
+still only presents one CPU-composed debug texture, the possibility vector is
+still one scalar per domain, and there is no networking and no browser storage
+backend (Phase 7) — those grow in later phases; do not mistake them for
+finished subsystems.
 
 ## Toolchain
 
@@ -54,13 +64,21 @@ cargo run --bin wer
 
 # Deterministic inspector: world position -> region + origin feature hash.
 # Add --layers / --species / --ecology / --steer for the dependency-hash chain,
-# the roster + food web, the L8 aggregates, or the capture->steer->project chain.
+# the roster + food web, the L8 aggregates, or the capture->steer->project
+# chain; --vault / --routes read the record store at $WER_VAULT_DIR (default
+# ./wer-vault) and report the records/route-graph around the position.
 cargo run --bin wer-inspect -- 300 -10 --steer
 
-# Phase sign-off harnesses (headless, CI gates): invalidation precision, and
-# Phase 4 steering (intentional/selective/coherent/resonance-gated).
+# Atlas bundles: export/import/validate/list record stores and bundle files
+# (the file-based proof of the sharing model; no server).
+cargo run --bin wer-atlas -- list wer-vault
+
+# Phase sign-off harnesses (headless, CI gates): invalidation precision,
+# Phase 4 steering, and Phase 5 persistence/sharing (durable/sparse/shareable/
+# preserve/routes/precision).
 cargo run --bin wer-ledger
 cargo run --bin wer-anchor
+cargo run --bin wer-vault
 
 # Run everything, including the determinism golden fixtures.
 cargo test --workspace

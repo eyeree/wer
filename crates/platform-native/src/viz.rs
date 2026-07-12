@@ -146,6 +146,9 @@ pub struct Overlays {
     /// Near-field organism markers, coloured by expressed appearance
     /// (phase-3-plan.md §11 — the popping/coherence detector for Tier B).
     pub organisms: bool,
+    /// Dim regions the explorer has never visited (the first appearance of
+    /// the atlas map, phase-5-plan.md §11). Only active when a vault is open.
+    pub discovered: bool,
 }
 
 impl Default for Overlays {
@@ -155,8 +158,24 @@ impl Default for Overlays {
             rings: true,
             pinned_flash: true,
             organisms: true,
+            discovered: true,
         }
     }
+}
+
+/// Vault-derived map decorations (phase-5-plan.md §11): the discovered set,
+/// preserve outlines, and route polylines. Built by the shell each frame from
+/// the open vault; [`MapDecor::default`] (nothing drawn) when no vault is open.
+#[derive(Debug, Default, Clone)]
+pub struct MapDecor {
+    /// Discovered regions within the view. `None` means no vault is open, so
+    /// no dimming is applied at all.
+    pub seen: Option<std::collections::BTreeSet<RegionCoord>>,
+    /// Preserved regions (outlined so a pinned window reads at a glance).
+    pub preserves: std::collections::BTreeSet<RegionCoord>,
+    /// Route polylines: recorded node positions in travel order, plus the
+    /// route's usage count (brightness — well-worn paths glow).
+    pub routes: Vec<(Vec<(f64, f64)>, u32)>,
 }
 
 /// Linear blend of two RGB colors.
@@ -392,6 +411,11 @@ pub struct MapComposer {
 
 const FLASH_FRAMES: u8 = 45;
 
+/// Preserve outline tint (phase-5-plan.md §11).
+const PRESERVE_OUTLINE: [u8; 3] = [120, 255, 170];
+/// Route polyline base tint; brightness saturates with usage.
+const ROUTE_TINT: [u8; 3] = [255, 220, 120];
+
 impl MapComposer {
     /// A composer viewing `half_regions` in every direction at `resolution`
     /// cells per region.
@@ -418,6 +442,14 @@ impl MapComposer {
         Self::side_for(self.half_regions, self.resolution) as u32
     }
 
+    /// Regions viewed in every direction from the center (the view is a
+    /// `2·half+1` square) — the bound the shell uses to gather per-region
+    /// decor (discovered set, preserves) for exactly the visible window.
+    #[must_use]
+    pub const fn half_regions(&self) -> i32 {
+        self.half_regions
+    }
+
     /// Compose the map for this frame and return the RGBA buffer
     /// (row 0 = north edge, as the renderer expects).
     pub fn compose(
@@ -427,6 +459,7 @@ impl MapComposer {
         channel: Channel,
         overlays: Overlays,
         anchors: &[Anchor],
+        decor: &MapDecor,
     ) -> &[u8] {
         self.detect_pinned_changes(map);
 
@@ -444,6 +477,17 @@ impl MapComposer {
             }
         }
 
+        if overlays.discovered {
+            if let Some(seen) = &decor.seen {
+                self.dim_undiscovered(center, seen);
+            }
+        }
+        for (path, usage) in &decor.routes {
+            self.draw_route(player, path, *usage);
+        }
+        for &coord in &decor.preserves {
+            self.outline_region(center, coord, PRESERVE_OUTLINE);
+        }
         if overlays.organisms {
             self.draw_organisms(map, player);
         }
@@ -452,6 +496,83 @@ impl MapComposer {
         }
         self.draw_player_marker(player);
         &self.pixels
+    }
+
+    /// Dim every view region the explorer has never visited (phase-5-plan.md
+    /// §11): the discovered world reads bright, the unknown reads dark — the
+    /// first appearance of the atlas map.
+    fn dim_undiscovered(
+        &mut self,
+        center: RegionCoord,
+        seen: &std::collections::BTreeSet<RegionCoord>,
+    ) {
+        let res = self.resolution as usize;
+        let side = self.side() as usize;
+        for row_region in 0..=(2 * self.half_regions) as usize {
+            let ry = center.y + self.half_regions - row_region as i32;
+            for col_region in 0..=(2 * self.half_regions) as usize {
+                let rx = center.x - self.half_regions + col_region as i32;
+                if seen.contains(&RegionCoord::new(rx, ry)) {
+                    continue;
+                }
+                for py in row_region * res..(row_region + 1) * res {
+                    let row = py * side;
+                    for px in col_region * res..(col_region + 1) * res {
+                        let offset = (row + px) * 4;
+                        for c in &mut self.pixels[offset..offset + 3] {
+                            *c = (u16::from(*c) * 5 / 9) as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Outline one region's pixel block (preserves, phase-5-plan.md §11).
+    fn outline_region(&mut self, center: RegionCoord, coord: RegionCoord, rgb: [u8; 3]) {
+        let row_region = center.y + self.half_regions - coord.y;
+        let col_region = coord.x - center.x + self.half_regions;
+        let span = 2 * self.half_regions;
+        if !(0..=span).contains(&row_region) || !(0..=span).contains(&col_region) {
+            return;
+        }
+        let res = self.resolution as i64;
+        let x0 = i64::from(col_region) * res;
+        let y0 = i64::from(row_region) * res;
+        for k in 0..res {
+            self.plot(x0 + k, y0, rgb);
+            self.plot(x0 + k, y0 + res - 1, rgb);
+            self.plot(x0, y0 + k, rgb);
+            self.plot(x0 + res - 1, y0 + k, rgb);
+        }
+    }
+
+    /// A recorded route as a polyline through its node positions, brightness
+    /// saturating with usage ("frequently used routes become easier to
+    /// follow", Overview; phase-5-plan.md §11).
+    fn draw_route(&mut self, player: (f64, f64), path: &[(f64, f64)], usage: u32) {
+        let cell = REGION_SIZE / f64::from(self.resolution);
+        let (west, north) = self.view_origin(player);
+        let brightness = 0.45 + 0.55 * (usage as f32 / (usage as f32 + 4.0));
+        let rgb = [
+            (ROUTE_TINT[0] as f32 * brightness) as u8,
+            (ROUTE_TINT[1] as f32 * brightness) as u8,
+            (ROUTE_TINT[2] as f32 * brightness) as u8,
+        ];
+        let to_px = |(wx, wy): (f64, f64)| ((wx - west) / cell, (north - wy) / cell);
+        for pair in path.windows(2) {
+            let (x0, y0) = to_px(pair[0]);
+            let (x1, y1) = to_px(pair[1]);
+            let steps = (x1 - x0).abs().max((y1 - y0).abs()).ceil().max(1.0) as usize;
+            for i in 0..=steps {
+                let t = i as f64 / steps as f64;
+                self.plot(
+                    (x0 + (x1 - x0) * t) as i64,
+                    (y0 + (y1 - y0) * t) as i64,
+                    rgb,
+                );
+            }
+        }
     }
 
     /// Near-field organism markers, coloured by expressed appearance. A marker

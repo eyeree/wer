@@ -288,6 +288,12 @@ pub struct RegionMap {
     /// The L8 dependency hash each region's organisms were realized from, so
     /// re-realization triggers exactly when the aggregate changes.
     organism_keys: BTreeMap<RegionCoord, u64>,
+    /// Persistent possibility overrides (phase-5-plan.md §7.5): regions pinned
+    /// to a quantized possibility state by a preserve. Consulted by the load
+    /// path (current/target from the buckets, stability 1) and honoured by
+    /// retarget/converge; deliberately **not** cleared on eviction — surviving
+    /// eviction is the override's job. A few dozen bytes per preserved region.
+    overrides: BTreeMap<RegionCoord, world_core::PossibilitySignature>,
     /// Run-local additions to each layer's declared `algorithm_revision`
     /// (see [`RegionMap::bump_layer_revision`]).
     revision_bumps: [u16; LAYER_COUNT as usize],
@@ -319,6 +325,7 @@ impl RegionMap {
             region_signatures: BTreeMap::new(),
             organisms: BTreeMap::new(),
             organism_keys: BTreeMap::new(),
+            overrides: BTreeMap::new(),
             revision_bumps: [0; LAYER_COUNT as usize],
             results_tx,
             results_rx,
@@ -799,6 +806,71 @@ impl RegionMap {
         Some(out)
     }
 
+    /// Pin a region to a quantized possibility state (phase-5-plan.md §7.5) —
+    /// the runtime half of a preserve. The override survives eviction: a
+    /// preserved region always reloads from its buckets, never from the field,
+    /// and neither steering nor convergence moves it while overridden.
+    ///
+    /// Applying an override to a resident region snaps `current`/`target` to
+    /// the signature's bucket centers. Creating a preserve *from* the region's
+    /// own state flips no bucket, so it dirties nothing and its tiles hold
+    /// bit-identical; importing a foreign preserve may flip buckets, which
+    /// dirties exactly the declared reader layers (ADR 0007) — regeneration to
+    /// the preserved landscape, not a snap of the realized one.
+    pub fn set_override(&mut self, coord: RegionCoord, sig: world_core::PossibilitySignature) {
+        self.overrides.insert(coord, sig);
+        if let Some(region) = self.regions.get_mut(&coord) {
+            let snapped = sig.dequantize();
+            let mut flipped = 0u8;
+            for (i, domain) in PossibilityDomain::ALL.iter().enumerate() {
+                if region.current.quantized(*domain) != snapped.quantized(*domain) {
+                    flipped |= 1 << i;
+                }
+            }
+            region.current = snapped;
+            region.target = snapped;
+            region.stability = 1.0;
+            if flipped != 0 {
+                region.dirty_layers |= domain_dirty_mask(flipped);
+                if region.status == GenerationStatus::Ready {
+                    region.status = GenerationStatus::Generating;
+                }
+            }
+        }
+    }
+
+    /// Release a region's possibility override (deleting a preserve). No
+    /// snap: `current` stays where the preserve held it, and the next
+    /// retarget/converge resumes normal travel-fueled steering from there
+    /// (phase-5-plan.md §7.5).
+    pub fn clear_override(&mut self, coord: RegionCoord) {
+        self.overrides.remove(&coord);
+    }
+
+    /// Whether a region is currently pinned by a possibility override.
+    #[inline]
+    #[must_use]
+    pub fn is_overridden(&self, coord: RegionCoord) -> bool {
+        self.overrides.contains_key(&coord)
+    }
+
+    /// Restore one region from a session snapshot (phase-5-plan.md §12.2):
+    /// bit-exact `current`, stability, and revision, target = current (the
+    /// next retarget recomputes it from the same inputs), every layer dirty so
+    /// caches, rosters, and organisms re-derive deterministically from the
+    /// restored possibility state (ADR 0008). Loading is not an event: nothing
+    /// converges and no target moves beyond what the live run would compute.
+    pub fn restore_region(&mut self, snap: &world_core::RegionSnapshotRecord) {
+        let mut region = RegionState::new(snap.coord);
+        region.current = PossibilityVector { dims: snap.current };
+        region.target = region.current;
+        region.stability = snap.stability;
+        region.revision = snap.revision;
+        region.dirty_layers = all_layers_mask();
+        region.status = GenerationStatus::Generating;
+        self.regions.insert(snap.coord, region);
+    }
+
     /// Apply a run-local bump to one layer's algorithm revision, invalidating
     /// that layer and its transitive dependents everywhere (phase-2-plan.md
     /// §9.2). A debug/testing hook: the invalidation-precision harness uses it
@@ -1123,9 +1195,17 @@ impl RegionMap {
         candidates.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
         for &(_, coord) in candidates.iter().take(budget.max_loads) {
             let mut region = RegionState::new(coord);
-            region.target = self.target_for(coord, field, anchors, bias);
-            region.current = region.target;
-            region.stability = stability_for(&self.cfg, center_distance(coord, player));
+            if let Some(sig) = self.overrides.get(&coord) {
+                // Preserved region: reload from its persisted buckets, pinned
+                // (phase-5-plan.md §7.5) — never from the field.
+                region.current = sig.dequantize();
+                region.target = region.current;
+                region.stability = 1.0;
+            } else {
+                region.target = self.target_for(coord, field, anchors, bias);
+                region.current = region.target;
+                region.stability = stability_for(&self.cfg, center_distance(coord, player));
+            }
             region.dirty_layers = all_layers_mask();
             self.regions.insert(coord, region);
             stats.loaded += 1;
@@ -1144,6 +1224,14 @@ impl RegionMap {
     ) {
         let coords: Vec<RegionCoord> = self.regions.keys().copied().collect();
         for coord in coords {
+            if self.overrides.contains_key(&coord) {
+                // Preserved: pinned to its buckets; neither the distance ramp
+                // nor steering moves it (phase-5-plan.md §7.5).
+                let region = self.regions.get_mut(&coord).expect("resident");
+                region.stability = 1.0;
+                region.target = region.current;
+                continue;
+            }
             let stability = stability_for(&self.cfg, center_distance(coord, player));
             let target = self.target_for(coord, field, anchors, bias);
             let region = self.regions.get_mut(&coord).expect("resident");

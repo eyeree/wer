@@ -126,8 +126,24 @@ pub struct PanelInfo<'a> {
     pub capture_polarity: AnchorKind,
     /// Whether the shell is in deliberate transition-movement mode.
     pub transition_mode: bool,
+    /// Vault store telemetry, when a vault is open (phase-5-plan.md §11).
+    pub vault: Option<VaultInfo>,
     /// Data under the mouse, when it is over the map.
     pub cursor: Option<CursorInfo>,
+}
+
+/// The panel's view of the open vault (phase-5-plan.md §8.2): live proof that
+/// the store holds records, not geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct VaultInfo {
+    /// Loaded records (discoveries + routes + preserves).
+    pub records: usize,
+    /// Records waiting to be flushed (backpressure, not an error).
+    pub dirty: usize,
+    /// Total discovered regions in the seen-set.
+    pub seen: u64,
+    /// Non-fatal problems found opening the store.
+    pub issues: usize,
 }
 
 /// Short display names for the eight possibility domains, indexed like
@@ -247,6 +263,21 @@ impl Hud {
             "rosters",
             &format!("{}", info.rosters),
         );
+        match info.vault {
+            Some(v) => {
+                cur.pair(
+                    self,
+                    "vault",
+                    &format!("{}r {}d", v.records, v.dirty),
+                    "seen",
+                    &format!("{}", v.seen),
+                );
+                if v.issues > 0 {
+                    cur.label_value(self, "vault issues", &format!("{}", v.issues), ALERT);
+                }
+            }
+            None => cur.label_value(self, "vault", "none (O save, L load)", LABEL),
+        }
         let viol_color = if info.pinned_violations == 0 {
             VALUE
         } else {

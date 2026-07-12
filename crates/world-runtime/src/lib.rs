@@ -19,9 +19,11 @@ pub mod realize;
 pub mod region;
 pub mod resonance;
 pub mod rostercache;
+pub mod route;
 pub mod storage;
 pub mod stream;
 pub mod task;
+pub mod vault;
 
 pub use budget::Budget;
 pub use generate::{
@@ -35,8 +37,10 @@ pub use realize::{realize_region, Organism};
 pub use region::{GenerationStatus, RegionState};
 pub use resonance::{Resonance, ResonanceNode};
 pub use rostercache::{RosterCache, RosterEntry, RosterSnapshot};
-pub use storage::{Storage, StorageError};
+pub use route::{RouteRecorder, RouteTracker, MAX_ROUTE_NODES, ROUTE_SAMPLE_SPACING};
+pub use storage::{MemoryStorage, Storage, StorageError};
 pub use stream::{
     stability_for, CellEcology, FrameStats, LayerDiagnostic, RegionMap, StreamConfig,
 };
 pub use task::{InlineExecutor, TaskExecutor, TaskPriority};
+pub use vault::{apply_session_regions, MergeStats, Vault, VaultError, VaultStats};
