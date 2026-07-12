@@ -11,6 +11,7 @@
 
 use std::process::ExitCode;
 
+use tools::atlas::import_bundle_into;
 use tools::{check_bundle, decode_bundle, encode_bundle, FileStorage};
 use world_runtime::{Vault, VaultError};
 
@@ -31,6 +32,12 @@ fn run() -> Result<(), String> {
             let vault = open_vault(store_dir).map_err(|e| e.to_string())?;
             for issue in vault.issues() {
                 eprintln!("note: {issue}");
+            }
+            if vault.suppressed_issue_count() > 0 {
+                eprintln!(
+                    "note: {} additional issue report(s) suppressed",
+                    vault.suppressed_issue_count()
+                );
             }
             let bundle = vault.export();
             let counts = (
@@ -54,18 +61,27 @@ fn run() -> Result<(), String> {
                 std::fs::read(bundle_file).map_err(|e| format!("read {bundle_file}: {e}"))?;
             let (_, bundle) = decode_bundle(&bytes).map_err(|e| e.to_string())?;
             let mut vault = open_vault(store_dir).map_err(|e| e.to_string())?;
-            let stats = vault.import(&bundle);
-            let flush = vault.flush_all();
+            let report = import_bundle_into(&mut vault, &bundle).map_err(|e| e.to_string())?;
             for issue in vault.issues() {
                 eprintln!("note: {issue}");
+            }
+            if vault.suppressed_issue_count() > 0 {
+                eprintln!(
+                    "note: {} additional issue report(s) suppressed",
+                    vault.suppressed_issue_count()
+                );
             }
             println!(
                 "imported into {store_dir}: {} added, {} merged, {} unchanged, {} rejected \
                  ({} records written)",
-                stats.added, stats.merged, stats.unchanged, stats.rejected, flush.flushed
+                report.merge.added,
+                report.merge.merged,
+                report.merge.unchanged,
+                report.merge.rejected,
+                report.flush.flushed
             );
-            if stats.rejected > 0 {
-                return Err(format!("{} records rejected", stats.rejected));
+            if report.merge.rejected > 0 {
+                return Err(format!("{} records rejected", report.merge.rejected));
             }
             Ok(())
         }
@@ -121,6 +137,12 @@ fn run() -> Result<(), String> {
             }
             for issue in vault.issues() {
                 eprintln!("  issue: {issue}");
+            }
+            if vault.suppressed_issue_count() > 0 {
+                eprintln!(
+                    "  issue: {} additional report(s) suppressed",
+                    vault.suppressed_issue_count()
+                );
             }
             Ok(())
         }

@@ -59,8 +59,10 @@ fn a_recorded_route_persists_and_attracts_softly_within_its_corridor() {
 
     // Persist it and reopen — the record survives, difficulty is defined.
     let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-    let id = vault.record_route(nodes, discoveries, "trek".into());
-    vault.flush_all();
+    let id = vault
+        .record_route(nodes, discoveries, "trek".into())
+        .unwrap();
+    vault.flush_all().unwrap();
     let mut vault = Vault::open(vault.store().clone()).unwrap();
     let route = vault.routes()[&id].clone();
     let difficulty = world_core::route_difficulty(&route.nodes);

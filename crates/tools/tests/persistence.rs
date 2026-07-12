@@ -98,15 +98,17 @@ fn save_load_settle_matches_the_uninterrupted_run() {
         step(&mut before, frame, &field);
     }
     let mut vault = Vault::open(MemoryStorage::new()).expect("fresh store opens");
-    vault.snapshot_session(
-        &before,
-        pos(SAVE_FRAME),
-        pos(SAVE_FRAME - 1),
-        &bias_at(SAVE_FRAME),
-        false,
-        &anchors_at(SAVE_FRAME),
-    );
-    let stats = vault.flush_all();
+    vault
+        .snapshot_session(
+            &before,
+            pos(SAVE_FRAME),
+            pos(SAVE_FRAME - 1),
+            &bias_at(SAVE_FRAME),
+            false,
+            &anchors_at(SAVE_FRAME),
+        )
+        .unwrap();
+    let stats = vault.flush_all().unwrap();
     assert_eq!(stats.dirty, 0);
     let store = vault.store().clone();
     drop(before);
@@ -114,7 +116,7 @@ fn save_load_settle_matches_the_uninterrupted_run() {
 
     // A "fresh process": reopen the store, restore, settle, continue.
     let reopened = Vault::open(store).expect("store reopens");
-    assert!(reopened.issues().is_empty(), "{:?}", reopened.issues());
+    assert_eq!(reopened.issue_count(), 0);
     let snap = reopened.session().expect("session persisted").clone();
     assert_eq!(snap.player, pos(SAVE_FRAME));
 
@@ -159,14 +161,14 @@ fn crash_consistency_a_partial_flush_still_opens_clean() {
         for i in 0..4 {
             let mut a = anchor;
             a.world_pos.0 += f64::from(i) * 100.0;
-            vault.record_discovery(&a, 0, format!("d{i}"));
+            vault.record_discovery(&a, 0, format!("d{i}")).unwrap();
         }
         vault
     };
 
     // Count the total writes a full flush performs.
     let mut full = build_vault();
-    let total = full.flush_all().flushed;
+    let total = full.flush_all().unwrap().flushed;
 
     for cut in 0..total {
         let mut vault = build_vault();
@@ -175,12 +177,12 @@ fn crash_consistency_a_partial_flush_still_opens_clean() {
             max_persist_ops: cut,
             ..Budget::unlimited()
         };
-        vault.flush(&budget);
+        vault.flush(&budget).unwrap();
         let survivor = Vault::open(vault.store().clone()).expect("partial store opens");
         assert!(
-            survivor.issues().is_empty(),
+            survivor.issue_count() == 0,
             "cut {cut}: {:?}",
-            survivor.issues()
+            survivor.issues().collect::<Vec<_>>()
         );
         // Every record that made it is whole and valid.
         for record in survivor.discoveries().values() {

@@ -1513,11 +1513,31 @@ records are skipped and reported; a bad store header aborts opening. The store
 sequence heals upward to the maximum loaded record sequence.
 
 Mutations update the in-memory maps and insert a `DirtyKey` in $O(\log n)$.
-`flush` encodes and atomically writes at most `max_persist_ops` dirty keys in
-deterministic order, with metadata ordered after data so a crash can leave a
-repairable stale sequence rather than a dangling advanced one. Native storage
-uses a temporary sibling file followed by rename; tests use a `BTreeMap`-backed
-memory store.
+A budgeted `flush` returns structured progress or a typed storage-operation/key
+failure after at most `max_persist_ops` successful writes; exhausting that
+budget with dirty work remaining is ordinary backpressure. `flush_all` returns
+success only when the dirty set is empty. A dirty key is retired only after its
+backend operation succeeds, and deterministic data-before-metadata order means
+a failed record stays retryable without metadata overtaking it. Preserve and
+route deletion likewise commits in memory only after durable backend removal.
+Every valid added, merged, or unchanged import result contributes its resulting
+sequence to the live local maximum; when that maximum is higher, import raises
+the counter and dirties metadata immediately. Every valid sequence through
+`u64::MAX` remains accepted and shareable. The next local edit is strictly
+newer when representable; at exhaustion, discovery, preserve, route, and
+session authoring return a typed error before changing records, session state,
+metadata, or dirtiness. Issue telemetry is deduplicated under stable identities,
+capped at 64 retained entries, and accompanied by a saturating
+suppressed-report counter.
+
+Native storage durably creates missing ancestors, creates a collision-safe
+hidden temp sibling, writes and `sync_all`s the complete temp file, atomically
+renames it, and `sync_all`s the containing directory before reporting success.
+Removal, including a not-found retry after an unlink/sync failure, also crosses
+the containing or nearest-existing directory barrier. Tests use an immediate
+`BTreeMap`-backed memory store and a staged native file-operations seam. The
+trait deliberately remains synchronous; an asynchronous/lazy browser backend
+and its equivalent transaction durability boundary remain future work.
 
 The vault itself never owns generated tiles, rosters, organisms, or renderer
 data. Its logical size is
@@ -1726,11 +1746,17 @@ The repository uses several complementary checks:
   exact in-flight cancellation, session restore, tile/job preservation,
   organism re-realization, and successor recovery after resident or evicted
   deletion;
+* focused neutral vault failure injection for structured progress/error
+  outcomes, data-before-metadata retry order, commit-after-remove deletion,
+  bounded issue state, and immediate valid-result import sequence advancement;
+* native file-protocol tests for durable ancestor creation, temp-file write and
+  synchronization, atomic rename, directory synchronization, not-found delete
+  barriers, and every staged failure/retry boundary;
 * the Phase 3 ecology harness (run as an integration test) for diversity and
   trophic bounds;
 * `wer-anchor` for selective, coherent steering and resonance gating;
-* `wer-vault` for persistence, merge laws, preserves, routes, and save/load;
-  and
+* `wer-vault` for persistence, merge laws, preserves, routes, save/load, and an
+  explicit 70-retry failure/ordering/delete/import-sequence scenario; and
 * `wer-scale` for executor/budget/cancellation/amortization settled hashes,
   field-cache pressure, tiers, and additive realization density.
 
@@ -1776,11 +1802,16 @@ into one implementation unit.
    deletion, same-bucket normalization, cancellation, session restore, and
    eviction/reload recovery.
 
-3. **Make persistence failures explicit and durable** (finding 28). Propagate
-   delete and flush errors, report a save only when all dirty data is written,
-   advance sequence metadata during imports, bound repeated issue reporting,
-   and use file plus directory synchronization where power-loss durability is
-   claimed.
+3. **Completed: Make persistence failures explicit and durable**
+   ([Improvement A.3](plans/prototype/improvement_A_3_persistence_failures_durability.md);
+   finding 28). Flush and delete failures now carry structured operation, key,
+   progress, and retry information; explicit saves succeed only when clean,
+   valid import results contribute to and raise a lagging live sequence
+   immediately, with typed no-mutation exhaustion when no newer value is
+   representable, and retained diagnostics are deduplicated and capped. Native
+   writes and removals cross file and directory durability barriers, with
+   staged fault tests and the expanded vault harness covering retry order and
+   recovery.
 
 4. **Separate authoritative regional history from disposable field memory**
    (findings 4 and 5). Keep `RegionState` when evicting derived tiles and update
@@ -2341,8 +2372,8 @@ atomic batches and session restore, the native effective-owner deletion seam,
 end-to-end overlap and evicted-deletion tests, and the `wer-vault` sign-off
 scenario exercise these contracts. Separate UI calls remain distinct material
 history; only canonical synchronization batches reconcile once. Duplicate-
-coordinate canonicalization (finding 25) and durable delete failure handling
-(finding 28) remain open.
+coordinate canonicalization (finding 25) remains open; durable local delete
+failure handling is resolved by Improvement A.3 and finding 28.
 
 #### 27. Vault loading is eager and its interface is not browser-shaped
 
@@ -2355,20 +2386,43 @@ naturally to IndexedDB.
 Use asynchronous, paged namespace iteration and lazy indexes. Load seen chunks
 and route spatial partitions near the player rather than the whole store.
 
-#### 28. Persistence error and sequence handling need hardening
+#### 28. Resolved: Persistence failures and sequence handling are explicit and durable
 
-`remove_preserve` drops the in-memory record and ignores backend remove errors,
-so a failed delete can silently resurrect after reopen. Repeated flush failures
-append duplicate issue strings. The native shell can report a save even if
-dirty data remains. Imported high sequence values do not advance the local
-metadata counter until reopen, allowing imported mutable text to dominate
-subsequent local edits.
+**Status:** Resolved by
+[Improvement A.3](plans/prototype/improvement_A_3_persistence_failures_durability.md).
+
+Previously, `remove_preserve` dropped the in-memory record and ignored backend
+remove errors, so a failed delete could silently resurrect after reopen.
+Repeated flush failures appended duplicate issue strings. The native shell
+could report a save even if dirty data remained. Imported high sequence values
+did not advance the local metadata counter until reopen, allowing imported
+mutable text to dominate subsequent local edits.
 
 Return and surface delete/flush failures, bound retry reporting, treat a save as
 successful only when clean, and advance/dirtify local sequence metadata during
 import. Temp-write plus rename also lacks file and directory `fsync`, so it
 prevents ordinary torn writes but does not provide the strongest claimed
 power-loss durability.
+
+**Resolution (Improvement A.3):** Flush and delete callers now receive
+structured operation/key failures and progress, `flush_all` succeeds only when
+the vault is clean, and dirty data cannot be retired or overtaken by metadata
+after an error. Preserve and route deletion use commit-after-durable-remove, so
+a failed action leaves the record and its runtime contribution visible for a
+retry. Every valid resulting import record contributes to the live local
+sequence maximum; import raises and dirties it immediately when it lags. A
+valid `u64::MAX` record remains accepted/exportable/reimportable, while all four
+local authoring paths return typed exhaustion without partial mutation when no
+newer sequence is representable. Stable issue identities deduplicate into at
+most 64 retained diagnostics plus a suppressed counter. Native writes
+synchronize a complete temp file before atomic rename and then synchronize the
+containing directory; durable ancestor creation and remove/not-found retries
+use directory barriers as well. Neutral scripted-storage tests, staged native
+file-operation tests, caller regressions, and the expanded `wer-vault` scenario
+exercise the ordering, bounded-reporting, retry, deletion, and sequence
+contracts. This does not add CRDT tombstones or resolve findings 24/25, and the
+synchronous eager interface/browser backend limitation in finding 27 remains
+open.
 
 #### 29. Session exactness has narrower preconditions than its headline
 

@@ -300,6 +300,12 @@ fn main() -> ExitCode {
                     for issue in &v.issues {
                         println!("  issue       {issue}");
                     }
+                    if v.suppressed_issues > 0 {
+                        println!(
+                            "  issue       {} additional report(s) suppressed",
+                            v.suppressed_issues
+                        );
+                    }
                 }
             }
         }

@@ -23,7 +23,8 @@ use world_core::{
 };
 use world_runtime::{
     apply_session_regions, Budget, FrameStats, InlineExecutor, MemoryStorage, RegionMap,
-    RouteTracker, StreamConfig, Vault, CHANNEL_COUNT, CHANNEL_ELEVATION, CHANNEL_HARDNESS,
+    RouteTracker, Storage, StorageError, StreamConfig, Vault, CHANNEL_COUNT, CHANNEL_ELEVATION,
+    CHANNEL_HARDNESS,
 };
 
 use crate::replay::state_hash;
@@ -52,6 +53,44 @@ const MAX_VIOLATIONS: usize = 16;
 fn record(violations: &mut Vec<String>, message: String) {
     if violations.len() < MAX_VIOLATIONS {
         violations.push(message);
+    }
+}
+
+#[derive(Debug, Default)]
+struct FaultState {
+    inner: MemoryStorage,
+    fail_store: Option<Vec<u8>>,
+    fail_remove: bool,
+    stores: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FaultStorage(std::rc::Rc<std::cell::RefCell<FaultState>>);
+
+impl Storage for FaultStorage {
+    fn load(&self, key: &[u8]) -> Result<Vec<u8>, StorageError> {
+        self.0.borrow().inner.load(key)
+    }
+
+    fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let mut state = self.0.borrow_mut();
+        state.stores.push(key.to_vec());
+        if state.fail_store.as_deref() == Some(key) {
+            return Err(StorageError::Backend("harness store fault".into()));
+        }
+        state.inner.store(key, value)
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<(), StorageError> {
+        let mut state = self.0.borrow_mut();
+        if state.fail_remove {
+            return Err(StorageError::Backend("harness remove fault".into()));
+        }
+        state.inner.remove(key)
+    }
+
+    fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.0.borrow().inner.keys_with_prefix(prefix)
     }
 }
 
@@ -163,15 +202,17 @@ fn scenario_durable() -> VaultReport {
     let mut before = RegionMap::new(config());
     run(&mut before, 0, SAVE + 1);
     let mut vault = Vault::open(MemoryStorage::new()).expect("fresh store");
-    vault.snapshot_session(
-        &before,
-        script_pos(SAVE),
-        script_pos(SAVE - 1),
-        &script_bias(SAVE, FRAMES),
-        false,
-        &script_anchors(SAVE),
-    );
-    vault.flush_all();
+    vault
+        .snapshot_session(
+            &before,
+            script_pos(SAVE),
+            script_pos(SAVE - 1),
+            &script_bias(SAVE, FRAMES),
+            false,
+            &script_anchors(SAVE),
+        )
+        .expect("sequence available");
+    vault.flush_all().expect("memory store flush");
     let reopened = Vault::open(vault.store().clone()).expect("reopen");
     let snap = reopened.session().expect("session persisted").clone();
 
@@ -221,31 +262,38 @@ fn scenario_crash_consistency() -> VaultReport {
     let build = || {
         let mut vault = Vault::open(MemoryStorage::new()).unwrap();
         for i in 0..4 {
-            vault.record_discovery(
-                &discovery_anchor(f64::from(i) * 120.0, 0.7),
-                0,
-                format!("d{i}"),
-            );
+            vault
+                .record_discovery(
+                    &discovery_anchor(f64::from(i) * 120.0, 0.7),
+                    0,
+                    format!("d{i}"),
+                )
+                .expect("sequence available");
         }
         vault
     };
-    let total = build().flush_all().flushed;
+    let total = build().flush_all().expect("memory store flush").flushed;
     for cut in 0..total {
         let mut vault = build();
-        vault.flush(&Budget {
-            max_persist_ops: cut,
-            ..Budget::unlimited()
-        });
+        vault
+            .flush(&Budget {
+                max_persist_ops: cut,
+                ..Budget::unlimited()
+            })
+            .expect("memory store flush");
         match Vault::open(vault.store().clone()) {
             Err(e) => record(
                 &mut violations,
                 format!("cut {cut}: store failed to open: {e}"),
             ),
             Ok(survivor) => {
-                if !survivor.issues().is_empty() {
+                if survivor.issue_count() > 0 {
                     record(
                         &mut violations,
-                        format!("cut {cut}: issues {:?}", survivor.issues()),
+                        format!(
+                            "cut {cut}: issues {:?}",
+                            survivor.issues().collect::<Vec<_>>()
+                        ),
                     );
                 }
                 for r in survivor.discoveries().values() {
@@ -263,6 +311,119 @@ fn scenario_crash_consistency() -> VaultReport {
         name: "durable: a crash mid-flush never corrupts the store",
         violations,
         summary: format!("{total} crash points exercised"),
+    }
+}
+
+/// Contract hardening (ADR 0022): failures remain explicit/retryable, data
+/// precedes metadata, delete is commit-after-remove, diagnostics stay bounded,
+/// and import advances the live local sequence immediately.
+fn scenario_persistence_failures() -> VaultReport {
+    let mut violations = Vec::new();
+    let storage = FaultStorage::default();
+    let control = storage.clone();
+    let mut vault = Vault::open(storage).expect("fault store opens");
+    let id = vault
+        .record_discovery(&discovery_anchor(12.0, 0.7), 0, "fault".into())
+        .expect("sequence available");
+    let key = world_runtime::vault::discovery_key(id);
+    control.0.borrow_mut().fail_store = Some(key.clone());
+
+    for attempt in 1..=70 {
+        match vault.flush_all() {
+            Ok(stats) => record(
+                &mut violations,
+                format!("failure attempt {attempt} reported clean success: {stats:?}"),
+            ),
+            Err(error) => {
+                if error.progress().is_clean() || error.progress().dirty != 2 {
+                    record(
+                        &mut violations,
+                        format!("failure attempt {attempt} reported wrong dirtiness: {error}"),
+                    );
+                }
+            }
+        }
+    }
+    if control
+        .0
+        .borrow()
+        .stores
+        .iter()
+        .any(|stored| stored.as_slice() == world_runtime::vault::KEY_META)
+    {
+        record(
+            &mut violations,
+            "metadata overtook a failed discovery write".into(),
+        );
+    }
+    if vault.issue_count() != 1
+        || vault
+            .active_persistence_issue()
+            .is_none_or(|issue| issue.occurrences() != 70)
+    {
+        record(
+            &mut violations,
+            format!(
+                "repeated failure diagnostics were not bounded: {} retained",
+                vault.issue_count()
+            ),
+        );
+    }
+    control.0.borrow_mut().fail_store = None;
+    match vault.flush_all() {
+        Ok(stats) if stats.is_clean() && vault.active_persistence_issue().is_none() => {}
+        result => record(
+            &mut violations,
+            format!("store retry did not recover cleanly: {result:?}"),
+        ),
+    }
+
+    let signature = PossibilitySignature::of(world_core::PossibilityVector::neutral());
+    let preserve = vault
+        .record_preserve(
+            vec![(RegionCoord::new(5, 6), signature)],
+            "retry-delete".into(),
+        )
+        .expect("sequence available");
+    vault.flush_all().expect("fault disabled");
+    control.0.borrow_mut().fail_remove = true;
+    if vault.remove_preserve(preserve).is_ok() || !vault.preserves().contains_key(&preserve) {
+        record(
+            &mut violations,
+            "failed delete removed the logical preserve".into(),
+        );
+    }
+    control.0.borrow_mut().fail_remove = false;
+    if !matches!(vault.remove_preserve(preserve), Ok(true))
+        || vault.preserves().contains_key(&preserve)
+    {
+        record(
+            &mut violations,
+            "successful delete retry did not commit logical absence".into(),
+        );
+    }
+
+    let mut remote = Vault::open(MemoryStorage::new()).unwrap();
+    remote
+        .record_discovery(&discovery_anchor(800.0, 0.8), 1, "remote".into())
+        .expect("sequence available");
+    let mut bundle = remote.export();
+    bundle.discoveries[0].sequence = 500;
+    let stats = vault.import(&bundle);
+    let local = vault
+        .record_discovery(&discovery_anchor(1600.0, 0.8), 1, "local".into())
+        .expect("sequence available");
+    if stats.added != 1 || vault.discoveries()[&local].sequence <= 500 {
+        record(
+            &mut violations,
+            "post-import local edit was not strictly newer in the same process".into(),
+        );
+    }
+
+    VaultReport {
+        name: "durable: persistence failures are explicit and retry-safe",
+        violations,
+        summary: "70 retries, data/meta ordering, delete, and import sequence".into(),
     }
 }
 
@@ -294,29 +455,35 @@ fn scenario_sparse() -> VaultReport {
             script_pos(frame).1,
         ));
     }
-    vault.flush_all();
+    vault.flush_all().expect("memory store flush");
     let travel_only = vault.store().bytes();
 
     // A handful of actions.
     const ACTIONS: usize = 6;
     for i in 0..ACTIONS {
-        vault.record_discovery(
-            &discovery_anchor(f64::from(i as u32) * 200.0, 0.7),
-            0,
-            format!("d{i}"),
-        );
+        vault
+            .record_discovery(
+                &discovery_anchor(f64::from(i as u32) * 200.0, 0.7),
+                0,
+                format!("d{i}"),
+            )
+            .expect("sequence available");
     }
     let sig = PossibilitySignature::of(map.iter_active().next().unwrap().current);
-    vault.record_preserve(vec![(RegionCoord::new(0, 0), sig)], "glade".into());
-    vault.snapshot_session(
-        &map,
-        script_pos(FRAMES - 1),
-        script_pos(FRAMES - 2),
-        &[0.0; POSSIBILITY_DIMS],
-        false,
-        &[],
-    );
-    vault.flush_all();
+    vault
+        .record_preserve(vec![(RegionCoord::new(0, 0), sig)], "glade".into())
+        .expect("sequence available");
+    vault
+        .snapshot_session(
+            &map,
+            script_pos(FRAMES - 1),
+            script_pos(FRAMES - 2),
+            &[0.0; POSSIBILITY_DIMS],
+            false,
+            &[],
+        )
+        .expect("sequence available");
+    vault.flush_all().expect("memory store flush");
     let total = vault.store().bytes();
 
     // Namespace check + per-value size bound (a tile at 8×8 f32 alone would
@@ -374,13 +541,18 @@ fn scenario_shareable() -> VaultReport {
     let mut violations = Vec::new();
 
     let mut a = Vault::open(MemoryStorage::new()).unwrap();
-    a.record_discovery(&discovery_anchor(0.0, 0.8), 1, "shared".into());
-    a.record_discovery(&discovery_anchor(400.0, 0.6), 1, "only-a".into());
+    a.record_discovery(&discovery_anchor(0.0, 0.8), 1, "shared".into())
+        .expect("sequence available");
+    a.record_discovery(&discovery_anchor(400.0, 0.6), 1, "only-a".into())
+        .expect("sequence available");
     let mut b = Vault::open(MemoryStorage::new()).unwrap();
-    b.record_discovery(&discovery_anchor(0.0, 0.8), 2, "shared-renamed".into());
-    b.record_discovery(&discovery_anchor(800.0, 0.5), 1, "only-b".into());
+    b.record_discovery(&discovery_anchor(0.0, 0.8), 2, "shared-renamed".into())
+        .expect("sequence available");
+    b.record_discovery(&discovery_anchor(800.0, 0.5), 1, "only-b".into())
+        .expect("sequence available");
     let mut c = Vault::open(MemoryStorage::new()).unwrap();
-    c.record_discovery(&discovery_anchor(1200.0, 0.4), 1, "only-c".into());
+    c.record_discovery(&discovery_anchor(1200.0, 0.4), 1, "only-c".into())
+        .expect("sequence available");
     let (ea, eb, ec) = (a.export(), b.export(), c.export());
 
     let merged = |bundles: &[&world_core::AtlasBundle]| {
@@ -495,7 +667,9 @@ fn scenario_preserve() -> VaultReport {
 
     // Import into a fresh world.
     let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-    vault.record_preserve(vec![(target, sig)], "glade".into());
+    vault
+        .record_preserve(vec![(target, sig)], "glade".into())
+        .expect("sequence available");
     let bundle = vault.export();
     let mut fresh_vault = Vault::open(MemoryStorage::new()).unwrap();
     fresh_vault.import(&bundle);
@@ -521,7 +695,9 @@ fn scenario_preserve() -> VaultReport {
     // opposite orders must settle identically, and winner deletion must reveal
     // the retained successor with exactly one resident revision bump.
     let mut overlap_vault = Vault::open(MemoryStorage::new()).unwrap();
-    overlap_vault.record_preserve(vec![(target, sig)], "first".into());
+    overlap_vault
+        .record_preserve(vec![(target, sig)], "first".into())
+        .expect("sequence available");
     let mut alternate = sig;
     alternate.buckets[world_core::PossibilityDomain::Aesthetics.index()] =
         if alternate.buckets[world_core::PossibilityDomain::Aesthetics.index()] < 2048 {
@@ -529,7 +705,9 @@ fn scenario_preserve() -> VaultReport {
         } else {
             0
         };
-    overlap_vault.record_preserve(vec![(target, alternate)], "second".into());
+    overlap_vault
+        .record_preserve(vec![(target, alternate)], "second".into())
+        .expect("sequence available");
     let (&winner_id, winner) = overlap_vault.preserves().first_key_value().unwrap();
     let (&successor_id, successor) = overlap_vault.preserves().last_key_value().unwrap();
     let winner_sig = winner.regions[0].1;
@@ -674,7 +852,9 @@ fn scenario_precision() -> VaultReport {
 
     // Records: a fast-domain discovery and a route, persisted then reloaded.
     let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-    vault.record_discovery(&discovery_anchor(600.0, 0.9), 0, "pull".into());
+    vault
+        .record_discovery(&discovery_anchor(600.0, 0.9), 0, "pull".into())
+        .expect("sequence available");
     let mut sig = PossibilitySignature::of(world_core::PossibilityVector::neutral());
     sig.buckets[PossibilityDomain::Ecology.index()] = 3400;
     let nodes: Vec<RouteNode> = (0..5)
@@ -686,8 +866,10 @@ fn scenario_precision() -> VaultReport {
             anchor_sig: 0,
         })
         .collect();
-    vault.record_route(nodes, vec![], "corridor".into());
-    vault.flush_all();
+    vault
+        .record_route(nodes, vec![], "corridor".into())
+        .expect("sequence available");
+    vault.flush_all().expect("memory store flush");
     let vault = Vault::open(vault.store().clone()).unwrap();
 
     let mut map = RegionMap::new(config());
@@ -760,6 +942,7 @@ pub fn run_vault_harness() -> Vec<VaultReport> {
     vec![
         scenario_durable(),
         scenario_crash_consistency(),
+        scenario_persistence_failures(),
         scenario_sparse(),
         scenario_shareable(),
         scenario_preserve(),

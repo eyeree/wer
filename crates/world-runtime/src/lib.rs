@@ -49,4 +49,7 @@ pub use stream::{
 pub use task::{InlineExecutor, TaskExecutor, TaskPriority};
 pub use tier::{AdapterClass, ResourceTier, TierInputs};
 pub use timing::{Pass, PassTimings, PASS_COUNT};
-pub use vault::{apply_session_regions, MergeStats, Vault, VaultError, VaultStats};
+pub use vault::{
+    apply_session_regions, MergeStats, PersistenceOperation, Vault, VaultError, VaultFlushError,
+    VaultIssue, VaultPersistenceError, VaultSequenceError, VaultStats, MAX_VAULT_ISSUES,
+};

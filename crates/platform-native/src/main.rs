@@ -89,9 +89,9 @@ use world_core::{
 use world_runtime::{
     apply_session_regions, AdapterClass, Budget, FrameStats, GenerationStatus, RegionMap,
     ResourceTier, RouteRecorder, RouteTracker, Storage, StreamConfig, TierInputs, Vault,
-    VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
-    CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
-    CHANNEL_WETNESS,
+    VaultPersistenceError, VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY,
+    CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE,
+    CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
 use executor::LaneExecutor;
@@ -130,25 +130,69 @@ enum ViewMode {
 }
 
 /// Remove the runtime's effective preserve owner and only that record's
-/// contributions. `Err(id)` reports impossible runtime/vault drift without
-/// deleting an arbitrary covering record (ADR 0020).
+/// contributions. Errors distinguish impossible runtime/vault drift from a
+/// retryable persistence failure; neither deletes an arbitrary covering record
+/// or changes runtime ownership (ADR 0020, ADR 0022).
+#[derive(Debug)]
+enum PreserveRemovalError {
+    MissingVaultRecord(u64),
+    Persistence(VaultPersistenceError),
+}
+
 fn remove_effective_preserve<S: Storage>(
     map: &mut RegionMap,
     vault: &mut Vault<S>,
     coord: RegionCoord,
-) -> Result<Option<(u64, String)>, u64> {
+) -> Result<Option<(u64, String)>, PreserveRemovalError> {
     let Some((id, _)) = map.effective_preserve(coord) else {
         return Ok(None);
     };
     let Some(record) = vault.preserves().get(&id).cloned() else {
-        return Err(id);
+        return Err(PreserveRemovalError::MissingVaultRecord(id));
     };
-    let removed = vault.remove_preserve(id);
+    let removed = vault
+        .remove_preserve(id)
+        .map_err(PreserveRemovalError::Persistence)?;
     debug_assert!(removed, "record cloned from the vault must be removable");
     for (region, _) in record.regions {
         map.remove_preserve_contribution(id, region);
     }
     Ok(Some((id, record.name)))
+}
+
+#[derive(Debug)]
+struct RouteRemovalOutcome {
+    removed: usize,
+    total: usize,
+    error: Option<VaultPersistenceError>,
+}
+
+/// Remove routes in ascending id order, stopping at the first durability
+/// failure. Tracker state is retained exactly for records still in the vault.
+fn remove_routes<S: Storage>(
+    vault: &mut Vault<S>,
+    tracker: &mut RouteTracker,
+) -> RouteRemovalOutcome {
+    let ids: Vec<u64> = vault.routes().keys().copied().collect();
+    let total = ids.len();
+    let mut removed = 0;
+    let mut error = None;
+    for id in ids {
+        match vault.remove_route(id) {
+            Ok(true) => removed += 1,
+            Ok(false) => unreachable!("id came from the vault"),
+            Err(found) => {
+                error = Some(found);
+                break;
+            }
+        }
+    }
+    tracker.retain(|id| vault.routes().contains_key(&id));
+    RouteRemovalOutcome {
+        removed,
+        total,
+        error,
+    }
 }
 
 /// The world-simulation half of the app (everything that isn't winit/wgpu).
@@ -169,6 +213,9 @@ struct World {
     vault: Option<Vault<FileStorage>>,
     /// The last flush's counters, for the panel.
     vault_stats: VaultStats,
+    /// Whether the frame loop has already logged the active persistence
+    /// failure. Repeats remain visible through bounded HUD telemetry.
+    vault_failure_logged: bool,
     /// Live expedition recording (`J` starts/finishes; phase-5-plan.md §7.3).
     recorder: Option<RouteRecorder>,
     /// Traversal detection over the recorded routes (usage bumps, §7.4).
@@ -235,6 +282,7 @@ impl World {
             transition_mode: false,
             vault,
             vault_stats: VaultStats::default(),
+            vault_failure_logged: false,
             recorder: None,
             tracker: RouteTracker::new(),
             path_tracking: false,
@@ -310,7 +358,22 @@ impl World {
             }
             // Budgeted trickle of dirty records (§7.7); saves marked by `O`
             // and event-driven records drain here.
-            self.vault_stats = vault.flush(&self.budget);
+            match vault.flush(&self.budget) {
+                Ok(flush) => {
+                    self.vault_stats = flush;
+                    if self.vault_failure_logged && vault.active_persistence_issue().is_none() {
+                        log::info!("vault persistence recovered");
+                        self.vault_failure_logged = false;
+                    }
+                }
+                Err(error) => {
+                    self.vault_stats = error.progress();
+                    if error.persistence_error().occurrences() == 1 {
+                        log::warn!("vault persistence: {error}");
+                    }
+                    self.vault_failure_logged = true;
+                }
+            }
             stats.pass_ms[world_runtime::Pass::Flush.index()] +=
                 flush_start.elapsed().as_secs_f32() * 1000.0;
         }
@@ -342,12 +405,16 @@ impl World {
             log::warn!("no vault open; no recorded paths to clear");
             return;
         };
-        let ids: Vec<u64> = vault.routes().keys().copied().collect();
-        for &id in &ids {
-            vault.remove_route(id);
+        let outcome = remove_routes(vault, &mut self.tracker);
+        if let Some(error) = outcome.error {
+            log::warn!(
+                "route clear stopped after {}/{} durable removal(s): {error}",
+                outcome.removed,
+                outcome.total
+            );
+        } else {
+            log::info!("cleared {} recorded route(s)", outcome.removed);
         }
-        self.tracker.retain(|_| false);
-        log::info!("cleared {} recorded route(s)", ids.len());
     }
 
     /// The `J` key: start recording an expedition, or finish and persist it.
@@ -374,7 +441,13 @@ impl World {
                 let difficulty = world_core::route_difficulty(&nodes);
                 let name = format!("route-{}", vault.routes().len() + 1);
                 let count = nodes.len();
-                let id = vault.record_route(nodes, discoveries, name.clone());
+                let id = match vault.record_route(nodes, discoveries, name.clone()) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        log::warn!("route discarded: {error}");
+                        return;
+                    }
+                };
                 log::info!(
                     "recorded {name} ({id:#018x}): {count} nodes, difficulty {difficulty:.2}"
                 );
@@ -407,7 +480,13 @@ impl World {
             .cell_signature(coord, cx, cy)
             .map_or(0, |s| s.seed());
         let name = format!("discovery-{}", vault.discoveries().len() + 1);
-        let id = vault.record_discovery(&anchor, signature_seed, name.clone());
+        let id = match vault.record_discovery(&anchor, signature_seed, name.clone()) {
+            Ok(id) => id,
+            Err(error) => {
+                log::warn!("discovery not recorded: {error}");
+                return;
+            }
+        };
         // A discovery made mid-expedition joins the route's journal (§7.3).
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.attach_discovery(id);
@@ -459,10 +538,14 @@ impl World {
                 );
                 return;
             }
-            Err(id) => {
+            Err(PreserveRemovalError::MissingVaultRecord(id)) => {
                 log::warn!(
                     "runtime preserve owner {id:#018x} is absent from the vault; deletion skipped"
                 );
+                return;
+            }
+            Err(PreserveRemovalError::Persistence(error)) => {
+                log::warn!("preserve deletion failed; runtime state retained: {error}");
                 return;
             }
             Ok(None) => {}
@@ -480,7 +563,13 @@ impl World {
             return;
         }
         let name = format!("preserve-{}", vault.preserves().len() + 1);
-        let id = vault.record_preserve(regions.clone(), name.clone());
+        let id = match vault.record_preserve(regions.clone(), name.clone()) {
+            Ok(id) => id,
+            Err(error) => {
+                log::warn!("preserve not created: {error}");
+                return;
+            }
+        };
         let count = regions.len();
         self.map.apply_preserve_contributions(
             regions
@@ -519,22 +608,36 @@ impl World {
             log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
             return;
         };
-        vault.snapshot_session(
+        if let Err(error) = vault.snapshot_session(
             &self.map,
             self.player,
             self.last_player,
             &self.bias,
             self.transition_mode,
             &self.anchors,
-        );
-        let stats = vault.flush_all();
-        log::info!(
-            "session saved: {} records, {} bytes ({} regions, {} anchors)",
-            stats.flushed,
-            stats.bytes,
-            self.map.len(),
-            self.anchors.len()
-        );
+        ) {
+            log::warn!("session save rejected before persistence: {error}");
+            return;
+        }
+        match vault.flush_all() {
+            Ok(stats) => {
+                debug_assert!(stats.is_clean());
+                self.vault_stats = stats;
+                self.vault_failure_logged = false;
+                log::info!(
+                    "session saved: {} records, {} bytes ({} regions, {} anchors)",
+                    stats.flushed,
+                    stats.bytes,
+                    self.map.len(),
+                    self.anchors.len()
+                );
+            }
+            Err(error) => {
+                self.vault_stats = error.progress();
+                self.vault_failure_logged = true;
+                log::warn!("session save failed; dirty records remain retryable: {error}");
+            }
+        }
     }
 
     /// Restore the saved session (the `L` key): rebuild the streaming window
@@ -1283,7 +1386,11 @@ impl App {
                 records: v.discoveries().len() + v.routes().len() + v.preserves().len(),
                 dirty: v.dirty_records(),
                 seen: v.seen_count(),
-                issues: v.issues().len(),
+                issues: v.issue_count(),
+                suppressed_issues: v.suppressed_issue_count(),
+                persistence_retries: v
+                    .active_persistence_issue()
+                    .map_or(0, world_runtime::VaultIssue::occurrences),
             }),
             zoom: self.zoom,
             cursor,
@@ -1970,7 +2077,54 @@ fn main() {
 #[cfg(test)]
 mod preserve_lifecycle_tests {
     use super::*;
-    use world_runtime::MemoryStorage;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use world_runtime::{MemoryStorage, StorageError};
+
+    #[derive(Debug, Clone)]
+    struct FailingRemoveStorage {
+        inner: MemoryStorage,
+        fail_remove_at: Rc<Cell<Option<usize>>>,
+        remove_calls: Rc<Cell<usize>>,
+    }
+
+    impl FailingRemoveStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStorage::new(),
+                fail_remove_at: Rc::new(Cell::new(None)),
+                remove_calls: Rc::new(Cell::new(0)),
+            }
+        }
+
+        fn fail_remove_call(&self, index: usize) {
+            self.fail_remove_at.set(Some(index));
+        }
+    }
+
+    impl Storage for FailingRemoveStorage {
+        fn load(&self, key: &[u8]) -> Result<Vec<u8>, StorageError> {
+            self.inner.load(key)
+        }
+
+        fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.inner.store(key, value)
+        }
+
+        fn remove(&mut self, key: &[u8]) -> Result<(), StorageError> {
+            let call = self.remove_calls.get();
+            self.remove_calls.set(call + 1);
+            if self.fail_remove_at.get() == Some(call) {
+                self.fail_remove_at.set(None);
+                return Err(StorageError::Backend("native remove fault".into()));
+            }
+            self.inner.remove(key)
+        }
+
+        fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
+            self.inner.keys_with_prefix(prefix)
+        }
+    }
 
     #[test]
     fn native_deletion_removes_effective_owner_and_reveals_successor() {
@@ -1979,8 +2133,12 @@ mod preserve_lifecycle_tests {
         let mut second = first;
         second.buckets[PossibilityDomain::Aesthetics.index()] = 4000;
         let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-        vault.record_preserve(vec![(coord, first)], "first".into());
-        vault.record_preserve(vec![(coord, second)], "second".into());
+        vault
+            .record_preserve(vec![(coord, first)], "first".into())
+            .unwrap();
+        vault
+            .record_preserve(vec![(coord, second)], "second".into())
+            .unwrap();
         let (&winner_id, winner) = vault.preserves().first_key_value().unwrap();
         let winner_name = winner.name.clone();
         let winner_signature = winner.regions[0].1;
@@ -2006,13 +2164,107 @@ mod preserve_lifecycle_tests {
         );
 
         assert_eq!(
-            remove_effective_preserve(&mut map, &mut vault, coord),
-            Ok(Some((winner_id, winner_name)))
+            remove_effective_preserve(&mut map, &mut vault, coord).unwrap(),
+            Some((winner_id, winner_name))
         );
         assert!(!vault.preserves().contains_key(&winner_id));
         assert_eq!(
             map.effective_preserve(coord),
             Some((successor_id, successor_signature))
+        );
+    }
+
+    #[test]
+    fn failed_native_preserve_delete_keeps_vault_and_map_until_retry() {
+        let coord = RegionCoord::new(0, 0);
+        let first = PossibilitySignature::of(world_core::PossibilityVector::neutral());
+        let mut second = first;
+        second.buckets[PossibilityDomain::Aesthetics.index()] = 4000;
+        let storage = FailingRemoveStorage::new();
+        let control = storage.clone();
+        let mut vault = Vault::open(storage).unwrap();
+        vault
+            .record_preserve(vec![(coord, first)], "first".into())
+            .unwrap();
+        vault
+            .record_preserve(vec![(coord, second)], "second".into())
+            .unwrap();
+        vault.flush_all().unwrap();
+        let (&winner_id, winner) = vault.preserves().first_key_value().unwrap();
+        let winner_signature = winner.regions[0].1;
+        let (&successor_id, successor) = vault.preserves().last_key_value().unwrap();
+        let successor_signature = successor.regions[0].1;
+        let mut map = RegionMap::new(StreamConfig::default());
+        map.apply_preserve_contributions(vault.preserves().iter().flat_map(|(&id, preserve)| {
+            preserve
+                .regions
+                .iter()
+                .map(move |&(region, signature)| (id, region, signature))
+        }));
+
+        control.fail_remove_call(0);
+        assert!(matches!(
+            remove_effective_preserve(&mut map, &mut vault, coord),
+            Err(PreserveRemovalError::Persistence(_))
+        ));
+        assert!(vault.preserves().contains_key(&winner_id));
+        assert_eq!(
+            map.effective_preserve(coord),
+            Some((winner_id, winner_signature))
+        );
+
+        assert!(remove_effective_preserve(&mut map, &mut vault, coord)
+            .unwrap()
+            .is_some());
+        assert!(!vault.preserves().contains_key(&winner_id));
+        assert_eq!(
+            map.effective_preserve(coord),
+            Some((successor_id, successor_signature))
+        );
+    }
+
+    #[test]
+    fn route_clear_failure_retains_failed_and_unvisited_routes_and_tracking() {
+        let storage = FailingRemoveStorage::new();
+        let control = storage.clone();
+        let mut vault = Vault::open(storage).unwrap();
+        for marker in 0..3 {
+            vault
+                .record_route(
+                    vec![world_core::RouteNode {
+                        pos_q: (0, 0),
+                        signature: PossibilitySignature::of(
+                            world_core::PossibilityVector::neutral(),
+                        ),
+                        cost_q: marker,
+                        stability_q: 0,
+                        anchor_sig: u64::from(marker),
+                    }],
+                    vec![],
+                    format!("route-{marker}"),
+                )
+                .unwrap();
+        }
+        vault.flush_all().unwrap();
+        let ids: Vec<u64> = vault.routes().keys().copied().collect();
+        let mut tracker = RouteTracker::new();
+        assert!(tracker
+            .observe(vault.routes().values(), (0.0, 0.0))
+            .is_empty());
+
+        control.fail_remove_call(1);
+        let outcome = remove_routes(&mut vault, &mut tracker);
+        assert_eq!((outcome.removed, outcome.total), (1, 3));
+        assert!(outcome.error.is_some());
+        assert!(!vault.routes().contains_key(&ids[0]));
+        assert!(vault.routes().contains_key(&ids[1]));
+        assert!(vault.routes().contains_key(&ids[2]));
+
+        let completed = tracker.observe(vault.routes().values(), (10_000.0, 10_000.0));
+        assert_eq!(
+            completed,
+            ids[1..],
+            "tracking survives for every retained route"
         );
     }
 }

@@ -5,7 +5,8 @@
 //! preserves, modified terrain, ...) through this trait, which native and web
 //! platforms implement over their respective backends. The interface is
 //! key/value and byte-oriented so it maps onto both a file tree and a browser
-//! object store, and callers must treat it as potentially asynchronous.
+//! object store. The current interface is synchronous; a successful mutation
+//! means that the backend has crossed its documented durability boundary.
 
 use core::fmt;
 
@@ -33,17 +34,22 @@ impl core::error::Error for StorageError {}
 ///
 /// Keys are opaque byte strings (callers namespace them, e.g. `disc/…`,
 /// `route/…` — see `vault`). Implementations must be safe for partial loading
-/// and must not assume the whole store fits in memory. Each `store` call must
-/// be atomic: after a crash the key holds either its old or its new value,
-/// never a torn write (phase-5-plan.md §7.7).
+/// and must not assume the whole store fits in memory. Each successful
+/// `store` call must be atomic and durable according to the backend: after a
+/// crash the key holds either its old or its new value, never a torn write,
+/// and the backend has completed the barrier required to retain that choice.
+/// A successful `remove` likewise means that absence has crossed the
+/// backend's durability boundary (ADR 0022).
 pub trait Storage {
     /// Read the bytes stored at `key`, or [`StorageError::NotFound`].
     fn load(&self, key: &[u8]) -> Result<Vec<u8>, StorageError>;
 
-    /// Write `value` at `key`, overwriting any existing entry.
+    /// Write `value` at `key`, overwriting any existing entry. `Ok(())` is
+    /// returned only after the backend's atomic durability boundary completes.
     fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError>;
 
-    /// Remove `key`. Removing a missing key is not an error.
+    /// Remove `key`. Removing a missing key is not an error, but `Ok(())`
+    /// still requires the backend's absence durability boundary to complete.
     fn remove(&mut self, key: &[u8]) -> Result<(), StorageError>;
 
     /// Every stored key that starts with `prefix`, in ascending byte order —

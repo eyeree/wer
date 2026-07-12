@@ -207,7 +207,9 @@ fn an_imported_preserve_realizes_identical_tiles_in_a_fresh_world() {
     }
     let sig = PossibilitySignature::of(map_a.get(target).expect("resident").current);
     let mut vault_a = Vault::open(MemoryStorage::new()).unwrap();
-    let id = vault_a.record_preserve(vec![(target, sig)], "glade".into());
+    let id = vault_a
+        .record_preserve(vec![(target, sig)], "glade".into())
+        .unwrap();
     map_a.apply_preserve_contribution(id, target, sig);
     for _ in 0..2 {
         settle(&mut map_a, (128.0, 128.0), 0.0, &[]);
@@ -248,8 +250,12 @@ fn overlap_order_winner_recovery_and_evicted_deletion_are_deterministic() {
     // Use real content-derived ids. Which signature receives the lower id is
     // intentionally not assumed; the ordered vault map defines the oracle.
     let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-    let first = vault.record_preserve(vec![(target, neutral)], "neutral".into());
-    let second = vault.record_preserve(vec![(target, alternate)], "alternate".into());
+    let first = vault
+        .record_preserve(vec![(target, neutral)], "neutral".into())
+        .unwrap();
+    let second = vault
+        .record_preserve(vec![(target, alternate)], "alternate".into())
+        .unwrap();
     assert_ne!(first, second);
     let (&low_id, low_record) = vault.preserves().first_key_value().unwrap();
     let (&high_id, high_record) = vault.preserves().last_key_value().unwrap();

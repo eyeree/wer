@@ -8,6 +8,29 @@ use world_core::{
     decode_record, encode_record, AtlasBundle, Envelope, PossibilitySignature, PreserveRecord,
     RecordError, RecordKind, RegionCoord, RECORD_FORMAT_VERSION, WORLD_ALGORITHM_VERSION,
 };
+use world_runtime::{MergeStats, Storage, Vault, VaultFlushError, VaultStats};
+
+/// A bundle merge whose accepted records have reached the backend durability
+/// boundary and left the vault clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtlasImportReport {
+    /// Per-record merge outcomes.
+    pub merge: MergeStats,
+    /// Durable writes performed by the explicit drain.
+    pub flush: VaultStats,
+}
+
+/// Merge and durably drain one bundle. No caller may emit an import-success
+/// summary until this returns `Ok` (ADR 0022).
+pub fn import_bundle_into<S: Storage>(
+    vault: &mut Vault<S>,
+    bundle: &AtlasBundle,
+) -> Result<AtlasImportReport, VaultFlushError> {
+    let merge = vault.import(bundle);
+    let flush = vault.flush_all()?;
+    debug_assert!(flush.is_clean());
+    Ok(AtlasImportReport { merge, flush })
+}
 
 /// Encode a bundle for the wire/file (canonical form: records sorted by id).
 #[must_use]
@@ -131,6 +154,8 @@ pub struct VaultPositionReport {
     pub seen_here: bool,
     /// Non-fatal problems the vault reported on open.
     pub issues: Vec<String>,
+    /// Additional issue identities omitted/displaced at the registry cap.
+    pub suppressed_issues: u64,
 }
 
 /// Select the lowest-id covering record and the last signature that record
@@ -199,7 +224,8 @@ pub fn inspect_vault(store_dir: &str, x: f64, y: f64) -> Result<VaultPositionRep
         nearby_discoveries,
         nearby_route_nodes,
         seen_here: vault.is_seen(region),
-        issues: vault.issues().to_vec(),
+        issues: vault.issues().map(ToString::to_string).collect(),
+        suppressed_issues: vault.suppressed_issue_count(),
     })
 }
 
@@ -243,6 +269,7 @@ mod tests {
         bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, DiscoveryRecord,
         PossibilityDomain, PossibilityVector,
     };
+    use world_runtime::{MemoryStorage, StorageError};
 
     fn bundle_with_one_discovery() -> AtlasBundle {
         let mask = domain_mask(&[PossibilityDomain::Ecology]);
@@ -297,6 +324,44 @@ mod tests {
         assert_eq!(
             effective_covering_preserve(&preserves, coord),
             Some((id, "duplicate".into(), last))
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingStore(MemoryStorage);
+
+    impl Storage for FailingStore {
+        fn load(&self, key: &[u8]) -> Result<Vec<u8>, StorageError> {
+            self.0.load(key)
+        }
+
+        fn store(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), StorageError> {
+            Err(StorageError::Backend("atlas flush fault".into()))
+        }
+
+        fn remove(&mut self, key: &[u8]) -> Result<(), StorageError> {
+            self.0.remove(key)
+        }
+
+        fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
+            self.0.keys_with_prefix(prefix)
+        }
+    }
+
+    #[test]
+    fn import_report_is_not_available_before_durable_flush_succeeds() {
+        let mut vault = Vault::open(FailingStore::default()).unwrap();
+        let error = import_bundle_into(&mut vault, &bundle_with_one_discovery()).unwrap_err();
+        assert_eq!(error.progress().flushed, 0);
+        assert_eq!(
+            error.progress().dirty,
+            2,
+            "record and metadata remain retryable"
+        );
+        assert_eq!(
+            vault.discoveries().len(),
+            1,
+            "accepted import remains visible"
         );
     }
 }

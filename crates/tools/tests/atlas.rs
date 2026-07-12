@@ -41,9 +41,13 @@ fn a_bundle_exported_from_one_store_steers_another_identically() {
 
     // Explorer A records two discoveries and exports a bundle file.
     let mut vault_a = Vault::open(FileStorage::open(&root_a).unwrap()).unwrap();
-    let id_1 = vault_a.record_discovery(&capture_like_anchor(100.0, 0.8), 0xAB, "one".into());
-    let id_2 = vault_a.record_discovery(&capture_like_anchor(900.0, 0.6), 0xCD, "two".into());
-    vault_a.flush_all();
+    let id_1 = vault_a
+        .record_discovery(&capture_like_anchor(100.0, 0.8), 0xAB, "one".into())
+        .unwrap();
+    let id_2 = vault_a
+        .record_discovery(&capture_like_anchor(900.0, 0.6), 0xCD, "two".into())
+        .unwrap();
+    vault_a.flush_all().unwrap();
     let bundle_bytes = encode_bundle(vault_a.export());
     let bundle_path = temp_store("bundle").with_extension("bundle");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
@@ -60,7 +64,7 @@ fn a_bundle_exported_from_one_store_steers_another_identically() {
     let stats = vault_b.import(&bundle);
     assert_eq!(stats.added, 2);
     assert_eq!(stats.rejected, 0);
-    vault_b.flush_all();
+    vault_b.flush_all().unwrap();
     let vault_b = Vault::open(FileStorage::open(&root_b).unwrap()).unwrap();
 
     // Shared steering is identical: the anchors B reconstructs steer the same

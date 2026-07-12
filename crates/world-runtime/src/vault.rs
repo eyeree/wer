@@ -5,10 +5,10 @@
 //! world state — it holds loaded record indexes, a dirty-record queue, and the
 //! store-local sequence counter, and it orchestrates encode/decode through the
 //! `world-core` record codec (ADR 0013). Persistence obeys temporal budgeting
-//! like every other subsystem: mutating actions mark records dirty in O(1),
-//! and [`Vault::flush`] writes at most `Budget::max_persist_ops` records per
-//! call, each key atomically (the `Storage` contract), so a crash mid-flush
-//! loses at most un-flushed dirtiness and never corrupts a record.
+//! like every other subsystem: mutating actions insert ordered dirty keys, and
+//! [`Vault::flush`] durably writes at most `Budget::max_persist_ops` records
+//! per call. Each key retires only after backend success, data precedes
+//! metadata, and failures return structured retryable state (ADR 0022).
 //!
 //! What the vault stores is *deviations only* (ADR 0014): quantized intents
 //! and identities — never tiles, organisms, or geometry. The key namespace
@@ -44,7 +44,191 @@ pub const KEY_META: &[u8] = b"meta/store";
 /// The session-snapshot key (overwritten in place).
 pub const KEY_SESSION: &[u8] = b"session/current";
 
-/// Errors opening or flushing a vault. Per-record decode problems during open
+/// Maximum number of nonfatal/active issue entries retained by a vault.
+pub const MAX_VAULT_ISSUES: usize = 64;
+
+/// The storage mutation which failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceOperation {
+    /// A key/value write.
+    Store,
+    /// A key removal (or durable confirmation of absence).
+    Remove,
+}
+
+/// The store-local sequence counter has no strictly newer `u64` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct VaultSequenceError {
+    last_sequence: u64,
+}
+
+impl VaultSequenceError {
+    /// The exhausted counter value (currently always [`u64::MAX`]).
+    #[must_use]
+    pub const fn last_sequence(&self) -> u64 {
+        self.last_sequence
+    }
+}
+
+impl core::fmt::Display for VaultSequenceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "vault sequence exhausted at {}; no strictly newer local edit is representable",
+            self.last_sequence
+        )
+    }
+}
+
+impl core::error::Error for VaultSequenceError {}
+
+impl core::fmt::Display for PersistenceOperation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Store => f.write_str("store"),
+            Self::Remove => f.write_str("remove"),
+        }
+    }
+}
+
+/// A structured, retryable vault persistence failure (ADR 0022).
+#[derive(Debug)]
+#[must_use]
+pub struct VaultPersistenceError {
+    operation: PersistenceOperation,
+    key: Vec<u8>,
+    source: StorageError,
+    occurrences: u64,
+}
+
+impl VaultPersistenceError {
+    /// The mutation attempted by the vault.
+    #[must_use]
+    pub const fn operation(&self) -> PersistenceOperation {
+        self.operation
+    }
+
+    /// The exact storage key involved in the failure.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// The backend failure.
+    #[must_use]
+    pub const fn source_error(&self) -> &StorageError {
+        &self.source
+    }
+
+    /// Consecutive reports for this active operation/key.
+    #[must_use]
+    pub const fn occurrences(&self) -> u64 {
+        self.occurrences
+    }
+}
+
+impl core::fmt::Display for VaultPersistenceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "vault {} of {} failed: {} (occurrence {})",
+            self.operation,
+            String::from_utf8_lossy(&self.key),
+            self.source,
+            self.occurrences
+        )
+    }
+}
+
+impl core::error::Error for VaultPersistenceError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A failed budgeted flush together with the progress made before it stopped.
+#[derive(Debug)]
+#[must_use]
+pub struct VaultFlushError {
+    progress: VaultStats,
+    error: VaultPersistenceError,
+}
+
+impl VaultFlushError {
+    /// Successful work and remaining dirtiness at the failure boundary.
+    #[must_use]
+    pub const fn progress(&self) -> VaultStats {
+        self.progress
+    }
+
+    /// The first backend failure.
+    #[must_use = "the persistence failure carries operation and key context"]
+    pub const fn persistence_error(&self) -> &VaultPersistenceError {
+        &self.error
+    }
+
+    fn into_parts(self) -> (VaultStats, VaultPersistenceError) {
+        (self.progress, self.error)
+    }
+}
+
+impl core::fmt::Display for VaultFlushError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} after flushing {} record(s) / {} byte(s); {} record(s) remain dirty",
+            self.error, self.progress.flushed, self.progress.bytes, self.progress.dirty
+        )
+    }
+}
+
+impl core::error::Error for VaultFlushError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// One retained, deduplicated nonfatal or active persistence diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultIssue {
+    message: String,
+    occurrences: u64,
+    identity: IssueIdentity,
+}
+
+impl VaultIssue {
+    /// Human-readable diagnostic text.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Number of reports deduplicated into this entry.
+    #[must_use]
+    pub const fn occurrences(&self) -> u64 {
+        self.occurrences
+    }
+}
+
+impl core::fmt::Display for VaultIssue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.message)?;
+        if self.occurrences > 1 {
+            write!(f, " (repeated {} times)", self.occurrences)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IssueIdentity {
+    Stored(Vec<u8>),
+    Import(RecordKind, u64),
+    Persistence(PersistenceOperation, Vec<u8>),
+}
+
+/// Errors opening a vault. Per-record decode problems during open
 /// are *not* errors — they are skipped and reported as [`Vault::issues`]
 /// (reject the record, never the store) — but an unreadable or future-format
 /// store header refuses to open rather than risk corrupting it.
@@ -112,6 +296,14 @@ pub struct VaultStats {
     pub dirty: usize,
 }
 
+impl VaultStats {
+    /// Whether no queued mutation remains.
+    #[must_use]
+    pub const fn is_clean(self) -> bool {
+        self.dirty == 0
+    }
+}
+
 /// The persistence orchestrator (phase-5-plan.md §5.2). Generic over
 /// [`Storage`], so harnesses use `MemoryStorage` and the native shell a file
 /// tree. See the module docs for the namespace and budgeting contract.
@@ -127,10 +319,100 @@ pub struct Vault<S: Storage> {
     dirty: BTreeSet<DirtyKey>,
     /// Non-fatal problems found while opening (skipped records, world-version
     /// mismatches) — surfaced by the panel and `wer-atlas check`.
-    issues: Vec<String>,
+    issues: Vec<VaultIssue>,
+    suppressed_issues: u64,
 }
 
 impl<S: Storage> Vault<S> {
+    fn record_issue(&mut self, identity: IssueIdentity, message: String) {
+        if let Some(issue) = self
+            .issues
+            .iter_mut()
+            .find(|issue| issue.identity == identity)
+        {
+            issue.occurrences = issue.occurrences.saturating_add(1);
+            issue.message = message;
+            return;
+        }
+        if self.issues.len() == MAX_VAULT_ISSUES {
+            self.suppressed_issues = self.suppressed_issues.saturating_add(1);
+            return;
+        }
+        self.issues.push(VaultIssue {
+            message,
+            occurrences: 1,
+            identity,
+        });
+    }
+
+    fn record_persistence_failure(
+        &mut self,
+        operation: PersistenceOperation,
+        key: Vec<u8>,
+        source: StorageError,
+    ) -> VaultPersistenceError {
+        let identity = IssueIdentity::Persistence(operation, key.clone());
+        if let Some(index) = self
+            .issues
+            .iter()
+            .position(|issue| matches!(issue.identity, IssueIdentity::Persistence(_, _)))
+        {
+            if self.issues[index].identity == identity {
+                let issue = &mut self.issues[index];
+                issue.occurrences = issue.occurrences.saturating_add(1);
+                issue.message = format!(
+                    "vault {operation} of {} failed: {source}",
+                    String::from_utf8_lossy(&key)
+                );
+                return VaultPersistenceError {
+                    operation,
+                    key,
+                    source,
+                    occurrences: issue.occurrences,
+                };
+            }
+            self.issues.remove(index);
+        }
+
+        let message = format!(
+            "vault {operation} of {} failed: {source}",
+            String::from_utf8_lossy(&key)
+        );
+        let issue = VaultIssue {
+            message,
+            occurrences: 1,
+            identity,
+        };
+        if self.issues.len() == MAX_VAULT_ISSUES {
+            // Persistence must always remain visible. With no previous active
+            // entry, every retained entry is nonfatal; replace the newest.
+            self.issues[MAX_VAULT_ISSUES - 1] = issue;
+            self.suppressed_issues = self.suppressed_issues.saturating_add(1);
+        } else {
+            self.issues.push(issue);
+        }
+        VaultPersistenceError {
+            operation,
+            key,
+            source,
+            occurrences: 1,
+        }
+    }
+
+    fn clear_persistence_issue(&mut self, operation: PersistenceOperation, key: &[u8]) -> bool {
+        let Some(index) = self.issues.iter().position(|issue| {
+            matches!(
+                &issue.identity,
+                IssueIdentity::Persistence(found_operation, found_key)
+                    if *found_operation == operation && found_key == key
+            )
+        }) else {
+            return false;
+        };
+        self.issues.remove(index);
+        true
+    }
+
     /// Open a store: read the header (refusing a future format), load every
     /// record, skip-and-report anything corrupt, and heal the sequence
     /// counter. A missing header means a fresh store.
@@ -145,6 +427,7 @@ impl<S: Storage> Vault<S> {
             seen: BTreeMap::new(),
             dirty: BTreeSet::new(),
             issues: Vec::new(),
+            suppressed_issues: 0,
         };
 
         match vault.store.load(KEY_META) {
@@ -153,7 +436,7 @@ impl<S: Storage> Vault<S> {
                     decode_record(&bytes, RecordKind::Meta).map_err(VaultError::Meta)?;
                 vault.meta = meta;
                 if envelope.world_version != WORLD_ALGORITHM_VERSION {
-                    vault.issues.push(format!(
+                    vault.record_issue(IssueIdentity::Stored(KEY_META.to_vec()), format!(
                         "store was written under world algorithm v{} (this build is v{}): \
                          records keep their meaning, but the same buckets realize a different world",
                         envelope.world_version, WORLD_ALGORITHM_VERSION
@@ -167,7 +450,10 @@ impl<S: Storage> Vault<S> {
         match vault.store.load(KEY_SESSION) {
             Ok(bytes) => match decode_record::<SessionSnapshot>(&bytes, RecordKind::Session) {
                 Ok((_, snap)) => vault.session = Some(snap),
-                Err(e) => vault.issues.push(format!("session snapshot skipped: {e}")),
+                Err(e) => vault.record_issue(
+                    IssueIdentity::Stored(KEY_SESSION.to_vec()),
+                    format!("session snapshot skipped: {e}"),
+                ),
             },
             Err(StorageError::NotFound) => {}
             Err(e) => return Err(e.into()),
@@ -233,10 +519,16 @@ impl<S: Storage> Vault<S> {
             match decode_record::<T>(&bytes, kind) {
                 Ok((_, record)) => {
                     if let Err(why) = insert(self, record) {
-                        self.issues.push(format!("{display_key} skipped: {why}"));
+                        self.record_issue(
+                            IssueIdentity::Stored(key.clone()),
+                            format!("{display_key} skipped: {why}"),
+                        );
                     }
                 }
-                Err(e) => self.issues.push(format!("{display_key} skipped: {e}")),
+                Err(e) => self.record_issue(
+                    IssueIdentity::Stored(key),
+                    format!("{display_key} skipped: {e}"),
+                ),
             }
         }
         Ok(())
@@ -252,8 +544,31 @@ impl<S: Storage> Vault<S> {
     /// Non-fatal problems found while opening.
     #[inline]
     #[must_use]
-    pub fn issues(&self) -> &[String] {
-        &self.issues
+    pub fn issues(&self) -> impl ExactSizeIterator<Item = &VaultIssue> {
+        self.issues.iter()
+    }
+
+    /// Number of retained diagnostics.
+    #[inline]
+    #[must_use]
+    pub fn issue_count(&self) -> usize {
+        self.issues.len()
+    }
+
+    /// Number of new diagnostic identities displaced or omitted at the cap.
+    #[inline]
+    #[must_use]
+    pub const fn suppressed_issue_count(&self) -> u64 {
+        self.suppressed_issues
+    }
+
+    /// The one active persistence diagnostic, if a retryable mutation is
+    /// currently failing.
+    #[must_use]
+    pub fn active_persistence_issue(&self) -> Option<&VaultIssue> {
+        self.issues
+            .iter()
+            .find(|issue| matches!(issue.identity, IssueIdentity::Persistence(_, _)))
     }
 
     /// Records currently waiting to be flushed.
@@ -306,18 +621,30 @@ impl<S: Storage> Vault<S> {
     }
 
     /// Hand out the next store sequence number.
-    fn next_sequence(&mut self) -> u64 {
-        self.meta.sequence += 1;
+    fn next_sequence(&mut self) -> Result<u64, VaultSequenceError> {
+        let Some(next) = self.meta.sequence.checked_add(1) else {
+            return Err(VaultSequenceError {
+                last_sequence: self.meta.sequence,
+            });
+        };
+        self.meta.sequence = next;
         self.dirty.insert(DirtyKey::Meta);
-        self.meta.sequence
+        Ok(self.meta.sequence)
     }
 
     /// Persist a captured anchor as a named discovery (phase-5-plan.md §7.1):
     /// quantized at this boundary (ADR 0013), content-id keyed (ADR 0014).
     /// Re-recording an identical capture merges into the existing record
-    /// instead of duplicating. Returns the record id.
-    pub fn record_discovery(&mut self, anchor: &Anchor, signature_seed: u64, name: String) -> u64 {
-        let sequence = self.next_sequence();
+    /// instead of duplicating. Returns the record id, or
+    /// [`VaultSequenceError`] before mutation when the local counter is
+    /// exhausted.
+    pub fn record_discovery(
+        &mut self,
+        anchor: &Anchor,
+        signature_seed: u64,
+        name: String,
+    ) -> Result<u64, VaultSequenceError> {
+        let sequence = self.next_sequence()?;
         let record = DiscoveryRecord::from_anchor(anchor, signature_seed, sequence, name);
         let id = record.id;
         match self.discoveries.entry(id) {
@@ -331,17 +658,18 @@ impl<S: Storage> Vault<S> {
                 self.dirty.insert(DirtyKey::Discovery(id));
             }
         }
-        id
+        Ok(id)
     }
 
     /// Persist a preserve: each region's possibility state, quantized
-    /// (phase-5-plan.md §7.5). Returns the record id.
+    /// (phase-5-plan.md §7.5). Returns the record id, or
+    /// [`VaultSequenceError`] before mutation when exhausted.
     pub fn record_preserve(
         &mut self,
         regions: Vec<(RegionCoord, PossibilitySignature)>,
         name: String,
-    ) -> u64 {
-        let sequence = self.next_sequence();
+    ) -> Result<u64, VaultSequenceError> {
+        let sequence = self.next_sequence()?;
         let record = PreserveRecord::new(regions, sequence, name);
         let id = record.id;
         match self.preserves.entry(id) {
@@ -355,44 +683,59 @@ impl<S: Storage> Vault<S> {
                 self.dirty.insert(DirtyKey::Preserve(id));
             }
         }
-        id
+        Ok(id)
     }
 
     /// Delete a preserve record. Returns whether it existed. The caller removes
     /// this id's runtime contributions; overlapping regions select their next
     /// lowest-id owner, while regions with no contributor rejoin normal
     /// steering without a snap (ADR 0020).
-    pub fn remove_preserve(&mut self, id: u64) -> bool {
-        if self.preserves.remove(&id).is_some() {
-            self.dirty.remove(&DirtyKey::Preserve(id));
-            // Remove eagerly: deletion is rare and leaving the key would
-            // resurrect the record on next open.
-            let _ = self.store.remove(&preserve_key(id));
-            return true;
+    #[must_use = "a preserve is removed only after durable backend success"]
+    pub fn remove_preserve(&mut self, id: u64) -> Result<bool, VaultPersistenceError> {
+        if !self.preserves.contains_key(&id) {
+            return Ok(false);
         }
-        false
+        let key = preserve_key(id);
+        if let Err(source) = self.store.remove(&key) {
+            return Err(self.record_persistence_failure(PersistenceOperation::Remove, key, source));
+        }
+        self.clear_persistence_issue(PersistenceOperation::Remove, &key);
+        // A durable delete also cancels a pending write of this same logical
+        // record. Its failed-store diagnostic is no longer active.
+        self.clear_persistence_issue(PersistenceOperation::Store, &key);
+        self.preserves.remove(&id);
+        self.dirty.remove(&DirtyKey::Preserve(id));
+        Ok(true)
     }
 
     /// Delete a route record. Returns whether it existed. (Mirrors
     /// [`Self::remove_preserve`]: deletion is rare, so the stored key is
     /// removed eagerly rather than resurrecting the record on next open.)
-    pub fn remove_route(&mut self, id: u64) -> bool {
-        if self.routes.remove(&id).is_some() {
-            self.dirty.remove(&DirtyKey::Route(id));
-            let _ = self.store.remove(&route_key(id));
-            return true;
+    #[must_use = "a route is removed only after durable backend success"]
+    pub fn remove_route(&mut self, id: u64) -> Result<bool, VaultPersistenceError> {
+        if !self.routes.contains_key(&id) {
+            return Ok(false);
         }
-        false
+        let key = route_key(id);
+        if let Err(source) = self.store.remove(&key) {
+            return Err(self.record_persistence_failure(PersistenceOperation::Remove, key, source));
+        }
+        self.clear_persistence_issue(PersistenceOperation::Remove, &key);
+        self.clear_persistence_issue(PersistenceOperation::Store, &key);
+        self.routes.remove(&id);
+        self.dirty.remove(&DirtyKey::Route(id));
+        Ok(true)
     }
 
-    /// Persist a recorded expedition (phase-5-plan.md §7.3). Returns the id.
+    /// Persist a recorded expedition (phase-5-plan.md §7.3). Returns the id,
+    /// or [`VaultSequenceError`] before mutation when exhausted.
     pub fn record_route(
         &mut self,
         nodes: Vec<RouteNode>,
         discoveries: Vec<u64>,
         name: String,
-    ) -> u64 {
-        let sequence = self.next_sequence();
+    ) -> Result<u64, VaultSequenceError> {
+        let sequence = self.next_sequence()?;
         let record = RouteRecord::new(nodes, discoveries, sequence, name);
         let id = record.id;
         match self.routes.entry(id) {
@@ -406,7 +749,7 @@ impl<S: Storage> Vault<S> {
                 self.dirty.insert(DirtyKey::Route(id));
             }
         }
-        id
+        Ok(id)
     }
 
     /// Bump a route's traversal count (phase-5-plan.md §7.4).
@@ -432,7 +775,8 @@ impl<S: Storage> Vault<S> {
 
     /// Snapshot the run-local session tier (phase-5-plan.md §4.5): player,
     /// bias, live anchors bit-exact, and every resident region's authoritative
-    /// state. Queued for flushing; overwrites the previous snapshot.
+    /// state. Queued for flushing; overwrites the previous snapshot. Sequence
+    /// exhaustion returns [`VaultSequenceError`] without replacing it.
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_session(
         &mut self,
@@ -442,8 +786,8 @@ impl<S: Storage> Vault<S> {
         bias: &[f32; POSSIBILITY_DIMS],
         transition_mode: bool,
         anchors: &[Anchor],
-    ) {
-        let sequence = self.next_sequence();
+    ) -> Result<(), VaultSequenceError> {
+        let sequence = self.next_sequence()?;
         let snap = SessionSnapshot {
             player,
             last_player,
@@ -463,6 +807,7 @@ impl<S: Storage> Vault<S> {
         };
         self.session = Some(snap);
         self.dirty.insert(DirtyKey::Session);
+        Ok(())
     }
 
     /// Export the shareable tier as a canonical bundle (phase-5-plan.md §4.5):
@@ -487,19 +832,23 @@ impl<S: Storage> Vault<S> {
     pub fn import(&mut self, bundle: &AtlasBundle) -> MergeStats {
         use std::collections::btree_map::Entry;
         let mut stats = MergeStats::default();
+        let mut valid_result_sequence_max = self.meta.sequence;
 
         macro_rules! merge_namespace {
-            ($records:expr, $index:expr, $dirty:expr) => {
+            ($records:expr, $index:expr, $dirty:expr, $kind:expr) => {
                 for record in $records {
                     if record.id != record.content_id() {
                         stats.rejected += 1;
-                        self.issues.push(format!(
-                            "import rejected {:#018x}: content id mismatch (corrupt or tampered)",
-                            record.id
-                        ));
+                        self.record_issue(
+                            IssueIdentity::Import($kind, record.id),
+                            format!(
+                                "import rejected {:?} {:#018x}: content id mismatch (corrupt or tampered)",
+                                $kind, record.id
+                            ),
+                        );
                         continue;
                     }
-                    match $index.entry(record.id) {
+                    let resulting_sequence = match $index.entry(record.id) {
                         Entry::Occupied(mut existing) => {
                             if existing.get_mut().merge_from(record) {
                                 self.dirty.insert($dirty(record.id));
@@ -507,27 +856,53 @@ impl<S: Storage> Vault<S> {
                             } else {
                                 stats.unchanged += 1;
                             }
+                            existing.get().sequence
                         }
                         Entry::Vacant(slot) => {
+                            let sequence = record.sequence;
                             slot.insert(record.clone());
                             self.dirty.insert($dirty(record.id));
                             stats.added += 1;
+                            sequence
                         }
-                    }
+                    };
+                    valid_result_sequence_max =
+                        valid_result_sequence_max.max(resulting_sequence);
                 }
             };
         }
 
-        merge_namespace!(&bundle.discoveries, self.discoveries, DirtyKey::Discovery);
-        merge_namespace!(&bundle.routes, self.routes, DirtyKey::Route);
-        merge_namespace!(&bundle.preserves, self.preserves, DirtyKey::Preserve);
+        merge_namespace!(
+            &bundle.discoveries,
+            self.discoveries,
+            DirtyKey::Discovery,
+            RecordKind::Discovery
+        );
+        merge_namespace!(
+            &bundle.routes,
+            self.routes,
+            DirtyKey::Route,
+            RecordKind::Route
+        );
+        merge_namespace!(
+            &bundle.preserves,
+            self.preserves,
+            DirtyKey::Preserve,
+            RecordKind::Preserve
+        );
+        if valid_result_sequence_max > self.meta.sequence {
+            self.meta.sequence = valid_result_sequence_max;
+            self.dirty.insert(DirtyKey::Meta);
+        }
         stats
     }
 
     /// Write dirty records, at most `budget.max_persist_ops` per call, in
     /// deterministic order (records before the meta header). Deferred work is
-    /// healthy backpressure; each key write is atomic (§7.7).
-    pub fn flush(&mut self, budget: &Budget) -> VaultStats {
+    /// healthy backpressure; each key crosses the backend's atomic durability
+    /// boundary before its dirty entry is retired (ADR 0022).
+    #[must_use = "flush failures and remaining backpressure must be handled"]
+    pub fn flush(&mut self, budget: &Budget) -> Result<VaultStats, VaultFlushError> {
         let mut stats = VaultStats::default();
         while stats.flushed < budget.max_persist_ops {
             let Some(&key) = self.dirty.iter().next() else {
@@ -560,38 +935,54 @@ impl<S: Storage> Vault<S> {
                 )),
             };
             if let Some((store_key, bytes)) = bytes {
-                if let Err(e) = self.store.store(&store_key, &bytes) {
-                    // Keep the record dirty for a later retry, but stop this
-                    // call: a full disk or a permissions change must not wedge
-                    // the frame loop hammering a dead backend.
-                    self.issues.push(format!(
-                        "flush of {} failed: {e}",
-                        String::from_utf8_lossy(&store_key)
-                    ));
-                    break;
+                if let Err(source) = self.store.store(&store_key, &bytes) {
+                    stats.dirty = self.dirty.len();
+                    let error = self.record_persistence_failure(
+                        PersistenceOperation::Store,
+                        store_key,
+                        source,
+                    );
+                    return Err(VaultFlushError {
+                        progress: stats,
+                        error,
+                    });
                 }
+                self.clear_persistence_issue(PersistenceOperation::Store, &store_key);
                 stats.flushed += 1;
                 stats.bytes += bytes.len();
             }
             self.dirty.remove(&key);
         }
         stats.dirty = self.dirty.len();
-        stats
+        Ok(stats)
     }
 
     /// Flush everything (tools, shutdown).
-    pub fn flush_all(&mut self) -> VaultStats {
+    #[must_use = "an explicit drain succeeds only when the vault is clean"]
+    pub fn flush_all(&mut self) -> Result<VaultStats, VaultFlushError> {
         let mut total = VaultStats::default();
         loop {
-            let stats = self.flush(&Budget::unlimited());
-            total.flushed += stats.flushed;
-            total.bytes += stats.bytes;
-            total.dirty = stats.dirty;
-            if stats.dirty == 0 || stats.flushed == 0 {
-                break;
+            match self.flush(&Budget::unlimited()) {
+                Ok(stats) => {
+                    total.flushed += stats.flushed;
+                    total.bytes += stats.bytes;
+                    total.dirty = stats.dirty;
+                    if stats.is_clean() {
+                        return Ok(total);
+                    }
+                }
+                Err(error) => {
+                    let (progress, error) = error.into_parts();
+                    total.flushed += progress.flushed;
+                    total.bytes += progress.bytes;
+                    total.dirty = progress.dirty;
+                    return Err(VaultFlushError {
+                        progress: total,
+                        error,
+                    });
+                }
             }
         }
-        total
     }
 }
 
@@ -635,7 +1026,117 @@ pub fn seen_key(chunk: RegionCoord) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::storage::MemoryStorage;
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::rc::Rc;
     use world_core::{bound_target, domain_mask, AnchorKind, AnchorSource, PossibilityDomain};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StorageCall {
+        Load(Vec<u8>),
+        Store(Vec<u8>),
+        Remove(Vec<u8>),
+        List(Vec<u8>),
+    }
+
+    #[derive(Debug)]
+    enum ScriptedFailure {
+        Store(Vec<u8>),
+        Remove { key: Vec<u8>, unlink_first: bool },
+    }
+
+    #[derive(Debug, Default)]
+    struct ScriptedState {
+        entries: BTreeMap<Vec<u8>, Vec<u8>>,
+        calls: Vec<StorageCall>,
+        failures: VecDeque<ScriptedFailure>,
+    }
+
+    /// A deterministic fault backend shared with the test after the vault
+    /// takes ownership of its clone.
+    #[derive(Debug, Clone, Default)]
+    struct ScriptedStorage(Rc<RefCell<ScriptedState>>);
+
+    impl ScriptedStorage {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn clear_calls(&self) {
+            self.0.borrow_mut().calls.clear();
+        }
+
+        fn calls(&self) -> Vec<StorageCall> {
+            self.0.borrow().calls.clone()
+        }
+
+        fn fail_store(&self, key: Vec<u8>) {
+            self.0
+                .borrow_mut()
+                .failures
+                .push_back(ScriptedFailure::Store(key));
+        }
+
+        fn fail_remove(&self, key: Vec<u8>, unlink_first: bool) {
+            self.0
+                .borrow_mut()
+                .failures
+                .push_back(ScriptedFailure::Remove { key, unlink_first });
+        }
+    }
+
+    impl Storage for ScriptedStorage {
+        fn load(&self, key: &[u8]) -> Result<Vec<u8>, StorageError> {
+            let mut state = self.0.borrow_mut();
+            state.calls.push(StorageCall::Load(key.to_vec()));
+            state
+                .entries
+                .get(key)
+                .cloned()
+                .ok_or(StorageError::NotFound)
+        }
+
+        fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            let mut state = self.0.borrow_mut();
+            state.calls.push(StorageCall::Store(key.to_vec()));
+            if matches!(state.failures.front(), Some(ScriptedFailure::Store(failed)) if failed == key)
+            {
+                state.failures.pop_front();
+                return Err(StorageError::Backend("scripted store failure".into()));
+            }
+            state.entries.insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+
+        fn remove(&mut self, key: &[u8]) -> Result<(), StorageError> {
+            let mut state = self.0.borrow_mut();
+            state.calls.push(StorageCall::Remove(key.to_vec()));
+            if matches!(state.failures.front(), Some(ScriptedFailure::Remove { key: failed, .. }) if failed == key)
+            {
+                let Some(ScriptedFailure::Remove { unlink_first, .. }) = state.failures.pop_front()
+                else {
+                    unreachable!()
+                };
+                if unlink_first {
+                    state.entries.remove(key);
+                }
+                return Err(StorageError::Backend("scripted remove failure".into()));
+            }
+            state.entries.remove(key);
+            Ok(())
+        }
+
+        fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
+            let mut state = self.0.borrow_mut();
+            state.calls.push(StorageCall::List(prefix.to_vec()));
+            Ok(state
+                .entries
+                .range(prefix.to_vec()..)
+                .take_while(|(key, _)| key.starts_with(prefix))
+                .map(|(key, _)| key.clone())
+                .collect())
+        }
+    }
 
     fn sample_anchor() -> Anchor {
         let mask = domain_mask(&[PossibilityDomain::Ecology, PossibilityDomain::Morphology]);
@@ -653,22 +1154,26 @@ mod tests {
     #[test]
     fn records_survive_reopen() {
         let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-        let disc = vault.record_discovery(&sample_anchor(), 0xABCD, "spire".into());
-        let pres = vault.record_preserve(
-            vec![(
-                RegionCoord::new(1, 2),
-                PossibilitySignature::of(world_core::PossibilityVector::neutral()),
-            )],
-            "glade".into(),
-        );
+        let disc = vault
+            .record_discovery(&sample_anchor(), 0xABCD, "spire".into())
+            .unwrap();
+        let pres = vault
+            .record_preserve(
+                vec![(
+                    RegionCoord::new(1, 2),
+                    PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+                )],
+                "glade".into(),
+            )
+            .unwrap();
         vault.mark_seen(RegionCoord::new(1, 2));
         vault.mark_seen(RegionCoord::new(-40, 7));
-        let stats = vault.flush_all();
-        assert_eq!(stats.dirty, 0);
+        let stats = vault.flush_all().unwrap();
+        assert!(stats.is_clean());
         assert!(stats.flushed >= 5); // 2 records + 2 seen chunks + meta
 
         let reopened = Vault::open(vault.store().clone()).unwrap();
-        assert!(reopened.issues().is_empty(), "{:?}", reopened.issues());
+        assert_eq!(reopened.issue_count(), 0);
         assert!(reopened.discoveries().contains_key(&disc));
         assert_eq!(reopened.discoveries()[&disc].name, "spire");
         assert!(reopened.preserves().contains_key(&pres));
@@ -681,8 +1186,12 @@ mod tests {
     #[test]
     fn rerecording_the_same_capture_deduplicates() {
         let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-        let a = vault.record_discovery(&sample_anchor(), 0xABCD, "first".into());
-        let b = vault.record_discovery(&sample_anchor(), 0xABCD, "second".into());
+        let a = vault
+            .record_discovery(&sample_anchor(), 0xABCD, "first".into())
+            .unwrap();
+        let b = vault
+            .record_discovery(&sample_anchor(), 0xABCD, "second".into())
+            .unwrap();
         assert_eq!(a, b, "same capture ⇒ same content id");
         assert_eq!(vault.discoveries().len(), 1);
         // The later name wins (higher sequence).
@@ -695,18 +1204,18 @@ mod tests {
         for i in 0..10 {
             let mut anchor = sample_anchor();
             anchor.world_pos.0 += f64::from(i) * 10.0;
-            vault.record_discovery(&anchor, 0, format!("d{i}"));
+            vault.record_discovery(&anchor, 0, format!("d{i}")).unwrap();
         }
         let budget = Budget {
             max_persist_ops: 3,
             ..Budget::unlimited()
         };
-        let first = vault.flush(&budget);
+        let first = vault.flush(&budget).unwrap();
         assert_eq!(first.flushed, 3);
         assert!(first.dirty > 0);
         let mut guard = 0;
         while vault.dirty_records() > 0 {
-            vault.flush(&budget);
+            vault.flush(&budget).unwrap();
             guard += 1;
             assert!(guard < 100, "flush must drain");
         }
@@ -717,8 +1226,10 @@ mod tests {
     #[test]
     fn corrupt_records_are_skipped_with_a_report_never_a_panic() {
         let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-        let id = vault.record_discovery(&sample_anchor(), 0xABCD, "ok".into());
-        vault.flush_all();
+        let id = vault
+            .record_discovery(&sample_anchor(), 0xABCD, "ok".into())
+            .unwrap();
+        vault.flush_all().unwrap();
         let mut store = vault.store().clone();
         // Tamper one record and drop garbage into the namespace.
         let key = discovery_key(id);
@@ -730,7 +1241,7 @@ mod tests {
 
         let reopened = Vault::open(store).unwrap();
         assert_eq!(reopened.discoveries().len(), 0, "tampered record rejected");
-        assert_eq!(reopened.issues().len(), 2, "{:?}", reopened.issues());
+        assert_eq!(reopened.issue_count(), 2);
     }
 
     /// A small distinct anchor for merge tests.
@@ -745,13 +1256,18 @@ mod tests {
     fn merge_laws_hold_at_the_vault_level() {
         // Three stores with overlapping and disjoint records.
         let mut a = Vault::open(MemoryStorage::new()).unwrap();
-        a.record_discovery(&anchor_at(0.0), 1, "shared".into());
-        a.record_discovery(&anchor_at(100.0), 1, "only-a".into());
+        a.record_discovery(&anchor_at(0.0), 1, "shared".into())
+            .unwrap();
+        a.record_discovery(&anchor_at(100.0), 1, "only-a".into())
+            .unwrap();
         let mut b = Vault::open(MemoryStorage::new()).unwrap();
-        b.record_discovery(&anchor_at(0.0), 1, "shared-renamed".into());
-        b.record_discovery(&anchor_at(200.0), 1, "only-b".into());
+        b.record_discovery(&anchor_at(0.0), 1, "shared-renamed".into())
+            .unwrap();
+        b.record_discovery(&anchor_at(200.0), 1, "only-b".into())
+            .unwrap();
         let mut c = Vault::open(MemoryStorage::new()).unwrap();
-        c.record_discovery(&anchor_at(300.0), 1, "only-c".into());
+        c.record_discovery(&anchor_at(300.0), 1, "only-c".into())
+            .unwrap();
 
         let (ea, eb, ec) = (a.export(), b.export(), c.export());
 
@@ -787,7 +1303,8 @@ mod tests {
     #[test]
     fn import_rejects_tampered_records_without_partial_apply() {
         let mut a = Vault::open(MemoryStorage::new()).unwrap();
-        a.record_discovery(&anchor_at(0.0), 1, "good".into());
+        a.record_discovery(&anchor_at(0.0), 1, "good".into())
+            .unwrap();
         let mut bundle = a.export();
         bundle.discoveries[0].strength_q ^= 1; // immutable field no longer matches id
         let mut b = Vault::open(MemoryStorage::new()).unwrap();
@@ -795,7 +1312,7 @@ mod tests {
         assert_eq!(stats.rejected, 1);
         assert_eq!(stats.added, 0);
         assert!(b.discoveries().is_empty());
-        assert_eq!(b.issues().len(), 1);
+        assert_eq!(b.issue_count(), 1);
     }
 
     #[test]
@@ -808,7 +1325,7 @@ mod tests {
             stability_q: 0,
             anchor_sig: 0,
         };
-        let id = a.record_route(vec![node], vec![], "trail".into());
+        let id = a.record_route(vec![node], vec![], "trail".into()).unwrap();
         a.bump_route_usage(id);
         a.bump_route_usage(id);
         let bundle = a.export();
@@ -822,7 +1339,9 @@ mod tests {
     #[test]
     fn sequence_heals_from_records_after_a_stale_meta() {
         let mut vault = Vault::open(MemoryStorage::new()).unwrap();
-        vault.record_discovery(&sample_anchor(), 0xABCD, "one".into());
+        vault
+            .record_discovery(&sample_anchor(), 0xABCD, "one".into())
+            .unwrap();
         // Flush only the record batch's first entries, never re-flushing meta
         // (simulates a crash between record and meta writes): record sequence
         // is 1 but the stored meta still says 0.
@@ -830,13 +1349,451 @@ mod tests {
             max_persist_ops: 1,
             ..Budget::unlimited()
         };
-        vault.flush(&budget); // writes the discovery (records sort before meta)
+        vault.flush(&budget).unwrap(); // writes discovery before meta
         let reopened = Vault::open(vault.store().clone()).unwrap();
         // Healed: the next sequence must exceed the record's.
         let mut reopened = reopened;
         let mut anchor = sample_anchor();
         anchor.world_pos.0 += 1000.0;
-        let id = reopened.record_discovery(&anchor, 0, "two".into());
+        let id = reopened.record_discovery(&anchor, 0, "two".into()).unwrap();
         assert!(reopened.discoveries()[&id].sequence > 1);
+    }
+
+    #[test]
+    fn flush_failure_keeps_data_before_meta_dirty_and_retry_clears_issue() {
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        let id = vault
+            .record_discovery(&sample_anchor(), 7, "faulted".into())
+            .unwrap();
+        let key = discovery_key(id);
+        storage.clear_calls();
+        storage.fail_store(key.clone());
+
+        let error = vault.flush_all().unwrap_err();
+        assert_eq!(error.progress().flushed, 0);
+        assert_eq!(error.progress().dirty, 2);
+        assert_eq!(
+            error.persistence_error().operation(),
+            PersistenceOperation::Store
+        );
+        assert_eq!(error.persistence_error().key(), key);
+        assert_eq!(error.persistence_error().occurrences(), 1);
+        assert_eq!(storage.calls(), vec![StorageCall::Store(key.clone())]);
+        assert_eq!(vault.issue_count(), 1);
+
+        storage.clear_calls();
+        let retry = vault.flush_all().unwrap();
+        assert!(retry.is_clean());
+        assert_eq!(
+            storage.calls(),
+            vec![
+                StorageCall::Store(key),
+                StorageCall::Store(KEY_META.to_vec())
+            ]
+        );
+        assert_eq!(vault.issue_count(), 0, "matching success clears failure");
+        let reopened = Vault::open(storage).unwrap();
+        assert_eq!(reopened.discoveries().len(), 1);
+    }
+
+    #[test]
+    fn partial_flush_does_not_rewrite_committed_prefix() {
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        let first = vault
+            .record_discovery(&anchor_at(11.0), 1, "one".into())
+            .unwrap();
+        let second = vault
+            .record_discovery(&anchor_at(22.0), 1, "two".into())
+            .unwrap();
+        let mut keys = [discovery_key(first), discovery_key(second)];
+        keys.sort();
+        storage.clear_calls();
+        storage.fail_store(keys[1].clone());
+
+        let error = vault.flush_all().unwrap_err();
+        assert_eq!(error.progress().flushed, 1);
+        assert_eq!(error.progress().dirty, 2, "failed record plus meta");
+        assert_eq!(
+            storage.calls(),
+            vec![
+                StorageCall::Store(keys[0].clone()),
+                StorageCall::Store(keys[1].clone())
+            ]
+        );
+
+        storage.clear_calls();
+        vault.flush_all().unwrap();
+        assert_eq!(
+            storage.calls(),
+            vec![
+                StorageCall::Store(keys[1].clone()),
+                StorageCall::Store(KEY_META.to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_failure_leaves_only_metadata_retryable_and_open_heals() {
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        let id = vault
+            .record_discovery(&sample_anchor(), 2, "one".into())
+            .unwrap();
+        storage.clear_calls();
+        storage.fail_store(KEY_META.to_vec());
+
+        let error = vault.flush_all().unwrap_err();
+        assert_eq!(error.progress().flushed, 1);
+        assert_eq!(error.progress().dirty, 1);
+        assert_eq!(error.persistence_error().key(), KEY_META);
+        assert_eq!(
+            storage.calls(),
+            vec![
+                StorageCall::Store(discovery_key(id)),
+                StorageCall::Store(KEY_META.to_vec())
+            ]
+        );
+
+        let mut reopened = Vault::open(storage.clone()).unwrap();
+        let next = reopened
+            .record_discovery(&anchor_at(900.0), 2, "two".into())
+            .unwrap();
+        assert!(reopened.discoveries()[&next].sequence > 1);
+
+        storage.clear_calls();
+        vault.flush_all().unwrap();
+        assert_eq!(storage.calls(), vec![StorageCall::Store(KEY_META.to_vec())]);
+    }
+
+    #[test]
+    fn budget_backpressure_is_success_but_flush_all_failure_is_not() {
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        let id = vault
+            .record_discovery(&sample_anchor(), 3, "budget".into())
+            .unwrap();
+        let zero = Budget {
+            max_persist_ops: 0,
+            ..Budget::unlimited()
+        };
+        let stats = vault.flush(&zero).unwrap();
+        assert_eq!(stats.flushed, 0);
+        assert!(!stats.is_clean());
+
+        let one = Budget {
+            max_persist_ops: 1,
+            ..Budget::unlimited()
+        };
+        let stats = vault.flush(&one).unwrap();
+        assert_eq!(stats.flushed, 1);
+        assert!(!stats.is_clean());
+        storage.fail_store(KEY_META.to_vec());
+        assert!(vault.flush_all().is_err());
+        assert!(storage.0.borrow().entries.contains_key(&discovery_key(id)));
+        assert!(!storage.0.borrow().entries.contains_key(KEY_META));
+    }
+
+    #[test]
+    fn persistence_issues_deduplicate_recover_and_restart() {
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        let id = vault
+            .record_discovery(&sample_anchor(), 4, "repeat".into())
+            .unwrap();
+        let key = discovery_key(id);
+        storage.fail_store(key.clone());
+        storage.fail_store(key.clone());
+        assert_eq!(
+            vault
+                .flush_all()
+                .unwrap_err()
+                .persistence_error()
+                .occurrences(),
+            1
+        );
+        assert_eq!(
+            vault
+                .flush_all()
+                .unwrap_err()
+                .persistence_error()
+                .occurrences(),
+            2
+        );
+        assert_eq!(vault.issue_count(), 1);
+        assert_eq!(vault.issues().next().unwrap().occurrences(), 2);
+
+        vault.flush_all().unwrap();
+        assert_eq!(vault.issue_count(), 0);
+        let next = vault
+            .record_discovery(&anchor_at(333.0), 4, "again".into())
+            .unwrap();
+        storage.fail_store(discovery_key(next));
+        assert_eq!(
+            vault
+                .flush_all()
+                .unwrap_err()
+                .persistence_error()
+                .occurrences(),
+            1
+        );
+    }
+
+    #[test]
+    fn issue_registry_is_bounded_and_persistence_displaces_newest_nonfatal() {
+        let mut source = Vault::open(MemoryStorage::new()).unwrap();
+        source
+            .record_discovery(&sample_anchor(), 5, "bad".into())
+            .unwrap();
+        let template = source.export().discoveries.remove(0);
+        let mut bundle = AtlasBundle::default();
+        for id in 1..=65 {
+            let mut record = template.clone();
+            record.id = id;
+            bundle.discoveries.push(record);
+        }
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        let stats = vault.import(&bundle);
+        assert_eq!(stats.rejected, 65);
+        assert_eq!(vault.issue_count(), MAX_VAULT_ISSUES);
+        assert_eq!(vault.suppressed_issue_count(), 1);
+
+        vault.import(&AtlasBundle {
+            discoveries: vec![bundle.discoveries[0].clone()],
+            ..AtlasBundle::default()
+        });
+        assert_eq!(vault.issue_count(), MAX_VAULT_ISSUES);
+        assert_eq!(vault.suppressed_issue_count(), 1);
+        assert_eq!(vault.issues().next().unwrap().occurrences(), 2);
+
+        let id = vault
+            .record_discovery(&anchor_at(777.0), 5, "persist".into())
+            .unwrap();
+        storage.fail_store(discovery_key(id));
+        let error = vault.flush_all().unwrap_err();
+        assert_eq!(error.persistence_error().occurrences(), 1);
+        assert_eq!(vault.issue_count(), MAX_VAULT_ISSUES);
+        assert_eq!(vault.suppressed_issue_count(), 2);
+        assert!(vault.issues().any(|issue| {
+            matches!(
+                issue.identity,
+                IssueIdentity::Persistence(PersistenceOperation::Store, _)
+            )
+        }));
+        vault.flush_all().unwrap();
+        assert_eq!(vault.issue_count(), MAX_VAULT_ISSUES - 1);
+    }
+
+    #[test]
+    fn failed_delete_is_commit_after_remove_and_unlink_error_needs_retry() {
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        let regions = vec![(
+            RegionCoord::new(3, 4),
+            PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+        )];
+        let id = vault
+            .record_preserve(regions.clone(), "old".into())
+            .unwrap();
+        vault.flush_all().unwrap();
+        vault.record_preserve(regions, "new".into()).unwrap();
+        let dirty_before = vault.dirty_records();
+        let key = preserve_key(id);
+        storage.fail_remove(key.clone(), false);
+
+        let error = vault.remove_preserve(id).unwrap_err();
+        assert_eq!(error.operation(), PersistenceOperation::Remove);
+        assert!(vault.preserves().contains_key(&id));
+        assert_eq!(vault.dirty_records(), dirty_before);
+        assert!(vault
+            .export()
+            .preserves
+            .iter()
+            .any(|record| record.id == id));
+        assert!(Vault::open(storage.clone())
+            .unwrap()
+            .preserves()
+            .contains_key(&id));
+
+        assert!(vault.remove_preserve(id).unwrap());
+        assert!(!vault.preserves().contains_key(&id));
+        assert!(!Vault::open(storage.clone())
+            .unwrap()
+            .preserves()
+            .contains_key(&id));
+        storage.clear_calls();
+        assert!(!vault.remove_preserve(id).unwrap());
+        assert!(storage.calls().is_empty());
+
+        let cancel_id = vault
+            .record_preserve(
+                vec![(
+                    RegionCoord::new(8, 9),
+                    PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+                )],
+                "cancel dirty write".into(),
+            )
+            .unwrap();
+        let cancel_key = preserve_key(cancel_id);
+        storage.fail_store(cancel_key.clone());
+        let store_error = vault.flush_all().unwrap_err();
+        assert_eq!(
+            store_error.persistence_error().operation(),
+            PersistenceOperation::Store
+        );
+        assert_eq!(store_error.persistence_error().key(), cancel_key);
+        assert!(vault.active_persistence_issue().is_some());
+        assert!(vault.remove_preserve(cancel_id).unwrap());
+        assert!(
+            vault.active_persistence_issue().is_none(),
+            "durable delete cancels the same-key failed store"
+        );
+
+        let node = RouteNode {
+            pos_q: (1, 2),
+            signature: PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+            cost_q: 1,
+            stability_q: 2,
+            anchor_sig: 3,
+        };
+        let canceled_route = vault
+            .record_route(vec![node], vec![], "canceled route".into())
+            .unwrap();
+        let canceled_route_key = route_key(canceled_route);
+        storage.fail_store(canceled_route_key);
+        assert!(vault.flush_all().is_err());
+        assert!(vault.remove_route(canceled_route).unwrap());
+        assert!(vault.active_persistence_issue().is_none());
+
+        let route = vault
+            .record_route(vec![node], vec![], "route".into())
+            .unwrap();
+        vault.flush_all().unwrap();
+        let route_storage_key = route_key(route);
+        storage.fail_remove(route_storage_key.clone(), true);
+        assert!(vault.remove_route(route).is_err());
+        assert!(
+            vault.routes().contains_key(&route),
+            "logical record remains"
+        );
+        assert!(!storage.0.borrow().entries.contains_key(&route_storage_key));
+        assert!(vault.remove_route(route).unwrap());
+        assert!(!vault.routes().contains_key(&route));
+    }
+
+    #[test]
+    fn import_advances_sequence_for_added_merged_and_unchanged_valid_results() {
+        let mut source = Vault::open(MemoryStorage::new()).unwrap();
+        source
+            .record_discovery(&sample_anchor(), 6, "remote".into())
+            .unwrap();
+        let mut bundle = source.export();
+        bundle.discoveries[0].sequence = 100;
+
+        let storage = ScriptedStorage::new();
+        let mut vault = Vault::open(storage.clone()).unwrap();
+        assert_eq!(vault.import(&bundle).added, 1);
+        let next = vault
+            .record_discovery(&anchor_at(1000.0), 6, "local".into())
+            .unwrap();
+        assert_eq!(vault.discoveries()[&next].sequence, 101);
+        storage.clear_calls();
+        vault.flush_all().unwrap();
+        let calls = storage.calls();
+        assert!(matches!(calls.last(), Some(StorageCall::Store(key)) if key == KEY_META));
+        let mut reopened = Vault::open(storage).unwrap();
+        let after_reopen = reopened
+            .record_discovery(&anchor_at(2000.0), 6, "later".into())
+            .unwrap();
+        assert!(reopened.discoveries()[&after_reopen].sequence > 101);
+
+        let mut stale = Vault::open(MemoryStorage::new()).unwrap();
+        stale.import(&bundle);
+        stale.flush_all().unwrap();
+        stale.meta.sequence = 0;
+        stale.dirty.remove(&DirtyKey::Meta);
+        let same = stale.export();
+        assert_eq!(stale.import(&same).unchanged, 1);
+        assert_eq!(stale.meta.sequence, 100);
+        assert!(stale.dirty.contains(&DirtyKey::Meta));
+
+        let mut mixed = bundle.clone();
+        let mut rejected = mixed.discoveries[0].clone();
+        rejected.strength_q ^= 1;
+        rejected.sequence = u64::MAX;
+        mixed.discoveries[0].sequence = 50;
+        mixed.discoveries.push(rejected);
+        let mut target = Vault::open(MemoryStorage::new()).unwrap();
+        let stats = target.import(&mixed);
+        assert_eq!((stats.added, stats.rejected), (1, 1));
+        let local = target
+            .record_discovery(&anchor_at(3000.0), 6, "valid max".into())
+            .unwrap();
+        assert_eq!(target.discoveries()[&local].sequence, 51);
+
+        let mut exhausted = bundle.clone();
+        exhausted.discoveries[0].sequence = u64::MAX;
+        let mut exhausted_target = Vault::open(MemoryStorage::new()).unwrap();
+        let stats = exhausted_target.import(&exhausted);
+        assert_eq!((stats.added, stats.rejected), (1, 0));
+        let exhausted_export = exhausted_target.export();
+        let dirty_before = exhausted_target.dirty_records();
+        assert_eq!(
+            exhausted_target
+                .record_discovery(&anchor_at(4000.0), 6, "exhausted".into())
+                .unwrap_err()
+                .last_sequence(),
+            u64::MAX
+        );
+        assert_eq!(exhausted_target.export(), exhausted_export);
+        assert_eq!(exhausted_target.dirty_records(), dirty_before);
+        assert!(exhausted_target
+            .record_preserve(Vec::new(), "exhausted preserve".into())
+            .is_err());
+        assert!(exhausted_target
+            .record_route(Vec::new(), Vec::new(), "exhausted route".into())
+            .is_err());
+        assert!(exhausted_target.preserves().is_empty());
+        assert!(exhausted_target.routes().is_empty());
+        assert_eq!(exhausted_target.dirty_records(), dirty_before);
+        let map = RegionMap::new(crate::stream::StreamConfig::default());
+        assert!(exhausted_target
+            .snapshot_session(
+                &map,
+                (0.0, 0.0),
+                (0.0, 0.0),
+                &[0.0; POSSIBILITY_DIMS],
+                false,
+                &[],
+            )
+            .is_err());
+        assert!(exhausted_target.session().is_none());
+        let mut max_replica = Vault::open(MemoryStorage::new()).unwrap();
+        assert_eq!(max_replica.import(&exhausted_export).added, 1);
+        assert_eq!(max_replica.export(), exhausted_export);
+        exhausted_target.flush_all().unwrap();
+        let mut exhausted_reopened = Vault::open(exhausted_target.store().clone()).unwrap();
+        assert_eq!(exhausted_reopened.export(), exhausted_export);
+        assert!(exhausted_reopened
+            .record_discovery(&anchor_at(4500.0), 6, "still exhausted".into())
+            .is_err());
+
+        let mut near_exhausted = bundle;
+        near_exhausted.discoveries[0].sequence = u64::MAX - 1;
+        let mut near_target = Vault::open(MemoryStorage::new()).unwrap();
+        assert_eq!(near_target.import(&near_exhausted).added, 1);
+        let last = near_target
+            .record_discovery(&anchor_at(5000.0), 6, "last allocatable successor".into())
+            .unwrap();
+        assert_eq!(near_target.discoveries()[&last].sequence, u64::MAX);
+        let final_export = near_target.export();
+        let mut final_replica = Vault::open(MemoryStorage::new()).unwrap();
+        assert_eq!(final_replica.import(&final_export).added, 2);
+        assert_eq!(final_replica.export(), final_export);
+        assert!(near_target
+            .record_discovery(&anchor_at(6000.0), 6, "one too many".into())
+            .is_err());
     }
 }

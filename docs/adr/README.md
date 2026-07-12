@@ -32,3 +32,4 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0019](0019-dependency-hashes-gate-integration.md) | Dependency hashes gate integration; resident inputs outrank cache targets | Accepted |
 | [0020](0020-preserve-overlaps-use-lowest-content-id.md) | Preserve overlaps use the lowest content id and material snaps advance revision | Accepted |
 | [0021](0021-file-bound-debug-captures.md) | File-bound debug captures may read GPU pixels; world state still never does | Accepted |
+| [0022](0022-persistence-success-requires-durable-backend-commit.md) | Persistence success requires durable backend commit | Accepted |

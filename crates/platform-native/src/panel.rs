@@ -200,6 +200,10 @@ pub struct VaultInfo {
     pub seen: u64,
     /// Non-fatal problems found opening the store.
     pub issues: usize,
+    /// Additional issue identities omitted/displaced at the registry cap.
+    pub suppressed_issues: u64,
+    /// Occurrence count of the active retryable persistence failure.
+    pub persistence_retries: u64,
 }
 
 /// Short display names for the eight possibility domains, indexed like
@@ -436,8 +440,21 @@ impl Hud {
                     "seen",
                     &format!("{}", v.seen),
                 );
-                if v.issues > 0 {
-                    cur.label_value(self, "vault issues", &format!("{}", v.issues), ALERT);
+                if v.issues > 0 || v.suppressed_issues > 0 {
+                    cur.label_value(
+                        self,
+                        "vault issues",
+                        &format!("{} +{} suppressed", v.issues, v.suppressed_issues),
+                        ALERT,
+                    );
+                }
+                if v.persistence_retries > 0 {
+                    cur.label_value(
+                        self,
+                        "persist retry",
+                        &format!("{}", v.persistence_retries),
+                        ALERT,
+                    );
                 }
             }
             None => cur.label_value(self, "vault", "none (O save, L load)", LABEL),
