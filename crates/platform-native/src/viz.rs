@@ -55,8 +55,14 @@ pub enum Channel {
     Influence,
     /// The streaming stability ramp (white = pinned, black = free).
     Stability,
-    /// Realized-state revision, hashed to a color: convergence churn flickers.
+    /// Realized-state revision as a grayscale ramp (black = never churned,
+    /// white = `REVISION_WHITE`+ realized-state changes): total convergence
+    /// churn a region has accumulated.
     Revision,
+    /// Mean per-domain gap between a region's realized (`current`) and target
+    /// possibility state as a grayscale ramp (black = settled, white =
+    /// `RESIDUAL_WHITE`+ mean gap): how far a region still has to converge.
+    Residual,
 }
 
 impl Channel {
@@ -80,7 +86,8 @@ impl Channel {
             Channel::DominantSpecies => Channel::Influence,
             Channel::Influence => Channel::Stability,
             Channel::Stability => Channel::Revision,
-            Channel::Revision => Channel::Composite,
+            Channel::Revision => Channel::Residual,
+            Channel::Residual => Channel::Composite,
         }
     }
 
@@ -105,6 +112,7 @@ impl Channel {
             "influence" => Some(Channel::Influence),
             "stability" => Some(Channel::Stability),
             "revision" => Some(Channel::Revision),
+            "residual" => Some(Channel::Residual),
             _ => None,
         }
     }
@@ -130,6 +138,7 @@ impl Channel {
             Channel::Influence => "influence",
             Channel::Stability => "stability",
             Channel::Revision => "revision",
+            Channel::Residual => "residual",
         }
     }
 }
@@ -418,6 +427,17 @@ pub struct MapComposer {
 }
 
 const FLASH_FRAMES: u8 = 45;
+
+/// Realized-state revisions mapped to white on the [`Channel::Revision`] ramp.
+/// A region that has changed its realized state this many times (or more) reads
+/// as fully churned; steady/pinned regions stay near black.
+const REVISION_WHITE: u32 = 256;
+
+/// Mean per-domain `|current - target|` mapped to white on the
+/// [`Channel::Residual`] ramp. Both vectors live in `[0, 1]`, so the raw mean
+/// gap is bounded by 1, but real convergence residuals are small — a modest cap
+/// keeps in-flight churn visible instead of washed out near black.
+const RESIDUAL_WHITE: f32 = 0.25;
 
 /// Preserve outline tint (phase-5-plan.md §11).
 const PRESERVE_OUTLINE: [u8; 3] = [120, 255, 170];
@@ -805,8 +825,21 @@ impl MapComposer {
                     },
                     Channel::Revision => match state {
                         Some(r) => {
-                            let h = splitmix64(u64::from(r.revision));
-                            [(h >> 16) as u8, (h >> 32) as u8, (h >> 48) as u8]
+                            let g = (r.revision.min(REVISION_WHITE) as f32 / REVISION_WHITE as f32
+                                * 255.0) as u8;
+                            [g, g, g]
+                        }
+                        None => missing_color(cx, cy),
+                    },
+                    Channel::Residual => match state {
+                        Some(r) => {
+                            let mut sum = 0.0f32;
+                            for i in 0..POSSIBILITY_DIMS {
+                                sum += (r.current.dims[i] - r.target.dims[i]).abs();
+                            }
+                            let mean = sum / POSSIBILITY_DIMS as f32;
+                            let g = ((mean / RESIDUAL_WHITE).clamp(0.0, 1.0) * 255.0) as u8;
+                            [g, g, g]
                         }
                         None => missing_color(cx, cy),
                     },

@@ -36,7 +36,8 @@ pub fn gpu_channel(channel: Channel) -> Option<u32> {
         | Channel::DominantSpecies
         | Channel::Influence
         | Channel::Stability
-        | Channel::Revision => None,
+        | Channel::Revision
+        | Channel::Residual => None,
     }
 }
 
