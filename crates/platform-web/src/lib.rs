@@ -21,7 +21,10 @@ use world_core::{
     habitat::HabitatSignature,
     hash::mix,
     possibility::PossibilityDomain,
-    record::{encode_record, DiscoveryRecord, PossibilitySignature, RecordKind},
+    record::{
+        encode_record, DiscoveryRecord, PossibilitySignature, RecordKind, RouteNode, RouteRecord,
+    },
+    route::attraction_anchors,
     species::{species_roster, species_seed},
     terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, WORLD_ALGORITHM_VERSION,
 };
@@ -262,6 +265,50 @@ pub fn shared_steer_sample() -> u64 {
     h
 }
 
+/// Additive ADR 0026 parity probe for aggregate route normalization. The two
+/// quantized routes contribute more candidates than are selected and more raw
+/// peak pull than the global route-channel cap. Count, nearest-order strength
+/// bits, and the projected steering result are folded into one portable value.
+#[must_use]
+pub fn route_attraction_sample() -> u64 {
+    let mut signature = PossibilitySignature {
+        buckets: [2048; world_core::POSSIBILITY_DIMS],
+    };
+    signature.buckets[PossibilityDomain::Ecology.index()] = 3900;
+    signature.buckets[PossibilityDomain::Aesthetics.index()] = 3500;
+    let node = |x, cost| RouteNode {
+        pos_q: (x, 0),
+        signature,
+        cost_q: cost,
+        stability_q: 0,
+        anchor_sig: 0,
+    };
+    let mut first = RouteRecord::new(
+        vec![node(0, 10), node(32, 11), node(64, 12), node(96, 13)],
+        vec![],
+        1,
+        String::from("parity-a"),
+    );
+    first.usage = 3;
+    let mut second = RouteRecord::new(
+        vec![node(0, 20), node(16, 21), node(48, 22), node(80, 23)],
+        vec![],
+        2,
+        String::from("parity-b"),
+    );
+    second.usage = 19;
+    let anchors = attraction_anchors([&second, &first], (0.0, 0.0), 5);
+    let value = project_plausible(steer(PossibilityVector::neutral(), &anchors, (24.0, 0.0)));
+    let mut h = mix(0xA77A_C710_0026_0001, anchors.len() as u64);
+    for anchor in anchors {
+        h = mix(h, u64::from(anchor.strength.to_bits()));
+    }
+    for dimension in value.dims {
+        h = mix(h, u64::from(dimension.to_bits()));
+    }
+    h
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -353,6 +400,13 @@ mod wasm {
     pub fn shared_steer_sample() -> u64 {
         super::shared_steer_sample()
     }
+
+    /// ADR 0026 aggregate route-attraction parity sample.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn route_attraction_sample() -> u64 {
+        super::route_attraction_sample()
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +433,7 @@ mod tests {
         );
         assert_eq!(super::record_codec_sample(), 0xFA7F_9032_2BAF_D7FB);
         assert_eq!(super::shared_steer_sample(), 0xF0FB_820F_2030_1752);
+        assert_eq!(super::route_attraction_sample(), 0x3D54_75F6_34AF_1C41);
     }
 
     #[test]

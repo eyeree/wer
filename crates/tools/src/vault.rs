@@ -17,9 +17,9 @@
 //!   anchors, route attraction) never regenerates the stable trio.
 
 use world_core::{
-    attraction_anchors, bound_target, domain_mask, route_pull, Anchor, AnchorKind, AnchorSource,
-    PossibilityDomain, PossibilityField, PossibilitySignature, RegionCoord, RouteNode, RouteRecord,
-    POSSIBILITY_DIMS, REGION_SIZE,
+    anchor_influence_profile, attraction_anchors, bound_target, domain_mask, route_pull, Anchor,
+    AnchorKind, AnchorSource, PossibilityDomain, PossibilityField, PossibilitySignature,
+    RegionCoord, RouteNode, RouteRecord, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
     apply_session_regions, Budget, FrameStats, InlineExecutor, MemoryStorage, RegionMap,
@@ -801,7 +801,7 @@ fn scenario_routes() -> VaultReport {
             anchor_sig: 0,
         })
         .collect();
-    let mut route = RouteRecord::new(nodes, vec![], 1, "trail".into());
+    let route = RouteRecord::new(nodes, vec![], 1, "trail".into());
 
     let base = world_core::PossibilityVector::neutral();
     let at = (450.0, 0.0);
@@ -823,16 +823,59 @@ fn scenario_routes() -> VaultReport {
             "route forced its recorded state (not soft)".into(),
         );
     }
-    route.usage = 40;
-    let worn_pull = pulled(&route);
-    if worn_pull <= fresh_pull {
+    // Usage monotonicity is strict below aggregate saturation; isolate one
+    // candidate so group normalization cannot turn it into a plateau.
+    let mut singleton = RouteRecord::new(vec![route.nodes[1]], vec![], 2, "single".into());
+    let singleton_fresh = pulled(&singleton);
+    singleton.usage = 40;
+    let worn_pull = pulled(&singleton);
+    if worn_pull <= singleton_fresh {
         record(
             &mut violations,
-            "usage did not strengthen attraction".into(),
+            "singleton usage did not strengthen attraction".into(),
         );
     }
     if route_pull(route.usage) > world_core::ROUTE_PULL_CAP {
         record(&mut violations, "route pull exceeded its cap".into());
+    }
+
+    // Every selected occurrence across route ids shares one worst-case
+    // aggregate budget. Co-located nodes attain the peak exactly.
+    let dense_nodes: Vec<_> = (0..16)
+        .map(|_| RouteNode {
+            pos_q: (450, 0),
+            signature: sig,
+            cost_q: 40,
+            stability_q: 0,
+            anchor_sig: 0,
+        })
+        .collect();
+    let mut dense_nodes_b = dense_nodes.clone();
+    for node in &mut dense_nodes_b {
+        node.cost_q = 41;
+    }
+    let mut dense_a = RouteRecord::new(dense_nodes, vec![], 3, "dense-a".into());
+    let mut dense_b = RouteRecord::new(dense_nodes_b, vec![], 4, "dense-b".into());
+    if dense_a.id == dense_b.id {
+        record(
+            &mut violations,
+            "dense multi-route fixture collapsed to one content id".into(),
+        );
+    }
+    dense_a.usage = u32::MAX;
+    dense_b.usage = u32::MAX - 1;
+    let dense = attraction_anchors([&dense_a, &dense_b], (450.0, 0.0), 32);
+    let dense_peak = anchor_influence_profile(&dense, (450.0, 0.0))
+        .into_iter()
+        .fold(0.0f32, f32::max);
+    if dense_peak > world_core::ROUTE_PULL_CAP {
+        record(
+            &mut violations,
+            format!(
+                "dense multi-route channel exceeded global cap ({dense_peak:?} > {:?})",
+                world_core::ROUTE_PULL_CAP
+            ),
+        );
     }
     let far = (450.0, world_core::ROUTE_CORRIDOR_RADIUS * 3.0);
     if !attraction_anchors([&route], far, 32).is_empty() {
@@ -858,9 +901,11 @@ fn scenario_routes() -> VaultReport {
     }
 
     VaultReport {
-        name: "routes: soft saturating attraction, one bump per leg",
+        name: "routes: globally bounded attraction, singleton usage, one bump per leg",
         violations,
-        summary: format!("pull {fresh_pull:.3} → {worn_pull:.3} (node {node_value:.3})"),
+        summary: format!(
+            "route {fresh_pull:.3}; singleton {singleton_fresh:.3} → {worn_pull:.3}; dense peak {dense_peak:.3}"
+        ),
     }
 }
 

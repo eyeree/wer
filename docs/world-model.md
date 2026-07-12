@@ -306,6 +306,17 @@ Suppress blends last, although Suppress reflection remains relative to the
 original unsteered base. Suppress therefore has final-blend priority; the model
 does not use a simultaneous polarity solve.
 
+The same canonical occurrences also define a direction-free active-influence
+profile for each domain $d$:
+
+$$
+q_d(x)=1-\prod_{a:\,d\in M_a}(1-w_a(x)).
+$$
+
+Both polarities contribute equally to this relevance weight, and duplicates
+remain multiplicative. The profile never chooses a desired state; steering and
+the final projected target retain that responsibility (ADR 0026).
+
 The result is projected through an ordered plausibility map $\Pi$. After all
 dimensions are clamped, the implemented constraints are:
 
@@ -376,8 +387,9 @@ distance/species/position total sort:
 * species diversity $V$ is normalized Shannon entropy;
 * distance quality $L$ is the mean of
   $\operatorname{clamp}(1-d_i/r_n,0,1)^2$;
-* anchor compatibility $K$ is one minus the influence-weighted mean absolute
-  difference between local realized state and masked anchor targets; and
+* anchor compatibility $K$ is agreement between the covering region's
+  authoritative current and final projected target over canonically active
+  domains; and
 * canopy occlusion is $O=\operatorname{clamp}(1-0.25e_v,0.7,1)$ for local
   vegetation density $e_v$.
 
@@ -399,21 +411,23 @@ L=\frac1n\sum_{i=1}^{n}
 \operatorname{clamp}(1-d_i/r_n,0,1)^2.
 $$
 
-For every anchor that reaches the player, let $M_a$ be its nonempty set of
-masked dimensions and
-
-$$
-\delta_a=\frac1{|M_a|}\sum_{j\in M_a}|p_{r,j}-t_{a,j}|.
-$$
-
+Let $q_d(x_r)$ be the canonical active-influence profile from Section 2.4,
+evaluated at the covering region center—the same point used to define $T_r$.
 Compatibility is
 
 $$
 K=\operatorname{clamp}\left(
-1-\frac{\sum_a w_a\delta_a}{\sum_a w_a},0,1\right),
+1-\frac{\sum_d q_d(x_r)|p_{r,d}-T_{r,d}|}
+{\sum_d q_d(x_r)},0,1\right),
 $$
 
-and is defined as one when the denominator is zero. The five terms combine as
+folding domains in fixed possibility order. It is defined as one when the
+denominator is zero, covering authority is missing, or a preserve effectively
+owns the region. An ordinary stable near region is not a preserve: if its
+pinned current differs from an active final target, that disagreement remains
+meaningful. The target already contains bias, Emphasize-first/Suppress-final
+composition, route normalization, and plausibility projection; resonance does
+not reconstruct literal anchor desires. The five terms combine as
 
 $$
 \rho=\operatorname{clamp}\left(
@@ -854,10 +868,15 @@ semantic ceiling `MAX_RESONANCE_NODES = 64`. The graph is not cached or
 persisted, and neither `Budget` nor `ResourceTier` can change its contents.
 
 Density dominates the formula, saturating at eight nodes. Entropy rewards a
-mixture of species, distance rewards close nodes, compatibility rewards anchors
-whose targets resemble the local realized state, and local canopy attenuates
-the result. With no nodes, resonance is exactly zero. The next convergence pass
-uses only the scalar strength; node details remain presentation/debug data.
+mixture of species, distance rewards close nodes, compatibility rewards
+agreement between authoritative current and the actual final projected target
+over canonically active domains, and local canopy attenuates the result. The
+active profile and target are both evaluated at the covering region center from
+the same effective anchor multiset refreshed immediately before this read.
+Missing authority, no active domain, and effective preserves are neutral;
+ordinary pinned regions are not. With no nodes, resonance is exactly zero. The
+next convergence pass uses only the scalar strength; node details remain
+presentation/debug data.
 
 The gate multiplies rather than adds to travel. This prevents a rich area from
 transforming while the player stands still and prevents a barren crossing from
@@ -897,7 +916,7 @@ summary.
 When route attraction is enabled, nodes from every route in the open vault that
 lie within 768 world units become derived Emphasize anchors. They affect
 Climate, Hydrology, Ecology, Morphology, Behavior, and Aesthetics, but never
-Planetary or Geology. A node's peak pull is
+Planetary or Geology. A node's raw pre-normalization pull is
 
 $$
 w(u)=0.35\left(0.35+0.65\frac{u}{u+4}\right),
@@ -905,8 +924,23 @@ $$
 
 where $u$ is route usage. Nearby candidates are sorted by squared distance,
 route id, and node index, then capped by the frame budget (32 by default).
-They pass through exactly the same steering and plausibility projection as
-player anchors.
+After truncation, all selected occurrences across every route share one global
+peak budget. Let $s_i$ be their raw strengths and, for a common scale
+$\lambda\in[0,1]$, define
+
+$$
+Q_d(\lambda)=1-\prod_{i:\,d\in M_i}(1-\lambda s_i).
+$$
+
+If the raw maximum over route domains is already at most 0.35, strength bits
+are retained. Otherwise exactly 32 `f32` bisection trials retain the greatest
+safe common scale with $\max_d Q_d(\lambda)\le0.35$. The exact ADR 0025
+canonical product is tested; no transcendental inversion is used. Because
+spatial falloff can only reduce each strength, the complete selected route
+channel is capped at every evaluation position. Output stays nearest-first,
+explicit anchors remain outside this budget, and the normalized route anchors
+then pass through the same steering and plausibility projection as player
+anchors (ADR 0026).
 
 [`RouteTracker`](crates/world-runtime/src/route.rs) treats one continuous stay
 inside a route corridor as a leg. On corridor exit, the leg increments usage if
@@ -1834,8 +1868,8 @@ storage, or the renderer.
 
 The repository uses several complementary checks:
 
-* fixed golden hashes and record bytes in `world-core`, including an additive
-  canonical-anchor-signature fixture;
+* fixed golden hashes and record bytes in `world-core`, including additive
+  canonical-anchor-signature and aggregate-route-attraction fixtures;
 * same-platform SIMD-versus-scalar differential tests;
 * the continuity replay for pinned stability and bounded seams;
 * `wer-ledger` for declared invalidation precision;
@@ -1858,10 +1892,12 @@ The repository uses several complementary checks:
   barriers, and every staged failure/retry boundary;
 * the Phase 3 ecology harness (run as an integration test) for diversity and
   trophic bounds;
-* `wer-anchor` for selective, coherent steering, resonance gating, and exact
-  canonical-multiset permutation/duplicate/polarity checks;
-* `wer-vault` for persistence, merge laws, preserves, routes, save/load, and an
-  explicit 70-retry failure/ordering/delete/import-sequence scenario; and
+* `wer-anchor` for selective, coherent steering, resonance gating,
+  Suppress-final compatibility, and exact canonical-multiset
+  permutation/duplicate/polarity checks;
+* `wer-vault` for persistence, merge laws, preserves, globally capped dense
+  multi-route attraction, singleton usage, save/load, and an explicit 70-retry
+  failure/ordering/delete/import-sequence scenario; and
 * `wer-scale` for executor/budget/cancellation/amortization settled hashes,
   per-frame tight-versus-roomy regional-history equality under field pressure,
   field/pool plateaus, additive realization density, and exact Low/Mid/High
@@ -1872,9 +1908,11 @@ Focused anchor tests exhaust all 720 permutations of an adversarial six-anchor
 multiset at center, partial-falloff, and zero-influence positions, comparing
 exact output bits. Runtime tests prove reorder and irrelevant metadata remain
 amortized while duplicate/radius/masked-target edits refresh fully. A native
-`World::update` regression proves a recorded node signs explicit plus selected
-route-derived anchors. The web parity surface adds a fixed duplicate-containing
-canonical signature probe and compiles the identical core implementation.
+`World::update` regression reverses explicit anchors and route insertion while
+requiring exact normalized strengths, target, compatibility, resonance cost,
+signature, route id, and encoded bytes. The web parity surface adds fixed
+duplicate-containing canonical-signature and quantized dense-route
+normalization probes and compiles the identical core implementation.
 
 CI formats, lints, checks, and tests the native workspace and compile-checks
 the three neutral/web crates for `wasm32-unknown-unknown`. The parity exports
@@ -1956,10 +1994,16 @@ into one implementation unit.
    changes remain amortized, and native route recording signs the exact
    explicit-plus-derived effective slice.
 
-7. **Enforce the intended semantics of route and suppress influences**
-   (findings 7 and 17). Cap total route attraction after combining nodes, and
-   score Suppress compatibility against the reflected or final desired state
-   rather than against the literal suppressed target.
+7. **Completed: Enforce the intended semantics of route and suppress
+   influences**
+   ([Improvement A.7](plans/prototype/improvement_A_7_route_suppress_influences.md);
+   findings 7 and 17). Deterministic selection now precedes one common-scale,
+   fixed-iteration cap over the complete selected route channel, while
+   compatibility weights authoritative current-versus-final-target differences
+   with the same canonical center-evaluated influence profile. Dense
+   multi-route, Suppress-final, exact permutation, native recording, tier, and
+   an additive native-golden/wasm-compiled parity sample cover the corrected
+   contracts.
 
 8. **Make stable topology and ordinary region boundaries satisfy their stated
    guarantees** (findings 9 and 19). Move routing elevation to fixed-point math
@@ -2237,7 +2281,11 @@ readiness may still differ by frame, and live float capture remains
 presentation-grade across native/wasm; neither caveat permits visual density to
 change gameplay once authoritative prerequisites match.
 
-#### 7. A per-node route cap does not make route attraction weak in aggregate
+#### 7. Resolved: route attraction is globally capped after candidate selection
+
+**Status:** Resolved by
+[Improvement A.7](plans/prototype/improvement_A_7_route_suppress_influences.md)
+and [ADR 0026](adr/0026-route-attraction-is-globally-bounded.md).
 
 Each route node is capped below 0.35, but overlapping nodes combine through
 
@@ -2250,9 +2298,17 @@ $W\approx0.9847$; at usage four, $W\approx0.9998$. A dense or overlapping
 route can therefore almost force its weighted target and overwhelm a player
 anchor, contrary to the stated soft-attraction contract.
 
-Aggregate nearby route nodes into a single normalized field with a cap on
-*total* route pull, or divide contribution by local route-node density before
-combination.
+The implementation keeps deterministic nearest-first selection, then applies
+one common scale to all selected occurrences across every route. Exactly 32
+safe `f32` bisection trials evaluate ADR 0025's canonical product, retaining raw
+bits when already safe and otherwise the greatest tested vector with aggregate
+peak at most 0.35. Peak normalization is position-independent, so falloff can
+only reduce it. Core and integration tests cover co-located multi-route worst
+cases, every returned node center and corridor probes, singleton bits, usage
+saturation, output order, and route-iterator permutations. The vault harness
+reports the dense peak, the native recording test covers normalized effective
+inputs, and an additive quantized route sample is golden-tested natively and
+compiled for wasm.
 
 #### 8. Transition mode currently reverses the high-level movement fantasy
 
@@ -2397,15 +2453,27 @@ geographic province, isolation, and smoothly weighted habitat fitness. That
 would preserve recognizable families across boundaries while permitting local
 speciation.
 
-#### 17. Suppress anchors are scored backward by resonance compatibility
+#### 17. Resolved: Suppress compatibility scores the final desired state
+
+**Status:** Resolved by
+[Improvement A.7](plans/prototype/improvement_A_7_route_suppress_influences.md)
+and [ADR 0026](adr/0026-route-attraction-is-globally-bounded.md).
 
 Anchor compatibility rewards the local world for being close to every
 anchor's literal target, irrespective of polarity. For Suppress, the desired
 direction is away from that target, so the current formula makes a world rich
 in the suppressed trait resonate more strongly.
 
-Compare against the reflected suppress desire or, more simply, against the
-final combined steered target.
+Compatibility now compares the covering authority's current vector with its
+already-refreshed final projected target. Canonical active-domain weights are
+evaluated at the region center from the same effective multiset; they describe
+relevance only and do not reconstruct polarity. Missing authority, no active
+domain, and effective preserves are neutral, while an ordinary pinned region
+with a different target remains meaningful. Focused tests distinguish final
+Suppress desire from the rejected literal trait, cover mixed polarity,
+duplicates, center geometry, and exact permutations; `wer-anchor` exposes the
+polarity-correct comparison and the native route-record test carries it through
+target, cost, id, and encoded bytes.
 
 #### 18. Capture is weakly localized and Planetary capture is only a baseline
 

@@ -13,6 +13,7 @@ use world_core::{
         anchor_set_signature, bound_target, domain_mask, project_plausible, steer, Anchor,
         AnchorKind, AnchorSource,
     },
+    attraction_anchors,
     biome::{classify, Biome},
     capture::{capture_target, category_mask, TraitCategory, TraitDeviation},
     climate::climate,
@@ -25,14 +26,15 @@ use world_core::{
     habitat::HabitatSignature,
     hydrology::hydrology,
     layer::LAYER_CLIMATE,
+    mix,
     possibility_field::PossibilityField,
     soils::soils,
     species::{species_roster, species_seed, Trophic},
     splitmix64,
     terrain::gradient_seed,
     vegetation::vegetation,
-    FeatureKey, PossibilityDomain, PossibilityVector, RegionCoord, Rng, REGION_SIZE,
-    WORLD_ALGORITHM_VERSION,
+    FeatureKey, PossibilityDomain, PossibilitySignature, PossibilityVector, RegionCoord, Rng,
+    RouteNode, RouteRecord, REGION_SIZE, WORLD_ALGORITHM_VERSION,
 };
 
 fn sample_key() -> FeatureKey {
@@ -225,6 +227,48 @@ fn canonical_anchor_set_signature_golden() {
         anchor_set_signature(&[first, second, first]),
         0xBDAA_C72D_CA08_3AF7
     );
+}
+
+#[test]
+fn aggregate_route_attraction_golden() {
+    // Additive ADR 0026 presentation/interop fixture. Existing generator,
+    // steering, record-wire, and content-id goldens remain untouched.
+    let mut signature = PossibilitySignature {
+        buckets: [2048; world_core::POSSIBILITY_DIMS],
+    };
+    signature.buckets[PossibilityDomain::Ecology.index()] = 3900;
+    signature.buckets[PossibilityDomain::Aesthetics.index()] = 3500;
+    let node = |x, cost| RouteNode {
+        pos_q: (x, 0),
+        signature,
+        cost_q: cost,
+        stability_q: 0,
+        anchor_sig: 0,
+    };
+    let mut first = RouteRecord::new(
+        vec![node(0, 10), node(32, 11), node(64, 12), node(96, 13)],
+        vec![],
+        1,
+        String::from("parity-a"),
+    );
+    first.usage = 3;
+    let mut second = RouteRecord::new(
+        vec![node(0, 20), node(16, 21), node(48, 22), node(80, 23)],
+        vec![],
+        2,
+        String::from("parity-b"),
+    );
+    second.usage = 19;
+    let anchors = attraction_anchors([&second, &first], (0.0, 0.0), 5);
+    let value = project_plausible(steer(PossibilityVector::neutral(), &anchors, (24.0, 0.0)));
+    let mut hash = mix(0xA77A_C710_0026_0001, anchors.len() as u64);
+    for anchor in anchors {
+        hash = mix(hash, u64::from(anchor.strength.to_bits()));
+    }
+    for dimension in value.dims {
+        hash = mix(hash, u64::from(dimension.to_bits()));
+    }
+    assert_eq!(hash, 0x3D54_75F6_34AF_1C41);
 }
 
 #[test]

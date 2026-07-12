@@ -39,11 +39,11 @@ use world_core::layer::{
     LAYER_DRAINAGE, LAYER_ECOLOGY,
 };
 use world_core::{
-    anchor_set_signature, capture_target, domain_mask, drainage_dep_hash, layer_dep_hash,
-    macro_coord_for, mix, organism_trait_deviation, project_plausible, steer, Anchor, AnchorKind,
-    AnchorSource, Biome, Climate, DrainageTile, Genome, GenomeBias, HabitatSignature,
-    PossibilityDomain, PossibilityField, PossibilitySignature, PossibilityVector, RegionCoord,
-    Soils, TraitDeviation, POSSIBILITY_DIMS, REGION_SIZE,
+    anchor_influence_profile, anchor_set_signature, capture_target, domain_mask, drainage_dep_hash,
+    layer_dep_hash, macro_coord_for, mix, organism_trait_deviation, project_plausible, steer,
+    Anchor, AnchorKind, AnchorSource, Biome, Climate, DrainageTile, Genome, GenomeBias,
+    HabitatSignature, PossibilityDomain, PossibilityField, PossibilitySignature, PossibilityVector,
+    RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS, REGION_SIZE,
 };
 
 use crate::budget::Budget;
@@ -866,6 +866,11 @@ impl RegionMap {
     /// count/diversity/distance,
     /// the local anchor compatibility, and a canopy occlusion proxy combine into
     /// a bounded `strength`. Order-independent and deterministic; never stored.
+    ///
+    /// `anchors` must be the same effective multiset (explicit plus normalized
+    /// route-derived anchors) that produced the resident authoritative targets.
+    /// This direct-call precondition keeps the active-domain profile coherent
+    /// with the final projected desire being scored (ADR 0026).
     #[must_use]
     pub fn resonance_at(&self, player: (f64, f64), anchors: &[Anchor]) -> Resonance {
         let radius = self.cfg.near_radius;
@@ -933,39 +938,27 @@ impl RegionMap {
         }
     }
 
-    /// How well the local ecology at the player matches the active anchor set,
-    /// `0..=1` — steering toward a world the player is *near an example of*
-    /// resonates more strongly (phase-4-plan.md §7.5). The influence-weighted
-    /// mean agreement between the player cell's realized possibility vector and
-    /// each anchor's masked target. Neutral (`1.0`) when no anchor reaches here.
+    /// How well the covering region's authoritative current state agrees with
+    /// its authoritative final projected target over actively steered domains
+    /// (ADR 0026). Domain relevance is the canonical saturating influence of
+    /// the same effective anchor multiset at the region center. Missing
+    /// authority, an effective preserve, or no active influence is neutral.
     fn anchor_compatibility(&self, player: (f64, f64), anchors: &[Anchor]) -> f32 {
-        if anchors.is_empty() {
+        let coord = RegionCoord::from_world(player.0, player.1);
+        if self.preserve_contributors.contains_key(&coord) {
             return 1.0;
         }
-        let coord = RegionCoord::from_world(player.0, player.1);
         let Some(region) = self.regions.get(&coord) else {
             return 1.0;
         };
-        let current = region.current;
+        let (ox, oy) = coord.origin();
+        let center = (ox + REGION_SIZE * 0.5, oy + REGION_SIZE * 0.5);
+        let profile = anchor_influence_profile(anchors, center);
         let mut weight_sum = 0.0f32;
         let mut diff_sum = 0.0f32;
-        for anchor in anchors {
-            let w = anchor.influence(player);
-            if w <= 0.0 {
-                continue;
-            }
-            let mut masked = 0u32;
-            let mut diff = 0.0f32;
-            for i in 0..POSSIBILITY_DIMS {
-                if anchor.mask & (1 << i as u8) != 0 {
-                    diff += (current.dims[i] - anchor.target.dims[i]).abs();
-                    masked += 1;
-                }
-            }
-            if masked > 0 {
-                diff_sum += w * (diff / masked as f32);
-                weight_sum += w;
-            }
+        for (domain, &weight) in profile.iter().enumerate() {
+            diff_sum += weight * (region.current.dims[domain] - region.target.dims[domain]).abs();
+            weight_sum += weight;
         }
         if weight_sum <= 0.0 {
             return 1.0;
@@ -1338,8 +1331,9 @@ impl RegionMap {
             self.realize_authoritative_near_window(player, &mut stats);
         });
         // Resonance is a pure read of the current canonical near-window view,
-        // computed between retarget and converge so the rate sees this frame's
-        // gate (phase-4-plan.md §8.2; ADR 0024).
+        // computed after retarget with the same effective slice so its active
+        // profile scores this frame's authoritative final targets (ADR 0026),
+        // and before converge so the rate sees this frame's gate (§8.2).
         let resonance = self.resonance_at(player, anchors);
         let transition_scale = if transition_mode {
             TRANSITION_CONVERGE_SCALE
@@ -3368,6 +3362,158 @@ mod capture_tests {
             }
             other => panic!("expected an organism capture, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::budget::Budget;
+    use crate::InlineExecutor;
+    use world_core::{bound_target, domain_mask};
+
+    const PLAYER: (f64, f64) = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
+
+    fn config() -> StreamConfig {
+        StreamConfig {
+            near_radius: REGION_SIZE * 0.125,
+            far_radius: REGION_SIZE * 0.25,
+            load_radius: REGION_SIZE * 0.375,
+            unload_radius: REGION_SIZE * 0.5,
+            field_resolution: 2,
+            ..StreamConfig::default()
+        }
+    }
+
+    fn anchor(kind: AnchorKind, target: f32, strength: f32) -> Anchor {
+        let mask = domain_mask(&[PossibilityDomain::Ecology]);
+        Anchor {
+            world_pos: PLAYER,
+            target: bound_target(mask, target),
+            mask,
+            kind,
+            strength,
+            falloff_radius: REGION_SIZE * 2.0,
+            source: AnchorSource::Manual,
+        }
+    }
+
+    fn retargeted(anchors: &[Anchor]) -> RegionMap {
+        let field = PossibilityField::default();
+        let budget = Budget::unlimited();
+        let mut map = RegionMap::new(config());
+        // Establish the authoritative unsteered current first, then refresh its
+        // final target with the exact effective slice scored below.
+        map.update(
+            PLAYER,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &budget,
+            &InlineExecutor,
+            false,
+        );
+        map.update(
+            PLAYER,
+            0.0,
+            &field,
+            anchors,
+            &NO_BIAS,
+            &budget,
+            &InlineExecutor,
+            false,
+        );
+        map
+    }
+
+    #[test]
+    fn suppress_compatibility_scores_final_desire_not_literal_target() {
+        let suppress = anchor(AnchorKind::Suppress, 1.0, 0.85);
+        let mut map = retargeted(&[suppress]);
+        let coord = RegionCoord::from_world(PLAYER.0, PLAYER.1);
+        let final_target = map.regions[&coord].target;
+
+        map.regions.get_mut(&coord).unwrap().current = final_target;
+        let at_final = map.anchor_compatibility(PLAYER, &[suppress]);
+        map.regions.get_mut(&coord).unwrap().current = suppress.target;
+        let at_literal = map.anchor_compatibility(PLAYER, &[suppress]);
+        assert_eq!(at_final.to_bits(), 1.0f32.to_bits());
+        assert!(at_final > at_literal);
+    }
+
+    #[test]
+    fn mixed_polarity_compatibility_is_exact_across_permutations() {
+        let emphasize = anchor(AnchorKind::Emphasize, 0.95, 0.63);
+        let suppress = anchor(AnchorKind::Suppress, 0.72, 0.41);
+        let duplicate = Anchor {
+            source: AnchorSource::River,
+            ..emphasize
+        };
+        let permutations = [
+            vec![emphasize, suppress, duplicate],
+            vec![duplicate, emphasize, suppress],
+            vec![suppress, duplicate, emphasize],
+            vec![suppress, emphasize, duplicate],
+        ];
+        let mut expected = None;
+        for anchors in permutations {
+            let map = retargeted(&anchors);
+            let coord = RegionCoord::from_world(PLAYER.0, PLAYER.1);
+            let image = (
+                map.regions[&coord].target.dims.map(f32::to_bits),
+                anchor_influence_profile(&anchors, PLAYER).map(f32::to_bits),
+                map.anchor_compatibility(PLAYER, &anchors).to_bits(),
+                map.resonance_at(PLAYER, &anchors).strength.to_bits(),
+            );
+            if let Some(expected) = expected {
+                assert_eq!(image, expected);
+            } else {
+                expected = Some(image);
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_neutral_cases_and_center_evaluation_are_explicit() {
+        let active = anchor(AnchorKind::Emphasize, 1.0, 0.8);
+        let mut map = retargeted(&[active]);
+        let coord = RegionCoord::from_world(PLAYER.0, PLAYER.1);
+        assert_eq!(
+            RegionMap::new(config()).anchor_compatibility(PLAYER, &[active]),
+            1.0
+        );
+        assert_eq!(map.anchor_compatibility(PLAYER, &[]), 1.0);
+        assert_eq!(
+            map.anchor_compatibility(PLAYER, &[Anchor { mask: 0, ..active }]),
+            1.0
+        );
+
+        // Ordinary near authority is pinned, but unlike a preserve it still
+        // has an active final desire and therefore non-neutral disagreement.
+        map.regions.get_mut(&coord).unwrap().current = PossibilityVector::neutral();
+        assert_eq!(map.regions[&coord].stability, 1.0);
+        assert!(map.anchor_compatibility(PLAYER, &[active]) < 1.0);
+
+        let signature = PossibilitySignature::of(map.regions[&coord].current);
+        map.apply_preserve_contribution(7, coord, signature);
+        assert_eq!(map.anchor_compatibility(PLAYER, &[active]), 1.0);
+
+        // The anchor reaches the queried player at a region corner, but not
+        // the center where this region-level target/profile is defined.
+        let corner = (0.0, 0.0);
+        let corner_only = Anchor {
+            world_pos: corner,
+            falloff_radius: REGION_SIZE * 0.1,
+            ..active
+        };
+        let mut center_map = RegionMap::new(config());
+        let mut region = RegionState::new(RegionCoord::new(0, 0));
+        region.target = bound_target(corner_only.mask, 1.0);
+        center_map.regions.insert(region.coord, region);
+        assert!(corner_only.influence(corner) > 0.0);
+        assert_eq!(center_map.anchor_compatibility(corner, &[corner_only]), 1.0);
     }
 }
 

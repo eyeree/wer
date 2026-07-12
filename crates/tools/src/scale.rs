@@ -1269,6 +1269,18 @@ pub fn tier_identity(cfg: &ScaleConfig) -> ScenarioOutcome {
 
     let mut probes = Vec::new();
     for (tier, budget, mut map) in maps {
+        // Direct resonance reads require the same effective slice that most
+        // recently produced authoritative targets (ADR 0026).
+        map.update(
+            (0.0, 0.0),
+            0.0,
+            &field,
+            &gameplay_anchors,
+            &[0.0; POSSIBILITY_DIMS],
+            &budget,
+            &InlineExecutor,
+            false,
+        );
         let center = world_core::RegionCoord::new(0, 0);
         let hashes = map
             .layer_diagnostics(center)

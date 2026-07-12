@@ -5,7 +5,8 @@
 //! round trip.
 
 use world_core::{
-    attraction_anchors, PossibilityField, RegionCoord, POSSIBILITY_DIMS, REGION_SIZE,
+    anchor_influence_profile, attraction_anchors, PossibilityField, RegionCoord, POSSIBILITY_DIMS,
+    REGION_SIZE, ROUTE_PULL_CAP,
 };
 use world_runtime::{
     Budget, InlineExecutor, MemoryStorage, RegionMap, RouteRecorder, StreamConfig, Vault,
@@ -80,6 +81,18 @@ fn a_recorded_route_persists_and_attracts_softly_within_its_corridor() {
     for (at, expect_pull) in [(on_route, true), (far_off, false)] {
         let anchors = attraction_anchors([&route], at, 32);
         assert_eq!(!anchors.is_empty(), expect_pull, "corridor bound at {at:?}");
+        if expect_pull {
+            let mut probes = vec![at];
+            probes.extend(anchors.iter().map(|anchor| anchor.world_pos));
+            for probe in probes {
+                assert!(
+                    anchor_influence_profile(&anchors, probe)
+                        .into_iter()
+                        .all(|pull| pull <= ROUTE_PULL_CAP),
+                    "combined route channel exceeded its global cap at {probe:?}"
+                );
+            }
+        }
         let mut plain = RegionMap::new(config());
         let mut pulled = RegionMap::new(config());
         for _ in 0..2 {

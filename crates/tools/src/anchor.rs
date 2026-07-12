@@ -655,6 +655,7 @@ fn stable_trio_scenario() -> AnchorReport {
 /// incompatible ones; the canonical graph respects its fixed semantic ceiling.
 fn resonance_scenario() -> AnchorReport {
     let mut violations = Vec::new();
+    let mut suppress_comparison = None;
     let field = PossibilityField::default();
     let bias = [0.0f32; POSSIBILITY_DIMS];
     let mut map = settled(&[], &Budget::unlimited());
@@ -698,8 +699,9 @@ fn resonance_scenario() -> AnchorReport {
         );
     }
 
-    // Anchor compatibility: an anchor targeting the local realized state
-    // resonates more than one targeting its opposite.
+    // Compatibility reads the final target refreshed by the same effective
+    // slice. Compare equivalent freshly retargeted worlds, never a hypothetical
+    // slice against unrelated resident targets (ADR 0026).
     if let Some(region) = map.get(RegionCoord::from_world(PLAYER.0, PLAYER.1)) {
         let current = region.current;
         let mask = category_mask(&[TraitCategory::Coloration]);
@@ -717,8 +719,22 @@ fn resonance_scenario() -> AnchorReport {
             falloff_radius: 3.0 * REGION_SIZE,
             source: AnchorSource::Manual,
         };
-        let compatible = map.resonance_at(PLAYER, &[mk(compatible_target)]);
-        let opposite = map.resonance_at(PLAYER, &[mk(opposite_target)]);
+        let score = |anchor: Anchor| {
+            let mut candidate = settled(&[], &Budget::unlimited());
+            candidate.update(
+                PLAYER,
+                0.0,
+                &field,
+                &[anchor],
+                &bias,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+            candidate.resonance_at(PLAYER, &[anchor])
+        };
+        let compatible = score(mk(compatible_target));
+        let opposite = score(mk(opposite_target));
         if compatible.strength < opposite.strength - 1e-4 {
             record(
                 &mut violations,
@@ -728,16 +744,64 @@ fn resonance_scenario() -> AnchorReport {
                 ),
             );
         }
+
+        // Suppress must score agreement with the actual Suppress-final target,
+        // not resemblance to the literal trait being rejected (finding 17).
+        let suppress = Anchor {
+            kind: AnchorKind::Suppress,
+            ..mk(opposite_target)
+        };
+        let mut suppressed = settled(&[], &Budget::unlimited());
+        suppressed.update(
+            PLAYER,
+            0.0,
+            &field,
+            &[suppress],
+            &bias,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        let suppressed_resonance = suppressed.resonance_at(PLAYER, &[suppress]);
+        let suppressed_region = suppressed
+            .get(RegionCoord::from_world(PLAYER.0, PLAYER.1))
+            .expect("covering authority");
+        let literal_compatibility = (1.0
+            - (suppressed_region.current.get(aes) - suppress.target.get(aes)).abs())
+        .clamp(0.0, 1.0);
+        suppress_comparison = Some((
+            suppressed_resonance.anchor_compatibility,
+            literal_compatibility,
+        ));
+        if suppressed_resonance.anchor_compatibility <= literal_compatibility {
+            record(
+                &mut violations,
+                format!(
+                    "Suppress final-target compatibility was not greater than literal-trait compatibility ({:.4} <= {:.4})",
+                    suppressed_resonance.anchor_compatibility, literal_compatibility
+                ),
+            );
+        }
     }
 
     AnchorReport {
-        name: "resonance gates transition (stationary/compatibility/fixed cap)",
+        name: "resonance gates transition (stationary/final-target compatibility/fixed cap)",
         violations,
-        summary: format!(
-            "resonance {:.3} over {} nodes",
-            resonance.strength,
-            resonance.nodes.len()
-        ),
+        summary: if let Some((final_target, literal)) = suppress_comparison {
+            format!(
+                "resonance {:.3} over {} nodes; Suppress final {:.3} > literal {:.3}",
+                resonance.strength,
+                resonance.nodes.len(),
+                final_target,
+                literal
+            )
+        } else {
+            format!(
+                "resonance {:.3} over {} nodes",
+                resonance.strength,
+                resonance.nodes.len()
+            )
+        },
     }
 }
 

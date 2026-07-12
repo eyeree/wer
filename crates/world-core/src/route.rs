@@ -8,13 +8,13 @@
 //! projection, and stays travel-fueled and resonance-gated — there is no
 //! second steering system to keep coherent. Attraction strength saturates
 //! with usage ("frequently used routes become easier to follow", Overview)
-//! and is capped well below 1 so a route biases but can never force a region
-//! to a remembered state.
+//! and the complete selected route channel is capped well below 1 so routes
+//! bias but can never force a region to a remembered state.
 //!
 //! Everything here is pure and portable: routes are quantized records
 //! (ADR 0013), so the same record attracts identically on every platform.
 
-use crate::anchor::{Anchor, AnchorKind, AnchorSource};
+use crate::anchor::{anchor_peak_profile, Anchor, AnchorKind, AnchorSource};
 use crate::record::{PossibilitySignature, RouteNode, RouteRecord};
 
 // Preserve the Phase 5 public module path while `anchor` owns the single
@@ -26,10 +26,13 @@ pub use crate::anchor::anchor_set_signature;
 /// attraction field" has edges).
 pub const ROUTE_CORRIDOR_RADIUS: f64 = 768.0;
 
-/// The ceiling on a route anchor's strength. Deliberately ≪ 1 (ADR 0015):
-/// a well-worn route bends the target toward its recorded possibility state
-/// but always leaves room for the player's own anchors and the base field.
+/// The ceiling on the complete selected route channel's combined peak pull.
+/// Deliberately ≪ 1 (ADR 0026): all selected nodes across all routes share
+/// this one budget, while explicit player anchors compose outside it.
 pub const ROUTE_PULL_CAP: f32 = 0.35;
+
+/// Contract-sized deterministic search bound for route normalization.
+const ROUTE_SCALE_BISECTION_STEPS: usize = 32;
 
 /// Usage count at which a route reaches half its maximum pull.
 const ROUTE_PULL_HALF_USAGE: f32 = 4.0;
@@ -47,9 +50,10 @@ pub const ROUTE_ATTRACTION_MASK: u8 = {
     !geology & !planetary
 };
 
-/// The attraction strength a route exerts, saturating in its usage count:
-/// monotone increasing, `route_pull(0) > 0` (a freshly shared route is
-/// already followable), bounded by [`ROUTE_PULL_CAP`].
+/// A route candidate's raw attraction strength before selected-group
+/// normalization. It is monotone in usage, nonzero at zero usage, and bounded
+/// by [`ROUTE_PULL_CAP`]. A singleton retains these bits; overlapping selected
+/// nodes share the aggregate ceiling through [`attraction_anchors`].
 #[inline]
 #[must_use]
 pub fn route_pull(usage: u32) -> f32 {
@@ -74,9 +78,12 @@ pub fn route_difficulty(nodes: &[RouteNode]) -> f32 {
 /// §7.4): every node of every route within [`ROUTE_CORRIDOR_RADIUS`] of the
 /// player becomes a weak [`ROUTE_ATTRACTION_MASK`]-masked `Emphasize` anchor
 /// toward the node's recorded possibility state, capped at `max_nodes`
-/// nearest-first with a deterministic total tiebreak. The result feeds the
-/// unchanged order-independent `steer`, so route + player anchors compose
-/// lawfully.
+/// nearest-first with a deterministic total tiebreak. After truncation, every
+/// selected occurrence is scaled by one common factor when necessary so the
+/// canonical saturating peak `1 - product(1 - strength)` is at most
+/// [`ROUTE_PULL_CAP`] in every affected domain (ADR 0026). Spatial influence
+/// cannot exceed peak strength, so the bound holds at every evaluation point.
+/// Explicit anchors are not included in this route-only budget.
 #[must_use]
 pub fn attraction_anchors<'a>(
     routes: impl IntoIterator<Item = &'a RouteRecord>,
@@ -102,7 +109,7 @@ pub fn attraction_anchors<'a>(
             .then_with(|| a.2.cmp(&b.2))
     });
     candidates.truncate(max_nodes);
-    candidates
+    let anchors: Vec<_> = candidates
         .into_iter()
         .map(|(_, _, _, node, usage)| Anchor {
             world_pos: (node.pos_q.0 as f64, node.pos_q.1 as f64),
@@ -115,7 +122,49 @@ pub fn attraction_anchors<'a>(
             falloff_radius: ROUTE_CORRIDOR_RADIUS,
             source: AnchorSource::Manual,
         })
-        .collect()
+        .collect();
+    normalize_route_anchors(anchors)
+}
+
+fn route_peak(anchors: &[Anchor]) -> f32 {
+    let profile = anchor_peak_profile(anchors);
+    profile
+        .iter()
+        .enumerate()
+        .filter_map(|(domain, &peak)| {
+            (ROUTE_ATTRACTION_MASK & (1 << domain as u8) != 0).then_some(peak)
+        })
+        .fold(0.0f32, f32::max)
+}
+
+fn normalize_route_anchors(raw: Vec<Anchor>) -> Vec<Anchor> {
+    if route_peak(&raw) <= ROUTE_PULL_CAP {
+        return raw;
+    }
+
+    let raw_strengths: Vec<f32> = raw.iter().map(|anchor| anchor.strength).collect();
+    let mut safe_scale = 0.0f32;
+    let mut unsafe_scale = 1.0f32;
+    let mut trial = raw.clone();
+    let mut safe = raw.clone();
+    for anchor in &mut safe {
+        anchor.strength = 0.0;
+    }
+
+    for _ in 0..ROUTE_SCALE_BISECTION_STEPS {
+        let mid = safe_scale + (unsafe_scale - safe_scale) * 0.5;
+        for (anchor, &strength) in trial.iter_mut().zip(&raw_strengths) {
+            anchor.strength = strength * mid;
+        }
+        if route_peak(&trial) <= ROUTE_PULL_CAP {
+            safe_scale = mid;
+            safe.clone_from(&trial);
+        } else {
+            unsafe_scale = mid;
+        }
+    }
+    debug_assert!(route_peak(&safe) <= ROUTE_PULL_CAP);
+    safe
 }
 
 /// A rebuilt, in-memory index of recorded routes by their possibility-space
@@ -287,6 +336,130 @@ mod tests {
             last = pull;
         }
         assert!(route_pull(0) > 0.0, "a fresh shared route is followable");
+    }
+
+    #[test]
+    fn aggregate_route_pull_is_one_global_worst_case_cap() {
+        use crate::anchor::{anchor_influence_profile, steer};
+
+        let nodes_a: Vec<_> = (0..16).map(|_| node_at(0, 4095, 10)).collect();
+        let nodes_b: Vec<_> = (0..16).map(|_| node_at(0, 4095, 20)).collect();
+        let route_a = route_with(nodes_a, u32::MAX);
+        let route_b = route_with(nodes_b, u32::MAX - 1);
+        assert_ne!(route_a.id, route_b.id);
+
+        let anchors = attraction_anchors([&route_b, &route_a], (0.0, 0.0), 32);
+        assert_eq!(anchors.len(), 32);
+        assert!(route_peak(&anchors) <= ROUTE_PULL_CAP);
+        assert!(anchors.iter().all(|anchor| {
+            anchor.kind == AnchorKind::Emphasize
+                && anchor.mask == ROUTE_ATTRACTION_MASK
+                && anchor.falloff_radius == ROUTE_CORRIDOR_RADIUS
+        }));
+
+        // Co-location attains the peak. Give the already-normalized derived
+        // anchors an exact all-one target so steering directly exposes the
+        // exact saturating route pull end to end.
+        let zero = PossibilityVector {
+            dims: [0.0; crate::POSSIBILITY_DIMS],
+        };
+        let ecology = PossibilityDomain::Ecology.index();
+        let profile = anchor_influence_profile(&anchors, (0.0, 0.0));
+        let mut unit_target_anchors = anchors.clone();
+        for anchor in &mut unit_target_anchors {
+            anchor.target = bound_target(ROUTE_ATTRACTION_MASK, 1.0);
+        }
+        let steered = steer(zero, &unit_target_anchors, (0.0, 0.0));
+        assert_eq!(steered.dims[ecology].to_bits(), profile[ecology].to_bits());
+        assert!(profile[ecology] <= ROUTE_PULL_CAP);
+
+        for at in [
+            (0.0, 0.0),
+            (128.0, 0.0),
+            (384.0, 0.0),
+            (ROUTE_CORRIDOR_RADIUS, 0.0),
+            (ROUTE_CORRIDOR_RADIUS + 1.0, 0.0),
+        ] {
+            assert!(
+                anchor_influence_profile(&anchors, at)[ecology] <= ROUTE_PULL_CAP,
+                "route channel exceeded cap at {at:?}"
+            );
+        }
+
+        let reversed = attraction_anchors([&route_a, &route_b], (0.0, 0.0), 32);
+        assert_eq!(anchors, reversed);
+        assert_eq!(
+            anchors
+                .iter()
+                .map(|a| a.strength.to_bits())
+                .collect::<Vec<_>>(),
+            reversed
+                .iter()
+                .map(|a| a.strength.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn route_normalization_preserves_safe_bits_order_and_common_scale() {
+        assert!(attraction_anchors([], (0.0, 0.0), 32).is_empty());
+        let singleton = route_with(vec![node_at(0, 3500, 0)], 17);
+        let one = attraction_anchors([&singleton], (0.0, 0.0), 1);
+        assert_eq!(one[0].strength.to_bits(), route_pull(17).to_bits());
+        assert!(attraction_anchors([&singleton], (0.0, 0.0), 0).is_empty());
+
+        // Two small synthetic raw occurrences stay under the aggregate cap
+        // and therefore keep their strength bits and nearest-first order.
+        let template = one[0];
+        let safe_raw = vec![
+            Anchor {
+                world_pos: (1.0, 0.0),
+                strength: 0.1,
+                ..template
+            },
+            Anchor {
+                world_pos: (2.0, 0.0),
+                strength: 0.2,
+                ..template
+            },
+        ];
+        let safe = normalize_route_anchors(safe_raw.clone());
+        assert_eq!(safe, safe_raw);
+
+        let dense_raw: Vec<_> = (0..8)
+            .map(|i| Anchor {
+                world_pos: (i as f64, 0.0),
+                strength: if i % 2 == 0 { 0.2 } else { 0.3 },
+                ..template
+            })
+            .collect();
+        let dense = normalize_route_anchors(dense_raw.clone());
+        assert!(route_peak(&dense) <= ROUTE_PULL_CAP);
+        assert_eq!(dense, normalize_route_anchors(dense_raw.clone()));
+        for pair in dense.windows(2).zip(dense_raw.windows(2)) {
+            let (scaled, raw) = pair;
+            assert_eq!(
+                scaled[0].strength.total_cmp(&scaled[1].strength),
+                raw[0].strength.total_cmp(&raw[1].strength)
+            );
+            assert_eq!(scaled[0].world_pos, raw[0].world_pos);
+        }
+    }
+
+    #[test]
+    fn aggregate_pull_is_monotone_through_saturation() {
+        let nodes: Vec<_> = (0..8).map(|_| node_at(0, 4095, 0)).collect();
+        let mut previous = 0.0f32;
+        for usage in [0, 1, 2, 4, 8, 100, u32::MAX] {
+            let route = route_with(nodes.clone(), usage);
+            let peak = route_peak(&attraction_anchors([&route], (0.0, 0.0), 8));
+            assert!(peak <= ROUTE_PULL_CAP);
+            assert!(
+                peak >= previous,
+                "aggregate pull decreased at usage {usage}: {previous:?} -> {peak:?}"
+            );
+            previous = peak;
+        }
     }
 
     #[test]

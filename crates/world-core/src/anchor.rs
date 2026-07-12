@@ -157,6 +157,50 @@ fn canonical_anchors(anchors: &[Anchor]) -> Vec<(AnchorSteeringKey, &Anchor)> {
     canonical
 }
 
+/// Per-domain strength with which an anchor multiset actively addresses a
+/// world-space point (ADR 0026).
+///
+/// This is a relevance profile, not a desired-state solver: Emphasize and
+/// Suppress occurrences contribute identically. Every occurrence is folded in
+/// ADR 0025's canonical raw-bit order with the same saturating product used by
+/// [`steer`], so duplicates retain their multiplicity and caller order cannot
+/// change any result bit.
+#[must_use]
+pub fn anchor_influence_profile(anchors: &[Anchor], at: (f64, f64)) -> [f32; POSSIBILITY_DIMS] {
+    let canonical = canonical_anchors(anchors);
+    influence_profile(&canonical, |anchor| anchor.influence(at))
+}
+
+/// The worst-case per-domain influence of an anchor multiset before spatial
+/// falloff. Route attraction uses this to bound its complete selected channel
+/// at every possible evaluation point (ADR 0026).
+pub(crate) fn anchor_peak_profile(anchors: &[Anchor]) -> [f32; POSSIBILITY_DIMS] {
+    let canonical = canonical_anchors(anchors);
+    influence_profile(&canonical, |anchor| anchor.strength.clamp(0.0, 1.0))
+}
+
+fn influence_profile(
+    canonical: &[(AnchorSteeringKey, &Anchor)],
+    influence: impl Fn(&Anchor) -> f32,
+) -> [f32; POSSIBILITY_DIMS] {
+    let mut profile = [0.0; POSSIBILITY_DIMS];
+    for (domain, value) in profile.iter_mut().enumerate() {
+        let mut keep = 1.0f32;
+        for (_, anchor) in canonical {
+            if anchor.mask & (1 << domain as u8) == 0 {
+                continue;
+            }
+            let weight = influence(anchor);
+            if weight <= 0.0 {
+                continue;
+            }
+            keep *= 1.0 - weight;
+        }
+        *value = (1.0 - keep).clamp(0.0, 1.0);
+    }
+    profile
+}
+
 /// A canonical signature of an anchor steering multiset (ADR 0025).
 ///
 /// Every occurrence is folded in raw-bit key order after the cardinality, so
@@ -535,6 +579,10 @@ mod tests {
             .iter()
             .map(|&at| steer(base, &fixture, at).dims.map(f32::to_bits))
             .collect();
+        let expected_profiles: Vec<[u32; POSSIBILITY_DIMS]> = positions
+            .iter()
+            .map(|&at| anchor_influence_profile(&fixture, at).map(f32::to_bits))
+            .collect();
         let expected_signature = anchor_set_signature(&fixture);
         let mut permutation = fixture;
         let mut count = 0;
@@ -547,8 +595,75 @@ mod tests {
                     *expected_bits
                 );
             }
+            for (&at, expected_bits) in positions.iter().zip(&expected_profiles) {
+                assert_eq!(
+                    anchor_influence_profile(anchors, at).map(f32::to_bits),
+                    *expected_bits
+                );
+            }
         });
         assert_eq!(count, 720);
+    }
+
+    #[test]
+    fn influence_profile_is_relevance_only_and_preserves_multiplicity() {
+        let ecology = PossibilityDomain::Ecology;
+        let aesthetics = PossibilityDomain::Aesthetics;
+        let ecology_mask = domain_mask(&[ecology]);
+        let aesthetics_mask = domain_mask(&[aesthetics]);
+        let emphasize = Anchor {
+            strength: 0.25,
+            mask: ecology_mask,
+            ..anchor(AnchorKind::Emphasize)
+        };
+        let suppress = Anchor {
+            kind: AnchorKind::Suppress,
+            ..emphasize
+        };
+
+        let emphasize_profile = anchor_influence_profile(&[emphasize], emphasize.world_pos);
+        let suppress_profile = anchor_influence_profile(&[suppress], suppress.world_pos);
+        assert_eq!(emphasize_profile, suppress_profile);
+        assert_eq!(
+            emphasize_profile[ecology.index()].to_bits(),
+            0.25f32.to_bits()
+        );
+        assert_eq!(emphasize_profile[aesthetics.index()], 0.0);
+
+        let duplicate = anchor_influence_profile(&[emphasize, emphasize], emphasize.world_pos);
+        assert!(duplicate[ecology.index()] > emphasize_profile[ecology.index()]);
+        let disjoint = Anchor {
+            mask: aesthetics_mask,
+            ..emphasize
+        };
+        let split = anchor_influence_profile(&[emphasize, disjoint], emphasize.world_pos);
+        assert_eq!(split[ecology.index()], 0.25);
+        assert_eq!(split[aesthetics.index()], 0.25);
+
+        let inert = [
+            Anchor {
+                strength: 0.0,
+                ..emphasize
+            },
+            Anchor {
+                falloff_radius: 0.0,
+                ..emphasize
+            },
+            Anchor {
+                mask: 0,
+                ..emphasize
+            },
+        ];
+        for anchor in inert {
+            assert_eq!(
+                anchor_influence_profile(&[anchor], emphasize.world_pos),
+                [0.0; POSSIBILITY_DIMS]
+            );
+        }
+        assert_eq!(
+            anchor_influence_profile(&[emphasize], (10_000.0, 10_000.0)),
+            [0.0; POSSIBILITY_DIMS]
+        );
     }
 
     #[test]

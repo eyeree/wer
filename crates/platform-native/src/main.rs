@@ -2283,78 +2283,164 @@ mod preserve_lifecycle_tests {
 
     #[test]
     fn route_recording_signs_the_effective_explicit_and_derived_anchors() {
-        let path =
-            std::env::temp_dir().join(format!("wer-a6-effective-route-{}", std::process::id()));
-        let storage = FileStorage::open(&path).unwrap();
-        let mut vault = Vault::open(storage).unwrap();
-        vault
-            .record_route(
-                vec![world_core::RouteNode {
-                    pos_q: (0, 0),
-                    signature: PossibilitySignature::of(world_core::PossibilityVector::neutral()),
-                    cost_q: 10,
-                    stability_q: 200,
-                    anchor_sig: 0,
-                }],
-                vec![],
-                "nearby source route".into(),
-            )
-            .unwrap();
+        let run = |reverse_explicit: bool, reverse_routes: bool, suffix: &str| {
+            let path = std::env::temp_dir().join(format!(
+                "wer-a7-effective-route-{}-{suffix}",
+                std::process::id()
+            ));
+            let storage = FileStorage::open(&path).unwrap();
+            let mut vault = Vault::open(storage).unwrap();
+            let route_nodes = |bucket: u16, cost| {
+                let mut possibility = world_core::PossibilityVector::neutral();
+                possibility.set(PossibilityDomain::Ecology, f32::from(bucket) / 4096.0);
+                (0..16)
+                    .map(|_| world_core::RouteNode {
+                        pos_q: (0, 0),
+                        signature: PossibilitySignature::of(possibility),
+                        cost_q: cost,
+                        stability_q: 200,
+                        anchor_sig: 0,
+                    })
+                    .collect()
+            };
+            let mut routes = vec![(3000, 10), (3800, 20)];
+            if reverse_routes {
+                routes.reverse();
+            }
+            for (bucket, cost) in routes {
+                vault
+                    .record_route(
+                        route_nodes(bucket, cost),
+                        vec![],
+                        format!("nearby source route {bucket}"),
+                    )
+                    .unwrap();
+            }
 
-        let tier = ResourceTier::Low;
-        let mask = domain_mask(&[PossibilityDomain::Ecology]);
-        let explicit = Anchor {
-            world_pos: (32.0, -16.0),
-            target: bound_target(mask, 0.88),
-            mask,
-            kind: AnchorKind::Emphasize,
-            strength: 0.7,
-            falloff_radius: 1400.0,
-            source: AnchorSource::Landform,
+            let tier = ResourceTier::Low;
+            let mask = domain_mask(&[PossibilityDomain::Ecology]);
+            let suppress = Anchor {
+                world_pos: (32.0, -16.0),
+                target: bound_target(mask, 0.88),
+                mask,
+                kind: AnchorKind::Suppress,
+                strength: 0.7,
+                falloff_radius: 1400.0,
+                source: AnchorSource::Landform,
+            };
+            let emphasize = Anchor {
+                world_pos: (-24.0, 8.0),
+                target: bound_target(mask, 0.72),
+                kind: AnchorKind::Emphasize,
+                strength: 0.35,
+                ..suppress
+            };
+            let mut explicit = vec![suppress, emphasize];
+            if reverse_explicit {
+                explicit.reverse();
+            }
+            let mut world = World {
+                map: RegionMap::new(tier.stream_config()),
+                field: PossibilityField::default(),
+                anchors: Vec::new(),
+                bias: [0.0; POSSIBILITY_DIMS],
+                player: (0.0, 0.0),
+                last_player: (0.0, 0.0),
+                transition_mode: false,
+                vault: Some(vault),
+                vault_stats: VaultStats::default(),
+                vault_failure_logged: false,
+                recorder: None,
+                tracker: RouteTracker::new(),
+                path_tracking: false,
+                route_attraction: true,
+                executor: Box::new(world_runtime::InlineExecutor),
+                budget: tier.budget(),
+            };
+            // Publish canonical organisms and establish the unsteered current
+            // before the same effective slice refreshes target and resonance.
+            for _ in 0..128 {
+                world.update();
+                if world.map.authoritative_realization_complete(world.player) {
+                    break;
+                }
+            }
+            assert!(world.map.authoritative_realization_complete(world.player));
+            world.anchors = explicit;
+            world.path_tracking = true;
+            world.recorder = Some(RouteRecorder::new());
+
+            let vault = world.vault.as_ref().unwrap();
+            let derived = world_core::attraction_anchors(
+                vault.routes().values(),
+                world.player,
+                world.budget.max_route_attraction_nodes,
+            );
+            assert_eq!(derived.len(), 32);
+            assert!(derived
+                .iter()
+                .all(|anchor| anchor.strength < world_core::route_pull(0)));
+            assert!(world_core::anchor_influence_profile(&derived, world.player)
+                .into_iter()
+                .all(|pull| pull <= world_core::ROUTE_PULL_CAP));
+            let mut effective = world.anchors.clone();
+            let explicit_only = world_core::anchor_set_signature(&effective);
+            effective.extend(derived.iter().copied());
+            let expected_signature = world_core::anchor_set_signature(&effective);
+            assert_ne!(expected_signature, explicit_only);
+
+            let stats = world.update();
+            let resonance = world.map.resonance_at(world.player, &effective);
+            assert!(!resonance.nodes.is_empty());
+            assert!(resonance.anchor_compatibility < 1.0);
+            assert_eq!(
+                stats.resonance_strength.to_bits(),
+                resonance.strength.to_bits()
+            );
+            let coord = RegionCoord::from_world(world.player.0, world.player.1);
+            let target_bits = world.map.get(coord).unwrap().target.dims.map(f32::to_bits);
+            let (nodes, discoveries) = world.recorder.take().unwrap().finish();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].anchor_sig, expected_signature);
+            assert_eq!(
+                nodes[0].cost_q,
+                ((1.0 - stats.resonance_strength.clamp(0.0, 1.0)) * 255.0) as u8
+            );
+            effective.reverse();
+            assert_eq!(
+                nodes[0].anchor_sig,
+                world_core::anchor_set_signature(&effective)
+            );
+            let record = world_core::RouteRecord::new(
+                nodes.clone(),
+                discoveries,
+                99,
+                "permutation probe".into(),
+            );
+            let bytes = world_core::encode_record(world_core::RecordKind::Route, &record);
+            let mut strength_bits: Vec<_> = derived
+                .iter()
+                .map(|anchor| anchor.strength.to_bits())
+                .collect();
+            strength_bits.sort_unstable();
+            let image = (
+                target_bits,
+                resonance.anchor_compatibility.to_bits(),
+                resonance.strength.to_bits(),
+                nodes[0].cost_q,
+                nodes[0].anchor_sig,
+                record.id,
+                bytes,
+                strength_bits,
+            );
+
+            drop(world);
+            std::fs::remove_dir_all(path).unwrap();
+            image
         };
-        let mut world = World {
-            map: RegionMap::new(tier.stream_config()),
-            field: PossibilityField::default(),
-            anchors: vec![explicit],
-            bias: [0.0; POSSIBILITY_DIMS],
-            player: (0.0, 0.0),
-            last_player: (0.0, 0.0),
-            transition_mode: false,
-            vault: Some(vault),
-            vault_stats: VaultStats::default(),
-            vault_failure_logged: false,
-            recorder: Some(RouteRecorder::new()),
-            tracker: RouteTracker::new(),
-            path_tracking: true,
-            route_attraction: true,
-            executor: Box::new(world_runtime::InlineExecutor),
-            budget: tier.budget(),
-        };
 
-        let mut expected = world.anchors.clone();
-        let vault = world.vault.as_ref().unwrap();
-        let derived = world_core::attraction_anchors(
-            vault.routes().values(),
-            world.player,
-            world.budget.max_route_attraction_nodes,
-        );
-        assert!(!derived.is_empty());
-        expected.extend(derived);
-        let explicit_only = world_core::anchor_set_signature(&world.anchors);
-        let expected_signature = world_core::anchor_set_signature(&expected);
-        assert_ne!(expected_signature, explicit_only);
-
-        world.update();
-        let (nodes, _) = world.recorder.take().unwrap().finish();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].anchor_sig, expected_signature);
-        expected.reverse();
-        assert_eq!(
-            nodes[0].anchor_sig,
-            world_core::anchor_set_signature(&expected)
-        );
-
-        drop(world);
-        std::fs::remove_dir_all(path).unwrap();
+        let forward = run(false, false, "forward");
+        let reversed = run(true, true, "reversed");
+        assert_eq!(forward, reversed);
     }
 }

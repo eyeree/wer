@@ -46,8 +46,8 @@ pub mod terrain;
 pub mod vegetation;
 
 pub use anchor::{
-    anchor_set_signature, bound_target, domain_mask, project_plausible, steer, Anchor, AnchorKind,
-    AnchorSource,
+    anchor_influence_profile, anchor_set_signature, bound_target, domain_mask, project_plausible,
+    steer, Anchor, AnchorKind, AnchorSource,
 };
 pub use biome::{classify, Biome, BIOME_COUNT};
 pub use capture::{

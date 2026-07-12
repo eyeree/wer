@@ -36,3 +36,4 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0023](0023-field-cache-pressure-parks-derived-state.md) | Field cache pressure parks derived state; regional history follows streaming geometry | Accepted |
 | [0024](0024-gameplay-uses-one-canonical-organism-slot.md) | Gameplay uses one canonical organism slot; resource-tier density is visual | Accepted |
 | [0025](0025-anchor-steering-uses-canonical-multisets.md) | Anchor steering uses canonical multisets | Accepted |
+| [0026](0026-route-attraction-is-globally-bounded.md) | Route attraction is globally bounded and resonance scores final desire | Accepted |
