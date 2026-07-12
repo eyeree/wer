@@ -95,7 +95,8 @@ pub fn probe_adapter() -> ProbedAdapter {
 
 /// A tiny local block_on (avoids a pollster dependency here): the adapter
 /// future is driven by wgpu's own executor on native and resolves promptly.
-fn pollster_block<F: core::future::Future>(fut: F) -> F::Output {
+/// `pub(crate)` for the headless [`pov::PovCapture`] bring-up (ADR 0021).
+pub(crate) fn pollster_block<F: core::future::Future>(fut: F) -> F::Output {
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn raw() -> RawWaker {
         fn no_op(_: *const ()) {}

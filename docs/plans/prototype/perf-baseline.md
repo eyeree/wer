@@ -152,7 +152,7 @@ output changed, zero fixtures re-blessed.
 |---|---|
 | mesh time, worker-side | 26.8 ms for 49 chunks ≈ **0.55 ms/chunk** (4,489 `elevation_row` samples + color packing per chunk) |
 | chunk vertex data | 4,485 verts × 28 B = **123 KB/chunk** (~6 MB at radius 3, pooled) |
-| shared index buffer | 26,112 × u32 = 102 KB, built once for every chunk ever drawn |
+| shared index buffer | 27,648 × u32 = 108 KB (skirt quads double-sided), built once for every chunk ever drawn |
 | cold entry | 49 chunks meshed, integrated at the 4-uploads/frame cap (~13 frames to full ring); ~56 KB/frame mean upload during the first second |
 | steady state | **0 remeshes, 0 uploads, 0 buffer allocations** (dep-hash + terrain-bucket keying; pool warm) |
 | llvmpipe frame rate, POV radius 3 | ~160 fps (present 5.2 ms, update 0.6 ms) |
@@ -162,3 +162,12 @@ output changed, zero fixtures re-blessed.
 The 2D map path is pixel-identical to pre-3D-1: a `--screenshot` byte-diff
 against the previous commit shows **0 differing map pixels** (the info panel
 legitimately gains the `mesh` pass row).
+
+Palette parity, measured with the ADR 0021 capture (`--pov-script`): a flat
+unfogged ground pixel in POV reads (65, 112, 102) where the 2D Composite map
+shows (67, 111, 100) at the same world position — the lighting constants
+hold the 2D palette's value range within ±2/255. Region-border cracks were
+found with the same harness (skirts were one-sided under back-face culling,
+and the possibility-field gradient steps borders by far more than the
+planned 4-unit drop) and fixed: double-sided skirt quads, 128-unit drop;
+a top-down radius-8 sweep now shows zero gap pixels.

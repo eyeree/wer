@@ -33,11 +33,11 @@
 //! - `V` — cycle the visualized channel (includes the anchor `influence`
 //!   field); `G` grid, `N` rings, `X` changed-while-pinned flash
 //! - `Tab` — toggle the 3D POV mode (3d-phase-1-plan.md): a fly camera over
-//!   the meshed near-field terrain. In POV: mouse look under cursor grab,
-//!   `WASD` along view/strafe, `Space`/`LShift` up/down, wheel adjusts fly
-//!   speed, `Esc` releases the mouse (click to re-grab; `Esc` again quits).
-//!   Every map binding above is map-mode-only. `WER_POV=1` starts in POV;
-//!   `WER_POV_RADIUS` sets the chunk draw radius in regions (default 3).
+//!   the meshed near-field terrain. In POV: hold the **left mouse button**
+//!   and drag to look, `WASD` along view/strafe, `Space`/`LShift` up/down,
+//!   wheel adjusts fly speed. Every map binding above is map-mode-only.
+//!   `WER_POV=1` starts in POV; `WER_POV_RADIUS` sets the chunk draw radius
+//!   in regions (default 3).
 //! - `Esc` — quit
 //! - Mouse over the map — the info panel shows the cell under the cursor
 //!   (world/region coordinates, streaming state, field samples, biome)
@@ -54,6 +54,16 @@
 //! window at the given position and writes the composed map + panel as a
 //! binary PPM. A zoom past the organism threshold also picks the organism
 //! nearest the center position, exercising the zoomed panel readout.
+//!
+//! Headless POV screenshot mode (offscreen GPU, ADR 0021):
+//! `wer --pov-script "<instructions>"` drives the POV camera through a
+//! `;`-separated instruction sequence and captures snapshots — the
+//! debugging/testing harness for POV rendering. Instructions:
+//! `size:WxH` (capture size, before the first snap), `pos:x,y[,z]`,
+//! `mouse:dx,dy` (simulated look drag, pixels), `move:f[,r[,u]]` (fly
+//! forward/right/up in world units), `settle[:n]` (world updates), and
+//! `snap:file.ppm`. Example:
+//! `wer --pov-script "pos:300,-10; snap:a.ppm; mouse:200,-50; move:150; snap:b.ppm"`
 
 mod executor;
 mod gpumap;
@@ -67,10 +77,10 @@ use std::time::Instant;
 
 use renderer::{letterbox_viewport, Renderer};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::window::{Window, WindowId};
 use world_core::{
     bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, Biome, PossibilityDomain,
     PossibilityField, PossibilitySignature, RegionCoord, TraitCategory, Trophic, LAYER_COUNT,
@@ -587,8 +597,11 @@ struct App {
     pov_chunks: PovChunkManager,
     /// Chunk draw radius in regions (`WER_POV_RADIUS`, default 3).
     pov_radius: i32,
-    /// Whether the cursor is grabbed for mouse look (POV only).
-    pov_grabbed: bool,
+    /// Mouse look is a left-button drag (WSLg/XWayland delivers unusable
+    /// raw `DeviceEvent` deltas — absolute jumps — so look input reads
+    /// window-space cursor deltas instead). `Some(last cursor position)`
+    /// while the button is held in POV.
+    pov_look_from: Option<(f64, f64)>,
     /// The previous telemetry second's POV counters, for the delta log line.
     pov_counters_last: PovCounters,
     /// Content hashes of the last uploaded overlay/panel strips, so an
@@ -668,7 +681,7 @@ impl App {
                 .ok()
                 .and_then(|v| v.parse::<i32>().ok())
                 .map_or(3, |r| r.clamp(1, 8)),
-            pov_grabbed: false,
+            pov_look_from: None,
             pov_counters_last: PovCounters::default(),
             overlay_hash: 0,
             panel_hash: 0,
@@ -723,18 +736,22 @@ impl App {
     }
 
     /// Toggle Map ↔ POV (`Tab`, 3d-phase-1-plan.md §8.1). Entering POV
-    /// places the camera at eye level over the player and grabs the cursor;
-    /// leaving always releases the grab. Chunks are kept across toggles
-    /// (cheap to hold, instant on re-entry; §7.4).
+    /// places the camera at eye level over the player. Chunks are kept
+    /// across toggles (cheap to hold, instant on re-entry; §7.4).
+    ///
+    /// Mouse look is a **left-button drag** — no cursor grab. The plan's
+    /// grab + raw-delta scheme is unusable on the reference environment:
+    /// WSLg/XWayland reports raw `DeviceEvent::MouseMotion` as absolute
+    /// jumps, which slammed the pitch to −89° on the first mouse move.
+    /// Window-space drag deltas are well-defined everywhere.
     fn toggle_view_mode(&mut self) {
         match self.view_mode {
             ViewMode::Map => {
                 self.view_mode = ViewMode::Pov;
                 let ground = pov::entry_ground(&self.world.map, self.world.player);
                 self.pov_camera.enter_at(self.world.player, ground);
-                self.set_pov_grab(true);
                 log::info!(
-                    "view: POV at ({:.0}, {:.0}) radius {} (Tab returns to the map; Esc releases the mouse)",
+                    "view: POV at ({:.0}, {:.0}) radius {} (hold the left button to look; Tab returns to the map)",
                     self.world.player.0,
                     self.world.player.1,
                     self.pov_radius
@@ -742,35 +759,10 @@ impl App {
             }
             ViewMode::Pov => {
                 self.view_mode = ViewMode::Map;
-                self.set_pov_grab(false);
+                self.pov_look_from = None;
                 log::info!("view: map");
             }
         }
-    }
-
-    /// Grab or release the cursor for mouse look (plan §8.2): `Locked`,
-    /// falling back to `Confined` (X11 under WSL2 — the primary dev
-    /// environment — supports Confined; `CursorMoved` re-centers under it).
-    /// Raw-look deltas arrive via `device_event` regardless, so a failed
-    /// grab degrades to a visible-cursor fly, not a dead camera.
-    fn set_pov_grab(&mut self, grab: bool) {
-        let Some(window) = self.window.as_ref() else {
-            self.pov_grabbed = grab;
-            return;
-        };
-        if grab {
-            if let Err(err) = window
-                .set_cursor_grab(CursorGrabMode::Locked)
-                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
-            {
-                log::warn!("cursor grab unavailable ({err}); mouse look continues ungrabbed");
-            }
-            window.set_cursor_visible(false);
-        } else {
-            let _ = window.set_cursor_grab(CursorGrabMode::None);
-            window.set_cursor_visible(true);
-        }
-        self.pov_grabbed = grab;
     }
 
     /// Fly movement from held keys (plan §8.3): `W`/`S` along the full 3D
@@ -812,11 +804,6 @@ impl App {
         if self.view_mode == ViewMode::Pov {
             match code {
                 KeyCode::Tab => self.toggle_view_mode(),
-                KeyCode::Escape if self.pov_grabbed => {
-                    // First press frees the mouse (stay in POV, look frozen);
-                    // a click re-grabs, a second press exits as usual.
-                    self.set_pov_grab(false);
-                }
                 KeyCode::Escape => event_loop.exit(),
                 _ => {}
             }
@@ -1467,12 +1454,10 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        // `WER_POV=1` starts directly in POV (plan §8.5): place the camera
-        // and grab the cursor now that the window exists.
+        // `WER_POV=1` starts directly in POV (plan §8.5).
         if self.view_mode == ViewMode::Pov {
             let ground = pov::entry_ground(&self.world.map, self.world.player);
             self.pov_camera.enter_at(self.world.player, ground);
-            self.set_pov_grab(true);
             log::info!("starting in POV (WER_POV set), radius {}", self.pov_radius);
         }
         self.last_frame = Instant::now();
@@ -1490,31 +1475,29 @@ impl ApplicationHandler for App {
                 self.modifiers = modifiers.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = Some((position.x, position.y));
-                // Under the Confined grab fallback (X11/WSL2, plan §8.2) the
-                // cursor still moves; re-center it so it never reaches the
-                // window edge. Look input reads raw deltas, not this.
-                if self.view_mode == ViewMode::Pov && self.pov_grabbed {
-                    if let Some(window) = self.window.as_ref() {
-                        let size = window.inner_size();
-                        let (cx, cy) = (f64::from(size.width) / 2.0, f64::from(size.height) / 2.0);
-                        if (position.x - cx).abs() > 1.0 || (position.y - cy).abs() > 1.0 {
-                            let _ = window
-                                .set_cursor_position(winit::dpi::PhysicalPosition::new(cx, cy));
-                        }
-                    }
+                // POV drag look: window-space deltas while the left button
+                // is held — the same math `--pov-script` simulates with
+                // `mouse:dx,dy`. (Raw device deltas are unusable under
+                // WSLg/XWayland: they arrive as absolute jumps.)
+                if let Some(last) = self.pov_look_from {
+                    self.pov_camera
+                        .look(position.x - last.0, position.y - last.1);
+                    self.pov_look_from = Some((position.x, position.y));
                 }
+                self.cursor_pos = Some((position.x, position.y));
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_pos = None;
+                self.pov_look_from = None;
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                ..
-            } => {
-                // A click inside the window re-grabs after Escape (plan §8.2).
-                if self.view_mode == ViewMode::Pov && !self.pov_grabbed {
-                    self.set_pov_grab(true);
+            WindowEvent::MouseInput { state, button, .. } => {
+                // Mouse look is active only while the left button is held
+                // in POV; releasing (or leaving the window) ends the drag.
+                if self.view_mode == ViewMode::Pov && button == winit::event::MouseButton::Left {
+                    self.pov_look_from = match state {
+                        ElementState::Pressed => self.cursor_pos,
+                        ElementState::Released => None,
+                    };
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1584,18 +1567,6 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
-        }
-    }
-
-    /// Raw mouse deltas for POV mouse look (3d-phase-1-plan.md §8.2):
-    /// `WindowEvent::CursorMoved` is clamped/warped under a grab, so look
-    /// input must come from the device stream. Active only in POV with the
-    /// grab held.
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.view_mode == ViewMode::Pov && self.pov_grabbed {
-                self.pov_camera.look(dx, dy);
-            }
         }
     }
 }
@@ -1729,6 +1700,128 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> R
     Ok(())
 }
 
+/// Headless scripted POV capture (`wer --pov-script`, ADR 0021): drive the
+/// camera through the *same* [`PovCamera`] paths the live shell uses
+/// (`mouse:` goes through `look`, `move:` through the fly-movement basis),
+/// settle the world with the inline executor, mesh with the same
+/// [`PovChunkManager`], render offscreen, and write binary PPMs — the
+/// debugging/testing harness for POV rendering. No window, no event loop.
+fn run_pov_script(script: &str) -> Result<(), String> {
+    let instrs = pov::parse_pov_script(script)?;
+    let cfg = StreamConfig::default();
+    let field = PossibilityField::default();
+    let bias = [0.0f32; POSSIBILITY_DIMS];
+    let mut map = RegionMap::new(cfg);
+    let mut camera = PovCamera::new();
+    let mut chunks = PovChunkManager::new();
+    let radius = std::env::var("WER_POV_RADIUS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .map_or(3, |r| r.clamp(1, 8));
+    let mut size = (1024u32, 768u32);
+    let mut capture: Option<renderer::pov::PovCapture> = None;
+
+    fn settle_world(
+        map: &mut RegionMap,
+        camera: &PovCamera,
+        field: &PossibilityField,
+        bias: &[f32; POSSIBILITY_DIMS],
+        n: u32,
+    ) {
+        for _ in 0..n {
+            // Zero travel, unbudgeted, inline: the screenshot-path settle.
+            map.update(
+                (camera.pos.x, camera.pos.y),
+                0.0,
+                field,
+                &[],
+                bias,
+                &Budget::unlimited(),
+                &world_runtime::InlineExecutor,
+                false,
+            );
+        }
+    }
+
+    // Default start: over the origin at entry eye height (like `WER_POV=1`).
+    camera.enter_at((0.0, 0.0), pov::entry_ground(&map, (0.0, 0.0)));
+
+    for instr in instrs {
+        match instr {
+            pov::PovInstr::Size(w, h) => {
+                if capture.is_some() {
+                    return Err(String::from("size must come before the first snap"));
+                }
+                size = (w, h);
+            }
+            pov::PovInstr::Pos(x, y, z) => match z {
+                Some(z) => camera.pos = glam::DVec3::new(x, y, z),
+                None => {
+                    // Ground placement wants the covering region's realized
+                    // vector; one settle makes it resident first.
+                    camera.pos.x = x;
+                    camera.pos.y = y;
+                    settle_world(&mut map, &camera, &field, &bias, 1);
+                    camera.enter_at((x, y), pov::entry_ground(&map, (x, y)));
+                }
+            },
+            pov::PovInstr::Mouse(dx, dy) => camera.look(dx, dy),
+            pov::PovInstr::Move { forward, right, up } => {
+                camera.pos += camera.forward() * forward
+                    + camera.right() * right
+                    + glam::DVec3::new(0.0, 0.0, up);
+            }
+            pov::PovInstr::Settle(n) => settle_world(&mut map, &camera, &field, &bias, n),
+            pov::PovInstr::Snap(path) => {
+                // Tiles under the camera, then the chunk ring, must be
+                // settled so the snapshot shows the steady state.
+                settle_world(&mut map, &camera, &field, &bias, 8);
+                if capture.is_none() {
+                    capture = Some(
+                        renderer::pov::PovCapture::new(size.0, size.1)
+                            .map_err(|e| format!("pov capture init: {e}"))?,
+                    );
+                }
+                let cap = capture.as_mut().expect("just ensured");
+                for _ in 0..256 {
+                    let (uploads, removes) = chunks.sync(
+                        &map,
+                        (camera.pos.x, camera.pos.y),
+                        radius,
+                        &world_runtime::InlineExecutor,
+                    );
+                    let done = uploads.is_empty() && chunks.is_idle();
+                    cap.apply(&uploads, &removes);
+                    if done {
+                        break;
+                    }
+                }
+                let aspect = size.0 as f32 / size.1 as f32;
+                let params = pov::frame_params(&camera, aspect, radius, CLEAR_COLOR);
+                let rgba = cap.snapshot(&params, CLEAR_COLOR);
+                let mut out = Vec::with_capacity(rgba.len() / 4 * 3 + 32);
+                out.extend_from_slice(format!("P6\n{} {}\n255\n", size.0, size.1).as_bytes());
+                for px in rgba.chunks_exact(4) {
+                    out.extend_from_slice(&px[..3]);
+                }
+                std::fs::write(&path, out).map_err(|e| format!("write {path}: {e}"))?;
+                log::info!(
+                    "pov snapshot {path}: {}x{} at ({:.1}, {:.1}, {:.1}) yaw {:.1}° pitch {:.1}° | {} chunks resident",
+                    size.0,
+                    size.1,
+                    camera.pos.x,
+                    camera.pos.y,
+                    camera.pos.z,
+                    camera.yaw.to_degrees(),
+                    camera.pitch.to_degrees(),
+                    chunks.len(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build the event loop, preferring X11 over Wayland under WSL.
 ///
 /// WSLg's Wayland compositor resets the client connection a few seconds after
@@ -1837,6 +1930,26 @@ fn main() {
         if let Err(err) = run_screenshot(path, channel, pos, zoom) {
             eprintln!("screenshot failed: {err}");
             std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(rest) = args
+        .split_first()
+        .and_then(|(first, rest)| (first == "--pov-script").then_some(rest))
+    {
+        let usage = "usage: wer --pov-script \"pos:300,-10; snap:a.ppm; mouse:200,-50; move:150; snap:b.ppm\"\n\
+                     instructions: size:WxH | pos:x,y[,z] | mouse:dx,dy | move:f[,r[,u]] | settle[:n] | snap:file.ppm";
+        match rest {
+            [script] => {
+                if let Err(err) = run_pov_script(script) {
+                    eprintln!("pov script failed: {err}\n{usage}");
+                    std::process::exit(1);
+                }
+            }
+            _ => {
+                eprintln!("{usage}");
+                std::process::exit(1);
+            }
         }
         return;
     }

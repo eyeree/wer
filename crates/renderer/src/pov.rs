@@ -35,9 +35,11 @@ pub const SKIRT_VERTS: usize = 4 * POV_GRID;
 /// Total vertices per chunk: core grid + skirt bottom ring (plan §6.1).
 pub const VERTS_PER_CHUNK: usize = CORE_VERTS + SKIRT_VERTS;
 
-/// Indices in the shared topology: 64×64 core quads + 4×64 skirt quads,
-/// two triangles each.
-pub const INDICES_PER_CHUNK: usize = (POV_MESH_RES * POV_MESH_RES + 4 * POV_MESH_RES) * 2 * 3;
+/// Indices in the shared topology: 64×64 core quads (two triangles each)
+/// plus 4×64 skirt quads (**four** triangles each — both windings, so a
+/// skirt wall survives back-face culling from either side; a one-sided
+/// skirt reads as a crack whenever the nearer chunk is the taller one).
+pub const INDICES_PER_CHUNK: usize = (POV_MESH_RES * POV_MESH_RES * 2 + 4 * POV_MESH_RES * 4) * 3;
 
 /// The core-lattice vertex that skirt vertex `e * POV_GRID + k` hangs below:
 /// the perimeter traversed counterclockwise viewed from above (south edge
@@ -74,8 +76,10 @@ pub fn chunk_indices() -> Vec<u32> {
         }
     }
     // Skirt: top edge reuses the core perimeter; bottom ring starts at
-    // CORE_VERTS. The (top_k, bottom_k, top_k+1) pattern faces outward for
-    // every edge because the perimeter enumeration is counterclockwise.
+    // CORE_VERTS. Each quad is emitted with BOTH windings: a skirt wall at a
+    // region border must read as terrain from whichever side the camera is
+    // on, and back-face culling would otherwise erase it exactly when the
+    // viewer stands on the taller chunk looking down the step.
     for edge in 0..4 {
         for k in 0..POV_MESH_RES {
             let top0 = skirt_core_index(edge, k) as u32;
@@ -83,6 +87,7 @@ pub fn chunk_indices() -> Vec<u32> {
             let bot0 = (CORE_VERTS + edge * POV_GRID + k) as u32;
             let bot1 = bot0 + 1;
             indices.extend_from_slice(&[top0, bot0, top1, top1, bot0, bot1]);
+            indices.extend_from_slice(&[top0, top1, bot0, top1, bot1, bot0]);
         }
     }
     debug_assert_eq!(indices.len(), INDICES_PER_CHUNK);
@@ -585,6 +590,161 @@ impl Pov {
     }
 }
 
+/// Headless POV capture (ADR 0021): the same terrain pass rendered to an
+/// offscreen texture, with the pixels copied back **for image-file output
+/// only**. This is the debug-screenshot analogue of the CPU `--screenshot`
+/// path — the POV view has no CPU rendering twin, so inspecting it headlessly
+/// requires reading the rendered pixels.
+///
+/// The ADR 0017 discipline survives structurally: the live [`crate::Renderer`]
+/// still exposes no readback API; this type is a separate headless
+/// construction (no surface, no window) used only by debug tooling
+/// (`wer --pov-script`). Captured bytes go to files for humans — never into
+/// hashes, persistence, gameplay, or golden fixtures (GPU output is
+/// non-portable bits).
+#[derive(Debug)]
+pub struct PovCapture {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pov: Pov,
+    color: wgpu::Texture,
+    width: u32,
+    height: u32,
+}
+
+impl PovCapture {
+    /// Bring up an offscreen device and the POV pipeline at `width`×`height`.
+    /// Blocking (debug tooling); honors the standard `WGPU_*` env vars.
+    pub fn new(width: u32, height: u32) -> Result<Self, crate::RendererError> {
+        let (width, height) = (width.max(1), height.max(1));
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = crate::pollster_block(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .map_err(|_| crate::RendererError::NoAdapter)?;
+        let info = adapter.get_info();
+        log::info!(
+            "pov capture adapter: {} ({:?}, driver: {} {})",
+            info.name,
+            info.backend,
+            info.driver,
+            info.driver_info
+        );
+        let (device, queue) =
+            crate::pollster_block(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("wer-pov-capture-device"),
+                ..Default::default()
+            }))
+            .map_err(crate::RendererError::Device)?;
+
+        // The same sRGB format family the surface path presents to, so a
+        // captured frame matches what the window shows.
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pov-capture-color"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut pov = Pov::new(&device, &queue, format);
+        pov.ensure_depth(&device, width, height);
+        Ok(Self {
+            device,
+            queue,
+            pov,
+            color,
+            width,
+            height,
+        })
+    }
+
+    /// Capture size in pixels.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Apply chunk uploads/evictions, exactly like the live path.
+    pub fn apply(&mut self, uploads: &[TerrainChunkUpload], removes: &[u64]) {
+        self.pov.apply(&self.device, &self.queue, uploads, removes);
+    }
+
+    /// Render one frame offscreen and return its RGBA8 bytes (sRGB-encoded,
+    /// row-major, `width × height × 4`) — for writing an image file.
+    #[must_use]
+    pub fn snapshot(&mut self, frame: &PovFrameParams, clear: [f64; 4]) -> Vec<u8> {
+        let draws = self.pov.write_frame(&self.device, &self.queue, frame);
+        let view = self
+            .color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pov-capture-frame"),
+            });
+        self.pov.draw(&mut encoder, &view, &draws, clear);
+
+        // Copy out with the mandatory 256-byte row alignment, then un-pad.
+        let padded = (self.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pov-capture-readback"),
+            size: u64::from(padded) * u64::from(self.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .expect("map_async callback ran")
+            .expect("readback buffer mapped");
+        let data = slice.get_mapped_range();
+        let mut rgba = Vec::with_capacity((self.width * self.height * 4) as usize);
+        for row in 0..self.height {
+            let at = (row * padded) as usize;
+            rgba.extend_from_slice(&data[at..at + (self.width * 4) as usize]);
+        }
+        drop(data);
+        readback.unmap();
+        rgba
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,10 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn every_boundary_edge_is_skirted_exactly_once() {
-        // Each perimeter lattice edge must appear in exactly one skirt quad
-        // (plan §10 check 4): count (top_k, top_k+1) pairs over the skirt
-        // triangles, normalized by vertex-index order.
+    fn every_boundary_edge_is_skirted_front_and_back() {
+        // Each perimeter lattice edge must appear in exactly one skirt quad,
+        // emitted with both windings (plan §10 check 4 + the double-sided
+        // fix): count (top_k, top_k+1) pairs over the skirt triangles,
+        // normalized by vertex-index order — one front-facing and one
+        // back-facing top triangle per edge.
         let indices = chunk_indices();
         let core = POV_MESH_RES * POV_MESH_RES * 6;
         let mut seen = std::collections::HashMap::new();
@@ -617,10 +779,10 @@ mod tests {
                 *seen.entry(key).or_insert(0u32) += 1;
             }
         }
-        // 4 edges x 64 lattice edges, each referenced by exactly one quad's
-        // top-edge triangle.
+        // 4 edges x 64 lattice edges, each referenced by exactly one quad,
+        // whose top-edge triangle appears once per winding.
         assert_eq!(seen.len(), 4 * POV_MESH_RES);
-        assert!(seen.values().all(|&count| count == 1));
+        assert!(seen.values().all(|&count| count == 2));
     }
 
     #[test]

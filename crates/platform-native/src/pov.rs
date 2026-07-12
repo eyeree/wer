@@ -28,10 +28,14 @@ use crate::viz::composite_cell_color;
 /// Vertex spacing in world units (`REGION_SIZE / POV_MESH_RES` = 4.0).
 const SPACING: f64 = REGION_SIZE / POV_MESH_RES as f64;
 
-/// How far the skirt's bottom ring hangs below the perimeter (one grid step
-/// — generous against the sub-unit border steps possibility drift produces
-/// between adjacent quantized vectors, plan §6.5).
-pub const POV_SKIRT_DROP: f32 = SPACING as f32;
+/// How far the skirt's bottom ring hangs below the perimeter. The plan sized
+/// this at one grid step (4.0) for *drift* steps, but the dominant border
+/// step is the possibility-field gradient: adjacent regions differ by up to
+/// `1 / cell_regions` (= 1/8) per dimension, which moves elevation by up to
+/// `BASE_AMPLITUDE · |relief| · Δgeology + SEA_SHIFT_RANGE · Δplanetary`
+/// ≈ 90 world units in the worst case. The wall's unused depth is occluded
+/// by the neighbor's terrain, so a deep skirt costs nothing.
+pub const POV_SKIRT_DROP: f32 = 128.0;
 
 /// Finished meshes integrated per frame (plan §7.3; tuned against the
 /// `docs/perf-baseline.md` methodology).
@@ -497,6 +501,14 @@ impl PovChunkManager {
         self.chunks.len()
     }
 
+    /// Whether nothing is in flight or awaiting integration — with an inline
+    /// executor, repeated `sync` calls until `idle` fully settle the ring
+    /// (the `--pov-script` snapshot path).
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.in_flight.is_empty()
+    }
+
     /// Per-frame sync (plan §7.2–§7.4): drain finished meshes, schedule
     /// stale/missing chunks within `radius` regions of the camera on the
     /// executor's Background lane, integrate at most
@@ -738,6 +750,122 @@ fn farthest_region(
     best.map(|(_, coord)| coord)
 }
 
+// ---------------------------------------------------------------------------
+// The scripted headless POV driver (`wer --pov-script`, ADR 0021)
+// ---------------------------------------------------------------------------
+
+/// One instruction of a `--pov-script` sequence: simulate camera input, let
+/// the world settle, or capture a snapshot. Parsed by [`parse_pov_script`];
+/// executed by the shell's headless runner. Every camera-affecting
+/// instruction goes through the *same* [`PovCamera`] code paths the live
+/// shell drives, so a scripted capture reproduces live behavior.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PovInstr {
+    /// `size:WxH` — capture resolution (before the first `snap`; default
+    /// 1024×768).
+    Size(u32, u32),
+    /// `pos:x,y[,z]` — place the camera; without `z` it sits at entry eye
+    /// height over the sampled ground.
+    Pos(f64, f64, Option<f64>),
+    /// `mouse:dx,dy` — a simulated raw mouse-look delta in pixels, through
+    /// [`PovCamera::look`].
+    Mouse(f64, f64),
+    /// `move:f[,r[,u]]` — fly `f` world units along the view direction, `r`
+    /// strafing right, `u` straight up (the held-key movement basis).
+    Move { forward: f64, right: f64, up: f64 },
+    /// `settle[:n]` — run `n` (default 8) zero-travel world updates at the
+    /// camera position, so tiles generate/regenerate.
+    Settle(u32),
+    /// `snap:path.ppm` — settle the chunk ring and write a snapshot.
+    Snap(String),
+}
+
+/// Parse a `--pov-script` instruction sequence: instructions separated by
+/// `;`, each `op` or `op:args` with comma-separated args, e.g.
+/// `"pos:300,-10; mouse:120,40; snap:a.ppm; move:200; settle; snap:b.ppm"`.
+pub fn parse_pov_script(script: &str) -> Result<Vec<PovInstr>, String> {
+    let mut out = Vec::new();
+    for raw in script.split(';') {
+        let instr = raw.trim();
+        if instr.is_empty() {
+            continue;
+        }
+        let (op, args) = match instr.split_once(':') {
+            Some((op, args)) => (op.trim(), args.trim()),
+            None => (instr, ""),
+        };
+        let nums = || -> Result<Vec<f64>, String> {
+            args.split(',')
+                .map(|a| {
+                    a.trim()
+                        .parse::<f64>()
+                        .map_err(|_| format!("bad number {a:?} in {instr:?}"))
+                })
+                .collect()
+        };
+        out.push(match op {
+            "size" => {
+                let dims: Vec<&str> = args.split(['x', ',']).map(str::trim).collect();
+                match dims[..] {
+                    [w, h] => match (w.parse::<u32>(), h.parse::<u32>()) {
+                        (Ok(w), Ok(h)) if w > 0 && h > 0 => PovInstr::Size(w, h),
+                        _ => return Err(format!("bad size {args:?} (want WxH)")),
+                    },
+                    _ => return Err(format!("bad size {args:?} (want WxH)")),
+                }
+            }
+            "pos" => match nums()?[..] {
+                [x, y] => PovInstr::Pos(x, y, None),
+                [x, y, z] => PovInstr::Pos(x, y, Some(z)),
+                _ => return Err(format!("pos wants x,y[,z], got {args:?}")),
+            },
+            "mouse" => match nums()?[..] {
+                [dx, dy] => PovInstr::Mouse(dx, dy),
+                _ => return Err(format!("mouse wants dx,dy, got {args:?}")),
+            },
+            "move" => match nums()?[..] {
+                [f] => PovInstr::Move {
+                    forward: f,
+                    right: 0.0,
+                    up: 0.0,
+                },
+                [f, r] => PovInstr::Move {
+                    forward: f,
+                    right: r,
+                    up: 0.0,
+                },
+                [f, r, u] => PovInstr::Move {
+                    forward: f,
+                    right: r,
+                    up: u,
+                },
+                _ => return Err(format!("move wants f[,r[,u]], got {args:?}")),
+            },
+            "settle" => {
+                if args.is_empty() {
+                    PovInstr::Settle(8)
+                } else {
+                    match args.parse::<u32>() {
+                        Ok(n) => PovInstr::Settle(n),
+                        Err(_) => return Err(format!("settle wants a count, got {args:?}")),
+                    }
+                }
+            }
+            "snap" => {
+                if args.is_empty() {
+                    return Err(String::from("snap wants a file path"));
+                }
+                PovInstr::Snap(String::from(args))
+            }
+            other => return Err(format!("unknown instruction {other:?}")),
+        });
+    }
+    if out.is_empty() {
+        return Err(String::from("empty script"));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +943,40 @@ mod tests {
                 dominant_ids: &self.dominant_ids,
             }
         }
+    }
+
+    #[test]
+    fn pov_script_parses_the_documented_forms() {
+        let script = "size:640x360; pos:300,-10; mouse:120,-40; snap:a.ppm; \
+                      move:200; move:0,-50,25; settle; settle:3; snap:b.ppm";
+        let parsed = parse_pov_script(script).expect("valid script");
+        assert_eq!(
+            parsed,
+            vec![
+                PovInstr::Size(640, 360),
+                PovInstr::Pos(300.0, -10.0, None),
+                PovInstr::Mouse(120.0, -40.0),
+                PovInstr::Snap(String::from("a.ppm")),
+                PovInstr::Move {
+                    forward: 200.0,
+                    right: 0.0,
+                    up: 0.0
+                },
+                PovInstr::Move {
+                    forward: 0.0,
+                    right: -50.0,
+                    up: 25.0
+                },
+                PovInstr::Settle(8),
+                PovInstr::Settle(3),
+                PovInstr::Snap(String::from("b.ppm")),
+            ]
+        );
+        assert!(parse_pov_script("").is_err());
+        assert!(parse_pov_script("teleport:1,2").is_err());
+        assert!(parse_pov_script("mouse:1").is_err());
+        assert!(parse_pov_script("snap").is_err());
+        assert!(parse_pov_script("size:0x4").is_err());
     }
 
     #[test]
