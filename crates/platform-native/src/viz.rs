@@ -401,6 +401,14 @@ pub struct MapComposer {
     /// Field cells per region edge (matches the stream config resolution).
     resolution: u16,
     pixels: Vec<u8>,
+    /// Integer view magnification about the image center (scroll wheel).
+    /// Presentation only: the base image is composed as usual and then the
+    /// center block is blown up nearest-neighbor, so zooming reveals no data
+    /// beyond the field resolution — it makes single-pixel markers (organisms)
+    /// readable and pickable. [`Self::pixel_to_world`] inverts it.
+    zoom: u32,
+    /// Scratch buffer the magnify step writes into (swapped with `pixels`).
+    zoom_scratch: Vec<u8>,
     /// Last revision seen per pinned region.
     pinned_revisions: BTreeMap<RegionCoord, u32>,
     /// Frames of highlight left per offending region.
@@ -426,10 +434,19 @@ impl MapComposer {
             half_regions,
             resolution,
             pixels: vec![0; side * side * 4],
+            zoom: 1,
+            zoom_scratch: Vec::new(),
             pinned_revisions: BTreeMap::new(),
             flash: BTreeMap::new(),
             pinned_violations: 0,
         }
+    }
+
+    /// Set the view magnification (clamped to at least 1). Applies to the CPU
+    /// [`Self::compose`] path only; the shell falls back from the GPU map
+    /// while zoomed so the base field and the overlays stay aligned.
+    pub fn set_zoom(&mut self, zoom: u32) {
+        self.zoom = zoom.max(1);
     }
 
     fn side_for(half_regions: i32, resolution: u16) -> usize {
@@ -495,6 +512,7 @@ impl MapComposer {
             self.draw_rings(map, player);
         }
         self.draw_player_marker(player);
+        self.magnify();
         &self.pixels
     }
 
@@ -834,14 +852,52 @@ impl MapComposer {
         }
     }
 
+    /// Blow the center block of the composed image up by the zoom factor,
+    /// nearest-neighbor, in place (a swap with the scratch buffer). Everything
+    /// already drawn — field cells and overlay markers alike — magnifies
+    /// together, so the zoomed view stays a faithful crop of the base map.
+    fn magnify(&mut self) {
+        if self.zoom <= 1 {
+            return;
+        }
+        let side = self.side() as usize;
+        let zoom = f64::from(self.zoom);
+        let center = side as f64 / 2.0;
+        // Source index for each output row/column: the continuous zoom-about-
+        // center mapping, floored to a base pixel (mirrors `pixel_to_world`).
+        let src: Vec<usize> = (0..side)
+            .map(|i| {
+                let s = (i as f64 + 0.5 - center) / zoom + center;
+                (s.max(0.0) as usize).min(side - 1)
+            })
+            .collect();
+        self.zoom_scratch.resize(self.pixels.len(), 0);
+        for (oy, &sy) in src.iter().enumerate() {
+            let src_row = sy * side;
+            let dst_row = oy * side;
+            for (ox, &sx) in src.iter().enumerate() {
+                let s = (src_row + sx) * 4;
+                let d = (dst_row + ox) * 4;
+                self.zoom_scratch[d..d + 4].copy_from_slice(&self.pixels[s..s + 4]);
+            }
+        }
+        std::mem::swap(&mut self.pixels, &mut self.zoom_scratch);
+    }
+
     /// World position at the center of image pixel `(px, py)` — the inverse of
-    /// the compose mapping, for mouse picking. Returns `None` outside the map.
+    /// the compose mapping (including the zoom magnification), for mouse
+    /// picking. Returns `None` outside the map.
     #[must_use]
     pub fn pixel_to_world(&self, player: (f64, f64), px: f64, py: f64) -> Option<(f64, f64)> {
         let side = f64::from(self.side());
         if px < 0.0 || py < 0.0 || px >= side || py >= side {
             return None;
         }
+        // Undo the magnify-about-center step first (identity at zoom 1).
+        let zoom = f64::from(self.zoom);
+        let center = side / 2.0;
+        let px = (px - center) / zoom + center;
+        let py = (py - center) / zoom + center;
         let cell = REGION_SIZE / f64::from(self.resolution);
         let (west, north) = self.view_origin(player);
         Some((west + (px + 0.5) * cell, north - (py + 0.5) * cell))
@@ -900,5 +956,84 @@ impl MapComposer {
             self.plot(px, py + d, [255, 255, 255]);
         }
         self.plot(px, py, [255, 40, 40]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_preserves_the_view_center() {
+        // The magnification is about the image center, so the world position
+        // under the center pixel must not move as the zoom changes.
+        let player = (300.0, -10.0);
+        let mut composer = MapComposer::new(3, 16);
+        let center = f64::from(composer.side()) / 2.0;
+        let base = composer
+            .pixel_to_world(player, center, center)
+            .expect("center is inside the map");
+        for zoom in [2, 4, 8, 16] {
+            composer.set_zoom(zoom);
+            let zoomed = composer
+                .pixel_to_world(player, center, center)
+                .expect("center is inside the map");
+            assert!(
+                (zoomed.0 - base.0).abs() < 1e-9 && (zoomed.1 - base.1).abs() < 1e-9,
+                "center moved at zoom x{zoom}: {base:?} -> {zoomed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoomed_picking_shrinks_the_world_span() {
+        // Pixel-to-world across the full image must cover exactly 1/zoom of
+        // the base world extent (the inverse of the magnify step).
+        let player = (0.0, 0.0);
+        let mut composer = MapComposer::new(3, 16);
+        let side = f64::from(composer.side());
+        let span = |c: &MapComposer| {
+            let w0 = c.pixel_to_world(player, 0.0, 0.0).unwrap();
+            let w1 = c.pixel_to_world(player, side - 1.0, 0.0).unwrap();
+            w1.0 - w0.0
+        };
+        let base = span(&composer);
+        composer.set_zoom(4);
+        let zoomed = span(&composer);
+        assert!(
+            (zoomed - base / 4.0).abs() < 1e-6,
+            "zoom x4 span {zoomed} != base {base} / 4"
+        );
+    }
+
+    #[test]
+    fn magnify_blows_up_the_center_block() {
+        // Paint a distinct color per base pixel, magnify, and check output
+        // pixels sample the base pixel the pixel_to_world inverse names.
+        let mut composer = MapComposer::new(1, 4);
+        let side = composer.side() as usize;
+        for i in 0..side * side {
+            let v = (i % 251) as u8;
+            composer.pixels[i * 4..i * 4 + 4].copy_from_slice(&[v, v.wrapping_add(1), 0, 255]);
+        }
+        let before = composer.pixels.clone();
+        composer.set_zoom(2);
+        composer.magnify();
+        let zoom = 2.0;
+        let center = side as f64 / 2.0;
+        for oy in 0..side {
+            for ox in 0..side {
+                let src = |i: usize| {
+                    let s = (i as f64 + 0.5 - center) / zoom + center;
+                    (s.max(0.0) as usize).min(side - 1)
+                };
+                let (sx, sy) = (src(ox), src(oy));
+                assert_eq!(
+                    composer.pixels[(oy * side + ox) * 4..(oy * side + ox) * 4 + 4],
+                    before[(sy * side + sx) * 4..(sy * side + sx) * 4 + 4],
+                    "output ({ox},{oy}) should show base ({sx},{sy})"
+                );
+            }
+        }
     }
 }

@@ -90,6 +90,32 @@ pub struct EcologyInfo {
     pub diversity: f32,
 }
 
+/// The realized organism under the cursor when the view is zoomed in past
+/// the pick threshold. Everything here is transient presentation state
+/// (phase-3-plan.md §7.6) — the readout inspects a realized instance, it
+/// never becomes identity.
+#[derive(Debug, Clone, Copy)]
+pub struct OrganismInfo {
+    /// Stable instance identity (the `feature_hash` of its cell slot).
+    pub id: u64,
+    /// The species it instantiates ([`world_core::Species::id`]).
+    pub species: u64,
+    /// Trophic role label.
+    pub trophic: &'static str,
+    /// Jittered world position.
+    pub world: (f64, f64),
+    /// Expressed hue in `[0, 1)`.
+    pub hue: f32,
+    /// Expressed bioluminance in `[0, 1]`.
+    pub luminance: f32,
+    /// Expressed body size in world units.
+    pub size: f32,
+    /// Expressed activity in `[0, 1]`.
+    pub activity: f32,
+    /// Expressed aggression in `[0, 1]`.
+    pub aggression: f32,
+}
+
 /// One frame's worth of panel content.
 #[derive(Debug)]
 pub struct PanelInfo<'a> {
@@ -148,8 +174,13 @@ pub struct PanelInfo<'a> {
     pub transition_mode: bool,
     /// Vault store telemetry, when a vault is open (phase-5-plan.md §11).
     pub vault: Option<VaultInfo>,
+    /// The view magnification (mouse wheel; 1 = the full window).
+    pub zoom: u32,
     /// Data under the mouse, when it is over the map.
     pub cursor: Option<CursorInfo>,
+    /// The organism under the mouse when zoomed in past the pick threshold;
+    /// shown in place of the cursor's region block while present.
+    pub organism: Option<OrganismInfo>,
 }
 
 /// The panel's view of the open vault (phase-5-plan.md §8.2): live proof that
@@ -446,6 +477,52 @@ impl Hud {
         );
         cur.rule(self);
 
+        // The cursor readout sits directly under the chan/player line so it
+        // stays visible on every tier — the panel is taller than the Low-tier
+        // map strip, and everything below this point may clip. The zoom level
+        // rides the section header so the block height (and therefore the
+        // panel layout) is unchanged by zooming.
+        let zoom_suffix = if info.zoom > 1 {
+            format!("  zoom x{}", info.zoom)
+        } else {
+            String::new()
+        };
+        if let Some(o) = &info.organism {
+            // Zoomed-in organism picking: the organism under the mouse
+            // replaces the region block (region info returns as soon as the
+            // cursor leaves the marker).
+            cur.line(self, &format!("ORGANISM{zoom_suffix}"), HEADER);
+            cur.label_value(self, "id", &format!("{:016x}", o.id), VALUE);
+            cur.label_value(self, "species", &format!("{:016x}", o.species), VALUE);
+            // "decomposer" overflows a pair's first column, so trophic gets
+            // the whole line.
+            cur.label_value(self, "trophic", o.trophic, ACTIVE);
+            cur.pair(
+                self,
+                "size",
+                &format!("{:.2}", o.size),
+                "hue",
+                &format!("{:.2}", o.hue),
+            );
+            cur.pair(
+                self,
+                "lumin",
+                &format!("{:.2}", o.luminance),
+                "activity",
+                &format!("{:.2}", o.activity),
+            );
+            cur.label_value(self, "aggression", &format!("{:.2}", o.aggression), VALUE);
+            cur.label_value(
+                self,
+                "world",
+                &format!("{:.0}, {:.0}", o.world.0, o.world.1),
+                VALUE,
+            );
+            cur.rule(self);
+        } else {
+            self.draw_cursor_block(&mut cur, info, &zoom_suffix);
+        }
+
         cur.line(self, "BIAS  1-8 up, shift down, Z", HEADER);
         for pair in (0..POSSIBILITY_DIMS).step_by(2) {
             let row_y = cur.y;
@@ -514,7 +591,25 @@ impl Hud {
         }
         cur.rule(self);
 
-        cur.line(self, "CURSOR", HEADER);
+        cur.line(self, "KEYS", HEADER);
+        for (keys, action) in [
+            ("WASD 1-8 Z", "move, bias, reset"),
+            ("E / Q / C", "anchors, clear"),
+            ("T Y K", "categ,polar,capture"),
+            ("R", "transition mode"),
+            ("V G N X M", "channel,overlays"),
+            ("scroll", "zoom (organism info)"),
+        ] {
+            let row_y = cur.y;
+            self.text(cur.x, row_y, keys, KEY);
+            self.text(cur.x + 13 * 8 * SCALE, row_y, action, LABEL);
+            cur.y += LINE_HEIGHT;
+        }
+    }
+
+    /// The region block under the cursor (the pre-zoom CURSOR section).
+    fn draw_cursor_block(&mut self, cur: &mut PanelCursor, info: &PanelInfo<'_>, suffix: &str) {
+        cur.line(self, &format!("CURSOR{suffix}"), HEADER);
         match &info.cursor {
             None => cur.line(self, "(move mouse over map)", LABEL),
             Some(c) => {
@@ -607,20 +702,6 @@ impl Hud {
             }
         }
         cur.rule(self);
-
-        cur.line(self, "KEYS", HEADER);
-        for (keys, action) in [
-            ("WASD 1-8 Z", "move, bias, reset"),
-            ("E / Q / C", "anchors, clear"),
-            ("T Y K", "categ,polar,capture"),
-            ("R", "transition mode"),
-            ("V G N X M", "channel,overlays"),
-        ] {
-            let row_y = cur.y;
-            self.text(cur.x, row_y, keys, KEY);
-            self.text(cur.x + 13 * 8 * SCALE, row_y, action, LABEL);
-            cur.y += LINE_HEIGHT;
-        }
     }
 
     /// Draw `text` at pixel `(x, y)` in `color`, clipped to the image.
@@ -708,5 +789,78 @@ impl PanelCursor {
         self.y += LINE_HEIGHT / 3;
         hud.hline(self.y);
         self.y += LINE_HEIGHT * 2 / 3;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info<'a>(
+        regen: &'a [u64; LAYER_COUNT as usize],
+        bias: &'a [f32; POSSIBILITY_DIMS],
+        organism: Option<OrganismInfo>,
+        zoom: u32,
+    ) -> PanelInfo<'a> {
+        PanelInfo {
+            fps: 60,
+            update_ms: 1.0,
+            compose_ms: 1.0,
+            render_ms: 1.0,
+            upload_kb: 0.0,
+            gpu_compose: false,
+            tier: "low",
+            cache_ceiling_bytes: 0,
+            pass_ms: [0.0; world_runtime::PASS_COUNT],
+            workers: 1,
+            stats: FrameStats::default(),
+            regen_totals: regen,
+            macro_tiles: 0,
+            rosters: 0,
+            organisms: 0,
+            jobs_in_flight: 0,
+            pinned_violations: 0,
+            channel: Channel::Composite,
+            player: (0.0, 0.0),
+            bias,
+            anchors: &[],
+            capture_category: "Morphology",
+            capture_polarity: AnchorKind::Emphasize,
+            transition_mode: false,
+            vault: None,
+            zoom,
+            cursor: None,
+            organism,
+        }
+    }
+
+    /// The organism block draws (and differs from the region block) without
+    /// panicking — the zoomed-in picking readout is renderable end to end.
+    #[test]
+    fn organism_block_renders_and_changes_the_panel() {
+        let regen = [0u64; LAYER_COUNT as usize];
+        let bias = [0.0f32; POSSIBILITY_DIMS];
+        let side = 900usize;
+        let map = vec![0u8; side * side * 4];
+
+        let mut hud = Hud::new(side);
+        let without = hud.compose(&map, &info(&regen, &bias, None, 4)).to_vec();
+
+        let organism = OrganismInfo {
+            id: 0x0123_4567_89AB_CDEF,
+            species: 0xFEDC_BA98_7654_3210,
+            trophic: "herbivore",
+            world: (123.0, -456.0),
+            hue: 0.25,
+            luminance: 0.5,
+            size: 1.5,
+            activity: 0.7,
+            aggression: 0.2,
+        };
+        let mut hud = Hud::new(side);
+        let with = hud
+            .compose(&map, &info(&regen, &bias, Some(organism), 4))
+            .to_vec();
+        assert_ne!(without, with, "organism block must change the panel");
     }
 }

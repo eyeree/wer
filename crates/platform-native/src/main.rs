@@ -32,14 +32,19 @@
 //! - `Esc` — quit
 //! - Mouse over the map — the info panel shows the cell under the cursor
 //!   (world/region coordinates, streaming state, field samples, biome)
+//! - Mouse wheel — zoom the map view in/out (presentation-only magnification
+//!   about the view center); zoomed in past x4, hovering an organism marker
+//!   shows that organism in the panel instead of the region info
 //!
 //! An information panel to the right of the map shows frame/streaming
 //! telemetry, the selected channel, bias and anchor state, cursor data, and
 //! the key bindings ([`panel`]).
 //!
 //! Headless screenshot mode (no window, for debugging the generators):
-//! `wer --screenshot <out.ppm> [channel] [x y]` settles the streaming window
-//! at the given position and writes the composed map + panel as a binary PPM.
+//! `wer --screenshot <out.ppm> [channel] [x y [zoom]]` settles the streaming
+//! window at the given position and writes the composed map + panel as a
+//! binary PPM. A zoom past the organism threshold also picks the organism
+//! nearest the center position, exercising the zoomed panel readout.
 
 mod executor;
 mod gpumap;
@@ -52,13 +57,13 @@ use std::time::Instant;
 
 use renderer::{letterbox_viewport, Renderer};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 use world_core::{
     bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, Biome, PossibilityDomain,
-    PossibilityField, PossibilitySignature, RegionCoord, TraitCategory, LAYER_COUNT,
+    PossibilityField, PossibilitySignature, RegionCoord, TraitCategory, Trophic, LAYER_COUNT,
     POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
@@ -70,7 +75,7 @@ use world_runtime::{
 
 use executor::LaneExecutor;
 use gpumap::AtlasManager;
-use panel::{CursorInfo, EcologyInfo, Hud, PanelInfo, VaultInfo};
+use panel::{CursorInfo, EcologyInfo, Hud, OrganismInfo, PanelInfo, VaultInfo};
 use tools::FileStorage;
 use viz::{Channel, MapComposer, MapDecor, Overlays};
 
@@ -86,6 +91,13 @@ const NUDGE_STEP: f32 = 0.05;
 /// Anchor parameters for the two Phase 1 anchor kinds.
 const ANCHOR_STRENGTH: f32 = 0.8;
 const ANCHOR_RADIUS: f64 = 2048.0;
+
+/// Largest mouse-wheel view magnification (powers of two from 1).
+const MAX_ZOOM: u32 = 16;
+
+/// Zoom level at (and past) which hovering an organism marker shows that
+/// organism in the panel instead of the region info.
+const ORGANISM_INFO_ZOOM: u32 = 4;
 
 /// The world-simulation half of the app (everything that isn't winit/wgpu).
 struct World {
@@ -471,6 +483,14 @@ struct App {
     modifiers: ModifiersState,
     /// Mouse position in window physical pixels, when over the window.
     cursor_pos: Option<(f64, f64)>,
+    /// Mouse-wheel view magnification (powers of two, 1..=MAX_ZOOM).
+    /// Presentation only; past [`ORGANISM_INFO_ZOOM`] the cursor picks
+    /// organisms. Zoomed views compose on the CPU so the base field and the
+    /// overlays stay aligned.
+    zoom: u32,
+    /// Fractional scroll accumulated toward the next zoom step (touchpads
+    /// deliver many small pixel deltas per notch).
+    scroll_accum: f64,
     /// Cumulative regenerated-tile counts per layer (panel telemetry).
     regen_totals: [u64; LAYER_COUNT as usize],
     last_frame: Instant,
@@ -525,6 +545,8 @@ impl App {
             keys_down: HashSet::new(),
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
+            zoom: 1,
+            scroll_accum: 0.0,
             regen_totals: [0; LAYER_COUNT as usize],
             last_frame: Instant::now(),
             stats_frames: 0,
@@ -838,6 +860,38 @@ impl App {
         }
     }
 
+    /// The realized organism whose marker sits under `world`, if any: the
+    /// nearest one within one field cell (a marker is one base-map pixel, i.e.
+    /// one cell). Reads the transient near-field realization (phase-3-plan.md
+    /// §7.6) — a debug readout, never a source of identity.
+    fn pick_organism(map: &RegionMap, world: (f64, f64)) -> Option<OrganismInfo> {
+        let cell = REGION_SIZE / f64::from(map.config().field_resolution);
+        let mut best: Option<(f64, &world_runtime::Organism)> = None;
+        for org in map.organisms() {
+            let d = f64::hypot(org.world_pos.0 - world.0, org.world_pos.1 - world.1);
+            if d <= cell && best.is_none_or(|(nearest, _)| d < nearest) {
+                best = Some((d, org));
+            }
+        }
+        best.map(|(_, org)| OrganismInfo {
+            id: org.id,
+            species: org.species,
+            trophic: match org.trophic {
+                Trophic::Producer => "producer",
+                Trophic::Herbivore => "herbivore",
+                Trophic::Omnivore => "omnivore",
+                Trophic::Carnivore => "carnivore",
+                Trophic::Decomposer => "decomposer",
+            },
+            world: org.world_pos,
+            hue: org.expressed.hue,
+            luminance: org.expressed.luminance,
+            size: org.expressed.size,
+            activity: org.expressed.activity,
+            aggression: org.expressed.aggression,
+        })
+    }
+
     /// Map the mouse (window physical pixels) through the letterbox viewport
     /// onto the composed image, then onto the world.
     fn cursor_world(&self) -> Option<(f64, f64)> {
@@ -919,13 +973,23 @@ impl App {
             *total += count as u64;
         }
 
-        let cursor = self
-            .cursor_world()
-            .map(|world| Self::sample_cursor(&self.world.map, world));
+        let cursor_world = self.cursor_world();
+        let cursor = cursor_world.map(|world| Self::sample_cursor(&self.world.map, world));
+        // Zoomed in far enough, the cursor picks the organism marker under it
+        // (the region info stays whenever no organism is under the mouse).
+        let organism = if self.zoom >= ORGANISM_INFO_ZOOM {
+            cursor_world.and_then(|world| Self::pick_organism(&self.world.map, world))
+        } else {
+            None
+        };
 
         let decor = self.build_decor();
         let gpu_channel = gpumap::gpu_channel(self.channel);
-        let use_gpu = self.gpu_compose && gpu_channel.is_some() && self.renderer.is_some();
+        // A zoomed view composes on the CPU: the GPU shader has no zoom
+        // transform, and the CPU path magnifies field and overlays together.
+        self.composer.set_zoom(self.zoom);
+        let use_gpu =
+            self.gpu_compose && self.zoom == 1 && gpu_channel.is_some() && self.renderer.is_some();
         let compose_start = Instant::now();
         if use_gpu {
             // GPU path (phase-6-plan.md §6.5): CPU draws only the sparse
@@ -978,7 +1042,9 @@ impl App {
                 seen: v.seen_count(),
                 issues: v.issues().len(),
             }),
+            zoom: self.zoom,
             cursor,
+            organism,
         };
         let mut upload_bytes = 0u64;
         let (compose_seconds, render_seconds) = if use_gpu {
@@ -1104,6 +1170,33 @@ impl ApplicationHandler for App {
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_pos = None;
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.scroll_accum += match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    // Touchpads scroll in pixels; ~40 px per wheel notch.
+                    MouseScrollDelta::PixelDelta(pos) => pos.y / 40.0,
+                };
+                let before = self.zoom;
+                while self.scroll_accum >= 1.0 {
+                    self.zoom = (self.zoom * 2).min(MAX_ZOOM);
+                    self.scroll_accum -= 1.0;
+                }
+                while self.scroll_accum <= -1.0 {
+                    self.zoom = (self.zoom / 2).max(1);
+                    self.scroll_accum += 1.0;
+                }
+                if self.zoom != before {
+                    log::info!(
+                        "zoom x{}{}",
+                        self.zoom,
+                        if self.zoom >= ORGANISM_INFO_ZOOM {
+                            " (organism picking active)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1156,7 +1249,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// composed false-color map as a binary PPM (P6). No window, no GPU — the map
 /// is CPU-composed, which is exactly what makes it inspectable in tests and
 /// from the command line.
-fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), String> {
+fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> Result<(), String> {
     let cfg = StreamConfig::default();
     let field = PossibilityField::default();
     let bias = [0.0f32; POSSIBILITY_DIMS];
@@ -1184,6 +1277,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
 
     let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
     let mut composer = MapComposer::new(half_regions, cfg.field_resolution);
+    composer.set_zoom(zoom);
     let overlays = Overlays {
         grid: false,
         rings: false,
@@ -1192,6 +1286,25 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         discovered: false,
     };
     composer.compose(&map, pos, channel, overlays, &[], &MapDecor::default());
+
+    // The organism readout, exactly as the live cursor picks it (the
+    // "cursor" sits at the given position).
+    let organism = if zoom >= ORGANISM_INFO_ZOOM {
+        let picked = App::pick_organism(&map, pos);
+        match &picked {
+            Some(o) => log::info!(
+                "picked organism {:#018x} ({} at {:.0}, {:.0})",
+                o.id,
+                o.trophic,
+                o.world.0,
+                o.world.1
+            ),
+            None => log::info!("no organism within a cell of ({}, {})", pos.0, pos.1),
+        }
+        picked
+    } else {
+        None
+    };
 
     // Include the info panel (cursor pinned at the given position) so HUD
     // rendering is inspectable headlessly too.
@@ -1222,7 +1335,9 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
         capture_polarity: AnchorKind::Emphasize,
         transition_mode: false,
         vault: None,
+        zoom,
         cursor: Some(App::sample_cursor(&map, pos)),
+        organism,
     };
     let (width, height) = hud.size();
     let pixels = hud.compose(composer.pixels(), &info);
@@ -1314,21 +1429,30 @@ fn main() {
         .split_first()
         .and_then(|(first, rest)| (first == "--screenshot").then_some(rest))
     {
-        let usage = "usage: wer --screenshot <out.ppm> [channel] [x y]";
-        let (path, channel, pos) = match rest {
-            [path] => (path, Channel::Composite, (0.0, 0.0)),
+        let usage = "usage: wer --screenshot <out.ppm> [channel] [x y [zoom]]";
+        let (path, channel, pos, zoom) = match rest {
+            [path] => (path, Channel::Composite, (0.0, 0.0), 1),
             [path, channel] => match Channel::parse(channel) {
-                Some(c) => (path, c, (0.0, 0.0)),
+                Some(c) => (path, c, (0.0, 0.0), 1),
                 None => {
                     eprintln!("unknown channel {channel:?}\n{usage}");
                     std::process::exit(1);
                 }
             },
-            [path, channel, x, y] => {
-                match (Channel::parse(channel), x.parse::<f64>(), y.parse::<f64>()) {
-                    (Some(c), Ok(x), Ok(y)) => (path, c, (x, y)),
+            [path, channel, x, y, zoom @ ..] if zoom.len() <= 1 => {
+                let zoom = match zoom {
+                    [z] => z.parse::<u32>().ok().filter(|z| *z >= 1),
+                    _ => Some(1),
+                };
+                match (
+                    Channel::parse(channel),
+                    x.parse::<f64>(),
+                    y.parse::<f64>(),
+                    zoom,
+                ) {
+                    (Some(c), Ok(x), Ok(y), Some(z)) => (path, c, (x, y), z),
                     _ => {
-                        eprintln!("bad channel or coordinates\n{usage}");
+                        eprintln!("bad channel, coordinates, or zoom\n{usage}");
                         std::process::exit(1);
                     }
                 }
@@ -1338,7 +1462,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(err) = run_screenshot(path, channel, pos) {
+        if let Err(err) = run_screenshot(path, channel, pos, zoom) {
             eprintln!("screenshot failed: {err}");
             std::process::exit(1);
         }
