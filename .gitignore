@@ -16,6 +16,9 @@ node_modules
 *.tracy
 /captures
 
+# F12 debug dumps from the app shell
+/dump
+
 # Editor / OS
 .DS_Store
 .idea/

@@ -38,6 +38,10 @@
 //!   wheel adjusts fly speed. Every map binding above is map-mode-only.
 //!   `WER_POV=1` starts in POV; `WER_POV_RADIUS` sets the chunk draw radius
 //!   in regions (default 3).
+//! - `F12` — write a debug dump into `./dump/<UTC datetime>/`: a screenshot
+//!   of the active view (map or POV) plus `state.txt` with the player/camera
+//!   state, steering, telemetry, dep-hash chain, and vault counters
+//!   ([`dump`]). Works in both map and POV modes.
 //! - `Esc` — quit
 //! - Mouse over the map — the info panel shows the cell under the cursor
 //!   (world/region coordinates, streaming state, field samples, biome)
@@ -65,6 +69,7 @@
 //! `snap:file.ppm`. Example:
 //! `wer --pov-script "pos:300,-10; snap:a.ppm; mouse:200,-50; move:150; snap:b.ppm"`
 
+mod dump;
 mod executor;
 mod gpumap;
 mod panel;
@@ -728,6 +733,9 @@ struct App {
     scroll_accum: f64,
     /// Cumulative regenerated-tile counts per layer (panel telemetry).
     regen_totals: [u64; LAYER_COUNT as usize],
+    /// The most recent `World::update` counters, kept for the `F12` debug
+    /// dump ([`dump`]) — the live frame consumes its stats by value.
+    last_stats: FrameStats,
     last_frame: Instant,
     // Rolling telemetry (phase-1-plan.md section 12; phase-6-plan.md §12),
     // displayed by the info panel; per-second counters are no longer logged.
@@ -797,6 +805,7 @@ impl App {
             zoom: 1,
             scroll_accum: 0.0,
             regen_totals: [0; LAYER_COUNT as usize],
+            last_stats: FrameStats::default(),
             last_frame: Instant::now(),
             stats_frames: 0,
             update_time_accum: 0.0,
@@ -904,12 +913,14 @@ impl App {
     /// One-shot actions on key press.
     fn handle_press(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
         // The POV keybinding gate (3d-phase-1-plan.md §8.4): in POV only
-        // `Tab` and `Escape` are handled; every map binding below stays
-        // map-mode-only. This gate is the whole guarantee that map mode is
-        // pixel-identical — no map state can even be touched from POV.
+        // `Tab`, `Escape`, and the `F12` debug dump are handled; every map
+        // binding below stays map-mode-only. This gate is the whole guarantee
+        // that map mode is pixel-identical — no map state can even be touched
+        // from POV (the dump only reads and writes files).
         if self.view_mode == ViewMode::Pov {
             match code {
                 KeyCode::Tab => self.toggle_view_mode(),
+                KeyCode::F12 => self.debug_dump(),
                 KeyCode::Escape => event_loop.exit(),
                 _ => {}
             }
@@ -1087,9 +1098,25 @@ impl App {
                     if self.refinement { "on" } else { "off" }
                 );
             }
+            KeyCode::F12 => self.debug_dump(),
             KeyCode::Escape => event_loop.exit(),
             _ => {}
         }
+    }
+
+    /// The panel's vault counters, shared by the live frame and the `F12`
+    /// debug dump.
+    fn vault_panel_info(&self) -> Option<VaultInfo> {
+        self.world.vault.as_ref().map(|v| VaultInfo {
+            records: v.discoveries().len() + v.routes().len() + v.preserves().len(),
+            dirty: v.dirty_records(),
+            seen: v.seen_count(),
+            issues: v.issue_count(),
+            suppressed_issues: v.suppressed_issue_count(),
+            persistence_retries: v
+                .active_persistence_issue()
+                .map_or(0, world_runtime::VaultIssue::occurrences),
+        })
     }
 
     /// The vault-derived map decorations for this frame (phase-5-plan.md
@@ -1310,6 +1337,7 @@ impl App {
         let update_start = Instant::now();
         let stats = self.world.update();
         let update_seconds = update_start.elapsed().as_secs_f64();
+        self.last_stats = stats;
         for (total, &count) in self
             .regen_totals
             .iter_mut()
@@ -1386,16 +1414,7 @@ impl App {
             capture_category: self.capture_category.name(),
             capture_polarity: self.capture_polarity,
             transition_mode: self.world.transition_mode,
-            vault: self.world.vault.as_ref().map(|v| VaultInfo {
-                records: v.discoveries().len() + v.routes().len() + v.preserves().len(),
-                dirty: v.dirty_records(),
-                seen: v.seen_count(),
-                issues: v.issue_count(),
-                suppressed_issues: v.suppressed_issue_count(),
-                persistence_retries: v
-                    .active_persistence_issue()
-                    .map_or(0, world_runtime::VaultIssue::occurrences),
-            }),
+            vault: self.vault_panel_info(),
             zoom: self.zoom,
             cursor,
             organism,
@@ -1489,6 +1508,7 @@ impl App {
             * core::mem::size_of::<renderer::PovVertex>()) as u64;
         stats.pass_ms[world_runtime::Pass::Mesh.index()] +=
             mesh_start.elapsed().as_secs_f32() * 1000.0;
+        self.last_stats = stats;
 
         let render_start = Instant::now();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -1795,13 +1815,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> R
     };
     let (width, height) = hud.size();
     let pixels = hud.compose(composer.pixels(), &info);
-
-    let mut out = Vec::with_capacity(pixels.len() / 4 * 3 + 32);
-    out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
-    for px in pixels.chunks_exact(4) {
-        out.extend_from_slice(&px[..3]);
-    }
-    std::fs::write(path, out).map_err(|e| format!("write {path}: {e}"))?;
+    dump::write_ppm(std::path::Path::new(path), pixels, width, height)?;
     log::info!(
         "wrote {width}x{height} {} map+panel at ({}, {}) to {path}",
         channel.name(),
@@ -1910,12 +1924,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                 let aspect = size.0 as f32 / size.1 as f32;
                 let params = pov::frame_params(&camera, aspect, radius, CLEAR_COLOR);
                 let rgba = cap.snapshot(&params, CLEAR_COLOR);
-                let mut out = Vec::with_capacity(rgba.len() / 4 * 3 + 32);
-                out.extend_from_slice(format!("P6\n{} {}\n255\n", size.0, size.1).as_bytes());
-                for px in rgba.chunks_exact(4) {
-                    out.extend_from_slice(&px[..3]);
-                }
-                std::fs::write(&path, out).map_err(|e| format!("write {path}: {e}"))?;
+                dump::write_ppm(std::path::Path::new(&path), &rgba, size.0, size.1)?;
                 log::info!(
                     "pov snapshot {path}: {}x{} at ({:.1}, {:.1}, {:.1}) yaw {:.1}° pitch {:.1}° | {} chunks resident",
                     size.0,

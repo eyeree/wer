@@ -78,7 +78,10 @@ domain, and there is no networking and no browser storage backend (Phase 7)
 ## Commands
 
 ```sh
-# Build & run the native app shell (opens a window, clears to dusk blue).
+# Build & run the native app shell. In the app, F12 writes a debug dump —
+# a screenshot of the active view (map or 3D POV) plus state.txt (player/
+# camera pose, steering, telemetry, dep-hash chain, vault counters) — to
+# ./dump/<UTC datetime>/, for diagnosing problems after the fact.
 cargo run --bin wer
 
 # Deterministic inspector: world position -> region + origin feature hash.
