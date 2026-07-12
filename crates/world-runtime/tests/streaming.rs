@@ -15,9 +15,9 @@ use world_core::{
     BIOME_COUNT, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    layer_channels, stability_for, Budget, GenerationStatus, InlineExecutor, RegionMap,
-    RosterCache, StreamConfig, TaskExecutor, TaskPriority, CHANNEL_ELEVATION, CHANNEL_HARDNESS,
-    CHANNEL_RIVER, CHANNEL_VEGETATION,
+    full_region_payload_bytes, layer_channels, stability_for, Budget, GenerationStatus,
+    InlineExecutor, RegionMap, RosterCache, StreamConfig, TaskExecutor, TaskPriority,
+    CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER, CHANNEL_VEGETATION,
 };
 
 const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
@@ -1140,9 +1140,9 @@ fn staleness_is_tracked_per_tile_by_dep_hash() {
     }
 }
 
-/// Phase 6 (§6.4): under unchanged steering the retarget pass round-robins
-/// `max_retarget_regions` per frame (deferral reported), while any steering
-/// change refreshes the whole window that same frame — dirty-first.
+/// Phase 6 (§6.4) plus ADR 0023: unchanged steering round-robins target
+/// calculation, while stability remains current for every resident and any
+/// steering change refreshes the whole target window immediately.
 #[test]
 fn retarget_amortizes_and_refreshes_on_steering_change() {
     use world_runtime::InlineExecutor;
@@ -1196,4 +1196,357 @@ fn retarget_amortizes_and_refreshes_on_steering_change() {
                     .get(world_core::PossibilityDomain::Ecology)
     });
     assert!(moved, "bias change did not reach any target this frame");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AuthorityFingerprint {
+    coord: RegionCoord,
+    current: [u32; POSSIBILITY_DIMS],
+    target: [u32; POSSIBILITY_DIMS],
+    stability: u32,
+    revision: u32,
+}
+
+fn authority_fingerprint(map: &RegionMap) -> Vec<AuthorityFingerprint> {
+    map.iter_active()
+        .map(|region| AuthorityFingerprint {
+            coord: region.coord,
+            current: region.current.dims.map(f32::to_bits),
+            target: region.target.dims.map(f32::to_bits),
+            stability: region.stability.to_bits(),
+            revision: region.revision,
+        })
+        .collect()
+}
+
+fn region_content_hashes(map: &RegionMap, coord: RegionCoord) -> Vec<u64> {
+    let tiles = map.cache().get(coord).expect("field-active region tiles");
+    let mut hashes: Vec<u64> = tiles
+        .channels
+        .iter()
+        .flatten()
+        .map(|tile| tile.content_hash())
+        .collect();
+    hashes.extend(tiles.biome.iter().map(|tile| tile.content_hash()));
+    hashes.extend(tiles.dominant.iter().map(|tile| tile.content_hash()));
+    hashes
+}
+
+#[test]
+fn authoritative_loading_is_independent_of_field_capacity() {
+    let player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    let base = StreamConfig {
+        near_radius: 0.1 * REGION_SIZE,
+        far_radius: 1.5 * REGION_SIZE,
+        load_radius: 1.1 * REGION_SIZE,
+        unload_radius: 2.5 * REGION_SIZE,
+        field_resolution: 2,
+        ..StreamConfig::default()
+    };
+    let mut tight = RegionMap::new(StreamConfig {
+        max_field_cache_bytes: 0,
+        ..base
+    });
+    let mut roomy = RegionMap::new(StreamConfig {
+        max_field_cache_bytes: usize::MAX,
+        ..base
+    });
+    let budget = Budget {
+        max_loads: 2,
+        ..Budget::unlimited()
+    };
+    let field = PossibilityField::default();
+    let tight_stats = tight.update(
+        player,
+        0.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    let roomy_stats = roomy.update(
+        player,
+        0.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+
+    assert_eq!(tight_stats.loaded, 2);
+    assert_eq!(tight_stats.loaded, roomy_stats.loaded);
+    assert_eq!(tight_stats.deferred_loads, roomy_stats.deferred_loads);
+    assert_eq!(authority_fingerprint(&tight), authority_fingerprint(&roomy));
+    assert!(tight
+        .iter_active()
+        .any(|region| region.status == GenerationStatus::Unloaded));
+    assert!(roomy
+        .iter_active()
+        .all(|region| region.status == GenerationStatus::Ready));
+    assert!(tight.cache().len() < roomy.cache().len());
+}
+
+#[test]
+fn admission_reserves_full_payload_before_queued_generation_integrates() {
+    let player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    let resolution = 2;
+    let cfg = StreamConfig {
+        near_radius: 0.1 * REGION_SIZE,
+        far_radius: 1.5 * REGION_SIZE,
+        load_radius: 1.1 * REGION_SIZE,
+        unload_radius: 2.5 * REGION_SIZE,
+        field_resolution: resolution,
+        max_field_cache_bytes: full_region_payload_bytes(resolution),
+        ..StreamConfig::default()
+    };
+    let field = PossibilityField::default();
+    let executor = ManualExecutor::default();
+    let mut map = RegionMap::new(cfg);
+
+    map.update(
+        player,
+        0.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &Budget::unlimited(),
+        &executor,
+        false,
+    );
+    assert!(executor.queue_len() > 0);
+    assert_eq!(map.cache().bytes(), 0, "no queued result has integrated");
+
+    let is_non_near = |coord: RegionCoord| {
+        let (ox, oy) = coord.origin();
+        f64::hypot(
+            ox + REGION_SIZE * 0.5 - player.0,
+            oy + REGION_SIZE * 0.5 - player.1,
+        ) > cfg.near_radius
+    };
+    let disposable_active = |map: &RegionMap| {
+        map.iter_active()
+            .filter(|region| {
+                region.status != GenerationStatus::Unloaded
+                    && is_non_near(region.coord)
+                    && !map.is_overridden(region.coord)
+            })
+            .count()
+    };
+    assert_eq!(disposable_active(&map), 1);
+
+    let preserved = map
+        .iter_active()
+        .find(|region| is_non_near(region.coord) && region.status == GenerationStatus::Unloaded)
+        .map(|region| region.coord)
+        .expect("parked non-near authority");
+    let signature = world_core::PossibilitySignature::of(map.get(preserved).unwrap().current);
+    map.apply_preserve_contribution(99, preserved, signature);
+
+    // Repeated frames with zero integrated bytes may admit the preserve
+    // exemption, but never a second disposable reservation.
+    for _ in 0..3 {
+        map.update(
+            player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &executor,
+            false,
+        );
+        assert_eq!(disposable_active(&map), 1);
+        assert_ne!(
+            map.get(preserved).unwrap().status,
+            GenerationStatus::Unloaded,
+            "preserve exemption should be admitted"
+        );
+        assert_eq!(map.cache().bytes(), 0, "jobs remain queued/partial");
+    }
+}
+
+#[test]
+fn parked_history_reactivates_without_reset_and_radius_removal_bounds_it() {
+    let origin = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    let payload = full_region_payload_bytes(2);
+    let tight_cfg = StreamConfig {
+        near_radius: 0.2 * REGION_SIZE,
+        far_radius: 1.0 * REGION_SIZE,
+        load_radius: 1.6 * REGION_SIZE,
+        unload_radius: 4.0 * REGION_SIZE,
+        field_resolution: 2,
+        max_field_cache_bytes: payload,
+        ..StreamConfig::default()
+    };
+    let mut roomy_cfg = tight_cfg;
+    roomy_cfg.max_field_cache_bytes = usize::MAX;
+    let mut tight = RegionMap::new(tight_cfg);
+    let mut roomy = RegionMap::new(roomy_cfg);
+    settle(&mut tight, origin);
+    settle(&mut roomy, origin);
+
+    let candidate = RegionCoord::new(-1, 0);
+    assert_ne!(
+        tight.get(candidate).unwrap().status,
+        GenerationStatus::Unloaded,
+        "nearest ordinary reservation should begin active"
+    );
+    let mut signature = world_core::PossibilitySignature::of(tight.get(candidate).unwrap().current);
+    let climate = &mut signature.buckets[PossibilityDomain::Climate.index()];
+    *climate = if *climate < 2048 { 4095 } else { 0 };
+    for map in [&mut tight, &mut roomy] {
+        map.apply_preserve_contribution(7, candidate, signature);
+        assert!(map.remove_preserve_contribution(7, candidate));
+    }
+    let retained_current = tight.get(candidate).unwrap().current;
+    let retained_revision = tight.get(candidate).unwrap().revision;
+
+    let right = (1.5 * REGION_SIZE, 0.5 * REGION_SIZE);
+    let mut bias = NO_BIAS;
+    bias[PossibilityDomain::Ecology.index()] = 0.25;
+    tight.update(
+        right,
+        0.0,
+        &PossibilityField::default(),
+        &[],
+        &bias,
+        &Budget::unlimited(),
+        &InlineExecutor,
+        false,
+    );
+    roomy.update(
+        right,
+        0.0,
+        &PossibilityField::default(),
+        &[],
+        &bias,
+        &Budget::unlimited(),
+        &InlineExecutor,
+        false,
+    );
+    let parked = tight.get(candidate).expect("authority retained in window");
+    assert_eq!(parked.status, GenerationStatus::Unloaded);
+    assert!(tight.cache().get(candidate).is_none());
+    assert_eq!(parked.current, retained_current);
+    assert_eq!(parked.revision, retained_revision);
+    assert_eq!(parked.target, roomy.get(candidate).unwrap().target);
+
+    let revisit = (-0.5 * REGION_SIZE, 0.5 * REGION_SIZE);
+    for _ in 0..8 {
+        tight.update(
+            revisit,
+            0.0,
+            &PossibilityField::default(),
+            &[],
+            &bias,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        roomy.update(
+            revisit,
+            0.0,
+            &PossibilityField::default(),
+            &[],
+            &bias,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+    }
+    let reactivated = tight.get(candidate).unwrap();
+    assert_eq!(reactivated.status, GenerationStatus::Ready);
+    assert_eq!(reactivated.current, retained_current);
+    assert_eq!(reactivated.revision, retained_revision);
+    assert_eq!(reactivated.target, roomy.get(candidate).unwrap().target);
+    assert_eq!(
+        region_content_hashes(&tight, candidate),
+        region_content_hashes(&roomy, candidate)
+    );
+
+    let beyond = (10.0 * REGION_SIZE, 0.5 * REGION_SIZE);
+    tight.update(
+        beyond,
+        0.0,
+        &PossibilityField::default(),
+        &[],
+        &bias,
+        &Budget::unlimited(),
+        &InlineExecutor,
+        false,
+    );
+    assert!(tight.get(candidate).is_none());
+}
+
+#[test]
+fn geometric_stability_is_current_even_when_targets_are_amortized() {
+    let field = PossibilityField::default();
+    let cfg = StreamConfig {
+        near_radius: 0.4 * REGION_SIZE,
+        far_radius: 1.5 * REGION_SIZE,
+        load_radius: 2.2 * REGION_SIZE,
+        unload_radius: 3.0 * REGION_SIZE,
+        field_resolution: 2,
+        max_field_cache_bytes: usize::MAX,
+        ..StreamConfig::default()
+    };
+    let mut map = RegionMap::new(cfg);
+    let origin = (0.5 * REGION_SIZE, 0.5 * REGION_SIZE);
+    settle(&mut map, origin);
+    let budget = Budget {
+        max_retarget_regions: 1,
+        ..Budget::unlimited()
+    };
+    let mut bias = NO_BIAS;
+    bias[PossibilityDomain::Ecology.index()] = 0.4;
+    map.update(
+        origin,
+        0.0,
+        &field,
+        &[],
+        &bias,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+
+    let crossing = RegionCoord::new(1, 0);
+    let current = map.get(crossing).unwrap().current;
+    let revision = map.get(crossing).unwrap().revision;
+    let player = (1.5 * REGION_SIZE, 0.5 * REGION_SIZE);
+    let stats = map.update(
+        player,
+        REGION_SIZE,
+        &field,
+        &[],
+        &bias,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+
+    assert_eq!(stats.retarget_deferred, stats.active_regions - 1);
+    for region in map.iter_active() {
+        assert_eq!(
+            region.stability.to_bits(),
+            stability_for(map.config(), {
+                let (ox, oy) = region.coord.origin();
+                f64::hypot(
+                    ox + REGION_SIZE * 0.5 - player.0,
+                    oy + REGION_SIZE * 0.5 - player.1,
+                )
+            })
+            .to_bits(),
+            "stale geometry for {:?}",
+            region.coord
+        );
+    }
+    let crossing = map.get(crossing).unwrap();
+    assert_eq!(crossing.stability, 1.0);
+    assert_eq!(crossing.current, current);
+    assert_eq!(crossing.revision, revision);
 }

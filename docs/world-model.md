@@ -74,7 +74,8 @@ behavioral fidelity envisioned by the project overview remains future work.
 At any moment, the implemented world is the combination of:
 
 1. a coordinate-defined base field over an effectively unbounded region grid;
-2. an eight-dimensional possibility state for each *resident* region;
+2. an eight-dimensional possibility state for each authoritative resident
+   region, whether its derived fields are active or capacity-parked;
 3. player bias, anchors, route attraction, and preserve contributor sets;
 4. a deterministic nine-layer generation graph evaluated for quantized region
    states;
@@ -105,11 +106,12 @@ coordinates -> base possibility field -> bias + anchors -> plausibility projecti
  climate + soils + biome + vegetation -> ecology -> near organisms
 ```
 
-There is no complete materialized world behind the active window. Outside that
-window, the base world is a pure recipe plus sparse records. An unpreserved
-region also does not retain its transformation history after eviction; when it
-is loaded again, it starts at the target implied by the then-current steering
-context. Preserves and run-local session snapshots are the exceptions.
+There is no complete materialized world behind the authoritative streaming
+window. Inside it, field capacity may park reproducible tiles while retaining
+the small regional transformation history. Crossing the unload radius removes
+that authority; an ordinary unpreserved region loaded again later starts at the
+target implied by the then-current steering context. Sparse preserve
+contributors and run-local session snapshots are the reconstruction exceptions.
 
 ### 2.2 Space and scale
 
@@ -326,10 +328,11 @@ set-derived, while revision and organism epochs retain sequential history.
 
 ### 2.5 Realized state, stability, travel, and resonance
 
-A resident region stores both its target $T_r$ and realized state $p_r$. The
-realized state is what generation currently samples. Let $d_r$ be the distance
-from the player to the region center, and let $r_n,r_f$ be the near and far
-stability radii. Stability is
+An authoritative resident stores both its target $T_r$ and realized state
+$p_r$, including while its derived field working set is parked. Field-active
+generation samples the realized state. Let $d_r$ be the distance from the
+player to the region center, and let $r_n,r_f$ be the near and far stability
+radii. Stability is
 
 $$
 S(d)=
@@ -342,9 +345,12 @@ S(d)=
 t=\frac{d-r_n}{r_f-r_n}.
 $$
 
-The default low tier uses $r_n=3R$ and $r_f=9R$. Regions inside the near
-radius are meant to be immovable; regions outside the far radius are fully
-free.
+The default low tier uses $r_n=3R$ and $r_f=9R$. The runtime recomputes this
+cheap geometric stability for every authoritative resident on every update,
+before resonance and convergence. Regions inside the near radius are therefore
+pinned in the same frame they cross it; regions outside the far radius are
+fully free. Capacity-parked residents still refresh targets and converge in the
+same ordered authoritative pass as field-active residents.
 
 The convergence gate is built from near-field organisms. Let $n\le N$ be the
 number of nearest nodes actually selected:
@@ -530,9 +536,10 @@ usage selects `max`, and seen bitmaps use bitwise union. These operations are
 commutative, associative, and idempotent for non-colliding ids.
 
 The session tier is deliberately different. It stores the exact IEEE float
-bits for player state, anchors, and every resident region's realized vector,
-stability, and revision. It is local to one run/platform, is never included in
-an atlas bundle, and re-derives every tile after load.
+bits for player state, anchors, and every authoritative resident region's
+realized vector, stability, and revision, parked residents included. It is
+local to one run/platform, is never included in an atlas bundle, and restores
+those regions parked before live admission re-derives their targets and tiles.
 
 ### 2.9 Three grades of determinism
 
@@ -551,7 +558,9 @@ contracts:
    quiescent scripted endpoint independent of executor, worker count, budgets,
    cancellation, and retarget amortization. Mid-journey state is explicitly
    allowed to differ because job timing changes when organisms become available
-   to resonance.
+   to resonance. Field-cache capacity is narrower: with equal near-field
+   prerequisites, authoritative regional history is compared and equal after
+   every scripted frame even though derived field residency differs.
 
 The distinction is essential. A permanent species id is portable *given the
 same integer habitat signature*, but deriving that signature from float tiles
@@ -648,11 +657,13 @@ random field itself.
 * a nine-bit dirty-layer mask; and
 * `Unloaded`, `Generating`, or `Ready` status.
 
-Only active regions have this state. Every ordinarily loaded region computes
-its target and sets `current = target`, including a previously visited region
-whose state was evicted. A restored session region instead recovers exact
-`current`, stability, and revision, marks every layer dirty, and regenerates its
-caches.
+The ordered region map is the sole authoritative set. `Unloaded` means that
+authority exists with no admitted field working set; `Generating` and `Ready`
+are field-active. A newly created ordinary authority computes its target and
+sets `current = target`. Capacity reactivation instead retains `current` and
+revision, recomputes target and geometry, marks every layer dirty, and rebuilds
+derived fields. A restored session region recovers exact `current`, stability,
+and revision as parked authority and follows that same live admission path.
 
 ### 3.3 Anchors and trait capture
 
@@ -743,20 +754,24 @@ The low-tier default radii are:
 |---|---:|---|
 | near | $3R=768$ | intended fully stable zone |
 | far | $9R=2304$ | end of the smooth stability ramp |
-| load | $12R=3072$ | load missing regions inside this circle |
-| unload | $14R=3584$ | evict beyond this circle |
+| load | $12R=3072$ | create missing authority/admit eligible fields inside this circle |
+| unload | $14R=3584$ | remove regional authority beyond this circle |
 
-The load/unload gap provides hysteresis. Missing regions are loaded
-nearest-first. Regions converge farthest-first, because the far field is where
-change is intended to appear first. Generation dispatch is nearest-first so
-visible data arrives first. Coordinate order breaks equal-distance ties.
+The load/unload gap provides hysteresis. Missing authority is created
+nearest-first under the load budget, independently of field capacity. Field
+admission is a separate nearest-first pass; near and contributor-covered
+regions are exemptions, while ordinary field-active regions reserve their full
+eventual payload. Regions converge farthest-first across the complete
+authoritative set, because the far field is where change is intended to appear
+first. Generation dispatch is nearest-first over field-active residents only.
+Coordinate order breaks equal-distance ties.
 
 One `update` performs these passes:
 
 1. integrate completed jobs;
-2. radius and capacity eviction;
-3. load missing regions;
-4. recompute stability and target, possibly amortized;
+2. radius removal and capacity parking of derived fields;
+3. create missing authority and admit eligible parked fields;
+4. recompute all geometric stability, then budget target calculation;
 5. construct resonance from the previous frame's organisms;
 6. converge eligible realized states;
 7. dispatch stale layers in topological order;
@@ -765,11 +780,12 @@ One `update` performs these passes:
    vegetation, and roster inputs.
 
 Travel is supplied explicitly by the caller instead of being inferred inside
-the map. Streaming, target calculation, and completion of already-dirty work
-continue while stationary; only `current -> target` convergence is travel
-gated. The convergence formula is first-order frame-slicing invariant only
-approximately: two half-distance lerps do not have exactly the same transient
-result as one full-distance lerp.
+the map. Streaming, target calculation, and completion of already-dirty
+field-active work continue while stationary; only `current -> target`
+convergence is travel gated. Parked authority participates in target refresh
+and convergence but never dispatches generation. The convergence formula is
+first-order frame-slicing invariant only approximately: two half-distance
+lerps do not have exactly the same transient result as one full-distance lerp.
 
 Possibility bucket flips use the declared domain-reader closure to mark dirty
 layers. Revisions still record any material float-state movement, including
@@ -1220,12 +1236,13 @@ Generation collects the distinct signatures in a region before dispatching
 Ecology, ensures each entry exists, and gives the worker an immutable
 signature-keyed snapshot.
 
-The union of those `region_signatures` across all resident regions is the
-indispensable roster working set. Cache maintenance walks that set in
-deterministic signature order and calls `ensure` to repair any missing pure
+The union of those `region_signatures` across field-active regions is the
+indispensable roster working set. Parked authority has no Ecology field to
+consume and does not pin roster entries. Cache maintenance walks the active set
+in deterministic signature order and calls `ensure` to repair any missing pure
 entry. Capacity eviction then removes only disposable entries, retaining its
 reverse-signature victim order. The configured roster bytes are a target with
-this required-set floor: if resident entries alone exceed it, all are retained
+this required-set floor: if active entries alone exceed it, all are retained
 and the reported cache bytes expose the overage.
 
 The representative productivity used to build a signature's food web places
@@ -1472,7 +1489,8 @@ The record types are:
   name and journal;
 * `PreserveRecord`: coordinate-sorted region/signature pairs plus metadata;
 * `SeenRecord`: a four-word bitmap for one 16 by 16 region chunk;
-* `SessionSnapshot`: exact player state, anchors, and resident region states;
+* `SessionSnapshot`: exact player state, anchors, and authoritative resident
+  region states, parked entries included;
   and
 * `AtlasBundle`: discoveries, routes, and preserves sorted by id.
 
@@ -1555,7 +1573,7 @@ atomic cancellation token.
 
 Dispatch works to a fixed point within the frame's cost budget:
 
-1. order resident regions nearest-first;
+1. order field-active regions nearest-first;
 2. close each dirty consumer's work set over missing or stale declared inputs,
    restoring lower-layer and macro requests before readiness is tested;
 3. scan each dirty mask in topological layer-id order;
@@ -1578,9 +1596,10 @@ Failed provenance retires the completed dispatch, reclaims owned tile buffers,
 leaves the previous cached layer untouched, marks the layer and its dependent
 closure dirty, and cancels obsolete dependent jobs before normal budgeted
 dispatch retries them. A rejected macro applies the Drainage closure to every
-covered resident region. Late, superseded, and orphaned results are discarded;
-dirty bits and cancellation are never substitutes for the identity and
-provenance checks.
+covered authority, but a parked region remains `Unloaded` and dispatches
+nothing. Parking retires level-0 dispatch identities, so late cancellation-off
+results are reclaimed without recreating fields. Dirty bits and cancellation
+are never substitutes for the identity and provenance checks.
 
 Drainage jobs are keyed by level-4 macro coordinate. Their priority is inherited
 from the nearest dependent region that requests the tile. Ecology jobs first
@@ -1635,14 +1654,15 @@ Resource tiers choose capacity and pacing presets:
 | organism slots/cell | 1 | 2 | 4 |
 | generation cost/frame | 96 | 192 | 384 |
 | resonance nodes | 64 | 96 | 128 |
-| retargets/frame | all | 160 | 240 |
+| target refreshes/frame | all | 160 | 240 |
 
 An explicit environment override wins tier detection. Otherwise at most four
 logical cores or a CPU-class graphics adapter selects Low; at least eight cores
 and a discrete adapter selects High; other configurations select Mid.
 
-The active data structures are:
+The streaming data structures are:
 
+* authoritative region map: coordinate -> `RegionState`, parked entries included;
 * `RegionCache`: coordinate -> `RegionTiles`;
 * `MacroCache`: level-4 coordinate -> shared `DrainageTile`;
 * `RosterCache`: habitat signature -> shared `RosterEntry`;
@@ -1651,19 +1671,29 @@ The active data structures are:
 * preserve contributors: coordinate -> ordered `(content id, signature)` map,
   whose first entry is the effective owner.
 
-Normal radius eviction drops region state, tiles, organisms, signature
+Normal radius removal drops regional authority, tiles, organisms, signature
 bookkeeping, and in-flight jobs outside the unload radius, but not sparse
-preserve contributors. A reload initializes from the then-effective lowest-id
-signature, including when the old winner was deleted while the coordinate was
-evicted. Field-capacity eviction removes farthest non-preserved regions outside
-the near radius; any coordinate with a contributor is exempt.
-Macro capacity removes farthest macro tiles. A dirty consumer later
+preserve contributors. A later load initializes from the then-effective
+lowest-id signature, including when the old winner was deleted while the
+coordinate was absent.
+
+Field capacity is different: it parks farthest field-active, non-preserved
+regions outside the near radius while retaining their `current`, `target`,
+stability, and revision. Every disposable `Generating` or `Ready` region
+reserves the full eventual payload, so partial generation cannot over-admit the
+target. Parking removes tiles, organisms, signatures, and level-0 jobs;
+reactivation recomputes target and geometry, dirties every layer, and rebuilds
+without creating a new history epoch. Near and contributor-covered fields are
+explicit exemptions above the target.
+
+Macro capacity removes farthest macro tiles. A dirty active consumer later
 demand-rebuilds a missing or stale macro through declared dependency repair;
 a freshly integrated demanded macro is retained transiently until Hydrology
 snapshots it, so asynchronous work also makes progress below a one-tile target.
-Roster capacity first ensures the protected resident-signature union, then
+Macro/roster dependency protection follows field-active consumers rather than
+parked authority. Roster capacity first ensures that protected signature union, then
 removes only disposable entries in reverse signature order. Its logical byte
-target may be exceeded when the resident working-set floor is larger.
+target may be exceeded when the active working-set floor is larger.
 
 `TilePool` keeps bounded stacks of reusable `Vec<f32>`, `Vec<u8>`, and
 `Vec<u16>` allocations. Buffers travel from main-thread pool to a job, into a
@@ -1691,10 +1721,11 @@ loop becomes table lookup plus pressure scaling, preserving operation order and
 output bits.
 
 Target refresh is amortized on Mid and High. A steering-input hash over bias and
-anchor fields forces a full-window refresh when controls change. Otherwise the
-runtime walks resident coordinates round-robin under `max_retarget_regions`.
-This amortizes both target and stability calculation; the latter is a continuity
-concern discussed below.
+anchor fields forces a full-authority target refresh when controls change.
+Otherwise the runtime walks all authoritative coordinates, parked entries
+included, round-robin under `max_retarget_regions`. Geometric stability is not
+part of that budget: every authoritative region refreshes it every frame before
+resonance and convergence.
 
 ### 3.27 CPU-authoritative presentation
 
@@ -1758,7 +1789,8 @@ The repository uses several complementary checks:
 * `wer-vault` for persistence, merge laws, preserves, routes, save/load, and an
   explicit 70-retry failure/ordering/delete/import-sequence scenario; and
 * `wer-scale` for executor/budget/cancellation/amortization settled hashes,
-  field-cache pressure, tiers, and additive realization density.
+  per-frame tight-versus-roomy regional-history equality under field pressure,
+  field/pool plateaus, tiers, and additive realization density.
 
 CI formats, lints, checks, and tests the native workspace and compile-checks
 the three neutral/web crates for `wasm32-unknown-unknown`. The parity exports
@@ -1813,11 +1845,15 @@ into one implementation unit.
    staged fault tests and the expanded vault harness covering retry order and
    recovery.
 
-4. **Separate authoritative regional history from disposable field memory**
-   (findings 4 and 5). Keep `RegionState` when evicting derived tiles and update
-   geometric stability for all near or boundary-crossing regions every frame.
-   This restores the near-field pin and prevents a memory ceiling from changing
-   the world trajectory.
+4. **Completed: Separate authoritative regional history from disposable field
+   memory**
+   ([Improvement A.4](plans/prototype/improvement_A_4_authoritative_regional_history.md);
+   findings 4 and 5). The ordered region map now retains bounded authority
+   while capacity parks only derived fields; loading and regional evolution are
+   ceiling-independent, every-frame geometry pins near crossings immediately,
+   and reactivation rebuilds from retained current/revision. Focused queued,
+   preserve, late-result, and session regressions plus a per-frame tight-versus-
+   roomy `wer-scale` history gate cover the corrected lifecycle.
 
 5. **Restore resource-tier invariance for gameplay and shared records**
    (finding 6). Compute resonance, capture, and persisted route cost from one
@@ -2011,38 +2047,62 @@ Ecology tiles. Lookup-only cell inspection then failed, while near-field
 realization could publish an incomplete vector and record the unchanged L8 key
 without retrying.
 
-The runtime now ensures and protects the union of resident signature sets,
+The runtime now ensures and protects the union of field-active signature sets,
 evicts only disposable entries, and permits that required floor to exceed its
 logical byte target. Realization preflights the complete set and defers without
 advancing its key if an entry is absent. Tight roster-ceiling tests cover
 required-entry repair, settled-cell inspection, realization retry, roomy-cache
 content equality, and continued eviction of unprotected signatures.
 
-#### 4. Amortized retargeting can violate the geometric near-field pin
+#### 4. Resolved: amortized retargeting can violate the geometric near-field pin
 
-Mid and High tiers round-robin the combined stability-and-target pass. Player
-movement is not part of the steering-change hash and there is no near-first
-exception. A resident region that has moved physically inside `near_radius`
-can retain an old `stability < 1` for several frames and continue converging
-while visible. The replay defines "pinned" using the stored stability, so it
-does not detect a geometrically near region whose stored value is stale.
+**Status:** Resolved by
+[Improvement A.4](plans/prototype/improvement_A_4_authoritative_regional_history.md).
+
+Previously, Mid and High tiers round-robined the combined stability-and-target
+pass. Player movement was not part of the steering-change hash and there was no
+near-first exception. A resident region that moved physically inside
+`near_radius` could retain an old `stability < 1` for several frames and
+continue converging while visible. The replay defined "pinned" using the stored
+stability, so it did not detect a geometrically near region whose stored value
+was stale.
 
 Stability is cheap and safety-critical; compute it for all regions every frame,
 or at least for every near/crossing region, and amortize only the target
 calculation.
 
-#### 5. Field-capacity eviction removes authoritative history, not just cache
+The runtime now refreshes geometric stability for every authoritative resident
+before resonance and convergence; `max_retarget_regions` budgets target
+calculation only. Continuity pin checks derive near status from geometry rather
+than trusting stored stability, and a focused one-target-per-frame regression
+moves a far coordinate into the near radius with positive travel and proves its
+current/revision remain unchanged while every resident's stability is current.
 
-When the field-byte ceiling is exceeded, the implementation calls
-`drop_region`, which discards `RegionState` as well as tiles. If that region is
-reloaded inside the load radius, it starts with `current = target`; its prior
-convergence history and revision are gone. Thus a field "cache" ceiling can
-change the mid-journey world rather than merely cause deterministic
+#### 5. Resolved: field-capacity eviction removes authoritative history, not just cache
+
+**Status:** Resolved by
+[Improvement A.4](plans/prototype/improvement_A_4_authoritative_regional_history.md).
+
+Previously, when the field-byte ceiling was exceeded, the implementation called
+`drop_region`, which discarded `RegionState` as well as tiles. If that region
+was reloaded inside the load radius, it started with `current = target`; its
+prior convergence history and revision were gone. Thus a field "cache" ceiling
+could change the mid-journey world rather than merely cause deterministic
 recomputation.
 
 Retain the small authoritative `RegionState` while evicting only derived tiles,
 or explicitly describe capacity eviction as world-state eviction and include
 it in schedule/continuity guarantees.
+
+Capacity pressure now changes `GenerationStatus` to `Unloaded` and tears down
+only tiles, signatures, organisms, and obsolete jobs. Authoritative loading,
+target refresh, stability, convergence, revision, preserves, and snapshots
+continue independently until the radius sweep removes the coordinate.
+Reactivation recomputes live target/geometry and rebuilds every layer without
+resetting history. Full-payload reservations prevent partial generations from
+over-admitting a logical target, and `wer-scale` compares ordered regional
+history after every changing-bias travel frame under tight and roomy ceilings,
+requiring both capacity parking and observed parked-state evolution.
 
 #### 6. Resource tiers feed gameplay and persistent identity
 
@@ -2473,22 +2533,25 @@ The published macro-tile estimate is also stale: a 48-by-48 `u8 + u32` tile is
 
 #### 33. Some advertised verification is absent or narrower than stated
 
-**Status:** Open. Improvement A.1 closes only the focused cache-recovery and
-dependency-provenance gaps described below.
+**Status:** Open. Improvements A.1 and A.4 close the focused cache-recovery,
+dependency-provenance, and field-capacity authority gaps described below.
 
-The scale harness checks executor counts, budget scale, cancellation, and
-retarget amortization but has no alternate frame-slicing case despite the ADR
-claim. Its memory scenario pressures only the field cache rather than all
-caches together. Its tier identity scenario does not record routes or captures.
-The settled state hash omits targets, dirty/status state, overrides, full
-organism position/expression, and executor queues, so equality is not equality
-of every stated component.
+The scale harness checks executor counts, budget scale, cancellation, retarget
+amortization, and per-frame tight-versus-roomy regional history, but has no
+alternate frame-slicing case despite the ADR claim. Its memory scenario
+pressures only the field cache rather than all caches together. Its tier
+identity scenario does not record routes or captures. The full hash now begins
+with coordinate/current/target/stability/revision authority, but deliberately
+omits derived field-admission status and still omits overrides, full organism
+position/expression, and executor queues, so equality is not equality of every
+stated component.
 
-Focused runtime tests now pressure macro and roster ceilings, reject stale
-results for every layer shape, exercise cell inspection and realization
-recovery, and assert stored versus expected keys in those scenarios. This does
-not turn `wer-scale` into a simultaneous all-cache test or expand its state
-hash.
+Focused runtime tests now pressure field/macro/roster ceilings, reserve full
+field payload before queued work integrates, reject stale results for every
+layer shape, exercise cell inspection and realization recovery, and assert
+stored versus expected keys in those scenarios. This does not turn `wer-scale`
+into a simultaneous all-cache test or make its hash cover external queues and
+every derived presentation detail.
 
 Add the remaining frame-slicing, all-cache-ceiling, cross-tier persistence, and
 full settled-state scenarios. Run wasm parity exports—not just compilation—in
@@ -2518,7 +2581,8 @@ the current prototype demonstrates:
 * The eight possibility domains are single proxies, not rich trait spaces.
 * The active representation is a uniform sparse grid, not an adaptive
   quadtree, clipmap, or multi-LOD environmental hierarchy.
-* Unpreserved evicted regions forget their realized history.
+* Unpreserved regions forget their realized history after geometric radius
+  unload; field-capacity parking inside the window retains it.
 * Organisms are sampled markers, not agents with behavior or local simulation.
 * Ecology has no migration, reproduction, competition, succession clock, or
   evolutionary history.

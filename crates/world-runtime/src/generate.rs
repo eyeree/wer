@@ -60,6 +60,21 @@ pub const CHANNEL_DIVERSITY: usize = 12;
 /// channels, not smuggled through f32 (phase-2-plan.md §6.1, phase-3-plan.md §6.1).
 pub const CHANNEL_COUNT: usize = 13;
 
+/// Logical bytes in one fully materialized region field at `resolution`.
+///
+/// This is the shared admission unit for the field working set: every region
+/// eventually owns all `f32` channels plus one biome byte and one dominant
+/// species index per cell. It deliberately measures payload bytes rather than
+/// allocator overhead (ADR 0023).
+#[must_use]
+pub const fn full_region_payload_bytes(resolution: u16) -> usize {
+    let cells = resolution as usize * resolution as usize;
+    cells
+        * (CHANNEL_COUNT * std::mem::size_of::<f32>()
+            + std::mem::size_of::<u8>()
+            + std::mem::size_of::<u16>())
+}
+
 /// The `f32` channels a layer produces (empty for drainage, which produces a
 /// macro tile, and for biome, which produces the u8 tile).
 #[must_use]
@@ -121,8 +136,9 @@ impl RegionTiles {
     }
 }
 
-/// Field-tile cache for the active window, owned by
-/// [`crate::stream::RegionMap`] and evicted together with region state.
+/// Disposable field-tile cache for field-active regions, owned by
+/// [`crate::stream::RegionMap`]. Capacity pressure may park these tiles while
+/// retaining the region's authoritative possibility history (ADR 0023).
 ///
 /// A `BTreeMap` (not a hash map) so iteration order is deterministic — the
 /// continuity replay asserts two runs produce identical caches, and budgeted

@@ -11,7 +11,9 @@ use world_core::{PossibilityDomain, PossibilityVector, RegionCoord};
 /// Where a region is in the generation pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationStatus {
-    /// Known to exist but nothing generated yet.
+    /// Authoritative state exists, but its disposable field working set is
+    /// not admitted. Capacity parking and session restore use this state;
+    /// ordinary convergence continues while it is parked (ADR 0023).
     Unloaded,
     /// One or more layers are queued or in flight.
     Generating,

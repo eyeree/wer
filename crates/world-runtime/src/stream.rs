@@ -5,10 +5,10 @@
 //! [`RegionMap::update`] is the once-per-frame heart of the runtime:
 //!
 //! 1. integrate finished generation jobs,
-//! 2. evict regions beyond `unload_radius` (hysteresis vs `load_radius`),
-//!    sweeping orphaned macro drainage tiles with them,
-//! 3. load missing regions nearest-first,
-//! 4. recompute every region's stability and steered target,
+//! 2. remove authority beyond `unload_radius` and park disposable fields under
+//!    capacity pressure, sweeping orphaned derived inputs with them,
+//! 3. create missing authority and admit eligible field working sets,
+//! 4. recompute every region's stability, then budget steered targets,
 //! 5. converge distant regions toward their targets (farthest-first); flipped
 //!    possibility buckets dirty exactly the declared reader layers and their
 //!    transitive dependents (ADR 0007),
@@ -48,10 +48,10 @@ use world_core::{
 
 use crate::budget::Budget;
 use crate::generate::{
-    generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache, RegionTiles,
-    TileBuffers, CHANNEL_DIVERSITY, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE,
-    CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
-    CHANNEL_WETNESS,
+    full_region_payload_bytes, generate_layer, layer_channels, GeneratedTile, LayerInputs,
+    RegionCache, RegionTiles, TileBuffers, CHANNEL_DIVERSITY, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
+    CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_TEMPERATURE,
+    CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 use crate::macrocache::MacroCache;
 use crate::pool::TilePool;
@@ -85,10 +85,11 @@ pub struct StreamConfig {
     /// Beyond this radius regions are free (`stability = 0`); between near and
     /// far a smoothstep ramp blends the two (phase-1-plan.md section 7.2).
     pub far_radius: f64,
-    /// Regions within this radius are kept resident.
+    /// Regions within this radius are admitted to the authoritative window.
     pub load_radius: f64,
-    /// Regions beyond this radius are evicted. Must exceed `load_radius`; the
-    /// gap is the hysteresis that prevents thrashing at the boundary.
+    /// Regions beyond this radius are removed from the authoritative window.
+    /// Must exceed `load_radius`; the gap is the hysteresis that prevents
+    /// thrashing at the boundary.
     pub unload_radius: f64,
     /// Convergence fraction per world unit of player travel. Transformation is
     /// fueled by the journey, not by wall-clock time: a stationary player's
@@ -103,12 +104,12 @@ pub struct StreamConfig {
     pub converge_rate_cap: f32,
     /// Samples per region edge for generated field tiles.
     pub field_resolution: u16,
-    /// Byte ceiling for the field-tile cache (phase-6-plan.md §4.3): after
-    /// the radius sweep, the capacity evictor removes farthest-first until
-    /// under this, exempting preserved regions and everything inside
-    /// `near_radius`; the loader defers non-near loads that would exceed it.
-    /// Always safe — every tile re-derives from its dependency hash
-    /// (ADR 0008) — so a ceiling costs recompute, never correctness.
+    /// Byte target for disposable field payload (phase-6-plan.md §4.3): after
+    /// the radius sweep, capacity pressure parks farthest field working sets
+    /// until their full-payload reservations fit, exempting preserved regions
+    /// and everything inside `near_radius`. Authority and its transformation
+    /// history remain resident (ADR 0023); every tile re-derives from its
+    /// dependency hash (ADR 0008).
     pub max_field_cache_bytes: usize,
     /// Byte target for the macro drainage cache. Evicted tiles re-derive
     /// lazily the next time a dependent's hydrology goes stale; a demanded
@@ -157,9 +158,9 @@ impl Default for StreamConfig {
 /// backpressure — expected and healthy, not an error.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FrameStats {
-    /// Regions inserted this frame.
+    /// Authoritative regions inserted this frame.
     pub loaded: usize,
-    /// Regions evicted this frame.
+    /// Authoritative regions removed beyond `unload_radius` this frame.
     pub evicted: usize,
     /// Regions whose realized state actually moved this frame.
     pub converged: usize,
@@ -179,7 +180,7 @@ pub struct FrameStats {
     pub deferred_converges: usize,
     /// Stale, ready region-layers that missed the dispatch cost budget.
     pub deferred_regens: usize,
-    /// Resident regions after this frame.
+    /// Authoritative resident regions after this frame, parked entries included.
     pub active_regions: usize,
     /// Heap bytes held by the field cache after this frame.
     pub cache_bytes: usize,
@@ -224,12 +225,12 @@ pub struct FrameStats {
     pub pool_misses: usize,
     /// Heap bytes idling in the tile pool after this frame.
     pub pool_bytes: usize,
-    /// Regions evicted by the byte-capacity ceiling (beyond the radius sweep;
-    /// phase-6-plan.md §4.3).
+    /// Region field working sets parked by the byte-capacity target (beyond
+    /// the radius sweep; ADR 0023).
     pub evicted_for_capacity: usize,
-    /// Resident regions whose retarget was deferred to a later frame by
-    /// `max_retarget_regions` (phase-6-plan.md §6.4) — round-robin
-    /// backpressure, not an error.
+    /// Authoritative regions whose steered target calculation was deferred by
+    /// `max_retarget_regions` (phase-6-plan.md §6.4). Geometric stability is
+    /// never deferred (ADR 0023).
     pub retarget_deferred: usize,
 }
 
@@ -358,7 +359,7 @@ enum JobResult {
     },
 }
 
-/// The active window of regions plus their field and macro caches.
+/// The authoritative streaming window plus its disposable field/macro caches.
 ///
 /// Region state lives in a `BTreeMap`, not a hash map: iteration order is part
 /// of the determinism contract. Budgeted work (loads, convergence, regen) must
@@ -415,11 +416,11 @@ pub struct RegionMap {
     pool: TilePool,
     /// Recycled organism vectors for the realizer (same story, smaller).
     organism_pool: Vec<Vec<Organism>>,
-    /// Hash of the steering inputs (bias + anchors) at the last retarget. A
-    /// change forces a full retarget; otherwise the pass round-robins under
+    /// Hash of the steering inputs (bias + anchors) at the last target pass. A
+    /// change forces every target to refresh; otherwise the pass round-robins under
     /// `max_retarget_regions` (phase-6-plan.md §6.4).
     steer_signature: u64,
-    /// Round-robin position of the amortized retarget.
+    /// Round-robin position of the amortized target calculation.
     retarget_cursor: Option<RegionCoord>,
     next_job_id: u64,
 }
@@ -461,6 +462,27 @@ impl RegionMap {
             retarget_cursor: None,
             next_job_id: 0,
         }
+    }
+
+    /// Whether a resident authority currently owns an admitted field working
+    /// set. `Unloaded` is capacity-parked authority, not absence (ADR 0023).
+    #[inline]
+    const fn field_active(region: &RegionState) -> bool {
+        !matches!(region.status, GenerationStatus::Unloaded)
+    }
+
+    /// Full-payload reservations currently charged to the disposable field
+    /// target. Near and contributor-covered field sets are explicit
+    /// exemptions and therefore form a floor above the configured target.
+    fn disposable_field_reservations(&self, player: (f64, f64)) -> usize {
+        self.regions
+            .values()
+            .filter(|region| {
+                Self::field_active(region)
+                    && center_distance(region.coord, player) > self.cfg.near_radius
+                    && !self.preserve_contributors.contains_key(&region.coord)
+            })
+            .count()
     }
 
     /// Enable or disable cancellation-token flipping (default: enabled). An
@@ -524,7 +546,7 @@ impl RegionMap {
         }
     }
 
-    /// Recover every buffer of an evicted region's tiles whose `Arc` the map
+    /// Recover every buffer of a parked or removed region's tiles whose `Arc` the map
     /// held the last reference to; in-flight readers just delay reclaim
     /// (§4.2 — the pool falls back to allocation, never blocks).
     fn reclaim_tiles(&mut self, tiles: RegionTiles) {
@@ -552,7 +574,8 @@ impl RegionMap {
         &self.cfg
     }
 
-    /// The field cache for the active window.
+    /// The disposable field cache. Capacity-parked authoritative residents are
+    /// intentionally absent from this traversal (ADR 0023).
     #[inline]
     #[must_use]
     pub const fn cache(&self) -> &RegionCache {
@@ -937,14 +960,14 @@ impl RegionMap {
         (1.0 - 0.25 * veg).clamp(0.7, 1.0)
     }
 
-    /// A resident region's state.
+    /// An authoritative resident's state, whether field-active or parked.
     #[inline]
     #[must_use]
     pub fn get(&self, coord: RegionCoord) -> Option<&RegionState> {
         self.regions.get(&coord)
     }
 
-    /// Number of resident regions.
+    /// Number of authoritative residents, parked entries included.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
@@ -958,7 +981,9 @@ impl RegionMap {
         self.regions.is_empty()
     }
 
-    /// Iterate resident regions in deterministic coordinate order.
+    /// Iterate authoritative residents in deterministic coordinate order,
+    /// parked entries included. The historical name remains API-compatible;
+    /// use [`RegionMap::cache`] for derived field residency.
     pub fn iter_active(&self) -> impl Iterator<Item = &RegionState> {
         self.regions.values()
     }
@@ -1161,7 +1186,7 @@ impl RegionMap {
         let dirtied = domain_dirty_mask(flipped);
         if dirtied != 0 {
             region.dirty_layers |= dirtied;
-            if region.status == GenerationStatus::Ready {
+            if Self::field_active(region) && region.status == GenerationStatus::Ready {
                 region.status = GenerationStatus::Generating;
             }
         }
@@ -1175,9 +1200,10 @@ impl RegionMap {
 
     /// Restore one region from a session snapshot (phase-5-plan.md §12.2):
     /// bit-exact `current`, stability, and revision, target = current (the
-    /// next retarget recomputes it from the same inputs), every layer dirty so
-    /// caches, rosters, and organisms re-derive deterministically from the
-    /// restored possibility state (ADR 0008). Loading is not an event: nothing
+    /// next field admission recomputes it from the live inputs). Restored
+    /// authority begins parked; admission later dirties every layer so caches,
+    /// rosters, and organisms re-derive deterministically from the restored
+    /// possibility state (ADRs 0008 and 0023). Loading is not an event: nothing
     /// converges and no target moves beyond what the live run would compute.
     pub fn restore_region(&mut self, snap: &world_core::RegionSnapshotRecord) {
         let mut region = RegionState::new(snap.coord);
@@ -1185,8 +1211,8 @@ impl RegionMap {
         region.target = region.current;
         region.stability = snap.stability;
         region.revision = snap.revision;
-        region.dirty_layers = all_layers_mask();
-        region.status = GenerationStatus::Generating;
+        region.dirty_layers = 0;
+        region.status = GenerationStatus::Unloaded;
         self.regions.insert(snap.coord, region);
     }
 
@@ -1200,7 +1226,7 @@ impl RegionMap {
         let mask = dependents_closure(layer);
         for region in self.regions.values_mut() {
             region.dirty_layers |= mask;
-            if region.status == GenerationStatus::Ready {
+            if Self::field_active(region) && region.status == GenerationStatus::Ready {
                 region.status = GenerationStatus::Generating;
             }
         }
@@ -1438,7 +1464,9 @@ impl RegionMap {
                             if macro_coord_for(c) == coord {
                                 region.dirty_layers |=
                                     layer_bit(world_core::layer::LAYER_HYDROLOGY);
-                                if region.status == GenerationStatus::Ready {
+                                if Self::field_active(region)
+                                    && region.status == GenerationStatus::Ready
+                                {
                                     region.status = GenerationStatus::Generating;
                                 }
                                 dirtied.push(c);
@@ -1557,9 +1585,8 @@ impl RegionMap {
     }
 
     /// Mark a layer and all transitive dependents dirty for one resident
-    /// region, retire any now-obsolete dependent dispatches, and leave its
-    /// status visibly generating. False-positive hints are harmless because
-    /// dispatch clears a matching stored-versus-expected key without work.
+    /// region and retire obsolete dependent dispatches. Parked authority keeps
+    /// `Unloaded`; only admitted fields may become visibly generating.
     fn mark_dirty_closure(&mut self, coord: RegionCoord, layer: u16, stats: &mut FrameStats) {
         if !self.regions.contains_key(&coord) {
             return;
@@ -1567,13 +1594,15 @@ impl RegionMap {
         let mask = dependents_closure(layer);
         if let Some(region) = self.regions.get_mut(&coord) {
             region.dirty_layers |= mask;
-            region.status = GenerationStatus::Generating;
+            if Self::field_active(region) {
+                region.status = GenerationStatus::Generating;
+            }
         }
         stats.jobs_cancelled += self.cancel_in_flight(coord, mask);
     }
 
-    /// Recompute a region's `GenerationStatus` from its dirty bits and
-    /// in-flight jobs.
+    /// Recompute an admitted region's `GenerationStatus` from its dirty bits
+    /// and in-flight jobs. Parking is changed only by field admission.
     fn refresh_status(&mut self, coord: RegionCoord) {
         let in_flight = self
             .in_flight
@@ -1581,6 +1610,9 @@ impl RegionMap {
             .next()
             .is_some();
         if let Some(region) = self.regions.get_mut(&coord) {
+            if !Self::field_active(region) {
+                return;
+            }
             region.status = if region.dirty_layers == 0 && !in_flight {
                 GenerationStatus::Ready
             } else {
@@ -1589,11 +1621,9 @@ impl RegionMap {
         }
     }
 
-    /// Evict regions beyond `unload_radius`, dropping state, cache tiles, and
-    /// any in-flight bookkeeping together, then enforce the byte-capacity
-    /// ceilings (phase-6-plan.md §4.3), then sweep macro tiles (and macro
-    /// jobs) and roster entries that no resident region depends on any more
-    /// (phase-2-plan.md §6.3).
+    /// Remove authority beyond `unload_radius`, park disposable field working
+    /// sets under capacity pressure, then sweep derived inputs against the
+    /// remaining field-active dependents (ADR 0023).
     fn evict(&mut self, player: (f64, f64), stats: &mut FrameStats) {
         let unload = self.cfg.unload_radius;
         let gone: Vec<RegionCoord> = self
@@ -1607,17 +1637,16 @@ impl RegionMap {
             self.drop_region(coord, stats);
             stats.evicted += 1;
         }
-        let capacity_evicted = self.enforce_capacity(player, stats);
-        if radius_evicted || capacity_evicted {
+        let capacity_parked = self.enforce_capacity(player, stats);
+        if radius_evicted || capacity_parked {
             self.sweep_dependent_caches(stats);
         }
     }
 
-    /// Drop one resident region completely: state, tiles (buffers back to
-    /// the pool), organisms (vector recycled), signature bookkeeping, and
-    /// in-flight jobs (cancelled — they stop costing worker time, §6.2).
-    fn drop_region(&mut self, coord: RegionCoord, stats: &mut FrameStats) {
-        self.regions.remove(&coord);
+    /// Park one resident's disposable fields while retaining its authoritative
+    /// possibility history. Late results lose dispatch identity and therefore
+    /// cannot recreate cache entries (ADR 0023).
+    fn park_region_fields(&mut self, coord: RegionCoord, stats: &mut FrameStats) {
         if let Some(tiles) = self.cache.remove_region(coord) {
             self.reclaim_tiles(tiles);
         }
@@ -1629,13 +1658,18 @@ impl RegionMap {
             .map(|(k, _)| *k)
             .collect();
         for k in keys {
-            if let Some(job) = self.in_flight.remove(&k) {
-                if self.cancellation {
-                    job.cancel.store(true, Ordering::Relaxed);
-                    stats.jobs_cancelled += 1;
-                }
-            }
+            stats.jobs_cancelled += self.retire_in_flight(k);
         }
+        if let Some(region) = self.regions.get_mut(&coord) {
+            region.dirty_layers = 0;
+            region.status = GenerationStatus::Unloaded;
+        }
+    }
+
+    /// Forget one resident completely after it crosses `unload_radius`.
+    fn drop_region(&mut self, coord: RegionCoord, stats: &mut FrameStats) {
+        self.park_region_fields(coord, stats);
+        self.regions.remove(&coord);
     }
 
     /// Retire one region's near-field realization and recycle its allocation.
@@ -1651,13 +1685,18 @@ impl RegionMap {
         self.organism_keys.remove(&coord);
     }
 
-    /// Sweep the dependent-tracked caches after any region left the window:
-    /// orphaned macro tiles and jobs, and roster entries no resident L8 tile
-    /// references any more (phase-2-plan.md §6.3).
+    /// Sweep dependent-tracked caches against field-active consumers. Parked
+    /// authority can compute expected keys but cannot consume macro/roster
+    /// allocations, so it does not pin them (ADR 0023).
     fn sweep_dependent_caches(&mut self, stats: &mut FrameStats) {
-        self.macro_cache.evict_orphans(self.regions.keys());
-        let needed: BTreeSet<RegionCoord> =
-            self.regions.keys().map(|&c| macro_coord_for(c)).collect();
+        let active: BTreeSet<RegionCoord> = self
+            .regions
+            .iter()
+            .filter(|(_, region)| Self::field_active(region))
+            .map(|(&coord, _)| coord)
+            .collect();
+        self.macro_cache.evict_orphans(active.iter());
+        let needed: BTreeSet<RegionCoord> = active.iter().map(|&c| macro_coord_for(c)).collect();
         let cancellation = self.cancellation;
         self.in_flight.retain(|(c, _), job| {
             let keep = c.level == 0 || needed.contains(c);
@@ -1667,14 +1706,13 @@ impl RegionMap {
             }
             keep
         });
-        // Sweep roster entries no resident region's L8 tile references any more
-        // (dependent-tracked, the macro cache's shape, §6.3).
+        // `park_region_fields` removes the parked region's signature set.
         let needed_signatures = self.required_roster_signatures();
         self.roster_cache.evict_unused(&needed_signatures);
     }
 
     /// The indispensable roster working set: the deterministic union of every
-    /// resident region's current or in-flight Ecology input signatures.
+    /// field-active region's current or in-flight Ecology input signatures.
     fn required_roster_signatures(&self) -> BTreeSet<HabitatSignature> {
         self.region_signatures.values().flatten().copied().collect()
     }
@@ -1690,35 +1728,32 @@ impl RegionMap {
         required
     }
 
-    /// Enforce the byte-capacity ceilings (phase-6-plan.md §4.3): after the
-    /// radius sweep, remove farthest-first — deterministic (distance bits,
-    /// then coord order) — until under ceiling, exempting preserved regions
-    /// and everything inside `near_radius`. Always safe: every evicted tile
-    /// re-derives bit-identically from its dependency hash (ADR 0008), so a
-    /// ceiling costs recompute on revisit, never correctness. Returns
-    /// whether anything was evicted.
+    /// Enforce derived byte-capacity targets. Field pressure parks active,
+    /// non-exempt working sets farthest-first according to their full eventual
+    /// payload reservation; it never removes authority (ADR 0023).
     fn enforce_capacity(&mut self, player: (f64, f64), stats: &mut FrameStats) -> bool {
-        let mut evicted_any = false;
-        let mut field_bytes = self.cache.bytes();
-        if field_bytes > self.cfg.max_field_cache_bytes {
+        let mut parked_any = false;
+        let payload = full_region_payload_bytes(self.cfg.field_resolution);
+        let mut reserved = self.disposable_field_reservations(player) * payload;
+        if reserved > self.cfg.max_field_cache_bytes {
             let mut order: Vec<(u64, RegionCoord)> = self
                 .regions
-                .keys()
-                .filter(|c| !self.preserve_contributors.contains_key(c))
-                .map(|&c| (center_distance(c, player).to_bits(), c))
+                .iter()
+                .filter(|(_, region)| Self::field_active(region))
+                .filter(|(coord, _)| !self.preserve_contributors.contains_key(coord))
+                .map(|(&coord, _)| (center_distance(coord, player).to_bits(), coord))
                 .filter(|&(d, _)| f64::from_bits(d) > self.cfg.near_radius)
                 .collect();
             // Farthest first, coord tiebreak for determinism.
             order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             for (_, coord) in order {
-                if field_bytes <= self.cfg.max_field_cache_bytes {
+                if reserved <= self.cfg.max_field_cache_bytes {
                     break;
                 }
-                let freed = self.cache.get(coord).map_or(0, RegionTiles::bytes);
-                self.drop_region(coord, stats);
-                field_bytes -= freed;
+                self.park_region_fields(coord, stats);
+                reserved = reserved.saturating_sub(payload);
                 stats.evicted_for_capacity += 1;
-                evicted_any = true;
+                parked_any = true;
             }
         }
 
@@ -1735,7 +1770,8 @@ impl RegionMap {
                 .regions
                 .iter()
                 .filter(|(_, region)| {
-                    region.dirty_layers & layer_bit(world_core::layer::LAYER_HYDROLOGY) != 0
+                    Self::field_active(region)
+                        && region.dirty_layers & layer_bit(world_core::layer::LAYER_HYDROLOGY) != 0
                 })
                 .map(|(&coord, _)| macro_coord_for(coord))
                 .collect();
@@ -1757,7 +1793,6 @@ impl RegionMap {
                 }
                 if let Some(tile) = self.macro_cache.remove(coord) {
                     macro_bytes -= tile.bytes();
-                    stats.evicted_for_capacity += 1;
                 }
             }
         }
@@ -1768,13 +1803,13 @@ impl RegionMap {
         let protected = self.maintain_roster_working_set();
         self.roster_cache
             .evict_to_bytes(self.cfg.max_roster_cache_bytes, &protected);
-        evicted_any
+        parked_any
     }
 
-    /// Insert missing regions within `load_radius`, nearest-first, up to the
-    /// budget. A fresh region snaps `current = target`: it was never realized
-    /// before, so first realization is not a pop (and at startup this fills
-    /// the pinned zone already settled).
+    /// Insert missing authority within `load_radius`, nearest-first and under
+    /// `max_loads`, independently of field capacity. Then admit eligible
+    /// parked working sets under the disposable full-payload target. A fresh
+    /// region snaps `current = target`; reactivation never does (ADR 0023).
     fn load(
         &mut self,
         player: (f64, f64),
@@ -1803,25 +1838,8 @@ impl RegionMap {
             }
         }
         candidates.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
-        // Capacity awareness (phase-6-plan.md §4.3): a non-near load that
-        // would push the field cache past its ceiling defers instead — the
-        // deterministic complement of the capacity evictor, so the two never
-        // thrash against each other. Near regions always load (the visible
-        // zone is exempt on both sides).
-        let per_region_bytes = {
-            let res = usize::from(self.cfg.field_resolution);
-            res * res * (crate::generate::CHANNEL_COUNT * 4 + 1 + 2)
-        };
-        let mut projected = self.cache.bytes();
-        for &(dist_bits, coord) in candidates.iter().take(budget.max_loads) {
-            let near = f64::from_bits(dist_bits) <= self.cfg.near_radius;
-            if !near
-                && !self.preserve_contributors.contains_key(&coord)
-                && projected + per_region_bytes > self.cfg.max_field_cache_bytes
-            {
-                continue; // deferred by the ceiling; counted below
-            }
-            projected += per_region_bytes;
+        let created = candidates.len().min(budget.max_loads);
+        for &(_, coord) in candidates.iter().take(created) {
             let mut region = RegionState::new(coord);
             if let Some((_, sig)) = self.effective_preserve(coord) {
                 // Preserved region: reload from its persisted buckets, pinned
@@ -1834,21 +1852,80 @@ impl RegionMap {
                 region.current = region.target;
                 region.stability = stability_for(&self.cfg, center_distance(coord, player));
             }
-            region.dirty_layers = all_layers_mask();
+            // Authority is created parked. Admission below is the sole path
+            // that allocates a field working set and marks its layers dirty.
             self.regions.insert(coord, region);
             stats.loaded += 1;
         }
-        stats.deferred_loads = candidates.len().saturating_sub(stats.loaded);
+        stats.deferred_loads = candidates.len().saturating_sub(created);
+        self.admit_fields(player, field, anchors, bias);
     }
 
-    /// Recompute stability and target for resident regions — amortized
-    /// (phase-6-plan.md §6.4): a steering change (bias or anchor set) always
-    /// refreshes the whole window this frame, because every target may have
-    /// moved; under unchanged steering the pass round-robins
-    /// `max_retarget_regions` per frame in coord order, so the window
-    /// refreshes over a few frames. Settled fixed points are amortization-
-    /// invariant (ADR 0018) — targets are pure functions of unchanged
-    /// inputs, so a deferred refresh recomputes the same values later.
+    /// Admit parked fields nearest-first. Near and contributor-covered
+    /// residents are exemptions; ordinary residents reserve one complete
+    /// eventual payload below the configured target.
+    fn admit_fields(
+        &mut self,
+        player: (f64, f64),
+        field: &PossibilityField,
+        anchors: &[Anchor],
+        bias: &[f32; POSSIBILITY_DIMS],
+    ) {
+        let mut candidates: Vec<(u64, RegionCoord)> = self
+            .regions
+            .iter()
+            .filter(|(_, region)| !Self::field_active(region))
+            .filter(|(&coord, _)| {
+                center_distance(coord, player) <= self.cfg.load_radius
+                    || self.preserve_contributors.contains_key(&coord)
+            })
+            .map(|(&coord, _)| (center_distance(coord, player).to_bits(), coord))
+            .collect();
+        candidates.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
+
+        let payload = full_region_payload_bytes(self.cfg.field_resolution);
+        let mut projected = self.disposable_field_reservations(player) * payload;
+        for (distance_bits, coord) in candidates {
+            let exempt = f64::from_bits(distance_bits) <= self.cfg.near_radius
+                || self.preserve_contributors.contains_key(&coord);
+            if !exempt && projected.saturating_add(payload) > self.cfg.max_field_cache_bytes {
+                continue;
+            }
+            self.activate_region(coord, player, field, anchors, bias);
+            if !exempt {
+                projected = projected.saturating_add(payload);
+            }
+        }
+    }
+
+    /// Turn retained authority into a field-active generation epoch without
+    /// resetting its realized history or revision.
+    fn activate_region(
+        &mut self,
+        coord: RegionCoord,
+        player: (f64, f64),
+        field: &PossibilityField,
+        anchors: &[Anchor],
+        bias: &[f32; POSSIBILITY_DIMS],
+    ) {
+        let preserved = self.preserve_contributors.contains_key(&coord);
+        let target = (!preserved).then(|| self.target_for(coord, field, anchors, bias));
+        let region = self.regions.get_mut(&coord).expect("resident admission");
+        if preserved {
+            region.target = region.current;
+            region.stability = 1.0;
+        } else {
+            region.target = target.expect("ordinary target");
+            region.stability = stability_for(&self.cfg, center_distance(coord, player));
+        }
+        region.dirty_layers = all_layers_mask();
+        region.status = GenerationStatus::Generating;
+    }
+
+    /// Refresh geometric stability for every authoritative region, then budget
+    /// only steered target calculation. A steering change still refreshes all
+    /// targets immediately; unchanged steering round-robins over every
+    /// coordinate, parked authority included (ADR 0023).
     fn retarget(
         &mut self,
         player: (f64, f64),
@@ -1858,6 +1935,8 @@ impl RegionMap {
         budget: &Budget,
         stats: &mut FrameStats,
     ) {
+        self.refresh_stability(player);
+
         let signature = steering_signature(anchors, bias);
         let steering_changed = signature != self.steer_signature;
         self.steer_signature = signature;
@@ -1865,7 +1944,7 @@ impl RegionMap {
         let coords: Vec<RegionCoord> = self.regions.keys().copied().collect();
         if steering_changed || coords.len() <= budget.max_retarget_regions {
             for coord in coords {
-                self.retarget_one(coord, player, field, anchors, bias);
+                self.refresh_target(coord, field, anchors, bias);
             }
             self.retarget_cursor = None;
             return;
@@ -1880,18 +1959,30 @@ impl RegionMap {
             if processed >= budget.max_retarget_regions {
                 break;
             }
-            self.retarget_one(coord, player, field, anchors, bias);
+            self.refresh_target(coord, field, anchors, bias);
             self.retarget_cursor = Some(coord);
             processed += 1;
         }
         stats.retarget_deferred = coords.len() - processed;
     }
 
-    /// Refresh one region's stability and steered target.
-    fn retarget_one(
+    /// Refresh every resident's cheap distance-derived stability in ordered
+    /// coordinate traversal. Preserves stay fully pinned and self-targeted.
+    fn refresh_stability(&mut self, player: (f64, f64)) {
+        for (&coord, region) in &mut self.regions {
+            if self.preserve_contributors.contains_key(&coord) {
+                region.stability = 1.0;
+                region.target = region.current;
+            } else {
+                region.stability = stability_for(&self.cfg, center_distance(coord, player));
+            }
+        }
+    }
+
+    /// Refresh one authoritative region's steered target.
+    fn refresh_target(
         &mut self,
         coord: RegionCoord,
-        player: (f64, f64),
         field: &PossibilityField,
         anchors: &[Anchor],
         bias: &[f32; POSSIBILITY_DIMS],
@@ -1904,10 +1995,8 @@ impl RegionMap {
             region.target = region.current;
             return;
         }
-        let stability = stability_for(&self.cfg, center_distance(coord, player));
         let target = self.target_for(coord, field, anchors, bias);
         let region = self.regions.get_mut(&coord).expect("resident");
-        region.stability = stability;
         region.target = target;
     }
 
@@ -1957,7 +2046,7 @@ impl RegionMap {
                 if flipped != 0 {
                     dirtied = domain_dirty_mask(flipped);
                     region.dirty_layers |= dirtied;
-                    if region.status == GenerationStatus::Ready {
+                    if Self::field_active(region) && region.status == GenerationStatus::Ready {
                         region.status = GenerationStatus::Generating;
                     }
                 }
@@ -1985,8 +2074,9 @@ impl RegionMap {
         // Nearest-first region order, fixed for the frame.
         let mut order: Vec<(u64, RegionCoord)> = self
             .regions
-            .keys()
-            .map(|&c| (center_distance(c, player).to_bits(), c))
+            .iter()
+            .filter(|(_, region)| Self::field_active(region))
+            .map(|(&coord, _)| (center_distance(coord, player).to_bits(), coord))
             .collect();
         order.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
 
@@ -2031,6 +2121,9 @@ impl RegionMap {
         executor: &dyn TaskExecutor,
         stats: &mut FrameStats,
     ) -> bool {
+        if !self.regions.get(&coord).is_some_and(Self::field_active) {
+            return false;
+        }
         self.repair_missing_dependencies(coord, stats);
         let mut dispatched = false;
         for layer in 0..LAYER_COUNT {
@@ -2137,7 +2230,9 @@ impl RegionMap {
                     let region = self.regions.get_mut(&coord).expect("resident");
                     if region.dirty_layers & bit == 0 {
                         region.dirty_layers |= bit;
-                        region.status = GenerationStatus::Generating;
+                        if Self::field_active(region) {
+                            region.status = GenerationStatus::Generating;
+                        }
                         changed = true;
                     }
                 }
@@ -2309,9 +2404,10 @@ impl RegionMap {
         let near_radius = self.cfg.near_radius;
         let near: BTreeSet<RegionCoord> = self
             .regions
-            .keys()
-            .copied()
-            .filter(|&c| center_distance(c, player) <= near_radius)
+            .iter()
+            .filter(|(_, region)| Self::field_active(region))
+            .map(|(&coord, _)| coord)
+            .filter(|&coord| center_distance(coord, player) <= near_radius)
             .collect();
         // Offscreen replacement: discard organisms of regions no longer near
         // (their vectors recycle through the pool, phase-6-plan.md §4.2).
@@ -2893,7 +2989,7 @@ mod preserve_tests {
     }
 
     #[test]
-    fn contributor_exempts_a_far_region_from_load_and_capacity_deferral() {
+    fn contributor_exempts_a_far_region_from_disposable_field_target() {
         let target = RegionCoord::new(1, 0);
         let mut cfg = config();
         cfg.near_radius = REGION_SIZE * 0.125;
@@ -2921,8 +3017,14 @@ mod preserve_tests {
         assert_eq!(map.effective_preserve(target), Some((10, signature)));
         assert!(
             map.get(target).is_some(),
-            "a contributor-covered non-near region must bypass load deferral and capacity eviction"
+            "a contributor-covered non-near region must retain authority"
         );
+        assert_ne!(
+            map.get(target).unwrap().status,
+            GenerationStatus::Unloaded,
+            "a contributor-covered resident must be field-active"
+        );
+        assert!(map.cache.get(target).is_some());
 
         // Non-winner removal leaves the exemption and resident state intact.
         assert!(map.remove_preserve_contribution(20, target));
@@ -2938,6 +3040,132 @@ mod preserve_tests {
         );
         assert!(map.get(target).is_some());
         assert_eq!(map.effective_preserve(target), Some((10, signature)));
+    }
+
+    #[test]
+    fn parked_preserve_winners_and_release_keep_one_authoritative_epoch() {
+        let mut map = settled_map();
+        let mut parking_stats = FrameStats::default();
+        map.park_region_fields(coord(), &mut parking_stats);
+        assert_eq!(map.get(coord()).unwrap().status, GenerationStatus::Unloaded);
+        assert!(map.cache.get(coord()).is_none());
+
+        // Force a noncanonical value inside the same bucket, then apply that
+        // bucket as a preserve while parked. This is a material revision and
+        // organism epoch, but not a tile-key change.
+        let base = PossibilitySignature::of(map.get(coord()).unwrap().current);
+        let snapped = base.dequantize();
+        let mut same_bucket = snapped;
+        let climate = snapped.get(PossibilityDomain::Climate);
+        same_bucket.set(
+            PossibilityDomain::Climate,
+            if climate < 1.0 {
+                climate + 0.000001
+            } else {
+                climate - 0.000001
+            },
+        );
+        assert_eq!(PossibilitySignature::of(same_bucket), base);
+        {
+            let region = map.regions.get_mut(&coord()).unwrap();
+            region.current = same_bucket;
+            region.target = same_bucket;
+        }
+        let normalization_revision = map.get(coord()).unwrap().revision;
+        map.apply_preserve_contribution(30, coord(), base);
+        let preserved_revision = normalization_revision + 1;
+        assert_eq!(map.get(coord()).unwrap().current, snapped);
+        assert_eq!(map.get(coord()).unwrap().revision, preserved_revision);
+        assert_eq!(map.get(coord()).unwrap().dirty_layers, 0);
+        assert_eq!(map.get(coord()).unwrap().status, GenerationStatus::Unloaded);
+
+        // Contributor admission rebuilds every field without inventing another
+        // regional epoch.
+        settle(&mut map);
+        assert_eq!(map.get(coord()).unwrap().revision, preserved_revision);
+        assert_eq!(map.get(coord()).unwrap().current, snapped);
+        assert!(map
+            .layer_diagnostics(coord())
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic.stored == diagnostic.expected));
+        map.park_region_fields(coord(), &mut parking_stats);
+        assert!(map.remove_preserve_contribution(30, coord()));
+        assert_eq!(map.get(coord()).unwrap().status, GenerationStatus::Unloaded);
+        assert_eq!(map.get(coord()).unwrap().revision, preserved_revision);
+
+        let high = changed_signature(base, PossibilityDomain::Climate);
+        let low = changed_signature(base, PossibilityDomain::Aesthetics);
+        let start_revision = map.get(coord()).unwrap().revision;
+
+        map.apply_preserve_contribution(20, coord(), high);
+        assert_eq!(map.get(coord()).unwrap().revision, start_revision + 1);
+        assert_eq!(map.get(coord()).unwrap().status, GenerationStatus::Unloaded);
+        map.apply_preserve_contribution(10, coord(), low);
+        assert_eq!(map.get(coord()).unwrap().revision, start_revision + 2);
+        assert_eq!(map.get(coord()).unwrap().status, GenerationStatus::Unloaded);
+        assert!(map.remove_preserve_contribution(10, coord()));
+        assert_eq!(map.get(coord()).unwrap().current, high.dequantize());
+        assert_eq!(map.get(coord()).unwrap().revision, start_revision + 3);
+
+        let before_release = map.get(coord()).unwrap().clone();
+        assert!(map.remove_preserve_contribution(20, coord()));
+        let after_release = map.get(coord()).unwrap();
+        assert_eq!(after_release.current, before_release.current);
+        assert_eq!(after_release.target, before_release.target);
+        assert_eq!(after_release.revision, before_release.revision);
+        assert_eq!(after_release.status, GenerationStatus::Unloaded);
+
+        settle(&mut map);
+        let reactivated = map.get(coord()).unwrap();
+        assert_eq!(reactivated.revision, before_release.revision);
+        assert_eq!(reactivated.current, before_release.current);
+        assert_eq!(reactivated.status, GenerationStatus::Ready);
+        assert!(map.cache.get(coord()).is_some());
+    }
+
+    #[test]
+    fn session_snapshot_includes_parked_authority_and_restore_starts_parked() {
+        use crate::{MemoryStorage, Vault};
+
+        let mut map = settled_map();
+        {
+            let region = map.regions.get_mut(&coord()).unwrap();
+            region.stability = 0.0;
+            let current = region.current.get(PossibilityDomain::Ecology);
+            region.target.set(
+                PossibilityDomain::Ecology,
+                if current < 0.5 { 1.0 } else { 0.0 },
+            );
+            assert!(region.converge(0.5).is_some());
+            assert!(region.revision > 0);
+        }
+        let mut parking_stats = FrameStats::default();
+        map.park_region_fields(coord(), &mut parking_stats);
+        let before = map.get(coord()).unwrap().clone();
+        assert_eq!(before.status, GenerationStatus::Unloaded);
+
+        let mut vault = Vault::open(MemoryStorage::new()).expect("memory vault");
+        vault
+            .snapshot_session(&map, PLAYER, PLAYER, &NO_BIAS, false, &[])
+            .expect("session sequence");
+        let session = vault.session().expect("session").clone();
+        assert_eq!(session.regions.len(), 1);
+
+        let mut restored = RegionMap::new(config());
+        crate::vault::apply_session_regions(&mut restored, &session);
+        let parked = restored.get(coord()).expect("restored authority");
+        assert_eq!(parked.status, GenerationStatus::Unloaded);
+        assert_eq!(parked.current, before.current);
+        assert_eq!(parked.stability.to_bits(), before.stability.to_bits());
+        assert_eq!(parked.revision, before.revision);
+        assert!(restored.cache.get(coord()).is_none());
+
+        settle(&mut restored);
+        let active = restored.get(coord()).unwrap();
+        assert_eq!(active.current, before.current);
+        assert_eq!(active.revision, before.revision);
+        assert_eq!(active.status, GenerationStatus::Ready);
     }
 }
 
@@ -3727,5 +3955,157 @@ mod recovery_tests {
             old_organisms,
             "same inputs and exact roster rebuild must realize identically"
         );
+    }
+
+    #[test]
+    fn parking_retains_history_while_radius_drop_forgets_authority() {
+        let mut map = settled_map();
+        {
+            let region = map.regions.get_mut(&coord()).unwrap();
+            region.stability = 0.0;
+            let current = region.current.get(PossibilityDomain::Ecology);
+            region.target.set(PossibilityDomain::Ecology, 1.0 - current);
+            assert!(region.converge(0.5).is_some());
+            region.stability = 0.375;
+        }
+        let before = map.regions[&coord()].clone();
+        let mut stats = FrameStats::default();
+        map.park_region_fields(coord(), &mut stats);
+
+        let parked = &map.regions[&coord()];
+        assert_eq!(parked.current, before.current);
+        assert_eq!(parked.target, before.target);
+        assert_eq!(parked.stability.to_bits(), before.stability.to_bits());
+        assert_eq!(parked.revision, before.revision);
+        assert_eq!(parked.status, GenerationStatus::Unloaded);
+        assert_eq!(parked.dirty_layers, 0);
+        assert!(map.cache.get(coord()).is_none());
+        assert!(!map.region_signatures.contains_key(&coord()));
+        assert!(!map.organisms.contains_key(&coord()));
+        assert!(!map.organism_keys.contains_key(&coord()));
+
+        map.sweep_dependent_caches(&mut stats);
+        assert!(map.macro_cache.is_empty());
+        assert!(map.roster_cache.is_empty());
+        map.drop_region(coord(), &mut stats);
+        assert!(!map.regions.contains_key(&coord()));
+    }
+
+    #[test]
+    fn parked_region_rejects_late_results_with_and_without_cancellation() {
+        for cancellation in [false, true] {
+            let mut map = settled_map();
+            map.set_cancellation_enabled(cancellation);
+            map.bump_layer_revision(LAYER_TERRAIN);
+            let executor = ManualExecutor::default();
+            let expected = map
+                .expected_layer_hash(coord(), LAYER_TERRAIN)
+                .expect("terrain key");
+            map.submit_layer(
+                coord(),
+                LAYER_TERRAIN,
+                expected,
+                TaskPriority::Critical,
+                &executor,
+            );
+            assert_eq!(executor.len(), 1);
+            assert_eq!(map.jobs_in_flight(), 1);
+
+            let mut parking_stats = FrameStats::default();
+            map.park_region_fields(coord(), &mut parking_stats);
+            assert_eq!(
+                parking_stats.jobs_cancelled,
+                usize::from(cancellation),
+                "token count must reflect the cancellation mode"
+            );
+            assert_eq!(map.jobs_in_flight(), 0);
+            assert_eq!(map.regions[&coord()].status, GenerationStatus::Unloaded);
+            assert!(map.cache.get(coord()).is_none());
+
+            executor.run_next();
+            let mut integration_stats = FrameStats::default();
+            map.integrate_finished(&mut integration_stats);
+            assert_eq!(
+                integration_stats.results_dropped,
+                usize::from(!cancellation),
+                "cancellation-off work runs and is rejected; cancellation-on work is a no-op"
+            );
+            assert_eq!(map.regions[&coord()].status, GenerationStatus::Unloaded);
+            assert!(map.cache.get(coord()).is_none());
+        }
+    }
+
+    #[test]
+    fn unchanged_steering_round_robin_refreshes_parked_targets() {
+        let player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+        let cfg = StreamConfig {
+            near_radius: 0.1 * REGION_SIZE,
+            far_radius: 1.5 * REGION_SIZE,
+            load_radius: 1.1 * REGION_SIZE,
+            unload_radius: 2.5 * REGION_SIZE,
+            field_resolution: 2,
+            max_field_cache_bytes: 0,
+            ..StreamConfig::default()
+        };
+        let field = PossibilityField::default();
+        let mut map = RegionMap::new(cfg);
+        map.update(
+            player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        let expected: BTreeMap<_, _> = map
+            .regions
+            .keys()
+            .map(|&coord| (coord, map.target_for(coord, &field, &[], &NO_BIAS)))
+            .collect();
+        let parked: Vec<_> = map
+            .regions
+            .iter()
+            .filter(|(_, region)| region.status == GenerationStatus::Unloaded)
+            .map(|(&coord, _)| coord)
+            .collect();
+        assert!(!parked.is_empty());
+        for (&coord, region) in &mut map.regions {
+            let mut stale = expected[&coord];
+            let value = stale.get(PossibilityDomain::Behavior);
+            stale.set(
+                PossibilityDomain::Behavior,
+                if value < 0.5 { 1.0 } else { 0.0 },
+            );
+            assert_ne!(stale, expected[&coord]);
+            region.target = stale;
+        }
+
+        let budget = Budget {
+            max_retarget_regions: 1,
+            max_regen_cost: 0,
+            ..Budget::unlimited()
+        };
+        let count = map.regions.len();
+        for _ in 0..count {
+            let stats = map.update(
+                player,
+                0.0,
+                &field,
+                &[],
+                &NO_BIAS,
+                &budget,
+                &InlineExecutor,
+                false,
+            );
+            assert_eq!(stats.retarget_deferred, count - 1);
+        }
+        for (&coord, target) in &expected {
+            assert_eq!(map.regions[&coord].target, *target);
+        }
+        for coord in parked {
+            assert_eq!(map.regions[&coord].status, GenerationStatus::Unloaded);
+        }
     }
 }

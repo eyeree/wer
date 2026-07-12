@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use world_core::{
     bound_target, domain_mask, macro_coord_for, mix, Anchor, AnchorKind, AnchorSource,
-    PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS,
+    PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
     Budget, FrameStats, GenerationStatus, InlineExecutor, RegionMap, StreamConfig, TaskExecutor,
@@ -225,6 +225,27 @@ fn snapshot_tiles(map: &RegionMap) -> TileSnapshot {
     snap
 }
 
+/// Order-stable hash of every authoritative regional history entry, independent
+/// of whether its disposable fields are active or capacity-parked (ADR 0023).
+#[must_use]
+pub fn regional_history_hash(map: &RegionMap) -> u64 {
+    let mut h: u64 = 0xA4A4_1401_7CBE_0023;
+    for region in map.iter_active() {
+        h = mix(h, region.coord.x as u32 as u64);
+        h = mix(h, region.coord.y as u32 as u64);
+        h = mix(h, u64::from(region.coord.level));
+        for dimension in region.current.dims {
+            h = mix(h, u64::from(dimension.to_bits()));
+        }
+        for dimension in region.target.dims {
+            h = mix(h, u64::from(dimension.to_bits()));
+        }
+        h = mix(h, u64::from(region.stability.to_bits()));
+        h = mix(h, u64::from(region.revision));
+    }
+    h
+}
+
 /// Order-stable hash of a map's full authoritative + derived state (regions,
 /// field cache, biome/dominant tiles, macro cache, roster cache, organisms).
 /// Two runs of the same script must produce the same value — and a
@@ -234,16 +255,7 @@ fn snapshot_tiles(map: &RegionMap) -> TileSnapshot {
 /// the one definition of "the same world".
 #[must_use]
 pub fn state_hash(map: &RegionMap) -> u64 {
-    let mut h: u64 = 0xC017_1401_7CBE_11A5;
-    for region in map.iter_active() {
-        h = mix(h, region.coord.x as u32 as u64);
-        h = mix(h, region.coord.y as u32 as u64);
-        h = mix(h, u64::from(region.revision));
-        h = mix(h, u64::from(region.stability.to_bits()));
-        for d in region.current.dims {
-            h = mix(h, u64::from(d.to_bits()));
-        }
-    }
+    let mut h = regional_history_hash(map);
     for (_, tiles) in map.cache().iter() {
         for tile in tiles.channels.iter().flatten() {
             h = mix(h, tile.content_hash());
@@ -356,9 +368,26 @@ pub fn run_continuity_replay_with(
         peak_cache_bytes =
             peak_cache_bytes.max(final_stats.cache_bytes + final_stats.macro_cache_bytes);
 
-        // -- Pinned stability: pinned before and after ⇒ revision unchanged.
+        // -- Pinned stability: geometry, rather than the stored stability,
+        //    defines the contract. This catches an amortized stale value on the
+        //    exact frame a coordinate crosses into the near radius (ADR 0023).
         for region in map.iter_active() {
-            if region.stability >= 1.0 {
+            let (ox, oy) = region.coord.origin();
+            let distance = f64::hypot(
+                ox + REGION_SIZE * 0.5 - player.0,
+                oy + REGION_SIZE * 0.5 - player.1,
+            );
+            let geometrically_pinned = distance <= cfg.stream.near_radius;
+            if geometrically_pinned && region.stability.to_bits() != 1.0f32.to_bits() {
+                record(
+                    &mut violations,
+                    format!(
+                        "frame {frame}: geometrically pinned region ({}, {}) has stale stability {}",
+                        region.coord.x, region.coord.y, region.stability
+                    ),
+                );
+            }
+            if geometrically_pinned {
                 if let Some(&(prev_rev, was_pinned)) = prev_state.get(&region.coord) {
                     if was_pinned && region.revision != prev_rev {
                         record(
@@ -401,7 +430,7 @@ pub fn run_continuity_replay_with(
                 }
             }
         }
-        macro_hashes.retain(|c, _| map.iter_active().any(|r| macro_coord_for(r.coord) == *c));
+        macro_hashes.retain(|coord, _| map.macro_cache().get(*coord).is_some());
         for (&mc, tile) in map.macro_cache().iter() {
             let now = tile.content_hash();
             match macro_hashes.get(&mc) {
@@ -426,7 +455,11 @@ pub fn run_continuity_replay_with(
             let Some(prev) = prev_tiles.get(coord) else {
                 continue;
             };
-            let pinned_now = map.get(*coord).is_some_and(|r| r.stability >= 1.0);
+            let (ox, oy) = coord.origin();
+            let pinned_now = f64::hypot(
+                ox + REGION_SIZE * 0.5 - player.0,
+                oy + REGION_SIZE * 0.5 - player.1,
+            ) <= cfg.stream.near_radius;
             let was_pinned = prev_state.get(coord).is_some_and(|&(_, p)| p);
             let hold_still = pinned_now && was_pinned;
             for (i, samples) in snapshot.channels.iter().enumerate() {
@@ -523,7 +556,11 @@ pub fn run_continuity_replay_with(
 
             // Identity stability: a region pinned across this frame and the last
             // realizes bit-identical organism ids (no flicker while visible).
-            let pinned_now = region.stability >= 1.0;
+            let (ox, oy) = coord.origin();
+            let pinned_now = f64::hypot(
+                ox + REGION_SIZE * 0.5 - player.0,
+                oy + REGION_SIZE * 0.5 - player.1,
+            ) <= cfg.stream.near_radius;
             let was_pinned = prev_state.get(&coord).is_some_and(|&(_, p)| p);
             if pinned_now && was_pinned {
                 if let Some(before) = prev_organisms.get(&coord) {
@@ -543,7 +580,17 @@ pub fn run_continuity_replay_with(
 
         prev_state = map
             .iter_active()
-            .map(|r| (r.coord, (r.revision, r.stability >= 1.0)))
+            .map(|region| {
+                let (ox, oy) = region.coord.origin();
+                let distance = f64::hypot(
+                    ox + REGION_SIZE * 0.5 - player.0,
+                    oy + REGION_SIZE * 0.5 - player.1,
+                );
+                (
+                    region.coord,
+                    (region.revision, distance <= cfg.stream.near_radius),
+                )
+            })
             .collect();
         prev_tiles = tiles_now;
     }
@@ -573,10 +620,10 @@ pub fn run_continuity_replay_with(
 }
 
 /// Update at the script's final position (zero travel, tail bias/anchors)
-/// until the map is a fixed point: every region `Ready`, nothing in flight,
-/// and [`state_hash`] unchanged over consecutive frames (which also waits
-/// out budget-paced realization). Returns whether the fixed point was
-/// reached within the bound.
+/// until the map is a fixed point: every field-active region `Ready`, parked
+/// regions intentionally `Unloaded`, nothing in flight, and [`state_hash`]
+/// unchanged over consecutive frames (which also waits out budget-paced
+/// realization). Returns whether the fixed point was reached within the bound.
 pub fn settle_to_fixed_point(
     map: &mut RegionMap,
     cfg: &ReplayConfig,
@@ -607,7 +654,7 @@ pub fn settle_to_fixed_point(
         let quiet = map.jobs_in_flight() == 0
             && map
                 .iter_active()
-                .all(|r| r.status == GenerationStatus::Ready);
+                .all(|r| r.status != GenerationStatus::Generating);
         if !quiet {
             // Give a threaded executor's workers a moment to deliver.
             if executor.parallelism() > 1 {
@@ -668,5 +715,30 @@ fn check_macro_seams(map: &RegionMap, cfg: &ReplayConfig, violations: &mut Vec<S
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use world_core::{PossibilityVector, RegionSnapshotRecord};
+
+    #[test]
+    fn regional_history_hash_distinguishes_coordinate_levels() {
+        let snapshot = |coord| RegionSnapshotRecord {
+            coord,
+            current: PossibilityVector::neutral().dims,
+            stability: 0.5,
+            revision: 7,
+        };
+        let mut level_zero = RegionMap::new(StreamConfig::default());
+        let mut level_one = RegionMap::new(StreamConfig::default());
+        level_zero.restore_region(&snapshot(RegionCoord::new(7, -3)));
+        level_one.restore_region(&snapshot(RegionCoord::at_level(7, -3, 1)));
+
+        assert_ne!(
+            regional_history_hash(&level_zero),
+            regional_history_hash(&level_one)
+        );
     }
 }

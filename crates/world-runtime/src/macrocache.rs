@@ -2,9 +2,10 @@
 //!
 //! Drainage tiles are keyed by their macro [`RegionCoord`] (level
 //! [`world_core::drainage::MACRO_LEVEL`]) and shared by every level-0 region
-//! under them via cheap `Arc` clones (tiles are immutable once integrated). A
-//! macro tile is resident while any dependent level-0 region is resident;
-//! eviction sweeps tiles with no remaining dependents each frame.
+//! under them via cheap `Arc` clones (tiles are immutable once integrated).
+//! Orphan sweeping considers only field-active level-0 dependents; the separate
+//! byte target may evict a clean macro earlier and dependency repair rebuilds it
+//! on demand. Capacity-parked authority never pins derived inputs (ADR 0023).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -12,9 +13,9 @@ use std::sync::Arc;
 
 use world_core::{macro_coord_for, DrainageTile, RegionCoord};
 
-/// Cache of macro drainage tiles for the active window. A `BTreeMap` for the
-/// same reason as the region map: deterministic iteration order is part of the
-/// replay's two-run equality contract.
+/// Cache of macro drainage tiles for the field-active working set. A
+/// `BTreeMap` for the same reason as the region map: deterministic iteration
+/// order is part of the replay's two-run equality contract.
 #[derive(Debug, Default)]
 pub struct MacroCache {
     tiles: BTreeMap<RegionCoord, Arc<DrainageTile>>,
@@ -33,10 +34,10 @@ impl MacroCache {
         self.tiles.insert(tile.coord(), tile);
     }
 
-    /// Drop every tile whose macro coordinate no longer covers any region in
-    /// `resident` (dependent-tracked eviction, phase-2-plan.md §6.3).
-    pub fn evict_orphans<'a>(&mut self, resident: impl Iterator<Item = &'a RegionCoord>) {
-        let needed: BTreeSet<RegionCoord> = resident.map(|&c| macro_coord_for(c)).collect();
+    /// Drop every tile whose macro coordinate no longer covers a coordinate in
+    /// `field_active` (dependent-tracked eviction, ADR 0023).
+    pub fn evict_orphans<'a>(&mut self, field_active: impl Iterator<Item = &'a RegionCoord>) {
+        let needed: BTreeSet<RegionCoord> = field_active.map(|&c| macro_coord_for(c)).collect();
         self.tiles.retain(|coord, _| needed.contains(coord));
     }
 

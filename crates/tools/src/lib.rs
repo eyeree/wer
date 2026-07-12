@@ -25,7 +25,9 @@ pub use ecology::{run_ecology_harness, EcologyReport};
 pub use executor::LaneExecutor;
 pub use filestore::FileStorage;
 pub use ledger::{run_invalidation_ledger, ScenarioReport};
-pub use replay::{run_continuity_replay, state_hash, ReplayConfig, ReplayReport};
+pub use replay::{
+    regional_history_hash, run_continuity_replay, state_hash, ReplayConfig, ReplayReport,
+};
 pub use scale::{run_scale_harness, ScaleConfig, ScaleReport};
 pub use vault::{run_vault_harness, VaultReport};
 

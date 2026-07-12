@@ -6,11 +6,11 @@
 //! distinct signature and shared through cheap `Arc` clones across every cell
 //! and region that resolves to that signature. Because coarse banding makes
 //! signatures repeat heavily, the cache is naturally bounded
-//! (`≤ Biome × band³` entries) and evicts signatures no resident region uses
-//! any more (the macro cache's dependent-sweep shape). Resident regions'
-//! signatures form an indispensable working set: a byte ceiling is a soft
-//! target that may be exceeded when that working set alone is larger (ADR
-//! 0019).
+//! (`≤ Biome × band³` entries) and evicts signatures no field-active region
+//! uses any more (the macro cache's dependent-sweep shape). Field-active
+//! regions' signatures form an indispensable working set: a byte ceiling is a
+//! soft target that may be exceeded when that working set alone is larger
+//! (ADRs 0019 and 0023).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -81,7 +81,8 @@ pub struct RosterEviction {
     pub bytes_removed: usize,
 }
 
-/// Cache of `(roster, food web)` per habitat signature for the active window.
+/// Cache of `(roster, food web)` per habitat signature for field-active
+/// dependents.
 /// A `BTreeMap` for deterministic iteration order, as with the other caches.
 #[derive(Debug, Default)]
 pub struct RosterCache {

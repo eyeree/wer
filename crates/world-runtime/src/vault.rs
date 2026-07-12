@@ -775,8 +775,9 @@ impl<S: Storage> Vault<S> {
 
     /// Snapshot the run-local session tier (phase-5-plan.md §4.5): player,
     /// bias, live anchors bit-exact, and every resident region's authoritative
-    /// state. Queued for flushing; overwrites the previous snapshot. Sequence
-    /// exhaustion returns [`VaultSequenceError`] without replacing it.
+    /// state, capacity-parked entries included. Queued for flushing; overwrites
+    /// the previous snapshot. Sequence exhaustion returns
+    /// [`VaultSequenceError`] without replacing it.
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_session(
         &mut self,
@@ -988,10 +989,11 @@ impl<S: Storage> Vault<S> {
 
 /// Restore a session's resident window into a fresh [`RegionMap`]
 /// (phase-5-plan.md §12.2). Every region comes back with its bit-exact
-/// `current`, stability, and revision, all layers dirty; follow with one
-/// settle update (travel = 0, the session's anchors/bias) so caches, rosters,
-/// and organisms re-derive deterministically before the journey continues —
-/// loading is not an event (no convergence, no target motion).
+/// `current`, stability, and revision as parked authority; follow with settle
+/// updates (travel = 0, the session's anchors/bias) so live field admission
+/// dirties and re-derives caches, rosters, and organisms deterministically
+/// before the journey continues. Restoration is not a fresh load epoch and
+/// never resets `current` or revision (ADR 0023).
 pub fn apply_session_regions(map: &mut RegionMap, snap: &SessionSnapshot) {
     for region in &snap.regions {
         map.restore_region(region);

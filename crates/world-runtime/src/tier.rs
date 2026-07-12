@@ -124,7 +124,9 @@ impl ResourceTier {
     /// The tier's frame budget (§7.4). Low is the Phase 5 default; the
     /// bigger tiers spend the headroom the M2–M5 milestones measured
     /// (docs/perf-baseline.md) on regen throughput, realization, and
-    /// resonance, and amortize the (larger) retarget pass over ≤ 4 frames.
+    /// resonance, and amortize the (larger) target-calculation pass over ≤ 4
+    /// frames. Geometric stability remains an all-region, every-frame pass
+    /// (ADR 0023).
     #[must_use]
     pub fn budget(self) -> Budget {
         let base = Budget::default();

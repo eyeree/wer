@@ -11,17 +11,17 @@
 //! independence, memory-ceiling, and density scenario families.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use world_core::{PossibilityDomain, PossibilityField, POSSIBILITY_DIMS, REGION_SIZE};
 use world_runtime::{
-    Budget, FrameStats, GenerationStatus, InlineExecutor, Pass, RegionMap, StreamConfig,
-    TaskExecutor, TaskPriority, PASS_COUNT,
+    full_region_payload_bytes, Budget, FrameStats, GenerationStatus, InlineExecutor, Pass,
+    RegionMap, StreamConfig, TaskExecutor, TaskPriority, PASS_COUNT,
 };
 
 use crate::executor::LaneExecutor;
-use crate::replay::state_hash;
+use crate::replay::{regional_history_hash, state_hash};
 
 type QueuedJob = (TaskPriority, Box<dyn FnOnce() + Send>);
 
@@ -220,14 +220,14 @@ impl ScaleConfig {
     }
 }
 
-/// Whether every resident region is fully generated and no work is queued or
-/// in flight.
+/// Whether every field-active region is fully generated, every parked region
+/// is intentionally quiescent, and no work is queued or in flight.
 fn settled(map: &RegionMap, exec: &QueueExecutor) -> bool {
     exec.queue_len() == 0
         && map.jobs_in_flight() == 0
         && map
             .iter_active()
-            .all(|r| r.status == GenerationStatus::Ready)
+            .all(|r| r.status != GenerationStatus::Generating)
 }
 
 /// The scripted bias storm for the long haul: a repeating ramp that pushes
@@ -586,7 +586,7 @@ fn settle_fixed_point(
         let quiet = map.jobs_in_flight() == 0
             && map
                 .iter_active()
-                .all(|r| r.status == GenerationStatus::Ready);
+                .all(|r| r.status != GenerationStatus::Generating);
         if !quiet {
             if executor.parallelism() > 1 {
                 std::thread::sleep(std::time::Duration::from_micros(50));
@@ -756,14 +756,13 @@ fn probe_content_hashes(
 }
 
 /// The §11.4 memory family: settle under a ceiling roughly half the full
-/// window's tiles, take a return trip, and prove (a) the capacity evictor
-/// fired, (b) cache bytes plateau at or under the ceiling every frame,
+/// window's tiles, take a return trip, and prove (a) capacity parking fired,
+/// (b) cache bytes plateau at or under the target every frame,
 /// (c) the revisited fixed point is bit-identical (ADR 0008: eviction costs
 /// recompute, never correctness), and (d) the pool stays bounded.
 #[must_use]
 pub fn memory_ceiling(cfg: &ScaleConfig) -> ScenarioOutcome {
-    let res = usize::from(cfg.stream.field_resolution);
-    let per_region = res * res * 55; // 13×f32 + u8 + u16 per cell
+    let per_region = full_region_payload_bytes(cfg.stream.field_resolution);
     let radius_regions = (cfg.stream.load_radius / REGION_SIZE).ceil();
     let full_window = (std::f64::consts::PI * radius_regions * radius_regions) as usize;
     let ceiling = (full_window / 2).max(40) * per_region;
@@ -776,6 +775,101 @@ pub fn memory_ceiling(cfg: &ScaleConfig) -> ScenarioOutcome {
         max_field_cache_bytes: ceiling,
         ..cfg.stream
     };
+
+    // ADR 0023 trajectory gate: with generation inline and unlimited, field
+    // capacity may change derived residency but never the ordered regional
+    // history. Compare after every scripted frame, not merely at the end.
+    let mut roomy_stream = stream;
+    roomy_stream.max_field_cache_bytes = usize::MAX;
+    let mut trajectory_tight = RegionMap::new(stream);
+    let mut trajectory_roomy = RegionMap::new(roomy_stream);
+    let trajectory_budget = Budget::unlimited();
+    let trajectory_field = PossibilityField::default();
+    let trajectory_exec = InlineExecutor;
+    let trajectory_speed = f64::hypot(cfg.velocity.0, cfg.velocity.1);
+    let trajectory_out_frames = ((2.5 * stream.unload_radius) / trajectory_speed).ceil() as u32;
+    let mut authority_divergence = None;
+    let mut trajectory_parks = 0usize;
+    let mut parked_authority_seen = false;
+    let mut material_convergences = 0usize;
+    let mut parked_evolution_seen = false;
+    let mut previous_authority: BTreeMap<_, _> = BTreeMap::new();
+    let mut trajectory_frame = 0u32;
+    let mut compare_frame = |position: (f64, f64), travel: f64, bias: [f32; POSSIBILITY_DIMS]| {
+        let tight_stats = trajectory_tight.update(
+            position,
+            travel,
+            &trajectory_field,
+            &[],
+            &bias,
+            &trajectory_budget,
+            &trajectory_exec,
+            false,
+        );
+        trajectory_roomy.update(
+            position,
+            travel,
+            &trajectory_field,
+            &[],
+            &bias,
+            &trajectory_budget,
+            &trajectory_exec,
+            false,
+        );
+        trajectory_parks += tight_stats.evicted_for_capacity;
+        material_convergences += tight_stats.converged;
+        parked_authority_seen |= trajectory_tight.iter_active().any(|region| {
+            region.status == GenerationStatus::Unloaded
+                && trajectory_tight.cache().get(region.coord).is_none()
+        });
+        for region in trajectory_tight
+            .iter_active()
+            .filter(|region| region.status == GenerationStatus::Unloaded)
+        {
+            if previous_authority
+                .get(&region.coord)
+                .is_some_and(|(current, revision)| {
+                    *revision != region.revision
+                        || *current != region.current.dims.map(f32::to_bits)
+                })
+            {
+                parked_evolution_seen = true;
+            }
+        }
+        previous_authority = trajectory_tight
+            .iter_active()
+            .map(|region| {
+                (
+                    region.coord,
+                    (region.current.dims.map(f32::to_bits), region.revision),
+                )
+            })
+            .collect();
+        let tight_hash = regional_history_hash(&trajectory_tight);
+        let roomy_hash = regional_history_hash(&trajectory_roomy);
+        if authority_divergence.is_none() && tight_hash != roomy_hash {
+            authority_divergence = Some((trajectory_frame, tight_hash, roomy_hash));
+        }
+        trajectory_frame += 1;
+    };
+    for _ in 0..4 {
+        compare_frame((0.0, 0.0), 0.0, [0.0; POSSIBILITY_DIMS]);
+    }
+    for frame in 0..(2 * trajectory_out_frames) {
+        let t = if frame < trajectory_out_frames {
+            f64::from(frame)
+        } else {
+            f64::from(2 * trajectory_out_frames - frame)
+        };
+        compare_frame(
+            (t * cfg.velocity.0, t * cfg.velocity.1),
+            trajectory_speed,
+            storm_bias(frame),
+        );
+    }
+    for _ in 0..4 {
+        compare_frame((0.0, 0.0), 0.0, storm_bias(2 * trajectory_out_frames));
+    }
 
     let field = PossibilityField::default();
     let mut map = RegionMap::new(stream);
@@ -807,11 +901,10 @@ pub fn memory_ceiling(cfg: &ScaleConfig) -> ScenarioOutcome {
         );
     });
     let _ = first;
-    // Probe: the near window is always resident, so its content is the
-    // return-trip oracle. (Whole-map hashes are not comparable here: under a
-    // ceiling the *resident set* legitimately depends on arrival direction —
-    // loads defer once full — but every region that IS resident must
-    // re-derive bit-identically, ADR 0008.)
+    // Probe: the near window is always field-active, so its content is the
+    // return-trip oracle. Derived field admission legitimately differs under
+    // a ceiling, while the paired authority hash above proves the regional
+    // resident set and history do not (ADRs 0008 and 0023).
     let probe = probe_content_hashes(&map, origin);
 
     // Walk out past double the unload radius and back, fueling eviction and
@@ -850,14 +943,43 @@ pub fn memory_ceiling(cfg: &ScaleConfig) -> ScenarioOutcome {
 
     let gates = vec![
         Gate {
-            name: "capacity evictor fires under a tight ceiling".into(),
-            passed: capacity_evictions > 0,
-            detail: format!("{capacity_evictions} capacity evictions"),
+            name: "capacity parking fires under a tight target".into(),
+            passed: capacity_evictions > 0 && trajectory_parks > 0,
+            detail: format!(
+                "{capacity_evictions} scenario parks, {trajectory_parks} paired-trajectory parks"
+            ),
         },
         Gate {
-            // The near window is exempt from both the evictor and the
-            // loader's ceiling check (§4.3: the visible zone always loads),
-            // so the plateau bound is ceiling + the exempt near window.
+            name: "tight and roomy regional history matches after every frame".into(),
+            passed: authority_divergence.is_none(),
+            detail: authority_divergence.map_or_else(
+                || format!("all {trajectory_frame} authority hashes matched"),
+                |(frame, tight, roomy)| {
+                    format!(
+                        "first divergence frame {frame}: tight {tight:#018x}, roomy {roomy:#018x}"
+                    )
+                },
+            ),
+        },
+        Gate {
+            name: "tight ceiling parks fields without removing authority".into(),
+            passed: parked_authority_seen,
+            detail: if parked_authority_seen {
+                "observed authoritative coordinate without field tiles".into()
+            } else {
+                "no parked authoritative coordinate observed".into()
+            },
+        },
+        Gate {
+            name: "parked authoritative history continues to evolve".into(),
+            passed: material_convergences > 0 && parked_evolution_seen,
+            detail: format!(
+                "{material_convergences} convergence events; parked revision/current evolution observed: {parked_evolution_seen}"
+            ),
+        },
+        Gate {
+            // The near window is exempt from both parking and the disposable
+            // admission target, so the plateau bound is target + near floor.
             name: "field cache plateaus at ceiling + exempt near window".into(),
             passed: peak_field_bytes <= ceiling + near_exempt_bytes,
             detail: format!(
@@ -889,7 +1011,7 @@ pub fn memory_ceiling(cfg: &ScaleConfig) -> ScenarioOutcome {
             "peak field cache MB".into(),
             peak_field_bytes as f64 / (1024.0 * 1024.0),
         ),
-        ("capacity evictions".into(), capacity_evictions as f64),
+        ("capacity parks".into(), capacity_evictions as f64),
         (
             "peak pool MB".into(),
             peak_pool_bytes as f64 / (1024.0 * 1024.0),
@@ -987,9 +1109,7 @@ pub fn tier_stability(tier: world_runtime::ResourceTier, cfg: &ScaleConfig) -> S
     let near_exempt = {
         let r = stream.near_radius / REGION_SIZE + 1.0;
         (std::f64::consts::PI * r * r).ceil() as usize
-            * usize::from(stream.field_resolution)
-            * usize::from(stream.field_resolution)
-            * 55
+            * full_region_payload_bytes(stream.field_resolution)
     };
 
     let name: &'static str = match tier {
