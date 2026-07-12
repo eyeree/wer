@@ -16,6 +16,12 @@
 //! region's source tiles change (its L8 dependency hash moves) and simply
 //! dropped when it leaves the near window — no morphing, no stored entity state
 //! (§7.6).
+//!
+//! The runtime coordinator verifies that every signature tracked for a
+//! resident region is present in the roster cache before it reuses or
+//! publishes that region's organism vector. These pure helpers remain
+//! lookup-only: roster maintenance and retry policy belong to the coordinator
+//! (ADR 0019).
 
 use world_core::layer::LAYER_ECOLOGY;
 use world_core::{
@@ -59,7 +65,10 @@ pub struct Organism {
 /// vegetation density, so coverage preserves the aggregate. Its species is
 /// sampled from the cell's roster weighted by biomass, so the realized trophic
 /// mix matches the aggregate (the §12.3 aggregate↔entity invariant). `None`
-/// inputs (tiles not yet generated) yield an empty realization.
+/// inputs (tiles not yet generated) yield an empty realization. A missing
+/// roster entry is likewise skipped here; the runtime's publishing path
+/// preflights roster completeness before calling this lookup-only helper, so a
+/// transient miss cannot replace a current realization with partial output.
 #[must_use]
 pub fn realize_region(
     coord: RegionCoord,
@@ -86,7 +95,10 @@ pub fn realize_region(
 /// [`realize_region`] writing into a caller-provided vector, so the runtime
 /// can recycle organism allocations through the rebuild-on-L8-change path
 /// (phase-6-plan.md §4.2). `out` is cleared first; content is identical to
-/// [`realize_region`].
+/// [`realize_region`]. The runtime coordinator calls this only after its
+/// resident roster-completeness preflight, keeping cache repair and deferred
+/// retry outside this pure, lookup-only function.
+///
 /// `organisms_per_cell` is the Phase 6 density lever (phase-6-plan.md §6.6):
 /// slot 0 derives the exact Phase 5 identity (`feature_index = cell`); slot
 /// `s > 0` derives the additive identity `cell + s·res²` from the same

@@ -2,17 +2,22 @@
 //! hysteresis, stability ramp shape, cost-budget enforcement, topological
 //! dispatch, dep-hash staleness precision, and macro cache lifecycle.
 
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, VecDeque};
+
+use world_core::habitat::{FERTILITY_BANDS, MOISTURE_BANDS, TEMPERATURE_BANDS};
 use world_core::layer::{
-    LAYER_BIOME, LAYER_CLIMATE, LAYER_DRAINAGE, LAYER_GEOLOGY, LAYER_HYDROLOGY, LAYER_SOILS,
-    LAYER_TERRAIN, LAYER_VEGETATION,
+    LAYER_BIOME, LAYER_CLIMATE, LAYER_DRAINAGE, LAYER_ECOLOGY, LAYER_GEOLOGY, LAYER_HYDROLOGY,
+    LAYER_SOILS, LAYER_TERRAIN, LAYER_VEGETATION,
 };
 use world_core::{
-    macro_coord_for, PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS,
-    REGION_SIZE,
+    macro_coord_for, HabitatSignature, PossibilityDomain, PossibilityField, RegionCoord,
+    BIOME_COUNT, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    stability_for, Budget, GenerationStatus, InlineExecutor, RegionMap, StreamConfig,
-    CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER, CHANNEL_VEGETATION,
+    layer_channels, stability_for, Budget, GenerationStatus, InlineExecutor, RegionMap,
+    RosterCache, StreamConfig, TaskExecutor, TaskPriority, CHANNEL_ELEVATION, CHANNEL_HARDNESS,
+    CHANNEL_RIVER, CHANNEL_VEGETATION,
 };
 
 const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
@@ -50,6 +55,242 @@ fn settled_map(player: (f64, f64)) -> RegionMap {
     let mut map = RegionMap::new(small_config());
     settle(&mut map, player);
     map
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LayerFingerprint {
+    dependency_hash: u64,
+    content_hashes: Vec<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RegionFingerprint {
+    coord: RegionCoord,
+    layers: Vec<LayerFingerprint>,
+}
+
+type TestJob = Box<dyn FnOnce() + Send>;
+
+#[derive(Default)]
+struct ManualExecutor {
+    queued: RefCell<VecDeque<TestJob>>,
+    run_inline: Cell<bool>,
+}
+
+impl ManualExecutor {
+    fn run_next(&self) {
+        self.queued
+            .borrow_mut()
+            .pop_front()
+            .expect("queued generation job")();
+    }
+
+    fn queue_len(&self) -> usize {
+        self.queued.borrow().len()
+    }
+
+    fn run_submissions_inline(&self) {
+        self.run_inline.set(true);
+    }
+}
+
+impl TaskExecutor for ManualExecutor {
+    fn submit(&self, _priority: TaskPriority, job: TestJob) {
+        if self.run_inline.get() {
+            job();
+        } else {
+            self.queued.borrow_mut().push_back(job);
+        }
+    }
+
+    fn parallelism(&self) -> usize {
+        1
+    }
+}
+
+fn is_current_fixed_point(map: &RegionMap) -> bool {
+    !map.is_empty()
+        && map.jobs_in_flight() == 0
+        && map.iter_active().all(|region| {
+            region.status == GenerationStatus::Ready
+                && region.dirty_layers == 0
+                && map
+                    .layer_diagnostics(region.coord)
+                    .is_some_and(|diagnostics| {
+                        diagnostics
+                            .iter()
+                            .all(|diagnostic| diagnostic.stored == diagnostic.expected)
+                    })
+        })
+}
+
+fn update_until_current(
+    map: &mut RegionMap,
+    player: (f64, f64),
+    budget: &Budget,
+    max_updates: usize,
+) -> [usize; world_core::LAYER_COUNT as usize] {
+    let field = PossibilityField::default();
+    let mut regenerated = [0; world_core::LAYER_COUNT as usize];
+    for _ in 0..max_updates {
+        let stats = map.update(
+            player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            budget,
+            &InlineExecutor,
+            false,
+        );
+        for (total, frame) in regenerated.iter_mut().zip(stats.regenerated_by_layer) {
+            *total += frame;
+        }
+        if is_current_fixed_point(map) {
+            return regenerated;
+        }
+    }
+    panic!(
+        "window did not reach a current fixed point in {max_updates} updates ({} jobs remain)",
+        map.jobs_in_flight()
+    );
+}
+
+fn layer_content_hashes(map: &RegionMap, coord: RegionCoord, layer: u16) -> Vec<u64> {
+    if layer == LAYER_DRAINAGE {
+        return vec![map
+            .macro_cache()
+            .get(macro_coord_for(coord))
+            .expect("current drainage tile")
+            .content_hash()];
+    }
+
+    let tiles = map.cache().get(coord).expect("current region tiles");
+    let mut hashes: Vec<u64> = layer_channels(layer)
+        .iter()
+        .map(|&channel| {
+            tiles.channels[channel]
+                .as_ref()
+                .expect("current layer channel")
+                .content_hash()
+        })
+        .collect();
+    if layer == LAYER_BIOME {
+        hashes.push(
+            tiles
+                .biome
+                .as_ref()
+                .expect("current biome tile")
+                .content_hash(),
+        );
+    } else if layer == LAYER_ECOLOGY {
+        hashes.push(
+            tiles
+                .dominant
+                .as_ref()
+                .expect("current dominant-species tile")
+                .content_hash(),
+        );
+    }
+    assert!(
+        !hashes.is_empty(),
+        "layer {layer} has no fingerprinted output"
+    );
+    hashes
+}
+
+fn world_fingerprint(map: &RegionMap) -> Vec<RegionFingerprint> {
+    map.iter_active()
+        .map(|region| {
+            let diagnostics = map
+                .layer_diagnostics(region.coord)
+                .expect("resident diagnostics");
+            let layers = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    assert_eq!(
+                        diagnostic.stored, diagnostic.expected,
+                        "region {:?} layer {} is not current",
+                        region.coord, diagnostic.layer
+                    );
+                    LayerFingerprint {
+                        dependency_hash: diagnostic.stored.expect("settled layer hash"),
+                        content_hashes: layer_content_hashes(map, region.coord, diagnostic.layer),
+                    }
+                })
+                .collect();
+            RegionFingerprint {
+                coord: region.coord,
+                layers,
+            }
+        })
+        .collect()
+}
+
+fn resident_cell_signatures(map: &RegionMap) -> BTreeSet<HabitatSignature> {
+    let resolution = map.config().field_resolution;
+    let mut signatures = BTreeSet::new();
+    for region in map.iter_active() {
+        assert_eq!(region.status, GenerationStatus::Ready);
+        for cy in 0..resolution {
+            for cx in 0..resolution {
+                let signature = map
+                    .cell_signature(region.coord, cx, cy)
+                    .expect("settled cell signature");
+                assert!(
+                    map.roster_cache().get(signature).is_some(),
+                    "settled cell {:?} ({cx}, {cy}) lost roster {signature:?}",
+                    region.coord
+                );
+                let ecology = map
+                    .cell_ecology(region.coord, cx, cy)
+                    .expect("settled cell ecology");
+                assert_eq!(ecology.signature, signature);
+                assert!(ecology.herbivore.is_some());
+                assert!(ecology.predator.is_some());
+                assert!(ecology.diversity.is_some());
+                signatures.insert(signature);
+            }
+        }
+    }
+    signatures
+}
+
+fn assert_roster_floor(map: &RegionMap, required: &BTreeSet<HabitatSignature>) -> usize {
+    let required_bytes: usize = required
+        .iter()
+        .map(|&signature| {
+            map.roster_cache()
+                .get(signature)
+                .expect("required roster")
+                .bytes()
+        })
+        .sum();
+    assert_eq!(map.roster_cache().len(), required.len());
+    assert_eq!(map.roster_cache().bytes(), required_bytes);
+    required_bytes
+}
+
+fn unused_valid_signature(used: &BTreeSet<HabitatSignature>) -> HabitatSignature {
+    for biome in 0..BIOME_COUNT {
+        let biome = u8::try_from(biome).expect("biome id fits in u8");
+        for temperature_band in 0..TEMPERATURE_BANDS {
+            for moisture_band in 0..MOISTURE_BANDS {
+                for fertility_band in 0..FERTILITY_BANDS {
+                    let candidate = HabitatSignature {
+                        biome,
+                        temperature_band,
+                        moisture_band,
+                        fertility_band,
+                    };
+                    if !used.contains(&candidate) {
+                        return candidate;
+                    }
+                }
+            }
+        }
+    }
+    panic!("tiny fixture unexpectedly covered the complete habitat signature space");
 }
 
 #[test]
@@ -363,6 +604,162 @@ fn revision_bump_invalidates_the_layer_and_its_dependents_only() {
 }
 
 #[test]
+fn zero_macro_target_recovers_hydrology_chain_to_roomy_fixed_point() {
+    let player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    let tight_config = StreamConfig {
+        near_radius: 0.1 * REGION_SIZE,
+        far_radius: 0.2 * REGION_SIZE,
+        load_radius: 0.25 * REGION_SIZE,
+        unload_radius: 0.5 * REGION_SIZE,
+        field_resolution: 2,
+        max_macro_cache_bytes: 0,
+        ..StreamConfig::default()
+    };
+    let mut roomy_config = tight_config;
+    roomy_config.max_macro_cache_bytes = usize::MAX;
+
+    let mut tight = RegionMap::new(tight_config);
+    let mut roomy = RegionMap::new(roomy_config);
+    update_until_current(&mut tight, player, &Budget::unlimited(), 8);
+    update_until_current(&mut roomy, player, &Budget::unlimited(), 8);
+    assert_eq!(tight.iter_active().count(), 1, "test window must stay tiny");
+
+    // The first idle capacity pass may discard Drainage while leaving the
+    // already-fresh Hydrology output and its clean scheduling hints alone.
+    let field = PossibilityField::default();
+    tight.update(
+        player,
+        0.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &Budget::unlimited(),
+        &InlineExecutor,
+        false,
+    );
+    roomy.update(
+        player,
+        0.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &Budget::unlimited(),
+        &InlineExecutor,
+        false,
+    );
+    let coord = RegionCoord::new(0, 0);
+    let macro_coord = macro_coord_for(coord);
+    assert!(tight.macro_cache().get(macro_coord).is_none());
+    let diagnostics = tight
+        .layer_diagnostics(coord)
+        .expect("resident diagnostics");
+    assert!(!diagnostics[LAYER_DRAINAGE as usize].dirty);
+    assert!(diagnostics[LAYER_DRAINAGE as usize].stored.is_none());
+    assert_eq!(
+        diagnostics[LAYER_HYDROLOGY as usize].stored,
+        diagnostics[LAYER_HYDROLOGY as usize].expected,
+        "capacity eviction must leave fresh Hydrology intact"
+    );
+
+    let drainage_revision = tight.effective_revision(LAYER_DRAINAGE);
+    let hydrology_revision = tight.effective_revision(LAYER_HYDROLOGY);
+    tight.bump_layer_revision(LAYER_HYDROLOGY);
+    roomy.bump_layer_revision(LAYER_HYDROLOGY);
+    assert_eq!(
+        tight.effective_revision(LAYER_DRAINAGE),
+        drainage_revision,
+        "the reproduction must invalidate Hydrology only"
+    );
+    assert_eq!(
+        tight.effective_revision(LAYER_HYDROLOGY),
+        hydrology_revision.wrapping_add(1)
+    );
+    let diagnostics = tight
+        .layer_diagnostics(coord)
+        .expect("resident diagnostics");
+    assert!(!diagnostics[LAYER_DRAINAGE as usize].dirty);
+    assert!(diagnostics[LAYER_HYDROLOGY as usize].dirty);
+
+    // Seventeen units admit exactly the missing macro job in the first
+    // recovery frame. Hold it in a manual queue so its result reaches the
+    // integrator at the start of the next update, immediately before the
+    // zero-target capacity pass. Hydrology is still dirty at that pass, so
+    // the just-integrated macro must survive long enough to be snapshotted.
+    let finite_budget = Budget {
+        max_regen_cost: 17,
+        ..Budget::unlimited()
+    };
+    let executor = ManualExecutor::default();
+    let queued_stats = tight.update(
+        player,
+        0.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &finite_budget,
+        &executor,
+        false,
+    );
+    assert_eq!(queued_stats.regen_cost_spent, 17);
+    assert_eq!(executor.queue_len(), 1);
+    assert_eq!(tight.jobs_in_flight(), 1);
+    assert!(tight.macro_cache().get(macro_coord).is_none());
+    executor.run_next();
+    assert!(
+        tight.macro_cache().get(macro_coord).is_none(),
+        "workers never write the cache directly"
+    );
+
+    executor.run_submissions_inline();
+    let recovered_stats = tight.update(
+        player,
+        0.0,
+        &field,
+        &[],
+        &NO_BIAS,
+        &finite_budget,
+        &executor,
+        false,
+    );
+    assert!(is_current_fixed_point(&tight));
+    assert_eq!(executor.queue_len(), 0);
+    assert!(
+        tight.macro_cache().get(macro_coord).is_some(),
+        "demanded macro must cross the capacity pass before Hydrology snapshots it"
+    );
+
+    let mut regenerated = queued_stats.regenerated_by_layer;
+    for (total, frame) in regenerated
+        .iter_mut()
+        .zip(recovered_stats.regenerated_by_layer)
+    {
+        *total += frame;
+    }
+    for layer in [
+        LAYER_DRAINAGE,
+        LAYER_HYDROLOGY,
+        LAYER_SOILS,
+        LAYER_BIOME,
+        LAYER_VEGETATION,
+        LAYER_ECOLOGY,
+    ] {
+        assert!(
+            regenerated[layer as usize] > 0,
+            "layer {layer} made no recovery progress"
+        );
+    }
+
+    update_until_current(&mut roomy, player, &finite_budget, 8);
+    assert_eq!(tight.jobs_in_flight(), 0);
+    assert!(tight
+        .iter_active()
+        .all(|region| region.status == GenerationStatus::Ready && region.dirty_layers == 0));
+    // Capture this demanded fixed point now: a later idle update is allowed to
+    // evict Drainage again under the zero target.
+    assert_eq!(world_fingerprint(&tight), world_fingerprint(&roomy));
+}
+
+#[test]
 fn dispatch_is_topological_under_tiny_budgets() {
     // With a budget so small only one job fits per frame, layers must still
     // appear strictly bottom-up: no layer generates before its inputs.
@@ -528,6 +925,201 @@ fn near_field_organisms_are_stable_and_preserve_the_aggregate() {
     let a: Vec<_> = map.organisms_in(near).unwrap().to_vec();
     let b: Vec<_> = other.organisms_in(near).unwrap().to_vec();
     assert_eq!(a, b, "two runs must realize identical organisms");
+}
+
+#[test]
+fn zero_roster_target_preserves_resident_ecology_and_realization() {
+    let initial_player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    let tight_config = StreamConfig {
+        near_radius: 0.25 * REGION_SIZE,
+        far_radius: 0.75 * REGION_SIZE,
+        load_radius: 1.05 * REGION_SIZE,
+        unload_radius: 2.25 * REGION_SIZE,
+        field_resolution: 4,
+        max_roster_cache_bytes: 0,
+        ..StreamConfig::default()
+    };
+    let mut roomy_config = tight_config;
+    roomy_config.max_roster_cache_bytes = usize::MAX;
+    let mut tight = RegionMap::new(tight_config);
+    let mut roomy = RegionMap::new(roomy_config);
+    update_until_current(&mut tight, initial_player, &Budget::unlimited(), 8);
+    update_until_current(&mut roomy, initial_player, &Budget::unlimited(), 8);
+
+    let approached = RegionCoord::new(1, 0);
+    assert!(
+        tight.get(approached).is_some(),
+        "approach target must be resident"
+    );
+    assert!(
+        tight.organisms_in(approached).is_none(),
+        "approach target must initially be outside the near window"
+    );
+
+    let initial_required = resident_cell_signatures(&tight);
+    assert!(
+        initial_required.len() > 1,
+        "fixture must exercise multiple resident habitat signatures"
+    );
+    let initial_floor = assert_roster_floor(&tight, &initial_required);
+    assert!(
+        initial_floor > tight.config().max_roster_cache_bytes,
+        "required roster working set must exceed the zero-byte target"
+    );
+
+    // Repeated idle updates each run the capacity pass. The protected cache
+    // must stabilize at its indispensable floor instead of rebuilding or
+    // shedding an entry needed by a settled L8 cell.
+    let field = PossibilityField::default();
+    for _ in 0..4 {
+        let tight_stats = tight.update(
+            initial_player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        roomy.update(
+            initial_player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        assert_eq!(tight_stats.rosters_built, 0, "protected rosters churned");
+        assert_eq!(tight_stats.roster_cache_bytes, initial_floor);
+        assert_eq!(resident_cell_signatures(&tight), initial_required);
+        assert_eq!(
+            assert_roster_floor(&tight, &initial_required),
+            initial_floor
+        );
+    }
+
+    // Move the already-settled cardinal neighbor into the near window without
+    // unloading it. Realization must read the retained roster set and match a
+    // roomy-cache replay exactly, including ids, species, and expressions.
+    let (ox, oy) = approached.origin();
+    let approached_player = (ox + REGION_SIZE * 0.5, oy + REGION_SIZE * 0.5);
+    update_until_current(&mut tight, approached_player, &Budget::unlimited(), 8);
+    update_until_current(&mut roomy, approached_player, &Budget::unlimited(), 8);
+    let tight_organisms = tight
+        .organisms_in(approached)
+        .expect("approached resident realized")
+        .to_vec();
+    let roomy_organisms = roomy
+        .organisms_in(approached)
+        .expect("roomy approached resident realized")
+        .to_vec();
+    assert!(
+        !tight_organisms.is_empty(),
+        "fixture must realize at least one organism"
+    );
+    assert_eq!(
+        tight_organisms, roomy_organisms,
+        "zero roster target changed organism ids, species, or expressions"
+    );
+    for organism in &tight_organisms {
+        let signature = tight
+            .cell_signature(approached, organism.cell.cx, organism.cell.cy)
+            .expect("organism cell signature");
+        let roster = tight
+            .roster_cache()
+            .get(signature)
+            .expect("organism cell roster");
+        assert!(
+            roster
+                .roster
+                .species
+                .iter()
+                .any(|species| species.id == organism.species),
+            "organism species is absent from its retained cell roster"
+        );
+    }
+
+    let final_required = resident_cell_signatures(&tight);
+    assert_eq!(final_required, resident_cell_signatures(&roomy));
+    let final_floor = assert_roster_floor(&tight, &final_required);
+    assert!(final_floor > tight.config().max_roster_cache_bytes);
+    for &signature in &final_required {
+        assert_eq!(
+            tight
+                .roster_cache()
+                .get(signature)
+                .expect("tight roster")
+                .as_ref(),
+            roomy
+                .roster_cache()
+                .get(signature)
+                .expect("roomy roster")
+                .as_ref(),
+            "roster content differs for {signature:?}"
+        );
+    }
+    assert_eq!(
+        world_fingerprint(&tight),
+        world_fingerprint(&roomy),
+        "zero roster target changed L8 dependency or content hashes"
+    );
+
+    for _ in 0..4 {
+        let tight_stats = tight.update(
+            approached_player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        roomy.update(
+            approached_player,
+            0.0,
+            &field,
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        assert_eq!(tight_stats.rosters_built, 0, "protected rosters churned");
+        assert_eq!(tight_stats.roster_cache_bytes, final_floor);
+        assert_eq!(resident_cell_signatures(&tight), final_required);
+        assert_eq!(assert_roster_floor(&tight, &final_required), final_floor);
+        assert_eq!(
+            tight.organisms_in(approached),
+            roomy.organisms_in(approached),
+            "realized organisms changed on a later capacity pass"
+        );
+    }
+
+    // The public cache policy still removes an unprotected entry at a zero
+    // target; protection is a working-set floor, not a blanket no-eviction
+    // mode. RegionMap intentionally exposes its live cache read-only, so use a
+    // standalone public cache to exercise the mutation contract.
+    let protected_signature = *final_required.iter().next().expect("required signature");
+    let disposable_signature = unused_valid_signature(&final_required);
+    let mut capacity_probe = RosterCache::default();
+    let protected_entry = capacity_probe.ensure(protected_signature);
+    capacity_probe.ensure(disposable_signature);
+    let protected: BTreeSet<_> = [protected_signature].into_iter().collect();
+    let eviction = capacity_probe.evict_to_bytes(0, &protected);
+    assert_eq!(eviction.entries_removed, 1);
+    assert!(eviction.bytes_removed > 0);
+    assert_eq!(
+        capacity_probe
+            .get(protected_signature)
+            .expect("protected entry retained")
+            .as_ref(),
+        protected_entry.as_ref()
+    );
+    assert!(capacity_probe.get(disposable_signature).is_none());
 }
 
 #[test]

@@ -280,8 +280,9 @@ pub struct GeneratedTile {
     pub coord: RegionCoord,
     /// Which layer produced it.
     pub layer: u16,
-    /// The dependency hash the tiles were generated from. Integration relies
-    /// on the scheduler's dirty-bit bookkeeping to drop superseded results.
+    /// The dependency hash the tiles were generated from. Integration checks
+    /// it against both the dispatch key and the recursively current expected
+    /// key; dirty bits are scheduling hints, not provenance (ADR 0019).
     pub dep_hash: u64,
     /// Dispatch identity assigned by the scheduler. Guards against a stale
     /// orphan (e.g. from an evicted-then-reloaded region) masquerading as the

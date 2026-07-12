@@ -433,10 +433,19 @@ directly-read possibility buckets in domain order
 input-layer dependency hashes in declaration order
 ```
 
-The implementation treats a stored tile as stale when its hash differs from the
-newly expected hash. Input hashes recursively include upstream provenance, so
-an upstream change changes downstream keys, absent a 64-bit collision. A dirty
-bitset is only a fast hint saying which hashes might need checking.
+The current expected key is derived recursively from authoritative region
+domains, effective revisions, resolution, and declared input keys even when an
+input tile is absent from the cache. Drainage's expected macro key is likewise
+computable without a resident macro tile. Input hashes therefore include
+upstream provenance, so an upstream change changes downstream keys, absent a
+64-bit collision.
+
+The implementation checks both stored tiles and completed results against that
+current expected key. A completed result must also match the key captured at
+dispatch, while its current job id is the separate dispatch-identity gate. A
+dirty bitset is only a scheduling hint and cancellation only saves work.
+Dispatch readiness remains material: before deferring a consumer, the runtime
+demand-repairs any missing or stale cached input through the declared graph.
 
 The implemented directed acyclic graph is:
 
@@ -1197,6 +1206,14 @@ Generation collects the distinct signatures in a region before dispatching
 Ecology, ensures each entry exists, and gives the worker an immutable
 signature-keyed snapshot.
 
+The union of those `region_signatures` across all resident regions is the
+indispensable roster working set. Cache maintenance walks that set in
+deterministic signature order and calls `ensure` to repair any missing pure
+entry. Capacity eviction then removes only disposable entries, retaining its
+reverse-signature victim order. The configured roster bytes are a target with
+this required-set floor: if resident entries alone exceed it, all are retained
+and the reported cache bytes expose the overage.
+
 The representative productivity used to build a signature's food web places
 fertility and moisture at their band centers:
 
@@ -1405,11 +1422,16 @@ order:
 5. draw two fractions to jitter position uniformly inside the cell.
 
 One density slot therefore has expected occupancy $d_v$; $k$ slots have
-expected occupancy $kd_v$. Organism vectors are keyed by the region's L8
-dependency hash. They are reused while that key is unchanged, rebuilt as a
-whole when it changes, and recycled when the region leaves the near window.
-There is no movement, animation state, hunger, reproduction, age, interaction,
-or behavior simulation.
+expected occupancy $kd_v$. Before clearing or publishing an organism vector,
+the coordinator verifies that every roster signature tracked for the resident
+region is present. An incomplete roster defers realization, preserves the
+previous vector, and does not advance the region's L8 organism key; roster
+maintenance repairs the pure inputs for a later retry.
+
+Organism vectors are keyed by the region's L8 dependency hash. They are reused
+while that key is unchanged, rebuilt as a whole when it changes, and recycled
+when the region leaves the near window. There is no movement, animation state,
+hunger, reproduction, age, interaction, or behavior simulation.
 
 ### 3.21 Record schema and codec
 
@@ -1487,24 +1509,37 @@ one bit for every visited region.
 Generation jobs are pure functions over owned metadata and immutable `Arc`
 snapshots. The main thread is the only cache writer. `RegionMap` maintains an
 `in_flight` ordered map keyed by `(coordinate, layer)`; each entry contains a
-monotonic job id and an atomic cancellation token.
+monotonic job id, the expected dependency key captured at dispatch, and an
+atomic cancellation token.
 
 Dispatch works to a fixed point within the frame's cost budget:
 
 1. order resident regions nearest-first;
-2. scan each dirty mask in topological layer-id order;
-3. clear a dirty false positive when stored and expected hashes already match;
-4. defer a layer until all declared inputs are present and fresh;
-5. submit it with Critical, Normal, or Background priority according to
+2. close each dirty consumer's work set over missing or stale declared inputs,
+   restoring lower-layer and macro requests before readiness is tested;
+3. scan each dirty mask in topological layer-id order;
+4. clear a dirty false positive when stored and expected hashes already match;
+5. defer a layer until all declared inputs are present and fresh;
+6. submit it with Critical, Normal, or Background priority according to
    distance; and
-6. integrate completed results and repeat while new work became ready.
+7. integrate completed results and repeat while new work became ready.
 
 The dirty bit is cleared at dispatch. If possibility state or an upstream tile
 changes while a job runs, the layer is dirtied again and its cancellation token
-is flipped. On arrival, a result is accepted only if its job id is still the
-current one and its dirty bit remained clear. Accepted output atomically
-replaces all channels of that layer and dirties every transitive dependent.
-Late, superseded, and orphaned results are discarded.
+is flipped. On arrival, job id establishes that the result belongs to the
+current dispatch. Before any channel changes, its dependency hash must equal
+both that dispatch's captured key and the key recursively expected from current
+authoritative state. Accepted output atomically replaces all channels of that
+layer and, when its key replaces a missing or different key, dirties every
+transitive dependent.
+
+Failed provenance retires the completed dispatch, reclaims owned tile buffers,
+leaves the previous cached layer untouched, marks the layer and its dependent
+closure dirty, and cancels obsolete dependent jobs before normal budgeted
+dispatch retries them. A rejected macro applies the Drainage closure to every
+covered resident region. Late, superseded, and orphaned results are discarded;
+dirty bits and cancellation are never substitutes for the identity and
+provenance checks.
 
 Drainage jobs are keyed by level-4 macro coordinate. Their priority is inherited
 from the nearest dependent region that requests the tile. Ecology jobs first
@@ -1576,9 +1611,13 @@ The active data structures are:
 Normal radius eviction drops region state, tiles, organisms, signature
 bookkeeping, and in-flight jobs outside the unload radius. Field-capacity
 eviction removes farthest non-preserved regions outside the near radius.
-Macro capacity removes farthest macro tiles; roster capacity removes entries in
-reverse signature order. These latter two capacity paths have correctness gaps
-described in Section 4.
+Macro capacity removes farthest macro tiles. A dirty consumer later
+demand-rebuilds a missing or stale macro through declared dependency repair;
+a freshly integrated demanded macro is retained transiently until Hydrology
+snapshots it, so asynchronous work also makes progress below a one-tile target.
+Roster capacity first ensures the protected resident-signature union, then
+removes only disposable entries in reverse signature order. Its logical byte
+target may be exceeded when the resident working-set floor is larger.
 
 `TilePool` keeps bounded stacks of reusable `Vec<f32>`, `Vec<u8>`, and
 `Vec<u16>` allocations. Buffers travel from main-thread pool to a job, into a
@@ -1652,6 +1691,9 @@ The repository uses several complementary checks:
 * same-platform SIMD-versus-scalar differential tests;
 * the continuity replay for pinned stability and bounded seams;
 * `wer-ledger` for declared invalidation precision;
+* focused `world-runtime` recovery tests for tight macro and roster ceilings,
+  every-layer stale-result rejection, settled-cell roster inspection, and
+  deferred then retried near-field realization;
 * the Phase 3 ecology harness (run as an integration test) for diversity and
   trophic bounds;
 * `wer-anchor` for selective, coherent steering and resonance gating;
@@ -1670,7 +1712,8 @@ currently execute those exports in a wasm engine or browser.
 This section separates likely correctness or contract violations from
 deliberate model simplifications. Some issues are unlikely under the generous
 default limits, but the corresponding public configuration claims are still
-stronger than the implementation.
+stronger than the implementation. Resolved findings remain below for
+auditability and are explicitly labeled; unlabeled findings remain open.
 
 ### Prioritized improvement roadmap
 
@@ -1683,11 +1726,13 @@ into one implementation unit.
 
 #### A. Correctness and contract integrity
 
-1. **Make dependency integration and cache eviction self-healing** (findings 2,
-   3, and 10). Re-request any missing dependency, keep resident roster inputs
-   available, and compare every completed job's dependency hash with the
-   currently expected hash before integration. Add tight-ceiling recovery tests
-   for macro drainage, rosters, and every dependent layer.
+1. **Completed: Make dependency integration and cache eviction self-healing**
+   ([Improvement A.1](plans/prototype/improvement_A_1_self_healing.md); findings
+   2, 3, and 10). The runtime now demand-repairs missing declared inputs,
+   protects and rebuilds resident roster entries, and gates completed work on
+   its dispatch and current dependency keys. Tight macro/roster ceilings,
+   every declared edge, every result shape, cell inspection, and realization
+   recovery are covered by focused runtime regressions.
 
 2. **Give preserves deterministic ownership and revision semantics** (finding
    26). Track all preserve contributors per region, resolve overlap by a stable
@@ -1874,28 +1919,36 @@ is unchanged.
 
 #### 2. Macro-cache capacity eviction can strand Hydrology forever
 
-The capacity path can remove a Drainage macro tile still needed by resident
-regions without dirtying layer 2. If Hydrology later becomes dirty,
-`inputs_fresh` blocks it because Drainage is missing, but only a dirty Drainage
-bit calls `check_macro` and submits a replacement. The documented "re-derives
-on demand" behavior is therefore absent.
+**Status:** Resolved by
+[Improvement A.1](plans/prototype/improvement_A_1_self_healing.md).
 
-Eviction should dirty Drainage for every covered resident, or dependency
-resolution should request missing macro data regardless of the Drainage dirty
-hint. A tight-macro-ceiling regression test should then dirty Hydrology and
-settle it again.
+The capacity path formerly could remove a Drainage macro while its covered
+regions retained clean Drainage hints. A later Hydrology invalidation then
+deferred forever because readiness observed the missing macro but did not
+request it.
+
+Dependency repair now restores a current-key Drainage request whenever a dirty
+consumer needs a missing or stale macro, without eagerly rebuilding unused
+macros. A tight-macro-ceiling regression evicts the input, invalidates
+Hydrology alone, settles the complete downstream chain, and compares its keys
+and content with a roomy-cache run.
 
 #### 3. Roster-cache capacity eviction can make life permanently disappear
 
-`RosterCache::evict_to_bytes` can remove signatures still referenced by fresh
-Ecology tiles. Cell inspection and realization call `get`, not `ensure`. A
-newly near region can consequently build an incomplete or empty organism
-vector, record the unchanged L8 hash as current, and never retry until some
-unrelated L8 invalidation occurs.
+**Status:** Resolved by
+[Improvement A.1](plans/prototype/improvement_A_1_self_healing.md).
 
-Needed signatures should be pinned, rebuilt before reads, or coupled to an
-explicit dependent invalidation. The current memory harness exercises the
-field ceiling only, so neither this nor the macro issue is covered.
+Roster eviction formerly could remove signatures still referenced by fresh
+Ecology tiles. Lookup-only cell inspection then failed, while near-field
+realization could publish an incomplete vector and record the unchanged L8 key
+without retrying.
+
+The runtime now ensures and protects the union of resident signature sets,
+evicts only disposable entries, and permits that required floor to exceed its
+logical byte target. Realization preflights the complete set and defers without
+advancing its key if an entry is absent. Tight roster-ceiling tests cover
+required-entry repair, settled-cell inspection, realization retry, roomy-cache
+content equality, and continued eviction of unprotected signatures.
 
 #### 4. Amortized retargeting can violate the geometric near-field pin
 
@@ -1990,13 +2043,20 @@ CI only compiles the wasm exports and executes their goldens natively.
 
 #### 10. Integration does not revalidate the dependency hash
 
-Although dependency hashes are described as ground truth, result integration
-accepts a tile when its job id matches and its dirty bit remained clear. It does
-not recompute the current expected hash and compare it with `result.dep_hash`.
-A dirty-bookkeeping bug can therefore admit a stale tile.
+**Status:** Resolved by
+[Improvement A.1](plans/prototype/improvement_A_1_self_healing.md).
 
-Rechecking the 64-bit expected key at integration is cheap relative to
-generation and would make dependency provenance the actual correctness gate.
+Integration formerly accepted a tile when its job id matched and dirty
+bookkeeping remained clear, without comparing `result.dep_hash` with current
+authoritative provenance. A missed dirty hint could therefore admit stale
+content.
+
+Each in-flight entry now records its dispatch key. Macro and region results
+integrate only when job id matches and the result key equals both that dispatch
+key and the recursively recomputed current key. Rejection leaves cached
+channels untouched, reclaims owned buffers, dirties the dependent closure, and
+requeues through normal dispatch. The stale-result matrix exercises every
+result shape and verifies atomic rejection followed by a correct retry.
 
 ### 4.2 Ecological and steering-model inconsistencies
 
@@ -2305,19 +2365,29 @@ The published macro-tile estimate is also stale: a 48-by-48 `u8 + u32` tile is
 
 #### 33. Some advertised verification is absent or narrower than stated
 
+**Status:** Open. Improvement A.1 closes only the focused cache-recovery and
+dependency-provenance gaps described below.
+
 The scale harness checks executor counts, budget scale, cancellation, and
 retarget amortization but has no alternate frame-slicing case despite the ADR
-claim. Its memory scenario pressures only the field cache. Its tier identity
-scenario does not record routes or captures. The settled state hash omits
-targets, dirty/status state, overrides, full organism position/expression, and
-executor queues, so equality is not equality of every stated component.
+claim. Its memory scenario pressures only the field cache rather than all
+caches together. Its tier identity scenario does not record routes or captures.
+The settled state hash omits targets, dirty/status state, overrides, full
+organism position/expression, and executor queues, so equality is not equality
+of every stated component.
 
-Add the missing scenarios and independently assert that every settled tile's
-stored dependency hash equals its expected hash. Run wasm parity exports—not
-just compilation—in CI. Add ordinary region-border tests for elevation, slope,
-soil, and biome, plus multi-node route softness and cache-eviction recovery.
-The SIMD differential generator should also sample all 12 biome ids; it
-currently calls `next_below(11)`, so Ice (id 11) is never exercised there.
+Focused runtime tests now pressure macro and roster ceilings, reject stale
+results for every layer shape, exercise cell inspection and realization
+recovery, and assert stored versus expected keys in those scenarios. This does
+not turn `wer-scale` into a simultaneous all-cache test or expand its state
+hash.
+
+Add the remaining frame-slicing, all-cache-ceiling, cross-tier persistence, and
+full settled-state scenarios. Run wasm parity exports—not just compilation—in
+CI. Add ordinary region-border tests for elevation, slope, soil, and biome, plus
+multi-node route softness. The SIMD differential generator should also sample
+all 12 biome ids; it currently calls `next_below(11)`, so Ice (id 11) is never
+exercised there.
 
 #### 34. GPU refinement is safely derived, but its parity story can improve
 

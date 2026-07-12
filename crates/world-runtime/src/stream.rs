@@ -20,11 +20,12 @@
 //!    frames, deepest layers last.
 //!
 //! Staleness is dependency-hash comparison — the ground truth (ADR 0008).
-//! `dirty_layers` is an exact optimization hint over it: converge, upstream
-//! integration, macro regeneration, and revision bumps set bits precisely when
-//! a layer's expected hash may have changed, so clean regions skip hash checks
-//! entirely, and a result arriving for a re-dirtied layer is dropped as
-//! superseded. Everything is budgeted (section 6.6), regeneration by declared
+//! `dirty_layers` is a conservative scheduling hint over it: convergence,
+//! upstream integration, macro regeneration, and revision bumps set bits when
+//! a layer's expected hash may have changed, while dependency repair restores
+//! omitted hints on demand. Job ids protect dispatch identity; dispatch and
+//! current dependency keys protect content provenance at integration (ADR
+//! 0019). Everything is budgeted (section 6.6), regeneration by declared
 //! *cost* rather than count (phase-2-plan.md §8.2), so a big possibility
 //! change ripples outward over several frames instead of hitching.
 
@@ -109,11 +110,13 @@ pub struct StreamConfig {
     /// Always safe — every tile re-derives from its dependency hash
     /// (ADR 0008) — so a ceiling costs recompute, never correctness.
     pub max_field_cache_bytes: usize,
-    /// Byte ceiling for the macro drainage cache. Evicted tiles re-derive
-    /// lazily the next time a dependent's hydrology goes stale.
+    /// Byte target for the macro drainage cache. Evicted tiles re-derive
+    /// lazily the next time a dependent's hydrology goes stale; a demanded
+    /// result is retained transiently until Hydrology snapshots it.
     pub max_macro_cache_bytes: usize,
-    /// Byte ceiling for the roster cache. Evicted entries rebuild on demand
-    /// (`RosterCache::ensure` — a pure function of the signature).
+    /// Byte target for the roster cache. Disposable entries evict
+    /// deterministically; the required resident working set is repaired and
+    /// may exceed this target (`RosterCache::ensure`, ADR 0019).
     pub max_roster_cache_bytes: usize,
     /// Near-field organisms realized per cell (phase-6-plan.md §6.6): the
     /// High-tier density lever. Slot 0 keeps the exact Phase 5 identities;
@@ -293,8 +296,9 @@ pub struct LayerDiagnostic {
     /// Quantized buckets of the layer's directly-read domains, in stable
     /// domain order.
     pub buckets: Vec<u16>,
-    /// The freshly computed expected dependency hash, or `None` while an
-    /// input tile is missing or the macro input is stale.
+    /// The dependency hash recursively expected from current authoritative
+    /// state. `None` only when the region is no longer resident; cache absence
+    /// is a readiness concern, not a provenance gap (ADR 0019).
     pub expected: Option<u64>,
     /// The stored dependency hash of the cached tiles, if generated.
     pub stored: Option<u64>,
@@ -396,8 +400,10 @@ pub struct RegionMap {
     /// LAYER_DRAINAGE)` for macro jobs — macro coords are just `RegionCoord`s
     /// at a higher level. Results whose id no longer matches (superseded,
     /// evicted, or from an evicted-then-reloaded region) are dropped on
-    /// arrival — the correctness gate; the cancellation token is a worker-time
-    /// optimization layered on top (phase-6-plan.md §6.2).
+    /// arrival. Matching ids establish dispatch identity; the recorded and
+    /// recursively current dependency keys separately gate content provenance
+    /// (ADR 0019). Cancellation is only a worker-time optimization layered on
+    /// top (phase-6-plan.md §6.2).
     in_flight: BTreeMap<(RegionCoord, u16), InFlightJob>,
     /// Whether supersession/eviction flips cancellation tokens (default on).
     /// A harness A/B hook (like [`RegionMap::bump_layer_revision`]): settled
@@ -418,13 +424,14 @@ pub struct RegionMap {
     next_job_id: u64,
 }
 
-/// Bookkeeping for one dispatched generation job: its dispatch identity (the
-/// correctness gate for late results) and its cancellation token (the
-/// optimization — flipped when the job is superseded or its region evicted,
-/// checked once by the job closure on dequeue, phase-6-plan.md §6.2).
+/// Bookkeeping for one dispatched generation job: its dispatch identity, the
+/// authoritative dependency key captured at submission, and its cancellation
+/// token (the optimization — flipped when the job is superseded or its region
+/// evicted, checked once by the job closure on dequeue, phase-6-plan.md §6.2).
 #[derive(Debug)]
 struct InFlightJob {
     id: u64,
+    expected_hash: u64,
     cancel: Arc<AtomicBool>,
 }
 
@@ -464,14 +471,14 @@ impl RegionMap {
         self.cancellation = enabled;
     }
 
-    /// Flip and forget the in-flight jobs of `coord` whose layer is in
-    /// `mask` — they were dispatched against inputs that just changed, so
-    /// their results are already doomed to be dropped; the token lets them
-    /// skip the kernel work too. Removing the entry lets the layer redispatch
-    /// with fresh inputs immediately; a late result from the cancelled job is
-    /// still rejected by its stale job id. Returns how many were cancelled.
+    /// Forget the in-flight jobs of `coord` whose layer is in `mask` — they
+    /// were dispatched against inputs that just changed, so their results are
+    /// already doomed to be dropped. When cancellation is enabled their token
+    /// also lets them skip the kernel work; when disabled they deliberately run
+    /// and are rejected by dispatch identity. Removing the entry always lets
+    /// fresh work redispatch immediately. Returns how many tokens were flipped.
     fn cancel_in_flight(&mut self, coord: RegionCoord, mask: u32) -> usize {
-        if !self.cancellation || mask == 0 {
+        if mask == 0 {
             return 0;
         }
         let keys: Vec<(RegionCoord, u16)> = self
@@ -482,12 +489,24 @@ impl RegionMap {
             .collect();
         let mut cancelled = 0;
         for k in keys {
-            if let Some(job) = self.in_flight.remove(&k) {
-                job.cancel.store(true, Ordering::Relaxed);
-                cancelled += 1;
-            }
+            cancelled += self.retire_in_flight(k);
         }
         cancelled
+    }
+
+    /// Retire one dispatch, flipping its token only when cancellation is
+    /// enabled. The entry is removed in either mode so correctness and retry
+    /// pacing never depend on whether workers honor cancellation (ADR 0018).
+    fn retire_in_flight(&mut self, key: (RegionCoord, u16)) -> usize {
+        let Some(job) = self.in_flight.remove(&key) else {
+            return 0;
+        };
+        if self.cancellation {
+            job.cancel.store(true, Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
     }
 
     /// Recover the buffers of a dropped (superseded/orphaned) generation
@@ -1083,14 +1102,17 @@ impl RegionMap {
         }
         // Every in-flight job of an invalidated layer — macro drainage
         // included (its keys carry LAYER_DRAINAGE) — is now stale (§6.2).
-        if self.cancellation {
-            self.in_flight.retain(|(_, l), job| {
-                let keep = mask & layer_bit(*l) == 0;
-                if !keep {
-                    job.cancel.store(true, Ordering::Relaxed);
-                }
-                keep
-            });
+        // Entries retire in both cancellation modes so fresh keys can dispatch
+        // immediately; cancellation-off workers still run and are rejected by
+        // their old job ids at integration.
+        let obsolete: Vec<(RegionCoord, u16)> = self
+            .in_flight
+            .keys()
+            .filter(|(_, layer)| mask & layer_bit(*layer) != 0)
+            .copied()
+            .collect();
+        for key in obsolete {
+            self.retire_in_flight(key);
         }
     }
 
@@ -1220,43 +1242,56 @@ impl RegionMap {
             .is_some_and(|t| t.dep_hash == self.expected_macro_hash(mc))
     }
 
-    /// The expected dependency hash of `(coord, layer)`, or `None` while any
-    /// input tile is missing or the macro input is stale. Callers must ensure
-    /// tile inputs are *fresh* (dirty bits clear, nothing in flight) before
-    /// trusting the result — the fold consumes stored input hashes.
+    /// The expected dependency hash of `(coord, layer)` recursively derived
+    /// from current authoritative region state, effective revisions, field
+    /// resolution, and the expected keys of declared inputs. Materialized tile
+    /// presence is deliberately irrelevant here: dispatch readiness checks it
+    /// separately, while integration can always validate provenance (ADR 0019).
     fn expected_layer_hash(&self, coord: RegionCoord, layer: u16) -> Option<u64> {
-        let decl = layer_decl(layer);
         let region = self.regions.get(&coord)?;
-        let tiles = self.cache.get(coord);
+        let mut memo = [None; LAYER_COUNT as usize];
+        Some(self.expected_layer_hash_inner(coord, layer, &region.current, &mut memo))
+    }
+
+    fn expected_layer_hash_inner(
+        &self,
+        coord: RegionCoord,
+        layer: u16,
+        current: &PossibilityVector,
+        memo: &mut [Option<u64>; LAYER_COUNT as usize],
+    ) -> u64 {
+        debug_assert_ne!(layer, LAYER_DRAINAGE, "macro drainage has its own key");
+        if let Some(hash) = memo[layer as usize] {
+            return hash;
+        }
+        let decl = layer_decl(layer);
         let mut input_hashes = Vec::with_capacity(decl.deps.len());
         for &dep in decl.deps {
             let hash = if dep == LAYER_DRAINAGE {
-                let mc = macro_coord_for(coord);
-                let tile = self.macro_cache.get(mc)?;
-                if tile.dep_hash != self.expected_macro_hash(mc) {
-                    return None;
-                }
-                tile.dep_hash
+                self.expected_macro_hash(macro_coord_for(coord))
             } else {
-                tiles?.layer_hash(dep)?
+                self.expected_layer_hash_inner(coord, dep, current, memo)
             };
             input_hashes.push(hash);
         }
-        Some(layer_dep_hash(
+        let hash = layer_dep_hash(
             coord,
             layer,
             self.effective_revision(layer),
-            &region.current.quantized_domains(decl.domains),
+            &current.quantized_domains(decl.domains),
             &input_hashes,
             self.cfg.field_resolution,
-        ))
+        );
+        memo[layer as usize] = Some(hash);
+        hash
     }
 
-    /// Drain the results channel, integrating tiles that are still current.
-    /// Arrival order does not matter: content is a pure function of the
-    /// dependency key (ADR 0008), and superseded results — those whose layer
-    /// was re-dirtied while they were in flight — are dropped, so a threaded
-    /// executor converges to the same cache as an inline one.
+    /// Drain the results channel, integrating only results whose job id,
+    /// dispatch dependency key, result key, and recursively current expected
+    /// key all agree (ADR 0019). Dirty bits and cancellation may avoid work,
+    /// but neither is trusted as content provenance. Rejected current
+    /// dispatches leave the cache untouched and restore the affected closure
+    /// to retryable state.
     fn integrate_finished(&mut self, stats: &mut FrameStats) {
         while let Ok(result) = self.results_rx.try_recv() {
             match result {
@@ -1266,11 +1301,26 @@ impl RegionMap {
                     tile,
                 } => {
                     let key = (coord, LAYER_DRAINAGE);
-                    if self.in_flight.get(&key).map(|j| j.id) != Some(job_id) {
+                    let Some((current_id, dispatch_hash)) = self
+                        .in_flight
+                        .get(&key)
+                        .map(|job| (job.id, job.expected_hash))
+                    else {
                         stats.results_dropped += 1;
                         continue; // superseded or evicted while in flight
+                    };
+                    if current_id != job_id {
+                        stats.results_dropped += 1;
+                        continue; // a newer dispatch owns this key
+                    }
+                    let current_hash = self.expected_macro_hash(coord);
+                    if tile.dep_hash != dispatch_hash || tile.dep_hash != current_hash {
+                        self.reject_macro_result(coord, stats);
+                        continue;
                     }
                     self.in_flight.remove(&key);
+                    let replaced_hash = self.macro_cache.get(coord).map(|old| old.dep_hash);
+                    let tile_hash = tile.dep_hash;
                     self.macro_cache.insert(Arc::new(tile));
                     stats.macro_jobs += 1;
                     stats.layers_regenerated += 1;
@@ -1278,48 +1328,52 @@ impl RegionMap {
                     // A regenerated macro tile changes its dependents' expected
                     // hydrology hashes; notify them so the hint stays exact
                     // (phase-2-plan.md §7.8).
-                    let mut dirtied: Vec<RegionCoord> = Vec::new();
-                    for (&c, region) in self.regions.iter_mut() {
-                        if macro_coord_for(c) == coord {
-                            region.dirty_layers |= layer_bit(world_core::layer::LAYER_HYDROLOGY);
-                            if region.status == GenerationStatus::Ready {
-                                region.status = GenerationStatus::Generating;
+                    if replaced_hash != Some(tile_hash) {
+                        let mut dirtied: Vec<RegionCoord> = Vec::new();
+                        for (&c, region) in &mut self.regions {
+                            if macro_coord_for(c) == coord {
+                                region.dirty_layers |=
+                                    layer_bit(world_core::layer::LAYER_HYDROLOGY);
+                                if region.status == GenerationStatus::Ready {
+                                    region.status = GenerationStatus::Generating;
+                                }
+                                dirtied.push(c);
                             }
-                            dirtied.push(c);
                         }
-                    }
-                    // In-flight hydrology jobs of those dependents were built
-                    // from the superseded macro tile: cancel them (§6.2).
-                    for c in dirtied {
-                        stats.jobs_cancelled +=
-                            self.cancel_in_flight(c, layer_bit(world_core::layer::LAYER_HYDROLOGY));
+                        // In-flight hydrology jobs of those dependents were built
+                        // from the superseded macro tile: cancel them (§6.2).
+                        for c in dirtied {
+                            stats.jobs_cancelled += self
+                                .cancel_in_flight(c, layer_bit(world_core::layer::LAYER_HYDROLOGY));
+                        }
                     }
                 }
                 JobResult::Tile(result) => {
                     let key = (result.coord, result.layer);
-                    if self.in_flight.get(&key).map(|j| j.id) != Some(result.job_id) {
+                    let Some((current_id, dispatch_hash)) = self
+                        .in_flight
+                        .get(&key)
+                        .map(|job| (job.id, job.expected_hash))
+                    else {
                         stats.results_dropped += 1;
                         self.reclaim_generated(result);
                         continue; // superseded or evicted while in flight
-                    }
-                    self.in_flight.remove(&key);
-                    let stale = self
-                        .regions
-                        .get(&result.coord)
-                        .map(|r| r.dirty_layers & layer_bit(result.layer) != 0);
-                    if stale != Some(false) {
-                        // The region evicted, or the layer was re-dirtied
-                        // while this job flew (bucket flip, upstream
-                        // regeneration, revision bump): its expected hash
-                        // moved on, so the result is stale. Dropping it
-                        // leaves the dirty bit set, which forces a redispatch
-                        // with fresh inputs.
+                    };
+                    if current_id != result.job_id {
                         stats.results_dropped += 1;
                         self.reclaim_generated(result);
+                        continue; // a newer dispatch owns this key
+                    }
+                    let current_hash = self.expected_layer_hash(result.coord, result.layer);
+                    if result.dep_hash != dispatch_hash || current_hash != Some(result.dep_hash) {
+                        self.reject_generated_result(result, stats);
                         continue;
                     }
+                    self.in_flight.remove(&key);
                     let coord = result.coord;
                     let layer = result.layer;
+                    let replaced_hash = self.cache.get(coord).and_then(|t| t.layer_hash(layer));
+                    let result_hash = result.dep_hash;
                     // Superseded predecessors' buffers go back to the pool
                     // the moment the map holds their last reference (§4.2).
                     for (channel, tile) in result.channels {
@@ -1344,21 +1398,74 @@ impl RegionMap {
                             }
                         }
                     }
-                    // Downstream layers' expected hashes changed the moment the
-                    // new tile landed: mark every transitive dependent — and
-                    // cancel any of them already in flight, since they were
-                    // dispatched against the input this tile just replaced.
                     let dependents = dependents_closure(layer) & !layer_bit(layer);
                     if let Some(region) = self.regions.get_mut(&coord) {
-                        region.dirty_layers |= dependents;
+                        // A valid result clears even a false-positive dirty hint.
+                        // Only a changed key invalidates downstream work.
+                        region.dirty_layers &= !layer_bit(layer);
+                        if replaced_hash != Some(result_hash) {
+                            region.dirty_layers |= dependents;
+                        }
                     }
                     stats.layers_regenerated += 1;
                     stats.regenerated_by_layer[layer as usize] += 1;
-                    stats.jobs_cancelled += self.cancel_in_flight(coord, dependents);
+                    if replaced_hash != Some(result_hash) {
+                        stats.jobs_cancelled += self.cancel_in_flight(coord, dependents);
+                    }
                     self.refresh_status(coord);
                 }
             }
         }
+    }
+
+    /// Reject one current macro dispatch whose content provenance failed,
+    /// leaving the old macro tile untouched and making every covered resident
+    /// Drainage-dependent closure retryable.
+    fn reject_macro_result(&mut self, macro_coord: RegionCoord, stats: &mut FrameStats) {
+        self.in_flight.remove(&(macro_coord, LAYER_DRAINAGE));
+        stats.results_dropped += 1;
+        self.mark_macro_dependents_dirty(macro_coord, stats);
+    }
+
+    /// Apply the Drainage dependent closure to every resident level-0 region
+    /// covered by one macro coordinate.
+    fn mark_macro_dependents_dirty(&mut self, macro_coord: RegionCoord, stats: &mut FrameStats) {
+        let covered: Vec<RegionCoord> = self
+            .regions
+            .keys()
+            .filter(|&&coord| macro_coord_for(coord) == macro_coord)
+            .copied()
+            .collect();
+        for coord in covered {
+            self.mark_dirty_closure(coord, LAYER_DRAINAGE, stats);
+        }
+    }
+
+    /// Reject one current region dispatch whose content provenance failed,
+    /// reclaiming all owned buffers and restoring deterministic retry state.
+    fn reject_generated_result(&mut self, result: GeneratedTile, stats: &mut FrameStats) {
+        let coord = result.coord;
+        let layer = result.layer;
+        self.in_flight.remove(&(coord, layer));
+        stats.results_dropped += 1;
+        self.reclaim_generated(result);
+        self.mark_dirty_closure(coord, layer, stats);
+    }
+
+    /// Mark a layer and all transitive dependents dirty for one resident
+    /// region, retire any now-obsolete dependent dispatches, and leave its
+    /// status visibly generating. False-positive hints are harmless because
+    /// dispatch clears a matching stored-versus-expected key without work.
+    fn mark_dirty_closure(&mut self, coord: RegionCoord, layer: u16, stats: &mut FrameStats) {
+        if !self.regions.contains_key(&coord) {
+            return;
+        }
+        let mask = dependents_closure(layer);
+        if let Some(region) = self.regions.get_mut(&coord) {
+            region.dirty_layers |= mask;
+            region.status = GenerationStatus::Generating;
+        }
+        stats.jobs_cancelled += self.cancel_in_flight(coord, mask);
     }
 
     /// Recompute a region's `GenerationStatus` from its dirty bits and
@@ -1451,9 +1558,25 @@ impl RegionMap {
         });
         // Sweep roster entries no resident region's L8 tile references any more
         // (dependent-tracked, the macro cache's shape, §6.3).
-        let needed_signatures: BTreeSet<HabitatSignature> =
-            self.region_signatures.values().flatten().copied().collect();
+        let needed_signatures = self.required_roster_signatures();
         self.roster_cache.evict_unused(&needed_signatures);
+    }
+
+    /// The indispensable roster working set: the deterministic union of every
+    /// resident region's current or in-flight Ecology input signatures.
+    fn required_roster_signatures(&self) -> BTreeSet<HabitatSignature> {
+        self.region_signatures.values().flatten().copied().collect()
+    }
+
+    /// Repair every indispensable roster entry before capacity eviction or a
+    /// synchronous reader can observe the cache. Returns the same protected
+    /// set used by orphan sweeping so the two policies cannot diverge.
+    fn maintain_roster_working_set(&mut self) -> BTreeSet<HabitatSignature> {
+        let required = self.required_roster_signatures();
+        for &signature in &required {
+            self.roster_cache.ensure(signature);
+        }
+        required
     }
 
     /// Enforce the byte-capacity ceilings (phase-6-plan.md §4.3): after the
@@ -1488,14 +1611,27 @@ impl RegionMap {
             }
         }
 
-        // Macro ceiling: farthest macro tiles go first; dependents keep
-        // their fresh hydrology tiles, and the macro tile re-derives lazily
-        // if one of them ever goes stale.
+        // Macro target: farthest macro tiles go first; dependents keep their
+        // fresh hydrology tiles, and a macro re-derives lazily when Hydrology
+        // next needs it. A freshly integrated macro is temporarily
+        // indispensable while any covered Hydrology bit remains dirty — an
+        // asynchronous result must survive this pre-dispatch capacity pass
+        // long enough to be snapshotted. Once Hydrology dispatches, its Arc
+        // snapshot is independent and the cache entry becomes disposable.
         if self.macro_cache.bytes() > self.cfg.max_macro_cache_bytes {
             let pmc = macro_coord_for(RegionCoord::from_world(player.0, player.1));
+            let protected: BTreeSet<RegionCoord> = self
+                .regions
+                .iter()
+                .filter(|(_, region)| {
+                    region.dirty_layers & layer_bit(world_core::layer::LAYER_HYDROLOGY) != 0
+                })
+                .map(|(&coord, _)| macro_coord_for(coord))
+                .collect();
             let mut tiles: Vec<(u64, RegionCoord)> = self
                 .macro_cache
                 .iter()
+                .filter(|(coord, _)| !protected.contains(coord))
                 .map(|(&c, _)| {
                     let dx = i64::from(c.x) - i64::from(pmc.x);
                     let dy = i64::from(c.y) - i64::from(pmc.y);
@@ -1515,11 +1651,12 @@ impl RegionMap {
             }
         }
 
-        // Roster ceiling: entries rebuild on demand (pure function of the
-        // signature); eviction order is reverse signature order —
-        // deterministic, which is all that matters here.
+        // Roster target: repair the resident working set, then evict only
+        // disposable entries in deterministic reverse-signature order. The
+        // indispensable floor may exceed the configured target (ADR 0019).
+        let protected = self.maintain_roster_working_set();
         self.roster_cache
-            .evict_to_bytes(self.cfg.max_roster_cache_bytes);
+            .evict_to_bytes(self.cfg.max_roster_cache_bytes, &protected);
         evicted_any
     }
 
@@ -1766,9 +1903,11 @@ impl RegionMap {
         }
     }
 
-    /// Scan one region's dirty layers in topological (id) order, clearing
-    /// false-positive hints and dispatching stale layers whose inputs are
-    /// fresh. Returns whether anything was submitted.
+    /// Scan one region's dirty layers in topological (id) order. Before the
+    /// scan, close its work set over missing/stale materialized dependencies;
+    /// then clear false-positive hints and dispatch stale layers whose actual
+    /// inputs match their authoritative keys. Returns whether anything was
+    /// submitted.
     fn dispatch_region(
         &mut self,
         coord: RegionCoord,
@@ -1778,6 +1917,7 @@ impl RegionMap {
         executor: &dyn TaskExecutor,
         stats: &mut FrameStats,
     ) -> bool {
+        self.repair_missing_dependencies(coord, stats);
         let mut dispatched = false;
         for layer in 0..LAYER_COUNT {
             let dirty = self.regions[&coord].dirty_layers;
@@ -1788,15 +1928,24 @@ impl RegionMap {
                 self.check_macro(coord, priority, field, budget, executor, stats);
                 continue;
             }
-            if self.in_flight.contains_key(&(coord, layer)) {
-                continue; // result pending; the dirty bit will drop it stale
+            let expected = self
+                .expected_layer_hash(coord, layer)
+                .expect("dispatch region is resident");
+            if let Some(job_hash) = self
+                .in_flight
+                .get(&(coord, layer))
+                .map(|job| job.expected_hash)
+            {
+                if job_hash == expected {
+                    continue; // current result pending; do not self-supersede
+                }
+                // A bookkeeping omission left obsolete work attached to this
+                // dirty layer. Retire it and the dependent closure now.
+                self.mark_dirty_closure(coord, layer, stats);
             }
             if !self.inputs_fresh(coord, layer) {
-                continue; // an earlier layer must land first
+                continue; // a repaired lower layer must land first
             }
-            let Some(expected) = self.expected_layer_hash(coord, layer) else {
-                continue;
-            };
             let tiles = self.cache.get(coord);
             if tiles.and_then(|t| t.layer_hash(layer)) == Some(expected) {
                 // False-positive hint: the inputs settled back to exactly the
@@ -1817,6 +1966,74 @@ impl RegionMap {
         dispatched
     }
 
+    /// Restore omitted dirty hints for every missing or stale materialized
+    /// dependency of a dirty consumer. Matching-key in-flight work is a valid
+    /// pending input; obsolete work retires before the producer is re-dirtied.
+    /// Repeating reaches the finite declared-DAG closure in one dispatch pass.
+    fn repair_missing_dependencies(&mut self, coord: RegionCoord, stats: &mut FrameStats) {
+        loop {
+            let mut changed = false;
+            for consumer in 0..LAYER_COUNT {
+                if consumer == LAYER_DRAINAGE
+                    || self.regions[&coord].dirty_layers & layer_bit(consumer) == 0
+                {
+                    continue;
+                }
+                for &dependency in layer_decl(consumer).deps {
+                    let (job_key, expected, stored) = if dependency == LAYER_DRAINAGE {
+                        let macro_coord = macro_coord_for(coord);
+                        (
+                            (macro_coord, LAYER_DRAINAGE),
+                            self.expected_macro_hash(macro_coord),
+                            self.macro_cache.get(macro_coord).map(|tile| tile.dep_hash),
+                        )
+                    } else {
+                        (
+                            (coord, dependency),
+                            self.expected_layer_hash(coord, dependency)
+                                .expect("repair region is resident"),
+                            self.cache
+                                .get(coord)
+                                .and_then(|tiles| tiles.layer_hash(dependency)),
+                        )
+                    };
+                    let pending = self.in_flight.get(&job_key).map(|job| job.expected_hash);
+
+                    if stored == Some(expected) {
+                        // A current cached input is ready unless a replacement
+                        // is pending. Obsolete replacement work cannot improve
+                        // it and must not strand the consumer.
+                        if pending.is_some_and(|hash| hash != expected) {
+                            stats.jobs_cancelled += self.retire_in_flight(job_key);
+                            changed = true;
+                        }
+                        continue;
+                    }
+                    if pending == Some(expected) {
+                        continue; // current producer work is already on its way
+                    }
+                    if pending.is_some() {
+                        stats.jobs_cancelled += self.retire_in_flight(job_key);
+                        if dependency == LAYER_DRAINAGE {
+                            self.mark_macro_dependents_dirty(job_key.0, stats);
+                        }
+                        changed = true;
+                    }
+                    let bit = layer_bit(dependency);
+                    let region = self.regions.get_mut(&coord).expect("resident");
+                    if region.dirty_layers & bit == 0 {
+                        region.dirty_layers |= bit;
+                        region.status = GenerationStatus::Generating;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     /// Handle a region's drainage dirty bit: clear it if the covering macro
     /// tile is fresh, otherwise make sure a macro job is on its way (riding
     /// the queue at the priority of its nearest dependent, phase-2-plan.md
@@ -1832,11 +2049,20 @@ impl RegionMap {
         stats: &mut FrameStats,
     ) {
         let mc = macro_coord_for(coord);
+        let expected = self.expected_macro_hash(mc);
+        if let Some(job_hash) = self
+            .in_flight
+            .get(&(mc, LAYER_DRAINAGE))
+            .map(|job| job.expected_hash)
+        {
+            if job_hash == expected {
+                return;
+            }
+            stats.jobs_cancelled += self.retire_in_flight((mc, LAYER_DRAINAGE));
+            self.mark_macro_dependents_dirty(mc, stats);
+        }
         if self.macro_fresh(coord) {
             self.clear_dirty(coord, LAYER_DRAINAGE);
-            return;
-        }
-        if self.in_flight.contains_key(&(mc, LAYER_DRAINAGE)) {
             return;
         }
         let cost = layer_decl(LAYER_DRAINAGE).cost;
@@ -1844,7 +2070,6 @@ impl RegionMap {
             stats.deferred_regens += 1;
             return;
         }
-        let expected = self.expected_macro_hash(mc);
         let job_id = self.next_job_id;
         self.next_job_id += 1;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1852,6 +2077,7 @@ impl RegionMap {
             (mc, LAYER_DRAINAGE),
             InFlightJob {
                 id: job_id,
+                expected_hash: expected,
                 cancel: Arc::clone(&cancel),
             },
         );
@@ -1862,7 +2088,7 @@ impl RegionMap {
             Box::new(move || {
                 // Checked once, on dequeue: a superseded/evicted job becomes
                 // a no-op before its kernel runs (phase-6-plan.md §6.2). The
-                // job-id check at integration remains the correctness gate.
+                // integration still checks job id and both dependency keys.
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
@@ -1880,21 +2106,24 @@ impl RegionMap {
         stats.layers_dispatched += 1;
     }
 
-    /// Whether every declared input of `(coord, layer)` is fresh: dirty bit
-    /// clear, tile present, nothing in flight (macro input checked by hash).
+    /// Whether every declared input of `(coord, layer)` is materialized with
+    /// its recursively authoritative key and has no pending replacement.
+    /// Dirty bits are scheduling hints and therefore not evidence either way.
     fn inputs_fresh(&self, coord: RegionCoord, layer: u16) -> bool {
-        let region = &self.regions[&coord];
         let tiles = self.cache.get(coord);
         for &dep in layer_decl(layer).deps {
             if dep == LAYER_DRAINAGE {
-                if !self.macro_fresh(coord) {
+                let mc = macro_coord_for(coord);
+                if self.in_flight.contains_key(&(mc, LAYER_DRAINAGE))
+                    || self.macro_cache.get(mc).map(|tile| tile.dep_hash)
+                        != Some(self.expected_macro_hash(mc))
+                {
                     return false;
                 }
                 continue;
             }
-            if region.dirty_layers & layer_bit(dep) != 0
-                || self.in_flight.contains_key(&(coord, dep))
-                || tiles.and_then(|t| t.layer_hash(dep)).is_none()
+            if self.in_flight.contains_key(&(coord, dep))
+                || tiles.and_then(|t| t.layer_hash(dep)) != self.expected_layer_hash(coord, dep)
             {
                 return false;
             }
@@ -1952,10 +2181,11 @@ impl RegionMap {
     }
 
     /// The near-field realization pass (phase-3-plan.md §8.3): (re)build the
-    /// organism list of each pinned near region whose L8 tile is fresh, drop the
-    /// lists of regions that left the near window, and cap per-frame organism
-    /// instantiation by whole regions. A pure read of the settled caches — it
-    /// never mutates tiles and never enters the results channel.
+    /// organism list of each pinned near region whose L8 tile and complete
+    /// resident roster set are fresh, drop lists of regions that left the near
+    /// window, and cap per-frame organism instantiation by whole regions. A
+    /// pure read of the settled caches — it never mutates tiles and never
+    /// enters the results channel.
     ///
     /// Re-realization is keyed on a region's L8 dependency hash: an organism
     /// list is rebuilt exactly when the aggregate it was sampled from changes
@@ -2007,6 +2237,7 @@ impl RegionMap {
             let region = &self.regions[&coord];
             if region.dirty_layers & layer_bit(LAYER_ECOLOGY) != 0
                 || self.in_flight.contains_key(&(coord, LAYER_ECOLOGY))
+                || self.expected_layer_hash(coord, LAYER_ECOLOGY) != Some(l8_hash)
             {
                 continue;
             }
@@ -2015,6 +2246,18 @@ impl RegionMap {
             }
             if stats.organisms_realized >= budget.max_realize_organisms {
                 break; // defer the rest to a later frame (§8.4)
+            }
+            let Some(signatures) = self.region_signatures.get(&coord) else {
+                continue;
+            };
+            if signatures
+                .iter()
+                .any(|&signature| self.roster_cache.get(signature).is_none())
+            {
+                // Fail closed: preserve the old organism vector and key. The
+                // next capacity pass repairs the required roster set, after
+                // which ordinary realization retries (ADR 0019).
+                continue;
             }
             let bias = GenomeBias {
                 morphology: region.current.get(PossibilityDomain::Morphology),
@@ -2049,8 +2292,9 @@ impl RegionMap {
     }
 
     /// Snapshot a layer's inputs and submit its generation job. Clears the
-    /// dirty bit at dispatch: anything that re-dirties the layer while the job
-    /// flies thereby marks the result superseded (see `integrate_finished`).
+    /// dirty bit at dispatch as a scheduling hint; integration independently
+    /// validates the recorded dispatch key and recursively current key, so a
+    /// later false-positive dirty bit neither accepts nor rejects content.
     fn submit_layer(
         &mut self,
         coord: RegionCoord,
@@ -2126,6 +2370,7 @@ impl RegionMap {
             (coord, layer),
             InFlightJob {
                 id: job_id,
+                expected_hash: expected,
                 cancel: Arc::clone(&cancel),
             },
         );
@@ -2136,7 +2381,7 @@ impl RegionMap {
             Box::new(move || {
                 // Checked once, on dequeue: a superseded/evicted job becomes
                 // a no-op before its kernel runs (phase-6-plan.md §6.2). The
-                // job-id check at integration remains the correctness gate.
+                // integration still checks job id and both dependency keys.
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
@@ -2242,5 +2487,700 @@ mod capture_tests {
             }
             other => panic!("expected an organism capture, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::budget::Budget;
+    use crate::generate::{RegionTiles, CHANNEL_COUNT};
+    use crate::InlineExecutor;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use world_core::layer::{LAYER_BIOME, LAYER_TERRAIN};
+
+    const PLAYER: (f64, f64) = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
+
+    type QueuedJob = (TaskPriority, Box<dyn FnOnce() + Send>);
+
+    /// A single-threaded executor whose jobs run only when a test explicitly
+    /// pumps them. This gives the recovery tests a deterministic gap between
+    /// dispatch, authoritative-state mutation, execution, and integration.
+    #[derive(Default)]
+    struct ManualExecutor {
+        queue: RefCell<VecDeque<QueuedJob>>,
+    }
+
+    impl ManualExecutor {
+        fn len(&self) -> usize {
+            self.queue.borrow().len()
+        }
+
+        fn run_next(&self) {
+            let (_, job) = self
+                .queue
+                .borrow_mut()
+                .pop_front()
+                .expect("a queued generation job");
+            job();
+        }
+
+        fn run_all(&self) {
+            loop {
+                let job = self.queue.borrow_mut().pop_front();
+                let Some((_, job)) = job else {
+                    break;
+                };
+                job();
+            }
+        }
+    }
+
+    impl TaskExecutor for ManualExecutor {
+        fn submit(&self, priority: TaskPriority, job: Box<dyn FnOnce() + Send>) {
+            self.queue.borrow_mut().push_back((priority, job));
+        }
+
+        fn parallelism(&self) -> usize {
+            1
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct F32TileImage {
+        dep_hash: u64,
+        content_hash: u64,
+        samples: Vec<u32>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct U8TileImage {
+        dep_hash: u64,
+        content_hash: u64,
+        samples: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct U16TileImage {
+        dep_hash: u64,
+        content_hash: u64,
+        samples: Vec<u16>,
+    }
+
+    /// Exact cached presentation state for the only resident region. Keeping
+    /// both samples and their folded hashes makes atomic non-publication and
+    /// oracle equality failures easy to diagnose.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RegionImage {
+        channels: [Option<F32TileImage>; CHANNEL_COUNT],
+        biome: Option<U8TileImage>,
+        dominant: Option<U16TileImage>,
+        drainage: DrainageTile,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProducerJobState {
+        None,
+        Current,
+        Obsolete,
+    }
+
+    fn coord() -> RegionCoord {
+        RegionCoord::new(0, 0)
+    }
+
+    fn field() -> PossibilityField {
+        PossibilityField::default()
+    }
+
+    fn tiny_config() -> StreamConfig {
+        StreamConfig {
+            near_radius: REGION_SIZE * 0.125,
+            far_radius: REGION_SIZE * 0.25,
+            load_radius: REGION_SIZE * 0.375,
+            unload_radius: REGION_SIZE * 0.5,
+            field_resolution: 2,
+            // A few slots make the fail-closed realization assertion
+            // non-vacuous while retaining only sixteen possible organisms.
+            organisms_per_cell: 4,
+            ..StreamConfig::default()
+        }
+    }
+
+    fn is_fully_settled(map: &RegionMap) -> bool {
+        if map.regions.len() != 1 || !map.in_flight.is_empty() {
+            return false;
+        }
+        let Some(region) = map.regions.get(&coord()) else {
+            return false;
+        };
+        if region.dirty_layers != 0 || region.status != GenerationStatus::Ready {
+            return false;
+        }
+        map.layer_diagnostics(coord()).is_some_and(|diagnostics| {
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.expected.is_some()
+                    && diagnostic.stored == diagnostic.expected
+                    && !diagnostic.dirty
+                    && !diagnostic.in_flight
+            })
+        })
+    }
+
+    fn settle_inline(map: &mut RegionMap) {
+        for _ in 0..4 {
+            map.update(
+                PLAYER,
+                0.0,
+                &field(),
+                &[],
+                &NO_BIAS,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+            if is_fully_settled(map) {
+                return;
+            }
+        }
+        panic!(
+            "tiny fixture did not settle: {:?}",
+            map.layer_diagnostics(coord())
+        );
+    }
+
+    fn settled_map() -> RegionMap {
+        let mut map = RegionMap::new(tiny_config());
+        settle_inline(&mut map);
+        assert_eq!(map.regions.len(), 1, "fixture must load one region only");
+        map
+    }
+
+    fn assert_fully_settled(map: &RegionMap) {
+        assert!(
+            is_fully_settled(map),
+            "expected every stored key to equal its authoritative key: {:?}",
+            map.layer_diagnostics(coord())
+        );
+    }
+
+    fn region_image(map: &RegionMap) -> RegionImage {
+        let tiles = map.cache.get(coord()).expect("settled region tiles");
+        let channels = std::array::from_fn(|channel| {
+            tiles.channels[channel].as_ref().map(|tile| F32TileImage {
+                dep_hash: tile.dep_hash,
+                content_hash: tile.content_hash(),
+                samples: tile
+                    .samples()
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect(),
+            })
+        });
+        let biome = tiles.biome.as_ref().map(|tile| U8TileImage {
+            dep_hash: tile.dep_hash,
+            content_hash: tile.content_hash(),
+            samples: tile.samples().to_vec(),
+        });
+        let dominant = tiles.dominant.as_ref().map(|tile| U16TileImage {
+            dep_hash: tile.dep_hash,
+            content_hash: tile.content_hash(),
+            samples: tile.samples().to_vec(),
+        });
+        let drainage = map
+            .macro_cache
+            .get(macro_coord_for(coord()))
+            .expect("macro tile");
+        RegionImage {
+            channels,
+            biome,
+            dominant,
+            drainage: drainage.as_ref().clone(),
+        }
+    }
+
+    fn dispatch_key(layer: u16) -> (RegionCoord, u16) {
+        if layer == LAYER_DRAINAGE {
+            (macro_coord_for(coord()), layer)
+        } else {
+            (coord(), layer)
+        }
+    }
+
+    fn generated_payload_bytes(layer: u16) -> usize {
+        let samples = usize::from(tiny_config().field_resolution).pow(2);
+        let f32_bytes = samples * layer_channels(layer).len() * core::mem::size_of::<f32>();
+        let categorical_bytes = match layer {
+            LAYER_BIOME => samples * core::mem::size_of::<u8>(),
+            LAYER_ECOLOGY => samples * core::mem::size_of::<u16>(),
+            _ => 0,
+        };
+        f32_bytes + categorical_bytes
+    }
+
+    fn dispatch_dirty_region(
+        map: &mut RegionMap,
+        executor: &dyn TaskExecutor,
+        stats: &mut FrameStats,
+    ) {
+        map.dispatch_region(
+            coord(),
+            TaskPriority::Critical,
+            &field(),
+            &Budget::unlimited(),
+            executor,
+            stats,
+        );
+    }
+
+    fn remove_layer_output(map: &mut RegionMap, layer: u16) {
+        let mut tiles = map.cache.remove_region(coord()).expect("region tiles");
+        for &channel in layer_channels(layer) {
+            assert!(
+                tiles.channels[channel].take().is_some(),
+                "layer {layer} channel {channel} must start resident"
+            );
+        }
+        if layer == LAYER_BIOME {
+            assert!(tiles.biome.take().is_some(), "biome output must exist");
+        }
+        if layer == LAYER_ECOLOGY {
+            assert!(
+                tiles.dominant.take().is_some(),
+                "ecology dominant output must exist"
+            );
+        }
+
+        let RegionTiles {
+            channels,
+            biome,
+            dominant,
+        } = tiles;
+        for (channel, tile) in channels.into_iter().enumerate() {
+            if let Some(tile) = tile {
+                map.cache.insert_channel(coord(), channel, tile);
+            }
+        }
+        if let Some(tile) = biome {
+            map.cache.insert_biome(coord(), tile);
+        }
+        if let Some(tile) = dominant {
+            map.cache.insert_dominant(coord(), tile);
+        }
+        assert_eq!(
+            map.cache
+                .get(coord())
+                .and_then(|resident| resident.layer_hash(layer)),
+            None,
+            "only the producer's atomic output set should be absent"
+        );
+    }
+
+    fn materialized_declared_edges() -> Vec<(u16, u16)> {
+        let mut edges = Vec::new();
+        for consumer in 0..LAYER_COUNT {
+            if consumer == LAYER_DRAINAGE {
+                continue; // Drainage -> Terrain is an algorithm edge only.
+            }
+            for &producer in layer_decl(consumer).deps {
+                if producer != LAYER_DRAINAGE {
+                    edges.push((producer, consumer));
+                }
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn integration_revalidates_every_result_shape_with_and_without_cancellation() {
+        for cancellation in [true, false] {
+            for layer in 0..LAYER_COUNT {
+                let mut map = settled_map();
+                map.set_cancellation_enabled(cancellation);
+                let old_image = region_image(&map);
+
+                // Revision 1 legitimately invalidates and dispatches this
+                // result. Revision 2 is then installed behind the dirty-bit
+                // scheduler's back, reproducing the bookkeeping omission the
+                // integration provenance gate must independently catch.
+                map.revision_bumps[layer as usize] =
+                    map.revision_bumps[layer as usize].wrapping_add(1);
+                let region = map.regions.get_mut(&coord()).expect("resident");
+                region.dirty_layers = layer_bit(layer);
+                region.status = GenerationStatus::Generating;
+                let executor = ManualExecutor::default();
+                let mut dispatch_stats = FrameStats::default();
+                dispatch_dirty_region(&mut map, &executor, &mut dispatch_stats);
+                assert_eq!(
+                    executor.len(),
+                    1,
+                    "layer {layer}, cancellation={cancellation}: one legitimate result"
+                );
+                assert_eq!(dispatch_stats.layers_dispatched, 1);
+                let key = dispatch_key(layer);
+                assert!(map.in_flight.contains_key(&key));
+                let pool_bytes_after_dispatch = map.pool.bytes();
+
+                let dirty_before_omission = map.regions[&coord()].dirty_layers;
+                map.revision_bumps[layer as usize] =
+                    map.revision_bumps[layer as usize].wrapping_add(1);
+                assert_eq!(
+                    map.regions[&coord()].dirty_layers,
+                    dirty_before_omission,
+                    "authoritative revision changed without dirty bookkeeping"
+                );
+
+                executor.run_next();
+                let mut integration_stats = FrameStats::default();
+                map.integrate_finished(&mut integration_stats);
+
+                assert_eq!(
+                    integration_stats.results_dropped, 1,
+                    "layer {layer}, cancellation={cancellation}"
+                );
+                assert_eq!(integration_stats.layers_regenerated, 0);
+                if layer != LAYER_DRAINAGE {
+                    assert!(
+                        map.pool.bytes()
+                            >= pool_bytes_after_dispatch + generated_payload_bytes(layer),
+                        "layer {layer}, cancellation={cancellation}: every rejected output buffer must return to the pool"
+                    );
+                }
+                assert_eq!(
+                    region_image(&map),
+                    old_image,
+                    "layer {layer}, cancellation={cancellation}: rejection must publish no channel"
+                );
+                assert!(
+                    !map.in_flight.contains_key(&key),
+                    "matching completed dispatch must retire"
+                );
+                let closure = dependents_closure(layer);
+                assert_eq!(
+                    map.regions[&coord()].dirty_layers,
+                    closure,
+                    "layer {layer}, cancellation={cancellation}: exact retry closure"
+                );
+                assert_eq!(map.regions[&coord()].status, GenerationStatus::Generating);
+
+                settle_inline(&mut map);
+                assert_fully_settled(&map);
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_key_mismatch_is_rejected_before_any_channel_is_published() {
+        let layer = LAYER_TERRAIN;
+        let mut map = settled_map();
+        let old_image = region_image(&map);
+        map.revision_bumps[layer as usize] = map.revision_bumps[layer as usize].wrapping_add(1);
+        let region = map.regions.get_mut(&coord()).expect("resident");
+        region.dirty_layers = layer_bit(layer);
+        region.status = GenerationStatus::Generating;
+
+        let executor = ManualExecutor::default();
+        let mut dispatch_stats = FrameStats::default();
+        dispatch_dirty_region(&mut map, &executor, &mut dispatch_stats);
+        let key = dispatch_key(layer);
+        let current = map
+            .expected_layer_hash(coord(), layer)
+            .expect("resident expected key");
+        let job = map.in_flight.get_mut(&key).expect("terrain dispatch");
+        assert_eq!(job.expected_hash, current);
+        job.expected_hash ^= 0xA11C_EBAD_D15C_A7C1;
+        assert_ne!(job.expected_hash, current);
+        let pool_bytes_after_dispatch = map.pool.bytes();
+
+        executor.run_next();
+        let mut integration_stats = FrameStats::default();
+        map.integrate_finished(&mut integration_stats);
+
+        assert_eq!(integration_stats.results_dropped, 1);
+        assert_eq!(integration_stats.layers_regenerated, 0);
+        assert!(
+            map.pool.bytes() >= pool_bytes_after_dispatch + generated_payload_bytes(layer),
+            "dispatch-key rejection must reclaim the generated output buffer"
+        );
+        assert_eq!(region_image(&map), old_image);
+        assert!(!map.in_flight.contains_key(&key));
+        assert_eq!(
+            map.regions[&coord()].dirty_layers,
+            dependents_closure(layer)
+        );
+        assert_eq!(map.regions[&coord()].status, GenerationStatus::Generating);
+
+        settle_inline(&mut map);
+        assert_fully_settled(&map);
+    }
+
+    #[test]
+    fn rejected_macro_marks_every_covered_resident_retryable() {
+        let mut map = settled_map();
+        let second = RegionCoord::new(1, 0);
+        let macro_coord = macro_coord_for(coord());
+        assert_eq!(macro_coord_for(second), macro_coord);
+
+        // A second level-0 resident is enough to exercise the macro fan-out;
+        // its field cache is irrelevant because rejection must only restore
+        // scheduling state and leave every cache untouched.
+        let mut second_region = RegionState::new(second);
+        second_region.current = field().sample(second);
+        second_region.target = second_region.current;
+        second_region.status = GenerationStatus::Ready;
+        map.regions.insert(second, second_region);
+        let old_macro = map
+            .macro_cache
+            .get(macro_coord)
+            .expect("settled macro")
+            .as_ref()
+            .clone();
+
+        map.revision_bumps[LAYER_DRAINAGE as usize] =
+            map.revision_bumps[LAYER_DRAINAGE as usize].wrapping_add(1);
+        let dispatch_region = map.regions.get_mut(&coord()).expect("dispatch resident");
+        dispatch_region.dirty_layers = layer_bit(LAYER_DRAINAGE);
+        dispatch_region.status = GenerationStatus::Generating;
+
+        let executor = ManualExecutor::default();
+        let mut dispatch_stats = FrameStats::default();
+        dispatch_dirty_region(&mut map, &executor, &mut dispatch_stats);
+        let key = (macro_coord, LAYER_DRAINAGE);
+        assert!(map.in_flight.contains_key(&key));
+        assert_eq!(executor.len(), 1);
+
+        // Make the queued result stale without repairing either resident's
+        // dirty bookkeeping, then execute it so integration must fan out.
+        map.revision_bumps[LAYER_DRAINAGE as usize] =
+            map.revision_bumps[LAYER_DRAINAGE as usize].wrapping_add(1);
+        executor.run_next();
+        let mut integration_stats = FrameStats::default();
+        map.integrate_finished(&mut integration_stats);
+
+        assert_eq!(integration_stats.results_dropped, 1);
+        assert!(!map.in_flight.contains_key(&key));
+        assert_eq!(
+            map.macro_cache
+                .get(macro_coord)
+                .expect("old macro retained")
+                .as_ref(),
+            &old_macro
+        );
+        let closure = dependents_closure(LAYER_DRAINAGE);
+        for resident in [coord(), second] {
+            assert_eq!(
+                map.regions[&resident].dirty_layers, closure,
+                "covered resident {resident:?} must receive the exact closure"
+            );
+            assert_eq!(map.regions[&resident].status, GenerationStatus::Generating);
+        }
+    }
+
+    #[test]
+    fn every_materialized_declared_edge_repairs_missing_producers() {
+        let edges = materialized_declared_edges();
+        assert_eq!(edges.len(), 18, "the declared cached-edge matrix changed");
+
+        let base_oracle = region_image(&settled_map());
+        let unique_producers: BTreeSet<u16> = edges.iter().map(|(producer, _)| *producer).collect();
+        let mut revised_oracles = BTreeMap::new();
+        for producer in unique_producers {
+            let mut oracle = settled_map();
+            oracle.bump_layer_revision(producer);
+            settle_inline(&mut oracle);
+            revised_oracles.insert(producer, region_image(&oracle));
+        }
+
+        for (producer, consumer) in edges {
+            for job_state in [
+                ProducerJobState::None,
+                ProducerJobState::Current,
+                ProducerJobState::Obsolete,
+            ] {
+                let mut map = settled_map();
+                remove_layer_output(&mut map, producer);
+                let region = map.regions.get_mut(&coord()).expect("resident");
+                region.dirty_layers = layer_bit(consumer);
+                region.status = GenerationStatus::Generating;
+                assert_eq!(
+                    region.dirty_layers & layer_bit(producer),
+                    0,
+                    "producer hint must remain omitted before repair"
+                );
+
+                let executor = ManualExecutor::default();
+                let expected_at_dispatch = map
+                    .expected_layer_hash(coord(), producer)
+                    .expect("producer expected key");
+                let mut old_job = None;
+                if job_state != ProducerJobState::None {
+                    map.submit_layer(
+                        coord(),
+                        producer,
+                        expected_at_dispatch,
+                        TaskPriority::Critical,
+                        &executor,
+                    );
+                    let job = map
+                        .in_flight
+                        .get(&(coord(), producer))
+                        .expect("manual producer dispatch");
+                    old_job = Some((job.id, job.expected_hash, Arc::clone(&job.cancel)));
+                }
+                if job_state == ProducerJobState::Obsolete {
+                    let dirty_before_omission = map.regions[&coord()].dirty_layers;
+                    map.revision_bumps[producer as usize] =
+                        map.revision_bumps[producer as usize].wrapping_add(1);
+                    assert_eq!(map.regions[&coord()].dirty_layers, dirty_before_omission);
+                }
+
+                let mut repair_stats = FrameStats::default();
+                dispatch_dirty_region(&mut map, &executor, &mut repair_stats);
+                let current_expected = map
+                    .expected_layer_hash(coord(), producer)
+                    .expect("current producer key");
+                let repaired_job = map
+                    .in_flight
+                    .get(&(coord(), producer))
+                    .expect("producer must be pending after same-pass repair");
+                assert_eq!(
+                    repaired_job.expected_hash, current_expected,
+                    "{producer}->{consumer}, {job_state:?}: repaired key"
+                );
+
+                match job_state {
+                    ProducerJobState::None => {
+                        assert_eq!(executor.len(), 1);
+                    }
+                    ProducerJobState::Current => {
+                        let (old_id, old_hash, old_cancel) = old_job.expect("old job");
+                        assert_eq!(repaired_job.id, old_id, "current job self-superseded");
+                        assert_eq!(repaired_job.expected_hash, old_hash);
+                        assert!(!old_cancel.load(Ordering::Relaxed));
+                        assert_eq!(repair_stats.jobs_cancelled, 0);
+                        assert_eq!(executor.len(), 1);
+                    }
+                    ProducerJobState::Obsolete => {
+                        let (old_id, old_hash, old_cancel) = old_job.expect("old job");
+                        assert_ne!(old_hash, current_expected);
+                        assert_ne!(repaired_job.id, old_id, "obsolete job was not replaced");
+                        assert!(old_cancel.load(Ordering::Relaxed));
+                        assert!(repair_stats.jobs_cancelled >= 1);
+                        assert!(
+                            executor.len() >= 2,
+                            "old and replacement closures remain queued"
+                        );
+                    }
+                }
+
+                executor.run_all();
+                let mut integration_stats = FrameStats::default();
+                map.integrate_finished(&mut integration_stats);
+                settle_inline(&mut map);
+                assert_fully_settled(&map);
+                let oracle = if job_state == ProducerJobState::Obsolete {
+                    &revised_oracles[&producer]
+                } else {
+                    &base_oracle
+                };
+                assert_eq!(
+                    &region_image(&map),
+                    oracle,
+                    "{producer}->{consumer}, {job_state:?}: recovered world differs from oracle"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn realization_fails_closed_until_required_rosters_are_rebuilt() {
+        let mut map = settled_map();
+        let old_organisms = map
+            .organisms
+            .get(&coord())
+            .expect("near region realization")
+            .clone();
+        assert!(
+            !old_organisms.is_empty(),
+            "four realization slots should make the fixture non-vacuous"
+        );
+        let old_key = map.organism_keys[&coord()];
+
+        // Land a new L8 key without running capacity maintenance or the
+        // realization pass. This leaves a real old organism vector/key that a
+        // retry is expected to replace.
+        map.bump_layer_revision(LAYER_ECOLOGY);
+        let mut generation_stats = FrameStats::default();
+        map.dispatch_regen(
+            PLAYER,
+            &field(),
+            &Budget::unlimited(),
+            &InlineExecutor,
+            &mut generation_stats,
+        );
+        let new_key = map
+            .cache
+            .get(coord())
+            .and_then(|tiles| tiles.layer_hash(LAYER_ECOLOGY))
+            .expect("new ecology output");
+        assert_ne!(new_key, old_key);
+        assert_eq!(map.organism_keys[&coord()], old_key);
+        assert_eq!(map.organisms[&coord()], old_organisms);
+
+        let required = map
+            .region_signatures
+            .get(&coord())
+            .expect("ecology signature bookkeeping")
+            .clone();
+        assert!(!required.is_empty());
+        let exact_entries: BTreeMap<_, _> = required
+            .iter()
+            .map(|&signature| {
+                (
+                    signature,
+                    map.roster_cache
+                        .get(signature)
+                        .expect("pre-eviction required roster")
+                        .as_ref()
+                        .clone(),
+                )
+            })
+            .collect();
+
+        // Simulate legacy capacity behavior: all entries disappear, but the
+        // resident Ecology dependent set remains authoritative.
+        map.roster_cache = RosterCache::default();
+        assert!(map.roster_cache.is_empty());
+        assert_eq!(map.region_signatures[&coord()], required);
+
+        let mut failed_stats = FrameStats::default();
+        map.realize_near_window(PLAYER, &Budget::unlimited(), &mut failed_stats);
+        assert_eq!(failed_stats.organisms_realized, 0);
+        assert_eq!(map.organism_keys[&coord()], old_key);
+        assert_eq!(map.organisms[&coord()], old_organisms);
+
+        let protected = map.maintain_roster_working_set();
+        assert_eq!(protected, required);
+        assert_eq!(map.roster_cache.len(), required.len());
+        for (&signature, expected) in &exact_entries {
+            assert_eq!(
+                map.roster_cache
+                    .get(signature)
+                    .expect("maintenance rebuilt required roster")
+                    .as_ref(),
+                expected
+            );
+        }
+
+        let mut retry_stats = FrameStats::default();
+        map.realize_near_window(PLAYER, &Budget::unlimited(), &mut retry_stats);
+        assert_eq!(map.organism_keys[&coord()], new_key);
+        assert_eq!(
+            map.organisms[&coord()],
+            old_organisms,
+            "same inputs and exact roster rebuild must realize identically"
+        );
     }
 }

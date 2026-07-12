@@ -1,6 +1,6 @@
 # Improvement A.1 — Self-Healing Dependency Integration and Cache Eviction
 
-**Status:** Planned
+**Status:** Completed
 
 **Roadmap item:** [Correctness and contract integrity A.1](../../world-model.md#prioritized-improvement-roadmap)
 
