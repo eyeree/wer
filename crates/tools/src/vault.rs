@@ -455,7 +455,7 @@ fn scenario_preserve() -> VaultReport {
         step(&mut map, (128.0, 128.0), 0.0, &[], &bias);
     }
     let sig = PossibilitySignature::of(map.get(target).expect("resident").current);
-    map.set_override(target, sig);
+    map.apply_preserve_contribution(1, target, sig);
     step(&mut map, (128.0, 128.0), 0.0, &[], &bias);
     let hashes = |m: &RegionMap| -> Vec<(usize, u64)> {
         (0..CHANNEL_COUNT)
@@ -500,11 +500,13 @@ fn scenario_preserve() -> VaultReport {
     let mut fresh_vault = Vault::open(MemoryStorage::new()).unwrap();
     fresh_vault.import(&bundle);
     let mut fresh = RegionMap::new(config());
-    for p in fresh_vault.preserves().values() {
-        for &(coord, s) in &p.regions {
-            fresh.set_override(coord, s);
-        }
-    }
+    let contributions = fresh_vault.preserves().iter().flat_map(|(&id, preserve)| {
+        preserve
+            .regions
+            .iter()
+            .map(move |&(coord, signature)| (id, coord, signature))
+    });
+    fresh.apply_preserve_contributions(contributions);
     for _ in 0..4 {
         step(&mut fresh, (128.0, 128.0), 0.0, &[], &bias);
     }
@@ -515,10 +517,74 @@ fn scenario_preserve() -> VaultReport {
         );
     }
 
+    // Overlap ownership (ADR 0020): real content-derived ids applied in
+    // opposite orders must settle identically, and winner deletion must reveal
+    // the retained successor with exactly one resident revision bump.
+    let mut overlap_vault = Vault::open(MemoryStorage::new()).unwrap();
+    overlap_vault.record_preserve(vec![(target, sig)], "first".into());
+    let mut alternate = sig;
+    alternate.buckets[world_core::PossibilityDomain::Aesthetics.index()] =
+        if alternate.buckets[world_core::PossibilityDomain::Aesthetics.index()] < 2048 {
+            4095
+        } else {
+            0
+        };
+    overlap_vault.record_preserve(vec![(target, alternate)], "second".into());
+    let (&winner_id, winner) = overlap_vault.preserves().first_key_value().unwrap();
+    let (&successor_id, successor) = overlap_vault.preserves().last_key_value().unwrap();
+    let winner_sig = winner.regions[0].1;
+    let successor_sig = successor.regions[0].1;
+    let mut ascending = RegionMap::new(config());
+    let mut descending = RegionMap::new(config());
+    let ascending_batch = overlap_vault
+        .preserves()
+        .iter()
+        .flat_map(|(&id, preserve)| {
+            preserve
+                .regions
+                .iter()
+                .map(move |&(coord, signature)| (id, coord, signature))
+        });
+    ascending.apply_preserve_contributions(ascending_batch);
+    let descending_batch = overlap_vault
+        .preserves()
+        .iter()
+        .rev()
+        .flat_map(|(&id, preserve)| {
+            preserve
+                .regions
+                .iter()
+                .map(move |&(coord, signature)| (id, coord, signature))
+        });
+    descending.apply_preserve_contributions(descending_batch);
+    for _ in 0..4 {
+        step(&mut ascending, (128.0, 128.0), 0.0, &[], &bias);
+        step(&mut descending, (128.0, 128.0), 0.0, &[], &bias);
+    }
+    if ascending.effective_preserve(target) != Some((winner_id, winner_sig))
+        || descending.effective_preserve(target) != Some((winner_id, winner_sig))
+        || hashes(&ascending) != hashes(&descending)
+    {
+        record(
+            &mut violations,
+            "overlapping preserves depended on application order".into(),
+        );
+    }
+    let revision = ascending.get(target).expect("overlap resident").revision;
+    ascending.remove_preserve_contribution(winner_id, target);
+    if ascending.effective_preserve(target) != Some((successor_id, successor_sig))
+        || ascending.get(target).expect("successor resident").revision != revision.wrapping_add(1)
+    {
+        record(
+            &mut violations,
+            "winner deletion did not select the successor with one revision bump".into(),
+        );
+    }
+
     VaultReport {
-        name: "preserve: holds under pressure, ships whole in a bundle",
+        name: "preserve: deterministic ownership, holds under pressure, ships whole",
         violations,
-        summary: format!("{} channels held", held.len()),
+        summary: format!("{} channels held; 2-owner overlap checked", held.len()),
     }
 }
 

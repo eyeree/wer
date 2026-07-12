@@ -69,6 +69,29 @@ fn region_tile_hashes(map: &RegionMap, coord: RegionCoord) -> Vec<(usize, u64)> 
     hashes
 }
 
+/// Stored dependency keys for every declared layer of one resident region.
+fn region_dep_hashes(map: &RegionMap, coord: RegionCoord) -> Vec<(u16, Option<u64>)> {
+    map.layer_diagnostics(coord)
+        .expect("resident diagnostics")
+        .into_iter()
+        .map(|diagnostic| (diagnostic.layer, diagnostic.stored))
+        .collect()
+}
+
+fn apply_vault_preserves(map: &mut RegionMap, vault: &Vault<MemoryStorage>, reverse: bool) {
+    let mut records: Vec<_> = vault.preserves().iter().collect();
+    if reverse {
+        records.reverse();
+    }
+    let contributions = records.into_iter().flat_map(|(&id, record)| {
+        record
+            .regions
+            .iter()
+            .map(move |&(coord, signature)| (id, coord, signature))
+    });
+    map.apply_preserve_contributions(contributions);
+}
+
 #[test]
 fn a_preserve_holds_under_steering_and_eviction_and_releases_without_a_snap() {
     let target = RegionCoord::new(0, 0);
@@ -80,7 +103,7 @@ fn a_preserve_holds_under_steering_and_eviction_and_releases_without_a_snap() {
     // Preserve the settled center region from its own state: flips no bucket,
     // so its tiles hold bit-identical from this exact moment.
     let sig = PossibilitySignature::of(map.get(target).expect("resident").current);
-    map.set_override(target, sig);
+    map.apply_preserve_contribution(1, target, sig);
     settle(&mut map, (128.0, 128.0), 0.0, &[]);
     let preserved_hashes = region_tile_hashes(&map, target);
 
@@ -138,7 +161,7 @@ fn a_preserve_holds_under_steering_and_eviction_and_releases_without_a_snap() {
     // Delete the preserve: no snap — the region resumes steering from where
     // the preserve held it, converging gradually (bounded per-frame motion).
     let held = map.get(target).unwrap().current;
-    map.clear_override(target);
+    map.remove_preserve_contribution(1, target);
     let cap = map.config().converge_rate_cap;
     let mut moved_total = 0.0f32;
     let mut previous = held;
@@ -184,8 +207,8 @@ fn an_imported_preserve_realizes_identical_tiles_in_a_fresh_world() {
     }
     let sig = PossibilitySignature::of(map_a.get(target).expect("resident").current);
     let mut vault_a = Vault::open(MemoryStorage::new()).unwrap();
-    vault_a.record_preserve(vec![(target, sig)], "glade".into());
-    map_a.set_override(target, sig);
+    let id = vault_a.record_preserve(vec![(target, sig)], "glade".into());
+    map_a.apply_preserve_contribution(id, target, sig);
     for _ in 0..2 {
         settle(&mut map_a, (128.0, 128.0), 0.0, &[]);
     }
@@ -197,11 +220,13 @@ fn an_imported_preserve_realizes_identical_tiles_in_a_fresh_world() {
     let stats = vault_b.import(&bundle);
     assert_eq!(stats.added, 1);
     let mut map_b = RegionMap::new(config());
-    for record in vault_b.preserves().values() {
-        for &(coord, sig) in &record.regions {
-            map_b.set_override(coord, sig);
-        }
-    }
+    let contributions = vault_b.preserves().iter().flat_map(|(&id, record)| {
+        record
+            .regions
+            .iter()
+            .map(move |&(coord, signature)| (id, coord, signature))
+    });
+    map_b.apply_preserve_contributions(contributions);
     for _ in 0..4 {
         settle(&mut map_b, (128.0, 128.0), 0.0, &[]);
     }
@@ -211,4 +236,125 @@ fn an_imported_preserve_realizes_identical_tiles_in_a_fresh_world() {
     let region_b = map_b.get(target).expect("resident");
     assert_eq!(PossibilitySignature::of(region_b.current), sig);
     assert_eq!(region_tile_hashes(&map_b, target), hashes_a);
+}
+
+#[test]
+fn overlap_order_winner_recovery_and_evicted_deletion_are_deterministic() {
+    let target = RegionCoord::new(0, 0);
+    let neutral = PossibilitySignature::of(world_core::PossibilityVector::neutral());
+    let mut alternate = neutral;
+    alternate.buckets[PossibilityDomain::Aesthetics.index()] = 4000;
+
+    // Use real content-derived ids. Which signature receives the lower id is
+    // intentionally not assumed; the ordered vault map defines the oracle.
+    let mut vault = Vault::open(MemoryStorage::new()).unwrap();
+    let first = vault.record_preserve(vec![(target, neutral)], "neutral".into());
+    let second = vault.record_preserve(vec![(target, alternate)], "alternate".into());
+    assert_ne!(first, second);
+    let (&low_id, low_record) = vault.preserves().first_key_value().unwrap();
+    let (&high_id, high_record) = vault.preserves().last_key_value().unwrap();
+    let low_signature = low_record.regions[0].1;
+    let high_signature = high_record.regions[0].1;
+    assert_ne!(low_signature, high_signature);
+
+    // Startup/import traversal in either direction, including an idempotent
+    // second synchronization, must produce the same authoritative world.
+    let mut forward = RegionMap::new(config());
+    apply_vault_preserves(&mut forward, &vault, false);
+    apply_vault_preserves(&mut forward, &vault, false);
+    let mut reverse = RegionMap::new(config());
+    apply_vault_preserves(&mut reverse, &vault, true);
+    for _ in 0..4 {
+        settle(&mut forward, (128.0, 128.0), 0.0, &[]);
+        settle(&mut reverse, (128.0, 128.0), 0.0, &[]);
+    }
+    assert_eq!(
+        forward.effective_preserve(target),
+        Some((low_id, low_signature))
+    );
+    assert_eq!(
+        reverse.effective_preserve(target),
+        Some((low_id, low_signature))
+    );
+    assert_eq!(
+        forward.get(target).unwrap().current,
+        low_signature.dequantize()
+    );
+    assert_eq!(
+        reverse.get(target).unwrap().current,
+        low_signature.dequantize()
+    );
+    assert_eq!(
+        region_dep_hashes(&forward, target),
+        region_dep_hashes(&reverse, target)
+    );
+    assert_eq!(
+        region_tile_hashes(&forward, target),
+        region_tile_hashes(&reverse, target)
+    );
+    assert_eq!(forward.organisms_in(target), reverse.organisms_in(target));
+
+    // Deleting the resident winner reveals the successor and advances the
+    // realized-state revision exactly once.
+    let old_revision = forward.get(target).unwrap().revision;
+    assert!(forward.remove_preserve_contribution(low_id, target));
+    assert_eq!(
+        forward.effective_preserve(target),
+        Some((high_id, high_signature))
+    );
+    assert_eq!(
+        forward.get(target).unwrap().revision,
+        old_revision.wrapping_add(1)
+    );
+    assert!(forward.organisms_in(target).is_none());
+    for _ in 0..4 {
+        settle(&mut forward, (128.0, 128.0), 0.0, &[]);
+    }
+
+    let mut successor_oracle = RegionMap::new(config());
+    successor_oracle.apply_preserve_contribution(high_id, target, high_signature);
+    for _ in 0..4 {
+        settle(&mut successor_oracle, (128.0, 128.0), 0.0, &[]);
+    }
+    assert_eq!(
+        forward.get(target).unwrap().current,
+        high_signature.dequantize()
+    );
+    assert_eq!(
+        region_dep_hashes(&forward, target),
+        region_dep_hashes(&successor_oracle, target)
+    );
+    assert_eq!(
+        region_tile_hashes(&forward, target),
+        region_tile_hashes(&successor_oracle, target)
+    );
+
+    // Contributor ownership outlives the resident. Removing a winner while
+    // evicted still selects the successor used on the later reload.
+    let mut evicted = RegionMap::new(config());
+    apply_vault_preserves(&mut evicted, &vault, true);
+    for _ in 0..4 {
+        settle(&mut evicted, (128.0, 128.0), 0.0, &[]);
+    }
+    for _ in 0..4 {
+        settle(&mut evicted, (5000.0, 5000.0), 0.0, &[]);
+    }
+    assert!(evicted.get(target).is_none());
+    assert!(evicted.remove_preserve_contribution(low_id, target));
+    assert_eq!(
+        evicted.effective_preserve(target),
+        Some((high_id, high_signature))
+    );
+    for _ in 0..4 {
+        settle(&mut evicted, (128.0, 128.0), 0.0, &[]);
+    }
+    assert_eq!(evicted.get(target).unwrap().revision, 0);
+    assert_eq!(
+        evicted.get(target).unwrap().current,
+        high_signature.dequantize()
+    );
+    assert_eq!(
+        region_tile_hashes(&evicted, target),
+        region_tile_hashes(&successor_oracle, target)
+    );
 }

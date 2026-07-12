@@ -358,9 +358,10 @@ impl<S: Storage> Vault<S> {
         id
     }
 
-    /// Delete a preserve record. Returns whether it existed. (The caller
-    /// clears the map's overrides; the regions rejoin normal steering from
-    /// their preserved state — no snap, phase-5-plan.md §7.5.)
+    /// Delete a preserve record. Returns whether it existed. The caller removes
+    /// this id's runtime contributions; overlapping regions select their next
+    /// lowest-id owner, while regions with no contributor rejoin normal
+    /// steering without a snap (ADR 0020).
     pub fn remove_preserve(&mut self, id: u64) -> bool {
         if self.preserves.remove(&id).is_some() {
             self.dirty.remove(&DirtyKey::Preserve(id));

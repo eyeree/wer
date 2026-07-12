@@ -78,9 +78,10 @@ use world_core::{
 };
 use world_runtime::{
     apply_session_regions, AdapterClass, Budget, FrameStats, GenerationStatus, RegionMap,
-    ResourceTier, RouteRecorder, RouteTracker, StreamConfig, TierInputs, Vault, VaultStats,
-    CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE,
-    CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    ResourceTier, RouteRecorder, RouteTracker, Storage, StreamConfig, TierInputs, Vault,
+    VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
+    CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+    CHANNEL_WETNESS,
 };
 
 use executor::LaneExecutor;
@@ -116,6 +117,28 @@ const ORGANISM_INFO_ZOOM: u32 = 4;
 enum ViewMode {
     Map,
     Pov,
+}
+
+/// Remove the runtime's effective preserve owner and only that record's
+/// contributions. `Err(id)` reports impossible runtime/vault drift without
+/// deleting an arbitrary covering record (ADR 0020).
+fn remove_effective_preserve<S: Storage>(
+    map: &mut RegionMap,
+    vault: &mut Vault<S>,
+    coord: RegionCoord,
+) -> Result<Option<(u64, String)>, u64> {
+    let Some((id, _)) = map.effective_preserve(coord) else {
+        return Ok(None);
+    };
+    let Some(record) = vault.preserves().get(&id).cloned() else {
+        return Err(id);
+    };
+    let removed = vault.remove_preserve(id);
+    debug_assert!(removed, "record cloned from the vault must be removable");
+    for (region, _) in record.regions {
+        map.remove_preserve_contribution(id, region);
+    }
+    Ok(Some((id, record.name)))
 }
 
 /// The world-simulation half of the app (everything that isn't winit/wgpu).
@@ -382,21 +405,26 @@ impl World {
         log::info!("recorded {name} ({id:#018x}) into the vault");
     }
 
-    /// Pin every vault preserve's regions into the live map (startup and
-    /// session load): a preserved region always realizes its recorded buckets,
-    /// wherever the run begins (phase-5-plan.md §7.5).
+    /// Synchronize every vault preserve into the live map (startup and session
+    /// load) in canonical `(content id, region coordinate)` order. The runtime
+    /// installs the complete batch before reconciling each touched resident
+    /// once, so repeated synchronization is idempotent and reversed record
+    /// traversal cannot create intermediate revision epochs (ADR 0020).
     fn apply_preserves(&mut self) {
         let Some(vault) = self.vault.as_ref() else {
             return;
         };
-        let pairs: Vec<(RegionCoord, PossibilitySignature)> = vault
+        let contributions: Vec<(u64, RegionCoord, PossibilitySignature)> = vault
             .preserves()
-            .values()
-            .flat_map(|p| p.regions.iter().copied())
+            .iter()
+            .flat_map(|(&id, preserve)| {
+                preserve
+                    .regions
+                    .iter()
+                    .map(move |&(coord, signature)| (id, coord, signature))
+            })
             .collect();
-        for (coord, sig) in pairs {
-            self.map.set_override(coord, sig);
-        }
+        self.map.apply_preserve_contributions(contributions);
     }
 
     /// The `P` key: standing inside a preserve deletes it (no snap — regions
@@ -405,25 +433,32 @@ impl World {
     /// quantized, a few dozen bytes per region and zero geometry
     /// (phase-5-plan.md §7.5).
     fn toggle_preserve(&mut self) {
-        let Some(vault) = self.vault.as_mut() else {
+        if self.vault.is_none() {
             log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
             return;
-        };
+        }
         let player_region = RegionCoord::from_world(self.player.0, self.player.1);
-        let covering = vault
-            .preserves()
-            .iter()
-            .find(|(_, p)| p.regions.iter().any(|(c, _)| *c == player_region))
-            .map(|(&id, p)| (id, p.name.clone(), p.regions.clone()));
-        if let Some((id, name, regions)) = covering {
-            vault.remove_preserve(id);
-            for (coord, _) in regions {
-                self.map.clear_override(coord);
+        match remove_effective_preserve(
+            &mut self.map,
+            self.vault.as_mut().expect("checked above"),
+            player_region,
+        ) {
+            Ok(Some((id, name))) => {
+                log::info!(
+                    "deleted preserve {name} ({id:#018x}); overlaps selected their next owner, final regions resume steering with no snap"
+                );
+                return;
             }
-            log::info!("deleted preserve {name} ({id:#018x}); regions resume steering, no snap");
-            return;
+            Err(id) => {
+                log::warn!(
+                    "runtime preserve owner {id:#018x} is absent from the vault; deletion skipped"
+                );
+                return;
+            }
+            Ok(None) => {}
         }
 
+        let vault = self.vault.as_mut().expect("checked above");
         let regions: Vec<(RegionCoord, PossibilitySignature)> = self
             .map
             .iter_active()
@@ -437,9 +472,11 @@ impl World {
         let name = format!("preserve-{}", vault.preserves().len() + 1);
         let id = vault.record_preserve(regions.clone(), name.clone());
         let count = regions.len();
-        for (coord, sig) in regions {
-            self.map.set_override(coord, sig);
-        }
+        self.map.apply_preserve_contributions(
+            regions
+                .into_iter()
+                .map(|(coord, signature)| (id, coord, signature)),
+        );
         log::info!("created {name} ({id:#018x}): {count} regions pinned");
     }
 
@@ -1814,5 +1851,55 @@ fn main() {
     let mut app = App::new(inline, tier);
     if let Err(err) = event_loop.run_app(&mut app) {
         log::error!("event loop exited with error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod preserve_lifecycle_tests {
+    use super::*;
+    use world_runtime::MemoryStorage;
+
+    #[test]
+    fn native_deletion_removes_effective_owner_and_reveals_successor() {
+        let coord = RegionCoord::new(0, 0);
+        let first = PossibilitySignature::of(world_core::PossibilityVector::neutral());
+        let mut second = first;
+        second.buckets[PossibilityDomain::Aesthetics.index()] = 4000;
+        let mut vault = Vault::open(MemoryStorage::new()).unwrap();
+        vault.record_preserve(vec![(coord, first)], "first".into());
+        vault.record_preserve(vec![(coord, second)], "second".into());
+        let (&winner_id, winner) = vault.preserves().first_key_value().unwrap();
+        let winner_name = winner.name.clone();
+        let winner_signature = winner.regions[0].1;
+        let (&successor_id, successor) = vault.preserves().last_key_value().unwrap();
+        let successor_signature = successor.regions[0].1;
+
+        let mut map = RegionMap::new(StreamConfig::default());
+        let contributions: Vec<_> = vault
+            .preserves()
+            .iter()
+            .rev()
+            .flat_map(|(&id, preserve)| {
+                preserve
+                    .regions
+                    .iter()
+                    .map(move |&(region, signature)| (id, region, signature))
+            })
+            .collect();
+        map.apply_preserve_contributions(contributions);
+        assert_eq!(
+            map.effective_preserve(coord),
+            Some((winner_id, winner_signature))
+        );
+
+        assert_eq!(
+            remove_effective_preserve(&mut map, &mut vault, coord),
+            Ok(Some((winner_id, winner_name)))
+        );
+        assert!(!vault.preserves().contains_key(&winner_id));
+        assert_eq!(
+            map.effective_preserve(coord),
+            Some((successor_id, successor_signature))
+        );
     }
 }

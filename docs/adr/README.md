@@ -30,3 +30,4 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0017](0017-gpu-compute-is-derived-presentation.md) | GPU compute is derived presentation; authoritative state never reads it back | Accepted |
 | [0018](0018-settled-state-is-schedule-independent.md) | Settled world state is schedule-independent; budgets/tiers scale pacing, never identity | Accepted |
 | [0019](0019-dependency-hashes-gate-integration.md) | Dependency hashes gate integration; resident inputs outrank cache targets | Accepted |
+| [0020](0020-preserve-overlaps-use-lowest-content-id.md) | Preserve overlaps use the lowest content id and material snaps advance revision | Accepted |

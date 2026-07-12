@@ -284,7 +284,7 @@ fn main() -> ExitCode {
                     );
                     match &v.covering_preserve {
                         Some((id, name, sig)) => {
-                            println!("  preserve    {name} ({id:#018x}) pins this region");
+                            println!("  preserve    {name} ({id:#018x}) is the effective owner");
                             println!("              buckets {:?}", sig.buckets);
                         }
                         None => println!("  preserve    none covers this region"),

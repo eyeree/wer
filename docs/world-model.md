@@ -52,8 +52,11 @@ vegetation plus the shared roster's biomass weights. Leaving the area discards
 the instances; returning reconstructs them from deterministic inputs.
 
 Routes and preserves turn exploration into durable structure. A preserve pins
-selected regions to their recorded possibility states. An expedition route
-stores samples of physical and possibility-space travel. Following a route
+selected regions to their recorded possibility states. When preserves overlap,
+the runtime retains every contributor and the lowest immutable content id owns
+the effective state; deleting that record reveals the next contributor.
+An expedition route stores samples of physical and possibility-space travel.
+Following a route
 creates weak anchors toward its remembered ecological character rather than
 replaying the old world exactly. Named discoveries, routes, and preserves can
 be exchanged in atlas bundles and merged without a central server.
@@ -72,7 +75,7 @@ At any moment, the implemented world is the combination of:
 
 1. a coordinate-defined base field over an effectively unbounded region grid;
 2. an eight-dimensional possibility state for each *resident* region;
-3. player bias, anchors, route attraction, and preserve overrides;
+3. player bias, anchors, route attraction, and preserve contributor sets;
 4. a deterministic nine-layer generation graph evaluated for quantized region
    states;
 5. memoized habitat rosters and transient near-field organisms;
@@ -313,7 +316,13 @@ T_r=\Pi\big(\operatorname{steer}(b_r,\mathcal A,x_r)\big).
 $$
 
 A preserve instead sets both target and realized state to a persisted
-quantized signature and forces full stability.
+quantized signature and forces full stability. Every covering preserve is
+retained by content id, and the numerically lowest id supplies the effective
+signature. Startup, session restore, and import install a complete contributor
+batch before reconciling each touched resident once, so reversing records in
+one synchronization batch produces the same revision, tiles, and organisms.
+Separate UI calls remain separate material events: final ownership is still
+set-derived, while revision and organism epochs retain sequential history.
 
 ### 2.5 Realized state, stability, travel, and resonance
 
@@ -764,7 +773,12 @@ result as one full-distance lerp.
 
 Possibility bucket flips use the declared domain-reader closure to mark dirty
 layers. Revisions still record any material float-state movement, including
-sub-bucket movement, but no longer determine tile staleness.
+sub-bucket movement, but no longer determine tile staleness. Applying a newly
+effective preserve winner follows the same separation: any exact realized
+vector change advances revision once and retires old-revision organisms, while
+only quantized bucket flips dirty tiles or cancel their in-flight work. Thus a
+same-bucket snap to canonical centers changes the organism identity epoch but
+keeps tile dependency hashes and jobs intact.
 
 ### 3.6 Resonance
 
@@ -1428,10 +1442,13 @@ region is present. An incomplete roster defers realization, preserves the
 previous vector, and does not advance the region's L8 organism key; roster
 maintenance repairs the pure inputs for a later retry.
 
-Organism vectors are keyed by the region's L8 dependency hash. They are reused
-while that key is unchanged, rebuilt as a whole when it changes, and recycled
-when the region leaves the near window. There is no movement, animation state,
-hunger, reproduction, age, interaction, or behavior simulation.
+Organism vectors are normally keyed by the region's L8 dependency hash. They
+are reused while that key is unchanged, rebuilt as a whole when it changes,
+and recycled when the region leaves the near window. A material preserve-winner
+snap is an explicit additional invalidation: it retires the vector and key so
+realization uses the new region revision even when center normalization stayed
+inside the same L8 buckets. There is no movement, animation state, hunger,
+reproduction, age, interaction, or behavior simulation.
 
 ### 3.21 Record schema and codec
 
@@ -1462,6 +1479,10 @@ The record types are:
 A discovery reconstructed as an anchor uses integer position, bucket-center
 target and strength, and integer falloff. A preserve applies those same bucket
 centers directly to region `current` and `target` and forces stability one.
+Runtime ownership is not encoded as another record field: the ordered set of
+covering record ids is retained per coordinate, and its lowest id is effective.
+Removing that id selects the next contributor; removing the last one releases
+the resident without snapping it back.
 
 Content ids exclude mutable names, journals, sequence counters, and route
 usage. Discovery ids include every quantized steering field and position;
@@ -1605,12 +1626,17 @@ The active data structures are:
 * `RegionCache`: coordinate -> `RegionTiles`;
 * `MacroCache`: level-4 coordinate -> shared `DrainageTile`;
 * `RosterCache`: habitat signature -> shared `RosterEntry`;
-* organism map: coordinate -> transient organism vector; and
-* region-signature sets that identify roster dependencies.
+* organism map: coordinate -> transient organism vector;
+* region-signature sets that identify roster dependencies; and
+* preserve contributors: coordinate -> ordered `(content id, signature)` map,
+  whose first entry is the effective owner.
 
 Normal radius eviction drops region state, tiles, organisms, signature
-bookkeeping, and in-flight jobs outside the unload radius. Field-capacity
-eviction removes farthest non-preserved regions outside the near radius.
+bookkeeping, and in-flight jobs outside the unload radius, but not sparse
+preserve contributors. A reload initializes from the then-effective lowest-id
+signature, including when the old winner was deleted while the coordinate was
+evicted. Field-capacity eviction removes farthest non-preserved regions outside
+the near radius; any coordinate with a contributor is exempt.
 Macro capacity removes farthest macro tiles. A dirty consumer later
 demand-rebuilds a missing or stale macro through declared dependency repair;
 a freshly integrated demanded macro is retained transiently until Hydrology
@@ -1694,6 +1720,12 @@ The repository uses several complementary checks:
 * focused `world-runtime` recovery tests for tight macro and roster ceilings,
   every-layer stale-result rejection, settled-cell roster inspection, and
   deferred then retried near-field realization;
+* focused preserve regressions for forward/reverse overlap application,
+  resident atomic-batch reconciliation, winner and non-winner deletion,
+  same-signature owner changes, revision-only bucket-center normalization,
+  exact in-flight cancellation, session restore, tile/job preservation,
+  organism re-realization, and successor recovery after resident or evicted
+  deletion;
 * the Phase 3 ecology harness (run as an integration test) for diversity and
   trophic bounds;
 * `wer-anchor` for selective, coherent steering and resonance gating;
@@ -1734,10 +1766,15 @@ into one implementation unit.
    every declared edge, every result shape, cell inspection, and realization
    recovery are covered by focused runtime regressions.
 
-2. **Give preserves deterministic ownership and revision semantics** (finding
-   26). Track all preserve contributors per region, resolve overlap by a stable
-   rule, recompute the winner after deletion, and advance the region revision
-   whenever an override materially changes realized state.
+2. **Completed: Give preserves deterministic ownership and revision semantics**
+   ([Improvement A.2](plans/prototype/improvement_A_2_preserve_ownership_revision.md);
+   finding 26). The runtime retains all preserve contributors and selects the
+   lowest content id, reveals successors after deletion, and advances revision
+   plus retires organisms on a material resident snap while bucket flips alone
+   govern tile dirtiness. Focused runtime, preserve integration, and vault
+   harness regressions cover resident batch-order reversal, winner/non-winner
+   deletion, same-bucket normalization, cancellation, session restore, and
+   eviction/reload recovery.
 
 3. **Make persistence failures explicit and durable** (finding 28). Propagate
    delete and flush errors, report a save only when all dirty data is written,
@@ -2271,24 +2308,41 @@ construction sorts but does not deduplicate repeated region coordinates. Byte
 encoding and preserve identity can therefore depend on duplicates despite set
 language. Validate uniqueness and define an explicit duplicate policy.
 
-#### 26. Overlapping preserves lack ownership and conflict semantics
+#### 26. Resolved: Overlapping preserves lacked ownership and conflict semantics
 
-The runtime stores only one override signature per region. Applying overlapping
-preserves makes application order decide the winner. Deleting one preserve can
-clear a region even if another preserve still covers it; applying a foreign
-preserve to a resident near region can also snap its realized vector and
-regenerate the supposedly pinned landscape.
+Previously, the runtime stored only one override signature per region. Applying
+overlapping preserves made application order decide the winner. Deleting one
+preserve could clear a region even if another preserve still covered it;
+applying a foreign preserve to a resident near region could also snap its
+realized vector and regenerate the supposedly pinned landscape.
 
-Track override contributors per region, define a deterministic conflict rule,
-and recompute the effective override after add/delete. Consider applying a
-foreign preserve only offscreen or through an explicit transition.
+The required correction was to track override contributors per region, define
+a deterministic conflict rule, and recompute the effective override after
+add/delete. Applying a foreign preserve only offscreen or through an explicit
+transition was also considered as a possible presentation policy.
 
-There is also a revision-accounting bug at this boundary. `set_override` can
-materially replace a resident region's realized vector, but it does not bump
-that region's revision. Near-field realization can then reuse an old feature-id
+There was also a revision-accounting bug at this boundary. `set_override` could
+materially replace a resident region's realized vector without bumping that
+region's revision. Near-field realization could then reuse an old feature-id
 epoch for a different roster or possibility state. A material override change
-should advance the revision (with same-bucket center snapping explicitly
-defined) before dependent organisms are rebuilt.
+needed to advance the revision (with same-bucket center snapping explicitly
+defined) before dependent organisms were rebuilt.
+
+**Resolution (Improvement A.2):** `RegionMap` now retains an ordered
+content-id-to-signature contributor map for every covered coordinate and uses
+the lowest content id as its effective owner. Winner deletion recomputes and
+applies the successor; non-winner deletion is inert, and final deletion keeps
+the no-snap release contract. Any material resident winner snap advances
+revision once and retires old-revision organisms, while only domain bucket
+flips dirty the ADR 0007 reader closure. Same-bucket center normalization
+therefore rebuilds organism identities without changing tile hashes or
+in-flight tile work. Runtime unit tests, including resident forward/reverse
+atomic batches and session restore, the native effective-owner deletion seam,
+end-to-end overlap and evicted-deletion tests, and the `wer-vault` sign-off
+scenario exercise these contracts. Separate UI calls remain distinct material
+history; only canonical synchronization batches reconcile once. Duplicate-
+coordinate canonicalization (finding 25) and durable delete failure handling
+(finding 28) remain open.
 
 #### 27. Vault loading is eager and its interface is not browser-shaped
 

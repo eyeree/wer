@@ -42,8 +42,8 @@ use world_core::{
     capture_target, domain_mask, drainage_dep_hash, layer_dep_hash, macro_coord_for, mix,
     organism_trait_deviation, project_plausible, steer, Anchor, AnchorKind, AnchorSource, Biome,
     Climate, DrainageTile, Genome, GenomeBias, HabitatSignature, PossibilityDomain,
-    PossibilityField, PossibilityVector, RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS,
-    REGION_SIZE,
+    PossibilityField, PossibilitySignature, PossibilityVector, RegionCoord, Soils, TraitDeviation,
+    POSSIBILITY_DIMS, REGION_SIZE,
 };
 
 use crate::budget::Budget;
@@ -382,12 +382,12 @@ pub struct RegionMap {
     /// The L8 dependency hash each region's organisms were realized from, so
     /// re-realization triggers exactly when the aggregate changes.
     organism_keys: BTreeMap<RegionCoord, u64>,
-    /// Persistent possibility overrides (phase-5-plan.md §7.5): regions pinned
-    /// to a quantized possibility state by a preserve. Consulted by the load
-    /// path (current/target from the buckets, stability 1) and honoured by
-    /// retarget/converge; deliberately **not** cleared on eviction — surviving
-    /// eviction is the override's job. A few dozen bytes per preserved region.
-    overrides: BTreeMap<RegionCoord, world_core::PossibilitySignature>,
+    /// Every preserve contribution covering a region, keyed by immutable
+    /// content id (ADR 0020). The lowest id is the effective owner. The nested
+    /// map is deliberately retained across region eviction so a later load
+    /// uses the then-current winner and deleting a winner can reveal its
+    /// successor without depending on application order.
+    preserve_contributors: BTreeMap<RegionCoord, BTreeMap<u64, PossibilitySignature>>,
     /// Run-local additions to each layer's declared `algorithm_revision`
     /// (see [`RegionMap::bump_layer_revision`]).
     revision_bumps: [u16; LAYER_COUNT as usize],
@@ -449,7 +449,7 @@ impl RegionMap {
             region_signatures: BTreeMap::new(),
             organisms: BTreeMap::new(),
             organism_keys: BTreeMap::new(),
-            overrides: BTreeMap::new(),
+            preserve_contributors: BTreeMap::new(),
             revision_bumps: [0; LAYER_COUNT as usize],
             results_tx,
             results_rx,
@@ -1017,56 +1017,160 @@ impl RegionMap {
         Some(out)
     }
 
-    /// Pin a region to a quantized possibility state (phase-5-plan.md §7.5) —
-    /// the runtime half of a preserve. The override survives eviction: a
-    /// preserved region always reloads from its buckets, never from the field,
-    /// and neither steering nor convergence moves it while overridden.
+    /// Add or replace one preserve's contribution to a region (ADR 0020).
     ///
-    /// Applying an override to a resident region snaps `current`/`target` to
-    /// the signature's bucket centers. Creating a preserve *from* the region's
-    /// own state flips no bucket, so it dirties nothing and its tiles hold
-    /// bit-identical; importing a foreign preserve may flip buckets, which
-    /// dirties exactly the declared reader layers (ADR 0007) — regeneration to
-    /// the preserved landscape, not a snap of the realized one.
-    pub fn set_override(&mut self, coord: RegionCoord, sig: world_core::PossibilitySignature) {
-        self.overrides.insert(coord, sig);
-        let mut dirtied = 0u32;
-        if let Some(region) = self.regions.get_mut(&coord) {
-            let snapped = sig.dequantize();
-            let mut flipped = 0u8;
-            for (i, domain) in PossibilityDomain::ALL.iter().enumerate() {
-                if region.current.quantized(*domain) != snapped.quantized(*domain) {
-                    flipped |= 1 << i;
-                }
+    /// All contributors are retained and the numerically lowest content id is
+    /// authoritative. Contributor-only churn is inert. A newly effective
+    /// signature snaps a resident to its bucket centers; an exact vector
+    /// change advances the region revision and retires old-revision organisms,
+    /// while only quantized bucket changes dirty generated layers (ADR 0007).
+    /// Applying the same `(preserve_id, coord, signature)` is idempotent.
+    pub fn apply_preserve_contribution(
+        &mut self,
+        preserve_id: u64,
+        coord: RegionCoord,
+        signature: PossibilitySignature,
+    ) {
+        self.apply_preserve_contributions([(preserve_id, coord, signature)]);
+    }
+
+    /// Atomically apply a synchronization batch of preserve contributions.
+    ///
+    /// The complete batch is installed before each touched resident coordinate
+    /// reconciles exactly once from its pre-batch winner to its final lowest-id
+    /// winner. This is the startup/session/import seam: reversing distinct
+    /// preserve records in one batch cannot create intermediate revision or
+    /// organism epochs. Separate calls remain separate material history and may
+    /// legitimately advance revision once per effective-winner change.
+    ///
+    /// Repeated entries for the same `(preserve_id, coord)` retain the last
+    /// signature in the supplied canonical record traversal. Duplicate
+    /// coordinate policy is finding 25 and is deliberately not changed here.
+    pub fn apply_preserve_contributions(
+        &mut self,
+        contributions: impl IntoIterator<Item = (u64, RegionCoord, PossibilitySignature)>,
+    ) {
+        let mut old_winners = BTreeMap::new();
+        for (preserve_id, coord, signature) in contributions {
+            if let std::collections::btree_map::Entry::Vacant(entry) = old_winners.entry(coord) {
+                entry.insert(self.effective_preserve(coord));
             }
-            region.current = snapped;
-            region.target = snapped;
-            region.stability = 1.0;
-            if flipped != 0 {
-                dirtied = domain_dirty_mask(flipped);
-                region.dirty_layers |= dirtied;
-                if region.status == GenerationStatus::Ready {
-                    region.status = GenerationStatus::Generating;
-                }
-            }
+            self.preserve_contributors
+                .entry(coord)
+                .or_default()
+                .insert(preserve_id, signature);
         }
-        // Superseded in-flight work for the flipped layers stops early (§6.2).
-        self.cancel_in_flight(coord, dirtied);
+        for (coord, old) in old_winners {
+            let new = self.effective_preserve(coord);
+            self.reconcile_preserve_winner(coord, old, new);
+        }
     }
 
-    /// Release a region's possibility override (deleting a preserve). No
-    /// snap: `current` stays where the preserve held it, and the next
-    /// retarget/converge resumes normal travel-fueled steering from there
-    /// (phase-5-plan.md §7.5).
-    pub fn clear_override(&mut self, coord: RegionCoord) {
-        self.overrides.remove(&coord);
+    /// Remove exactly one preserve's contribution from a region.
+    ///
+    /// Removing a non-winner is bookkeeping-only. Removing the winner applies
+    /// the lowest-id successor, if any. Removing the final contributor releases
+    /// the region without snapping or changing its revision, tiles, jobs, or
+    /// organisms; ordinary retargeting resumes on a later update (ADR 0020).
+    /// Returns whether the contribution existed.
+    pub fn remove_preserve_contribution(&mut self, preserve_id: u64, coord: RegionCoord) -> bool {
+        let old = self.effective_preserve(coord);
+        let removed = self
+            .preserve_contributors
+            .get_mut(&coord)
+            .is_some_and(|contributors| contributors.remove(&preserve_id).is_some());
+        if !removed {
+            return false;
+        }
+        if self
+            .preserve_contributors
+            .get(&coord)
+            .is_some_and(BTreeMap::is_empty)
+        {
+            self.preserve_contributors.remove(&coord);
+        }
+        let new = self.effective_preserve(coord);
+        self.reconcile_preserve_winner(coord, old, new);
+        true
     }
 
-    /// Whether a region is currently pinned by a possibility override.
+    /// The deterministic effective preserve owner and signature for a region.
+    /// The inner ordered map is the sole source of truth; no cached winner can
+    /// drift from the contributor set (ADR 0020).
+    #[must_use]
+    pub fn effective_preserve(&self, coord: RegionCoord) -> Option<(u64, PossibilitySignature)> {
+        self.preserve_contributors
+            .get(&coord)
+            .and_then(BTreeMap::first_key_value)
+            .map(|(&id, &signature)| (id, signature))
+    }
+
+    /// Whether a region has at least one preserve contributor.
     #[inline]
     #[must_use]
     pub fn is_overridden(&self, coord: RegionCoord) -> bool {
-        self.overrides.contains_key(&coord)
+        self.preserve_contributors.contains_key(&coord)
+    }
+
+    /// Reconcile one contributor mutation against its old and new effective
+    /// owner. Owner changes with an equal signature are deliberately inert.
+    fn reconcile_preserve_winner(
+        &mut self,
+        coord: RegionCoord,
+        old: Option<(u64, PossibilitySignature)>,
+        new: Option<(u64, PossibilitySignature)>,
+    ) {
+        let old_signature = old.map(|(_, signature)| signature);
+        let new_signature = new.map(|(_, signature)| signature);
+        if let Some(signature) = new_signature {
+            if Some(signature) != old_signature {
+                self.apply_effective_preserve_signature(coord, signature);
+            }
+        }
+        // `Some -> None` is the intentional no-snap release. Retargeting on a
+        // subsequent update will restore ordinary stability and target state.
+    }
+
+    /// Snap a newly effective signature into an already resident region.
+    /// Exact vector and bucket changes are separate contracts: the former
+    /// advances identity epoch and retires organisms, the latter invalidates
+    /// only declared layer readers.
+    fn apply_effective_preserve_signature(
+        &mut self,
+        coord: RegionCoord,
+        signature: PossibilitySignature,
+    ) {
+        let Some(region) = self.regions.get_mut(&coord) else {
+            return;
+        };
+        let old_current = region.current;
+        let snapped = signature.dequantize();
+        let mut flipped = 0u8;
+        for (i, domain) in PossibilityDomain::ALL.iter().enumerate() {
+            if old_current.quantized(*domain) != snapped.quantized(*domain) {
+                flipped |= 1 << i;
+            }
+        }
+        let material = old_current != snapped;
+        region.current = snapped;
+        region.target = snapped;
+        region.stability = 1.0;
+        if material {
+            region.revision = region.revision.wrapping_add(1);
+        }
+        let dirtied = domain_dirty_mask(flipped);
+        if dirtied != 0 {
+            region.dirty_layers |= dirtied;
+            if region.status == GenerationStatus::Ready {
+                region.status = GenerationStatus::Generating;
+            }
+        }
+        if material {
+            self.retire_organisms(coord);
+        }
+        // Superseded in-flight work stops only for layers whose quantized
+        // inputs changed. Same-bucket normalization leaves all jobs intact.
+        self.cancel_in_flight(coord, dirtied);
     }
 
     /// Restore one region from a session snapshot (phase-5-plan.md §12.2):
@@ -1518,13 +1622,7 @@ impl RegionMap {
             self.reclaim_tiles(tiles);
         }
         self.region_signatures.remove(&coord);
-        if let Some(mut organisms) = self.organisms.remove(&coord) {
-            organisms.clear();
-            if self.organism_pool.len() < 256 {
-                self.organism_pool.push(organisms);
-            }
-        }
-        self.organism_keys.remove(&coord);
+        self.retire_organisms(coord);
         let keys: Vec<(RegionCoord, u16)> = self
             .in_flight
             .range((coord, 0)..=(coord, u16::MAX))
@@ -1538,6 +1636,19 @@ impl RegionMap {
                 }
             }
         }
+    }
+
+    /// Retire one region's near-field realization and recycle its allocation.
+    /// Preserve-driven revision changes use this immediately, before a later
+    /// realization pass can publish identities from the old epoch (ADR 0020).
+    fn retire_organisms(&mut self, coord: RegionCoord) {
+        if let Some(mut organisms) = self.organisms.remove(&coord) {
+            organisms.clear();
+            if self.organism_pool.len() < 256 {
+                self.organism_pool.push(organisms);
+            }
+        }
+        self.organism_keys.remove(&coord);
     }
 
     /// Sweep the dependent-tracked caches after any region left the window:
@@ -1593,7 +1704,7 @@ impl RegionMap {
             let mut order: Vec<(u64, RegionCoord)> = self
                 .regions
                 .keys()
-                .filter(|c| !self.overrides.contains_key(c))
+                .filter(|c| !self.preserve_contributors.contains_key(c))
                 .map(|&c| (center_distance(c, player).to_bits(), c))
                 .filter(|&(d, _)| f64::from_bits(d) > self.cfg.near_radius)
                 .collect();
@@ -1704,12 +1815,15 @@ impl RegionMap {
         let mut projected = self.cache.bytes();
         for &(dist_bits, coord) in candidates.iter().take(budget.max_loads) {
             let near = f64::from_bits(dist_bits) <= self.cfg.near_radius;
-            if !near && projected + per_region_bytes > self.cfg.max_field_cache_bytes {
+            if !near
+                && !self.preserve_contributors.contains_key(&coord)
+                && projected + per_region_bytes > self.cfg.max_field_cache_bytes
+            {
                 continue; // deferred by the ceiling; counted below
             }
             projected += per_region_bytes;
             let mut region = RegionState::new(coord);
-            if let Some(sig) = self.overrides.get(&coord) {
+            if let Some((_, sig)) = self.effective_preserve(coord) {
                 // Preserved region: reload from its persisted buckets, pinned
                 // (phase-5-plan.md §7.5) — never from the field.
                 region.current = sig.dequantize();
@@ -1782,7 +1896,7 @@ impl RegionMap {
         anchors: &[Anchor],
         bias: &[f32; POSSIBILITY_DIMS],
     ) {
-        if self.overrides.contains_key(&coord) {
+        if self.preserve_contributors.contains_key(&coord) {
             // Preserved: pinned to its buckets; neither the distance ramp
             // nor steering moves it (phase-5-plan.md §7.5).
             let region = self.regions.get_mut(&coord).expect("resident");
@@ -2393,6 +2507,437 @@ impl RegionMap {
                 let _ = tx.send(JobResult::Tile(out));
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod preserve_tests {
+    use super::*;
+    use crate::budget::Budget;
+    use crate::InlineExecutor;
+
+    const PLAYER: (f64, f64) = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
+
+    fn coord() -> RegionCoord {
+        RegionCoord::new(0, 0)
+    }
+
+    fn config() -> StreamConfig {
+        StreamConfig {
+            near_radius: REGION_SIZE * 0.125,
+            far_radius: REGION_SIZE * 0.25,
+            load_radius: REGION_SIZE * 0.375,
+            unload_radius: REGION_SIZE * 0.5,
+            field_resolution: 2,
+            organisms_per_cell: 4,
+            ..StreamConfig::default()
+        }
+    }
+
+    fn settle(map: &mut RegionMap) {
+        for _ in 0..4 {
+            map.update(
+                PLAYER,
+                0.0,
+                &PossibilityField::default(),
+                &[],
+                &NO_BIAS,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+            let region = map.get(coord()).expect("center resident");
+            if region.status == GenerationStatus::Ready
+                && region.dirty_layers == 0
+                && map.jobs_in_flight() == 0
+                && map.organisms_in(coord()).is_some()
+            {
+                return;
+            }
+        }
+        panic!("preserve fixture did not settle");
+    }
+
+    fn settled_map() -> RegionMap {
+        let mut map = RegionMap::new(config());
+        settle(&mut map);
+        assert!(
+            !map.organisms_in(coord())
+                .expect("realized organisms")
+                .is_empty(),
+            "four slots keep the identity assertions non-vacuous"
+        );
+        map
+    }
+
+    fn changed_signature(
+        base: PossibilitySignature,
+        domain: PossibilityDomain,
+    ) -> PossibilitySignature {
+        let mut changed = base;
+        let bucket = &mut changed.buckets[domain.index()];
+        *bucket = if *bucket < 2048 { 4095 } else { 0 };
+        changed
+    }
+
+    fn tile_keys(map: &RegionMap) -> Vec<(u16, Option<u64>)> {
+        map.layer_diagnostics(coord())
+            .expect("resident diagnostics")
+            .into_iter()
+            .map(|diagnostic| (diagnostic.layer, diagnostic.stored))
+            .collect()
+    }
+
+    fn tile_content_hashes(map: &RegionMap) -> Vec<u64> {
+        let tiles = map.cache.get(coord()).expect("resident tiles");
+        let mut hashes: Vec<u64> = tiles
+            .channels
+            .iter()
+            .flatten()
+            .map(|tile| tile.content_hash())
+            .collect();
+        if let Some(tile) = &tiles.biome {
+            hashes.push(tile.content_hash());
+        }
+        if let Some(tile) = &tiles.dominant {
+            hashes.push(tile.content_hash());
+        }
+        hashes
+    }
+
+    #[test]
+    fn lowest_content_id_wins_in_both_application_orders() {
+        let low = PossibilitySignature::of(PossibilityVector::neutral());
+        let high = changed_signature(low, PossibilityDomain::Climate);
+
+        for order in [[(20, high), (10, low)], [(10, low), (20, high)]] {
+            let mut map = RegionMap::new(config());
+            for (id, signature) in order {
+                map.apply_preserve_contribution(id, coord(), signature);
+            }
+            assert_eq!(map.effective_preserve(coord()), Some((10, low)));
+            assert!(map.is_overridden(coord()));
+        }
+    }
+
+    #[test]
+    fn resident_batch_order_reconciles_once_to_identical_realized_state() {
+        let mut forward = settled_map();
+        let mut reverse = settled_map();
+        let base = PossibilitySignature::of(forward.get(coord()).unwrap().current);
+        let low_signature = changed_signature(base, PossibilityDomain::Aesthetics);
+        let high_signature = changed_signature(base, PossibilityDomain::Climate);
+        let old_revision = forward.get(coord()).unwrap().revision;
+        assert_eq!(reverse.get(coord()).unwrap().revision, old_revision);
+
+        forward.apply_preserve_contributions([
+            (10, coord(), low_signature),
+            (20, coord(), high_signature),
+        ]);
+        reverse.apply_preserve_contributions([
+            (20, coord(), high_signature),
+            (10, coord(), low_signature),
+        ]);
+
+        for map in [&forward, &reverse] {
+            assert_eq!(map.effective_preserve(coord()), Some((10, low_signature)));
+            assert_eq!(
+                map.get(coord()).unwrap().current,
+                low_signature.dequantize()
+            );
+            assert_eq!(
+                map.get(coord()).unwrap().revision,
+                old_revision.wrapping_add(1),
+                "one synchronization batch is one material revision event"
+            );
+            assert!(map.organisms_in(coord()).is_none());
+        }
+
+        settle(&mut forward);
+        settle(&mut reverse);
+        assert_eq!(
+            forward.get(coord()).unwrap().current,
+            reverse.get(coord()).unwrap().current
+        );
+        assert_eq!(
+            forward.get(coord()).unwrap().revision,
+            reverse.get(coord()).unwrap().revision
+        );
+        assert_eq!(tile_keys(&forward), tile_keys(&reverse));
+        assert_eq!(tile_content_hashes(&forward), tile_content_hashes(&reverse));
+        assert_eq!(forward.organisms_in(coord()), reverse.organisms_in(coord()));
+    }
+
+    #[test]
+    fn same_bucket_snap_bumps_revision_and_rebuilds_only_organisms() {
+        let mut map = settled_map();
+        let signature = PossibilitySignature::of(map.get(coord()).unwrap().current);
+        let snapped = signature.dequantize();
+        assert_ne!(
+            map.get(coord()).unwrap().current,
+            snapped,
+            "fixture must begin away from at least one bucket center"
+        );
+        let old_revision = map.get(coord()).unwrap().revision;
+        let old_tiles = tile_keys(&map);
+        let old_organisms = map.organisms_in(coord()).unwrap().to_vec();
+        let old_key = map.organism_keys[&coord()];
+
+        // A same-bucket normalization must not retire unrelated work.
+        let cancel = Arc::new(AtomicBool::new(false));
+        map.in_flight.insert(
+            (coord(), LAYER_ECOLOGY),
+            InFlightJob {
+                id: u64::MAX,
+                expected_hash: old_key,
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        map.apply_preserve_contribution(10, coord(), signature);
+
+        let region = map.get(coord()).unwrap();
+        assert_eq!(region.current, snapped);
+        assert_eq!(region.target, snapped);
+        assert_eq!(region.revision, old_revision.wrapping_add(1));
+        assert_eq!(region.dirty_layers, 0);
+        assert_eq!(region.status, GenerationStatus::Ready);
+        assert_eq!(tile_keys(&map), old_tiles);
+        assert!(map.in_flight.contains_key(&(coord(), LAYER_ECOLOGY)));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(map.organisms_in(coord()).is_none());
+        assert!(!map.organism_keys.contains_key(&coord()));
+
+        // Remove the synthetic job; normal realization can now rebuild from
+        // the unchanged fresh L8 key using the incremented revision.
+        map.in_flight.remove(&(coord(), LAYER_ECOLOGY));
+        settle(&mut map);
+        assert_eq!(tile_keys(&map), old_tiles);
+        assert_eq!(map.organism_keys[&coord()], old_key);
+        let new_organisms = map.organisms_in(coord()).unwrap();
+        assert!(!new_organisms.is_empty());
+        assert_ne!(new_organisms, old_organisms);
+        assert!(
+            new_organisms
+                .iter()
+                .all(|new| old_organisms.iter().all(|old| new.id != old.id)),
+            "the new possibility revision must define a new feature-id epoch"
+        );
+    }
+
+    #[test]
+    fn bucket_changing_snap_cancels_exactly_the_declared_in_flight_closure() {
+        let mut map = settled_map();
+        let base = PossibilitySignature::of(map.get(coord()).unwrap().current);
+        let changed = changed_signature(base, PossibilityDomain::Climate);
+        let expected_dirty = domain_dirty_mask(1 << PossibilityDomain::Climate.index());
+        let mut tokens = BTreeMap::new();
+        for layer in 0..LAYER_COUNT {
+            let token = Arc::new(AtomicBool::new(false));
+            map.in_flight.insert(
+                (coord(), layer),
+                InFlightJob {
+                    id: u64::from(layer) + 1,
+                    expected_hash: u64::from(layer),
+                    cancel: Arc::clone(&token),
+                },
+            );
+            tokens.insert(layer, token);
+        }
+
+        map.apply_preserve_contribution(10, coord(), changed);
+
+        assert_eq!(map.get(coord()).unwrap().dirty_layers, expected_dirty);
+        for (layer, token) in tokens {
+            let must_cancel = expected_dirty & layer_bit(layer) != 0;
+            assert_eq!(
+                token.load(Ordering::Relaxed),
+                must_cancel,
+                "layer {layer} cancellation token"
+            );
+            assert_eq!(
+                map.in_flight.contains_key(&(coord(), layer)),
+                !must_cancel,
+                "layer {layer} in-flight bookkeeping"
+            );
+        }
+    }
+
+    #[test]
+    fn session_restore_reconciles_an_overlap_batch_once() {
+        let mut map = RegionMap::new(config());
+        let snapshot_current = PossibilityVector::neutral();
+        let snapshot = world_core::RegionSnapshotRecord {
+            coord: coord(),
+            current: snapshot_current.dims,
+            stability: 0.25,
+            revision: 41,
+        };
+        let session = world_core::SessionSnapshot {
+            player: PLAYER,
+            last_player: PLAYER,
+            bias: NO_BIAS,
+            transition_mode: false,
+            anchors: Vec::new(),
+            regions: vec![snapshot],
+            sequence: 1,
+        };
+        crate::vault::apply_session_regions(&mut map, &session);
+        let base = PossibilitySignature::of(snapshot_current);
+        let winner = changed_signature(base, PossibilityDomain::Aesthetics);
+        let nonwinner = changed_signature(base, PossibilityDomain::Climate);
+
+        map.apply_preserve_contributions([(20, coord(), nonwinner), (10, coord(), winner)]);
+
+        assert_eq!(map.effective_preserve(coord()), Some((10, winner)));
+        let restored = map.get(coord()).unwrap();
+        assert_eq!(restored.current, winner.dequantize());
+        assert_eq!(restored.target, winner.dequantize());
+        assert_eq!(restored.stability, 1.0);
+        assert_eq!(restored.revision, 42);
+        settle(&mut map);
+        assert_eq!(map.get(coord()).unwrap().revision, 42);
+        assert!(map.organisms_in(coord()).is_some());
+    }
+
+    #[test]
+    fn winner_nonwinner_and_final_deletions_follow_the_transition_table() {
+        let mut map = settled_map();
+        let low_signature = PossibilitySignature::of(map.get(coord()).unwrap().current);
+        let high_signature = changed_signature(low_signature, PossibilityDomain::Aesthetics);
+
+        map.apply_preserve_contribution(20, coord(), high_signature);
+        settle(&mut map);
+        map.apply_preserve_contribution(10, coord(), low_signature);
+        settle(&mut map);
+        assert_eq!(map.effective_preserve(coord()), Some((10, low_signature)));
+
+        // A non-winning deletion is completely inert outside bookkeeping.
+        let before_nonwinner = map.get(coord()).unwrap().clone();
+        let before_tiles = tile_keys(&map);
+        let before_key = map.organism_keys[&coord()];
+        let before_organisms = map.organisms_in(coord()).unwrap().to_vec();
+        assert!(map.remove_preserve_contribution(20, coord()));
+        assert_eq!(map.effective_preserve(coord()), Some((10, low_signature)));
+        let after_nonwinner = map.get(coord()).unwrap();
+        assert_eq!(after_nonwinner.current, before_nonwinner.current);
+        assert_eq!(after_nonwinner.target, before_nonwinner.target);
+        assert_eq!(after_nonwinner.revision, before_nonwinner.revision);
+        assert_eq!(after_nonwinner.dirty_layers, before_nonwinner.dirty_layers);
+        assert_eq!(after_nonwinner.status, before_nonwinner.status);
+        assert_eq!(tile_keys(&map), before_tiles);
+        assert_eq!(map.organism_keys[&coord()], before_key);
+        assert_eq!(map.organisms_in(coord()).unwrap(), before_organisms);
+
+        // Re-add then reveal the successor. Its changed Aesthetics bucket
+        // dirties exactly the declared closure and advances the epoch once.
+        map.apply_preserve_contribution(20, coord(), high_signature);
+        let revision_before_winner_delete = map.get(coord()).unwrap().revision;
+        assert!(map.remove_preserve_contribution(10, coord()));
+        assert_eq!(map.effective_preserve(coord()), Some((20, high_signature)));
+        let expected_dirty = domain_dirty_mask(1 << PossibilityDomain::Aesthetics.index());
+        let changed = map.get(coord()).unwrap();
+        assert_eq!(changed.current, high_signature.dequantize());
+        assert_eq!(
+            changed.revision,
+            revision_before_winner_delete.wrapping_add(1)
+        );
+        assert_eq!(changed.dirty_layers, expected_dirty);
+        assert_eq!(changed.status, GenerationStatus::Generating);
+        assert!(map.organisms_in(coord()).is_none());
+        assert!(!map.organism_keys.contains_key(&coord()));
+        settle(&mut map);
+
+        // Final deletion is a no-snap release: all resident derived state is
+        // byte-for-byte untouched until a future travel-fueled convergence.
+        let before_final = map.get(coord()).unwrap().clone();
+        let before_final_tiles = tile_keys(&map);
+        let before_final_key = map.organism_keys[&coord()];
+        let before_final_organisms = map.organisms_in(coord()).unwrap().to_vec();
+        assert!(map.remove_preserve_contribution(20, coord()));
+        assert_eq!(map.effective_preserve(coord()), None);
+        assert!(!map.is_overridden(coord()));
+        let after_final = map.get(coord()).unwrap();
+        assert_eq!(after_final.current, before_final.current);
+        assert_eq!(after_final.target, before_final.target);
+        assert_eq!(after_final.revision, before_final.revision);
+        assert_eq!(after_final.dirty_layers, before_final.dirty_layers);
+        assert_eq!(after_final.status, before_final.status);
+        assert_eq!(tile_keys(&map), before_final_tiles);
+        assert_eq!(map.organism_keys[&coord()], before_final_key);
+        assert_eq!(map.organisms_in(coord()).unwrap(), before_final_organisms);
+    }
+
+    #[test]
+    fn equal_signature_owner_change_updates_only_the_reported_owner() {
+        let mut map = settled_map();
+        let signature = PossibilitySignature::of(map.get(coord()).unwrap().current);
+        map.apply_preserve_contribution(20, coord(), signature);
+        settle(&mut map);
+        let before = map.get(coord()).unwrap().clone();
+        let before_tiles = tile_keys(&map);
+        let before_key = map.organism_keys[&coord()];
+        let before_organisms = map.organisms_in(coord()).unwrap().to_vec();
+
+        map.apply_preserve_contribution(10, coord(), signature);
+        assert_eq!(map.effective_preserve(coord()), Some((10, signature)));
+        let after = map.get(coord()).unwrap();
+        assert_eq!(after.current, before.current);
+        assert_eq!(after.target, before.target);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.dirty_layers, before.dirty_layers);
+        assert_eq!(after.status, before.status);
+        assert_eq!(tile_keys(&map), before_tiles);
+        assert_eq!(map.organism_keys[&coord()], before_key);
+        assert_eq!(map.organisms_in(coord()).unwrap(), before_organisms);
+    }
+
+    #[test]
+    fn contributor_exempts_a_far_region_from_load_and_capacity_deferral() {
+        let target = RegionCoord::new(1, 0);
+        let mut cfg = config();
+        cfg.near_radius = REGION_SIZE * 0.125;
+        cfg.far_radius = REGION_SIZE * 1.25;
+        cfg.load_radius = REGION_SIZE * 1.5;
+        cfg.unload_radius = REGION_SIZE * 2.0;
+        cfg.max_field_cache_bytes = 0;
+        let mut map = RegionMap::new(cfg);
+        let signature = PossibilitySignature::of(PossibilityVector::neutral());
+        map.apply_preserve_contribution(20, target, signature);
+        map.apply_preserve_contribution(10, target, signature);
+
+        for _ in 0..3 {
+            map.update(
+                PLAYER,
+                0.0,
+                &PossibilityField::default(),
+                &[],
+                &NO_BIAS,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+        }
+        assert_eq!(map.effective_preserve(target), Some((10, signature)));
+        assert!(
+            map.get(target).is_some(),
+            "a contributor-covered non-near region must bypass load deferral and capacity eviction"
+        );
+
+        // Non-winner removal leaves the exemption and resident state intact.
+        assert!(map.remove_preserve_contribution(20, target));
+        map.update(
+            PLAYER,
+            0.0,
+            &PossibilityField::default(),
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        assert!(map.get(target).is_some());
+        assert_eq!(map.effective_preserve(target), Some((10, signature)));
     }
 }
 

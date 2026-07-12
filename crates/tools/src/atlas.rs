@@ -5,8 +5,8 @@
 //! No server anywhere: merge needs no coordinator (ADR 0014).
 
 use world_core::{
-    decode_record, encode_record, AtlasBundle, Envelope, RecordError, RecordKind,
-    RECORD_FORMAT_VERSION, WORLD_ALGORITHM_VERSION,
+    decode_record, encode_record, AtlasBundle, Envelope, PossibilitySignature, PreserveRecord,
+    RecordError, RecordKind, RegionCoord, RECORD_FORMAT_VERSION, WORLD_ALGORITHM_VERSION,
 };
 
 /// Encode a bundle for the wire/file (canonical form: records sorted by id).
@@ -119,7 +119,8 @@ pub fn check_bundle(bytes: &[u8]) -> Result<BundleCheck, RecordError> {
 pub struct VaultPositionReport {
     /// Store totals: discoveries, routes, preserves, regions seen.
     pub totals: (usize, usize, usize, u64),
-    /// The preserve pinning the covering region, with its buckets, if any.
+    /// The lowest-content-id preserve covering the region (ADR 0020), with its
+    /// buckets, if any.
     pub covering_preserve: Option<(u64, String, world_core::PossibilitySignature)>,
     /// Discoveries within reach: `(id, name, distance)`, nearest first.
     pub nearby_discoveries: Vec<(u64, String, f64)>,
@@ -132,20 +133,35 @@ pub struct VaultPositionReport {
     pub issues: Vec<String>,
 }
 
+/// Select the lowest-id covering record and the last signature that record
+/// supplies for the coordinate. The latter mirrors ordered batch insertion in
+/// `RegionMap` when a legacy/non-canonical record repeats a coordinate; finding
+/// 25 remains responsible for defining and enforcing a duplicate policy.
+fn effective_covering_preserve(
+    preserves: &std::collections::BTreeMap<u64, PreserveRecord>,
+    region: RegionCoord,
+) -> Option<(u64, String, PossibilitySignature)> {
+    preserves.iter().find_map(|(&id, preserve)| {
+        preserve
+            .regions
+            .iter()
+            .rev()
+            .find(|(coord, _)| *coord == region)
+            .map(|&(_, signature)| (id, preserve.name.clone(), signature))
+    })
+}
+
 /// Open a store and gather the records relevant to a world position.
 pub fn inspect_vault(store_dir: &str, x: f64, y: f64) -> Result<VaultPositionReport, String> {
-    use world_core::{RegionCoord, ROUTE_CORRIDOR_RADIUS};
+    use world_core::ROUTE_CORRIDOR_RADIUS;
     let store = crate::FileStorage::open(store_dir).map_err(|e| e.to_string())?;
     let vault = world_runtime::Vault::open(store).map_err(|e| e.to_string())?;
     let region = RegionCoord::from_world(x, y);
     let distance = |px: i64, py: i64| f64::hypot(px as f64 - x, py as f64 - y);
 
-    let covering_preserve = vault.preserves().iter().find_map(|(&id, p)| {
-        p.regions
-            .iter()
-            .find(|(c, _)| *c == region)
-            .map(|&(_, sig)| (id, p.name.clone(), sig))
-    });
+    // `Vault::preserves` is a `BTreeMap`, so this is the same lowest-id rule as
+    // `RegionMap::effective_preserve`, not an iteration-order approximation.
+    let covering_preserve = effective_covering_preserve(vault.preserves(), region);
 
     let mut nearby_discoveries: Vec<(u64, String, f64)> = vault
         .discoveries()
@@ -225,7 +241,7 @@ mod tests {
     use super::*;
     use world_core::{
         bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, DiscoveryRecord,
-        PossibilityDomain,
+        PossibilityDomain, PossibilityVector,
     };
 
     fn bundle_with_one_discovery() -> AtlasBundle {
@@ -264,5 +280,23 @@ mod tests {
         let bytes = encode_bundle(bundle);
         let check = check_bundle(&bytes).unwrap();
         assert!(!check.passed());
+    }
+
+    #[test]
+    fn covering_preserve_uses_the_winning_records_last_duplicate_signature() {
+        let coord = RegionCoord::new(0, 0);
+        let first = PossibilitySignature::of(PossibilityVector::neutral());
+        let mut last = first;
+        last.buckets[PossibilityDomain::Aesthetics.index()] = 4000;
+        let mut record = PreserveRecord::new(Vec::new(), 1, "duplicate".into());
+        record.regions = vec![(coord, first), (coord, last)];
+        record.id = record.content_id();
+        let id = record.id;
+        let preserves = std::collections::BTreeMap::from([(id, record)]);
+
+        assert_eq!(
+            effective_covering_preserve(&preserves, coord),
+            Some((id, "duplicate".into(), last))
+        );
     }
 }
