@@ -410,28 +410,30 @@ fn aggregate_entity_scenario() -> EcologyReport {
     }
 }
 
-/// Realization budget: entering the window realizes over several frames without
-/// overrunning the per-frame cap, and settles to the full population
-/// (phase-3-plan.md §12.3, §8.4).
+/// Visual-realization budget: canonical slot 0 publishes on its fixed schedule,
+/// while expanding the window to four displayed slots ripples over frames
+/// without overrunning the presentation cap (ADR 0024).
 fn realization_budget_scenario() -> EcologyReport {
     let mut violations = Vec::new();
     let field = PossibilityField::default();
     let bias = [0.0f32; POSSIBILITY_DIMS];
     let cap = 40usize;
-    let per_region_max =
-        harness_config().field_resolution as usize * harness_config().field_resolution as usize;
+    let mut stream = harness_config();
+    stream.organisms_per_cell = 4;
+    let per_region_max = stream.field_resolution as usize
+        * stream.field_resolution as usize
+        * usize::from(stream.organisms_per_cell);
     let budget = Budget {
         max_loads: usize::MAX,
         max_converge_regions: usize::MAX,
         max_regen_cost: u32::MAX,
         max_realize_organisms: cap,
-        max_resonance_nodes: usize::MAX,
         max_persist_ops: usize::MAX,
         max_route_attraction_nodes: usize::MAX,
         max_retarget_regions: usize::MAX,
     };
 
-    let mut map = RegionMap::new(harness_config());
+    let mut map = RegionMap::new(stream);
     let mut frames_with_realization = 0u32;
     for _ in 0..80 {
         let stats = map.update(
@@ -466,7 +468,20 @@ fn realization_budget_scenario() -> EcologyReport {
     }
 
     // It must settle to the same population an unlimited run reaches.
-    let full = settled_map(&Budget::unlimited()).organism_count();
+    let mut full_map = RegionMap::new(stream);
+    for _ in 0..80 {
+        full_map.update(
+            PLAYER,
+            0.0,
+            &field,
+            &[],
+            &bias,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+    }
+    let full = full_map.organism_count();
     let budgeted = map.organism_count();
     if budgeted != full {
         record(

@@ -103,7 +103,10 @@ coordinates -> base possibility field -> bias + anchors -> plausibility projecti
  terrain + geology + climate + hydrology -> soils                  |
  terrain + climate + hydrology + soils -> biome                    |
  climate + soils + biome -> vegetation ----------------------------+
- climate + soils + biome + vegetation -> ecology -> near organisms
+ climate + soils + biome + vegetation -> ecology -> canonical slot-0 organisms
+                                                        |             |
+                                                        |             +-> capture + resonance -> route cost
+                                                        +-> tier-budgeted extra visual slots
 ```
 
 There is no complete materialized world behind the authoritative streaming
@@ -112,6 +115,10 @@ the small regional transformation history. Crossing the unload radius removes
 that authority; an ordinary unpreserved region loaded again later starts at the
 target implied by the then-current steering context. Sparse preserve
 contributors and run-local session snapshots are the reconstruction exceptions.
+Near-field organism vectors distinguish one fixed authoritative slot-0 sample
+from optional higher-density presentation slots. Gameplay and shared-route cost
+read only slot 0; Low/Mid/High may display different populations without
+changing those inputs once the same L8 and roster prerequisites are ready.
 
 ### 2.2 Space and scale
 
@@ -352,8 +359,9 @@ pinned in the same frame they cross it; regions outside the far radius are
 fully free. Capacity-parked residents still refresh targets and converge in the
 same ordered authoritative pass as field-active residents.
 
-The convergence gate is built from near-field organisms. Let $n\le N$ be the
-number of nearest nodes actually selected:
+The convergence gate is built from canonical slot-0 near-field organisms. Let
+$n\le 64$ be the number of nearest nodes actually selected after the fixed
+distance/species/position total sort:
 
 * density is $D=\min(n/8,1)$;
 * species diversity $V$ is normalized Shannon entropy;
@@ -494,8 +502,8 @@ Ecology is a three-tier model:
 
 1. environmental fields describe each cell;
 2. a coarse habitat signature selects a shared species roster and food web;
-3. the near window samples organism instances from local vegetation, the
-   habitat, and roster biomass weights.
+3. the near window samples one canonical organism slot plus optional visual
+   instances from local vegetation, the habitat, and roster biomass weights.
 
 For a cell, the habitat signature is
 
@@ -516,7 +524,9 @@ player, each cell and resource-tier slot independently realizes an organism
 with probability equal to vegetation density. A stable hash chooses whether
 the organism exists, its species, and its jittered position; genome-plus-bias
 arithmetic determines expression. These instances are discarded when their
-region leaves the near window.
+region leaves the near window. Slot membership is explicit: slot 0 is the only
+capture/resonance/gameplay sample, while slots above zero are additive renderer
+and diagnostic population.
 
 ### 2.8 Persistence and sharing
 
@@ -540,6 +550,12 @@ bits for player state, anchors, and every authoritative resident region's
 realized vector, stability, and revision, parked residents included. It is
 local to one run/platform, is never included in an atlas bundle, and restores
 those regions parked before live admission re-derives their targets and tiles.
+An exact save→load→settle comparison requires canonical near state to be
+complete at save and zero travel after load until
+`authoritative_realization_complete`. Otherwise authoritative regional history
+is still restored exactly, but transient gameplay availability rebuilds one
+ready near region per update because the session does not persist organism
+vectors or bypass the fixed scheduler.
 
 ### 2.9 Three grades of determinism
 
@@ -557,8 +573,11 @@ contracts:
 3. **Settled schedule independence.** Pure jobs and dependency keys make a
    quiescent scripted endpoint independent of executor, worker count, budgets,
    cancellation, and retarget amortization. Mid-journey state is explicitly
-   allowed to differ because job timing changes when organisms become available
-   to resonance. Field-cache capacity is narrower: with equal near-field
+   allowed to differ because job timing changes when prerequisite L8/roster
+   inputs become ready. Once those inputs are equal, a fixed one-region-per-
+   frame canonical publication schedule makes capture, resonance, and shared
+   route bytes invariant to resource density and visual realization budgets.
+   Field-cache capacity is narrower: with equal near-field
    prerequisites, authoritative regional history is compared and equal after
    every scripted frame even though derived field residency differs.
 
@@ -719,6 +738,8 @@ $\operatorname{clamp}((T+15)/50,0,1)$ for Climate. If no organism is available,
 an Ecology capture can use vegetation density. The current Planetary capture
 has no separate measured deviation; it records the region baseline. Captures
 are presentation-grade because they read float tiles and realized organisms.
+Organism capture searches the explicit canonical slot-0 view only; higher
+resource-tier slots cannot become the nearest gameplay specimen.
 
 The eight fiction-facing `TraitCategory` variants currently map one-to-one onto
 the eight scalar domains. Coloration maps to Aesthetics; morphology/scale to
@@ -772,12 +793,14 @@ One `update` performs these passes:
 2. radius removal and capacity parking of derived fields;
 3. create missing authority and admit eligible parked fields;
 4. recompute all geometric stability, then budget target calculation;
-5. construct resonance from the previous frame's organisms;
-6. converge eligible realized states;
-7. dispatch stale layers in topological order;
-8. integrate again for the synchronous executor; and
-9. when the L8 key is fresh, realize near-field organisms from settled habitat,
-   vegetation, and roster inputs.
+5. retire stale organism currency and publish slot 0 for at most one nearest
+   fresh, roster-complete near region;
+6. construct resonance from the current canonical slot-0 view;
+7. converge eligible realized states;
+8. dispatch stale layers in topological order;
+9. integrate again for the synchronous executor; and
+10. expand already-canonical vectors to the tier's visual density under the
+    presentation-realization budget.
 
 Travel is supplied explicitly by the caller instead of being inferred inside
 the map. Streaming, target calculation, and completion of already-dirty
@@ -799,10 +822,11 @@ keeps tile dependency hashes and jobs intact.
 ### 3.6 Resonance
 
 [`resonance.rs`](crates/world-runtime/src/resonance.rs) turns nearby realized
-organisms into a one-frame graph. `RegionMap::resonance_at` gathers all
-organisms within the near radius, orders them by squared distance with species
-and position tie-breaks, and truncates to the budget's node cap. The graph is
-not cached or persisted.
+organisms into a one-frame graph. `RegionMap::resonance_at` gathers only
+authoritative slot-0 organisms within the near radius, orders them by squared
+distance with species and position tie-breaks, and truncates to the fixed
+semantic ceiling `MAX_RESONANCE_NODES = 64`. The graph is not cached or
+persisted, and neither `Budget` nor `ResourceTier` can change its contents.
 
 Density dominates the formula, saturating at eight nodes. Entropy rewards a
 mixture of species, distance rewards close nodes, compatibility rewards anchors
@@ -825,6 +849,10 @@ Each node stores:
 * transition cost `floor(255 * (1 - resonance))`;
 * stability in an 8-bit band; and
 * an order-independent summary of active anchors.
+
+Transition cost uses the canonical `FrameStats::resonance_strength` from the
+immediately preceding map update. Higher visual organism slots therefore do
+not change route nodes, content ids, or encoded shared bytes.
 
 The anchor summary covers the player's explicit anchor slice. Route-derived
 anchors are excluded even though their effects may already appear in the
@@ -1432,7 +1460,8 @@ Ecology-layer key to create transient `Organism` structs only inside the near
 window. It reads the upstream vegetation, temperature, moisture, fertility,
 and biome fields plus the roster/web; it does not sample the L8 pressure,
 diversity, or dominant-index channels themselves. Each struct contains feature
-id, species id, trophic role, local cell, world position, and expressed genome.
+id, species id, trophic role, explicit density slot, local cell, world position,
+and expressed genome.
 
 For resolution $n$, cell index $c=c_yn+c_x$, and resource-density slot $s$,
 the feature index is
@@ -1441,7 +1470,8 @@ $$
 i=c+sn^2.
 $$
 
-Slot 0 is the Phase 5 identity; higher slots are additive. The organism id
+Slot 0 is the Phase 5 identity and canonical gameplay sample; higher slots are
+additive presentation instances. The organism id
 folds world version, region, layer 8, this feature index, and the region's
 current revision. A SplitMix stream seeded by that id is consumed in a fixed
 order:
@@ -1453,19 +1483,22 @@ order:
 5. draw two fractions to jitter position uniformly inside the cell.
 
 One density slot therefore has expected occupancy $d_v$; $k$ slots have
-expected occupancy $kd_v$. Before clearing or publishing an organism vector,
-the coordinator verifies that every roster signature tracked for the resident
-region is present. An incomplete roster defers realization, preserves the
-previous vector, and does not advance the region's L8 organism key; roster
-maintenance repairs the pure inputs for a later retry.
+expected occupancy $kd_v$. A fixed pre-resonance pass publishes one nearest
+whole slot-0 region per frame once its L8 key and complete roster set are
+fresh. A separate post-integration pass may atomically recompute that vector at
+the tier's one/two/four-slot visual density under
+`max_realize_organisms`. Visual backpressure cannot delay or accelerate the
+canonical publication schedule.
 
-Organism vectors are normally keyed by the region's L8 dependency hash. They
-are reused while that key is unchanged, rebuilt as a whole when it changes,
-and recycled when the region leaves the near window. A material preserve-winner
-snap is an explicit additional invalidation: it retires the vector and key so
-realization uses the new region revision even when center normalization stayed
-inside the same L8 buckets. There is no movement, animation state, hunger,
-reproduction, age, interaction, or behavior simulation.
+One currency map records canonical L8-key availability and another records
+visual `(L8 key, slot count)` completion over the same vector; empty barren
+vectors retain both keys. Missing or changed L8 provenance, missing signatures
+or rosters, near exit, capacity parking, preserve revision changes, and session
+replacement retire the vector and both currencies before gameplay reads. A
+material preserve-winner snap therefore uses the new region revision even when
+center normalization stayed inside the same L8 buckets. There is no movement,
+animation state, hunger, reproduction, age, interaction, or behavior
+simulation.
 
 ### 3.21 Record schema and codec
 
@@ -1627,8 +1660,9 @@ time. The low-tier 16.6 ms nominal budget is:
 | region loads | 48 |
 | region convergence steps | 512 |
 | generation cost | 96 |
-| realized organisms | 400, with whole-region overshoot allowed |
-| resonance nodes | 64 |
+| canonical slot-0 publication | 1 nearest whole region (fixed semantic work) |
+| visual organism expansion | 400, with whole-region overshoot allowed |
+| resonance nodes | fixed semantic ceiling of 64 |
 | persistence operations | 8 |
 | route-attraction nodes | 32 |
 | target refreshes | unlimited |
@@ -1651,14 +1685,17 @@ Resource tiers choose capacity and pacing presets:
 | field cache | 48 MiB | 96 MiB | 160 MiB |
 | macro cache | 12 MiB | 16 MiB | 24 MiB |
 | roster cache | 8 MiB | 8 MiB | 8 MiB |
-| organism slots/cell | 1 | 2 | 4 |
+| organism slots/cell (displayed) | 1 | 2 | 4 |
 | generation cost/frame | 96 | 192 | 384 |
-| resonance nodes | 64 | 96 | 128 |
+| resonance nodes (gameplay) | 64 | 64 | 64 |
 | target refreshes/frame | all | 160 | 240 |
 
 An explicit environment override wins tier detection. Otherwise at most four
 logical cores or a CPU-class graphics adapter selects Low; at least eight cores
 and a discrete adapter selects High; other configurations select Mid.
+`max_realize_organisms` controls only expansion beyond the already-published
+canonical slot-0 vector. The one-region canonical admission and 64-node
+resonance ceiling are fixed semantics, not tier capacity knobs.
 
 The streaming data structures are:
 
@@ -1666,7 +1703,8 @@ The streaming data structures are:
 * `RegionCache`: coordinate -> `RegionTiles`;
 * `MacroCache`: level-4 coordinate -> shared `DrainageTile`;
 * `RosterCache`: habitat signature -> shared `RosterEntry`;
-* organism map: coordinate -> transient organism vector;
+* organism map: coordinate -> transient organism vector, with separate
+  canonical-L8 and visual-`(L8, slots)` currency maps;
 * region-signature sets that identify roster dependencies; and
 * preserve contributors: coordinate -> ordered `(content id, signature)` map,
   whose first entry is the effective owner.
@@ -1769,8 +1807,10 @@ The repository uses several complementary checks:
 * the continuity replay for pinned stability and bounded seams;
 * `wer-ledger` for declared invalidation precision;
 * focused `world-runtime` recovery tests for tight macro and roster ceilings,
-  every-layer stale-result rejection, settled-cell roster inspection, and
-  deferred then retried near-field realization;
+  every-layer stale-result rejection, settled-cell roster inspection,
+  fail-closed canonical invalidation/repair, fixed cross-budget publication,
+  non-vacuous cross-density capture/resonance, and the exact sorted first 64
+  canonical resonance nodes;
 * focused preserve regressions for forward/reverse overlap application,
   resident atomic-batch reconciliation, winner and non-winner deletion,
   same-signature owner changes, revision-only bucket-center normalization,
@@ -1790,7 +1830,9 @@ The repository uses several complementary checks:
   explicit 70-retry failure/ordering/delete/import-sequence scenario; and
 * `wer-scale` for executor/budget/cancellation/amortization settled hashes,
   per-frame tight-versus-roomy regional-history equality under field pressure,
-  field/pool plateaus, tiers, and additive realization density.
+  field/pool plateaus, additive realization density, and exact Low/Mid/High
+  canonical organism, anchored capture/resonance, actual route-record id/node,
+  and encoded-byte equality.
 
 CI formats, lints, checks, and tests the native workspace and compile-checks
 the three neutral/web crates for `wasm32-unknown-unknown`. The parity exports
@@ -1855,10 +1897,14 @@ into one implementation unit.
    preserve, late-result, and session regressions plus a per-frame tight-versus-
    roomy `wer-scale` history gate cover the corrected lifecycle.
 
-5. **Restore resource-tier invariance for gameplay and shared records**
-   (finding 6). Compute resonance, capture, and persisted route cost from one
-   fixed authoritative sample; treat higher organism slots as visual additions
-   only. Gate this with cross-tier capture and byte-identical route tests.
+5. **Completed: Restore resource-tier invariance for gameplay and shared
+   records**
+   ([Improvement A.5](plans/prototype/improvement_A_5_resource_tier_invariance.md);
+   finding 6). Organisms now carry explicit density slots; a fixed one-region
+   pre-resonance pass publishes canonical slot 0, while tier-budgeted expansion
+   adds visual slots only. Capture and fixed-cap 64-node resonance read slot 0,
+   and focused plus `wer-scale` gates require exact Low/Mid/High capture,
+   resonance, actual route records, and encoded route bytes.
 
 6. **Canonicalize all anchor reductions and signatures** (findings 1 and 21).
    Sort anchors by a complete bitwise key before floating-point reduction, make
@@ -2104,24 +2150,38 @@ over-admitting a logical target, and `wer-scale` compares ordered regional
 history after every changing-bias travel frame under tight and roomy ceilings,
 requiring both capacity parking and observed parked-state evolution.
 
-#### 6. Resource tiers feed gameplay and persistent identity
+#### 6. Resolved: Resource tiers fed gameplay and persistent identity
 
-High tier adds organism slots and increases the resonance-node cap. Resonance
-reads realized organism count and species entropy, so hardware tier changes the
-convergence rate during travel. Extra slots can also change which organism is
-nearest during capture. Route nodes persist `1 - resonance` as part of their
-content id, so the same physical expedition can produce different shared route
-bytes on Low and High hardware.
+**Status:** Resolved by
+[Improvement A.5](plans/prototype/improvement_A_5_resource_tier_invariance.md).
 
-The effect is not even monotone after density saturates at eight nodes: adding
-farther or less evenly distributed organisms can lower the mean-distance or
-diversity term while density stays one.
+Previously, High tier added organism slots and increased the resonance-node
+cap. Resonance read realized organism count and species entropy, so hardware
+tier changed the convergence rate during travel. Extra slots could also change
+which organism was nearest during capture. Route nodes persisted
+`1 - resonance` as part of their content id, so the same physical expedition
+could produce different shared route bytes on Low and High hardware.
 
-This contradicts the description of organism density as presentation-only and
-the claim that shared surfaces are tier-invariant. Authoritative resonance and
-capture should use a fixed virtual sample—such as slot 0 or aggregate tiles—
-while extra organisms remain visual. Add cross-tier capture and route-record
-byte tests.
+The effect was not even monotone after density saturated at eight nodes: adding
+farther or less evenly distributed organisms could lower the mean-distance or
+diversity term while density stayed one.
+
+That behavior contradicted the description of organism density as
+presentation-only and the claim that shared surfaces are tier-invariant.
+
+Resolution: every organism now records its density slot, slot 0 is the sole
+gameplay sample, and higher slots remain additive presentation. Canonical
+publication admits one nearest fresh roster-complete region per frame before
+resonance, independently of visual realization budgets; stale or incomplete
+inputs retire both canonical and presentation currency before gameplay reads.
+Resonance always selects the exact first 64 canonical nodes under its total
+sort. Non-vacuous focused tests probe an extra organism whose species differs
+from the nearest canonical specimen, and the scale harness settles equal ready
+Low/Mid/High inputs under one explicit anchor before requiring bit-exact
+capture/resonance and byte-identical actual `RouteRecord` encodings. L8/executor
+readiness may still differ by frame, and live float capture remains
+presentation-grade across native/wasm; neither caveat permits visual density to
+change gameplay once authoritative prerequisites match.
 
 #### 7. A per-node route cap does not make route attraction weak in aggregate
 

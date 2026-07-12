@@ -409,7 +409,13 @@ impl Hud {
             self,
             [
                 ("organisms", &format!("{}", info.organisms)),
-                ("realized", &format!("{}", info.stats.organisms_realized)),
+                (
+                    "realized a/v",
+                    &format!(
+                        "{}/{}",
+                        info.stats.authoritative_organisms_realized, info.stats.organisms_realized
+                    ),
+                ),
                 (
                     "resonance",
                     &format!("{:.2}", info.stats.resonance_strength),

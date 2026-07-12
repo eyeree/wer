@@ -37,13 +37,19 @@ pub struct ResonanceNode {
 pub struct Resonance {
     /// Transition capability at the player, `0..=1` — the gate multiplier.
     pub strength: f32,
-    /// Contributing near-field features within reach, nearest-first, capped at
-    /// `max_resonance_nodes`.
+    /// Contributing canonical near-field features within reach, nearest-first,
+    /// capped at [`MAX_RESONANCE_NODES`].
     pub nodes: Vec<ResonanceNode>,
     /// How well the local ecology matches the active anchor set, `0..=1` — why
     /// steering here pulls where it does (the influence viz reads it).
     pub anchor_compatibility: f32,
 }
+
+/// Fixed semantic ceiling for the authoritative resonance graph (ADR 0024).
+///
+/// This is deliberately not a frame-budget or resource-tier setting: changing
+/// the selected nodes changes convergence and persisted route cost.
+pub const MAX_RESONANCE_NODES: usize = 64;
 
 impl Resonance {
     /// The empty resonance (a barren, organism-free neighbourhood): zero

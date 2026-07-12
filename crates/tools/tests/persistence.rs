@@ -2,8 +2,8 @@
 //! saved mid-journey and reloaded into a fresh process settles to the *same*
 //! world — the state hash of the save→load→settle run equals the
 //! uninterrupted run's, bit for bit. Also asserts that loading is not an
-//! event: the settle update after a restore converges nothing and loads
-//! nothing beyond what the session captured.
+//! event: the bounded zero-travel settle updates after a restore converge
+//! nothing and load nothing beyond what the session captured.
 
 use tools::state_hash;
 use world_core::{
@@ -97,6 +97,10 @@ fn save_load_settle_matches_the_uninterrupted_run() {
     for frame in 0..=SAVE_FRAME {
         step(&mut before, frame, &field);
     }
+    assert!(
+        before.authoritative_realization_complete(pos(SAVE_FRAME)),
+        "save-point precondition: the scripted source map must have complete canonical near state"
+    );
     let mut vault = Vault::open(MemoryStorage::new()).expect("fresh store opens");
     vault
         .snapshot_session(
@@ -124,21 +128,33 @@ fn save_load_settle_matches_the_uninterrupted_run() {
     apply_session_regions(&mut restored, &snap);
     let anchors: Vec<Anchor> = snap.anchors.iter().map(|a| a.to_anchor()).collect();
 
-    // The settle update (phase-5-plan.md §12.2): travel = 0 at the save-point
-    // inputs rebuilds caches, rosters, and organisms without moving any state.
-    // Loading is not an event.
-    let settle = restored.update(
-        snap.player,
-        0.0,
-        &field,
-        &anchors,
-        &snap.bias,
-        &Budget::unlimited(),
-        &InlineExecutor,
-        snap.transition_mode,
+    // The settle phase (phase-5-plan.md §12.2; ADR 0024): travel = 0 at the
+    // save-point inputs rebuilds caches and rosters, then drains the fixed
+    // one-canonical-region-per-frame publication schedule without moving any
+    // state. Loading is not an event. One pass per captured authority plus a
+    // final observation is a conservative bound for the smaller near subset.
+    let settle_frames = restored.len() + 1;
+    for _ in 0..settle_frames {
+        let settle = restored.update(
+            snap.player,
+            0.0,
+            &field,
+            &anchors,
+            &snap.bias,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            snap.transition_mode,
+        );
+        assert_eq!(settle.converged, 0, "restore must not converge anything");
+        assert_eq!(settle.loaded, 0, "the session captured the whole window");
+        if restored.authoritative_realization_complete(snap.player) {
+            break;
+        }
+    }
+    assert!(
+        restored.authoritative_realization_complete(snap.player),
+        "zero-travel restore settling must publish every ready canonical near region"
     );
-    assert_eq!(settle.converged, 0, "restore must not converge anything");
-    assert_eq!(settle.loaded, 0, "the session captured the whole window");
 
     for frame in SAVE_FRAME + 1..FRAMES {
         step(&mut restored, frame, &field);

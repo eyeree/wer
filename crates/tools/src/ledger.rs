@@ -325,7 +325,6 @@ fn budget_ripple_scenario() -> ScenarioReport {
         max_converge_regions: usize::MAX,
         max_regen_cost: 24,
         max_realize_organisms: usize::MAX,
-        max_resonance_nodes: usize::MAX,
         max_persist_ops: usize::MAX,
         max_route_attraction_nodes: usize::MAX,
         max_retarget_regions: usize::MAX,

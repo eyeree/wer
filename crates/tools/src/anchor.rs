@@ -15,9 +15,9 @@
 //!   in the steered world, the diversity floor is retained, and emphasizing a
 //!   fast (E/M/B/A) domain never moves the stable trio.
 //! - **Transition / resonance** — a stationary player produces zero convergence,
-//!   a denser neighbourhood resonates more strongly than a sparse one,
 //!   anchor-compatible surroundings resonate more than incompatible ones, and
-//!   the resonance graph stays within its node budget.
+//!   the canonical graph stays within its fixed semantic ceiling. Density
+//!   monotonicity is pinned separately by the pure resonance unit test.
 //!
 //! Regeneration *precision* under steering (which layers regenerate for which
 //! domain flip) is asserted by the invalidation ledger; this harness checks the
@@ -562,9 +562,8 @@ fn stable_trio_scenario() -> AnchorReport {
 }
 
 /// Transition / resonance (phase-4-plan.md §12.3): a stationary player produces
-/// zero convergence; a denser neighbourhood resonates more than a sparse one;
-/// anchor-compatible surroundings resonate more than incompatible ones; the
-/// resonance graph respects its node budget.
+/// zero convergence; anchor-compatible surroundings resonate more than
+/// incompatible ones; the canonical graph respects its fixed semantic ceiling.
 fn resonance_scenario() -> AnchorReport {
     let mut violations = Vec::new();
     let field = PossibilityField::default();
@@ -596,33 +595,16 @@ fn resonance_scenario() -> AnchorReport {
         }
     }
 
-    // Dense vs sparse: a bigger node budget resonates at least as strongly as a
-    // starved one (density is monotone through the real window).
-    let dense = map.resonance_at(PLAYER, &[], &Budget::unlimited());
-    let sparse = map.resonance_at(
-        PLAYER,
-        &[],
-        &Budget {
-            max_resonance_nodes: 2,
-            ..Budget::unlimited()
-        },
-    );
-    if dense.strength < sparse.strength - 1e-6 {
+    // The authoritative graph has one semantic ceiling, independent of frame
+    // budgets and resource tiers (ADR 0024).
+    let resonance = map.resonance_at(PLAYER, &[]);
+    if resonance.nodes.len() > world_runtime::MAX_RESONANCE_NODES {
         record(
             &mut violations,
             format!(
-                "denser neighbourhood resonated less ({:.4} < {:.4})",
-                dense.strength, sparse.strength
-            ),
-        );
-    }
-    // Node budget respected.
-    if sparse.nodes.len() > 2 {
-        record(
-            &mut violations,
-            format!(
-                "resonance graph overran its node budget ({} > 2)",
-                sparse.nodes.len()
+                "resonance graph overran its fixed ceiling ({} > {})",
+                resonance.nodes.len(),
+                world_runtime::MAX_RESONANCE_NODES
             ),
         );
     }
@@ -646,8 +628,8 @@ fn resonance_scenario() -> AnchorReport {
             falloff_radius: 3.0 * REGION_SIZE,
             source: AnchorSource::Manual,
         };
-        let compatible = map.resonance_at(PLAYER, &[mk(compatible_target)], &Budget::unlimited());
-        let opposite = map.resonance_at(PLAYER, &[mk(opposite_target)], &Budget::unlimited());
+        let compatible = map.resonance_at(PLAYER, &[mk(compatible_target)]);
+        let opposite = map.resonance_at(PLAYER, &[mk(opposite_target)]);
         if compatible.strength < opposite.strength - 1e-4 {
             record(
                 &mut violations,
@@ -660,12 +642,12 @@ fn resonance_scenario() -> AnchorReport {
     }
 
     AnchorReport {
-        name: "resonance gates transition (stationary/density/compatibility/budget)",
+        name: "resonance gates transition (stationary/compatibility/fixed cap)",
         violations,
         summary: format!(
             "resonance {:.3} over {} nodes",
-            dense.strength,
-            dense.nodes.len()
+            resonance.strength,
+            resonance.nodes.len()
         ),
     }
 }

@@ -59,6 +59,7 @@ use crate::realize::{realize_region_into, Organism};
 use crate::region::{GenerationStatus, RegionState};
 use crate::resonance::{
     combine_resonance, density_term, gated_rate, species_entropy, Resonance, ResonanceNode,
+    MAX_RESONANCE_NODES,
 };
 use crate::rostercache::{RosterCache, RosterEntry, RosterSnapshot};
 use crate::task::{TaskExecutor, TaskPriority};
@@ -124,7 +125,8 @@ pub struct StreamConfig {
     /// slots 1.. derive additive identities (`feature_index = cell +
     /// slot·res²`) from the same scheme, each independently density-gated so
     /// expected population scales linearly and the aggregate↔entity ratios
-    /// hold. Presentation state only (ADR 0010): no persisted or shared byte
+    /// hold. Slot 0 remains the canonical gameplay sample; higher slots are
+    /// presentation-only (ADRs 0010 and 0024), so no persisted or shared byte
     /// changes with this knob.
     pub organisms_per_cell: u16,
 }
@@ -191,16 +193,21 @@ pub struct FrameStats {
     pub rosters_built: usize,
     /// Heap bytes held by the roster cache after this frame.
     pub roster_cache_bytes: usize,
-    /// Near-field organisms instantiated this frame (≤ `max_realize_organisms`
-    /// modulo a final region overshoot, phase-3-plan.md §8.4).
+    /// Canonical slot-0 organisms instantiated by the fixed one-region
+    /// authoritative pass this frame (ADR 0024). This semantic work is not
+    /// charged to a resource-tier budget.
+    pub authoritative_organisms_realized: usize,
+    /// Presentation organisms instantiated while expanding canonical vectors
+    /// to the configured visual density this frame (≤
+    /// `max_realize_organisms` modulo a final region overshoot).
     pub organisms_realized: usize,
     /// Total near-field organisms resident after this frame.
     pub organisms: usize,
     /// Transition capability at the player this frame, `0..=1` — the resonance
     /// gate multiplier folded into convergence (phase-4-plan.md §8.3, ADR 0012).
     pub resonance_strength: f32,
-    /// Contributing nodes in this frame's resonance graph (≤
-    /// `max_resonance_nodes`).
+    /// Contributing canonical nodes in this frame's resonance graph (≤
+    /// [`MAX_RESONANCE_NODES`]).
     pub resonance_nodes: usize,
     /// Active anchors this frame.
     pub anchors_active: usize,
@@ -380,9 +387,13 @@ pub struct RegionMap {
     /// and un-cached, phase-3-plan.md §8.3). Rebuilt when a region's L8 tile
     /// changes, dropped when it leaves the near window.
     organisms: BTreeMap<RegionCoord, Vec<Organism>>,
-    /// The L8 dependency hash each region's organisms were realized from, so
-    /// re-realization triggers exactly when the aggregate changes.
-    organism_keys: BTreeMap<RegionCoord, u64>,
+    /// The L8 dependency hash each region's canonical slot-0 organisms were
+    /// realized from. This is gameplay availability, independent of visual
+    /// density (ADR 0024).
+    authoritative_organism_keys: BTreeMap<RegionCoord, u64>,
+    /// The L8 dependency hash and slot count represented by the presentation
+    /// vector. Empty realizations retain a key so barrenness is complete work.
+    presentation_organism_keys: BTreeMap<RegionCoord, (u64, u16)>,
     /// Every preserve contribution covering a region, keyed by immutable
     /// content id (ADR 0020). The lowest id is the effective owner. The nested
     /// map is deliberately retained across region eviction so a later load
@@ -449,7 +460,8 @@ impl RegionMap {
             roster_cache: RosterCache::default(),
             region_signatures: BTreeMap::new(),
             organisms: BTreeMap::new(),
-            organism_keys: BTreeMap::new(),
+            authoritative_organism_keys: BTreeMap::new(),
+            presentation_organism_keys: BTreeMap::new(),
             preserve_contributors: BTreeMap::new(),
             revision_bumps: [0; LAYER_COUNT as usize],
             results_tx,
@@ -596,9 +608,16 @@ impl RegionMap {
         &self.roster_cache
     }
 
-    /// All realized near-field organisms in the window (phase-3-plan.md §8.3).
+    /// All realized near-field organisms in the window, including additive
+    /// presentation slots (phase-3-plan.md §8.3; ADR 0024).
     pub fn organisms(&self) -> impl Iterator<Item = &Organism> {
         self.organisms.values().flatten()
+    }
+
+    /// Canonical slot-0 organisms available to gameplay in deterministic
+    /// region/vector order (ADR 0024).
+    pub fn authoritative_organisms(&self) -> impl Iterator<Item = &Organism> {
+        self.organisms().filter(|organism| organism.slot == 0)
     }
 
     /// A pinned near region's realized organisms, if any.
@@ -608,11 +627,42 @@ impl RegionMap {
         self.organisms.get(&coord).map(Vec::as_slice)
     }
 
+    /// Canonical slot-0 organisms for one region. The iterator may be empty for
+    /// a completed barren realization.
+    pub fn authoritative_organisms_in(
+        &self,
+        coord: RegionCoord,
+    ) -> impl Iterator<Item = &Organism> {
+        self.organisms
+            .get(&coord)
+            .into_iter()
+            .flatten()
+            .filter(|organism| organism.slot == 0)
+    }
+
     /// Total near-field organisms currently resident.
     #[inline]
     #[must_use]
     pub fn organism_count(&self) -> usize {
         self.organisms.values().map(Vec::len).sum()
+    }
+
+    /// Whether every field-active region in the current near window has a
+    /// fresh, roster-complete canonical slot-0 publication. This is a settling
+    /// observation for harnesses and session restore; it does not advance work
+    /// or require optional visual-density expansion (ADR 0024).
+    #[must_use]
+    pub fn authoritative_realization_complete(&self, player: (f64, f64)) -> bool {
+        self.near_realization_coords(player)
+            .into_iter()
+            .all(|coord| {
+                let Some(hash) = self.fresh_ecology_hash(coord) else {
+                    return false;
+                };
+                self.realization_rosters_complete(coord)
+                    && self.organisms.contains_key(&coord)
+                    && self.authoritative_organism_keys.get(&coord) == Some(&hash)
+            })
     }
 
     /// Classify a cell's habitat signature from its settled biome/climate/soil
@@ -687,7 +737,7 @@ impl RegionMap {
     /// [`Anchor`](world_core::Anchor) (phase-4-plan.md §4.2, §7.1). The runtime
     /// gatherer for the pure `world-core` capture math: it reads the covering
     /// region's `current` possibility vector (the habitat baseline), the nearest
-    /// realized organism (for an organism capture) or the terrain/hydrology/
+    /// authoritative slot-0 organism (for an organism capture) or the terrain/hydrology/
     /// climate channels (for an environmental capture), builds a bounded
     /// [`TraitDeviation`](world_core::TraitDeviation), and calls
     /// [`capture_target`](world_core::capture_target). `None` if nothing
@@ -731,8 +781,9 @@ impl RegionMap {
         let mut deviation = TraitDeviation::zero();
         let mut organism_species = None;
 
-        // Organism capture: the nearest realized organism drives the M/B/A/E
-        // deviation (§7.1). Its genome is reconstructed from its species id
+        // Organism capture: the nearest authoritative slot-0 organism drives
+        // the M/B/A/E deviation (§7.1; ADR 0024). Its genome is reconstructed
+        // from its species id
         // (`Genome::from_seed`, the same derivation realization used).
         if category_mask & organism_mask != 0 {
             if let Some(org) = self.nearest_organism(coord, world_pos) {
@@ -809,15 +860,15 @@ impl RegionMap {
         })
     }
 
-    /// The realized organism nearest a world position within its region, if any
-    /// are resident there (the near window only).
+    /// The authoritative slot-0 organism nearest a world position within its
+    /// region, if any are resident there (the near window only).
     fn nearest_organism(&self, coord: RegionCoord, world_pos: (f64, f64)) -> Option<&Organism> {
         let dist2 = |p: (f64, f64)| {
             let dx = p.0 - world_pos.0;
             let dy = p.1 - world_pos.1;
             dx * dx + dy * dy
         };
-        self.organisms.get(&coord)?.iter().min_by(|a, b| {
+        self.authoritative_organisms_in(coord).min_by(|a, b| {
             dist2(a.world_pos)
                 .partial_cmp(&dist2(b.world_pos))
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -826,17 +877,13 @@ impl RegionMap {
 
     /// Build the transient resonance graph at the player and its gate strength
     /// (phase-4-plan.md §7.5). A pure read of the settled near-window caches:
-    /// the realized organisms within `near_radius` become nodes (nearest-first,
-    /// capped at `max_resonance_nodes`), and their count/diversity/distance,
+    /// canonical slot-0 organisms within `near_radius` become nodes
+    /// (nearest-first, capped at [`MAX_RESONANCE_NODES`]), and their
+    /// count/diversity/distance,
     /// the local anchor compatibility, and a canopy occlusion proxy combine into
     /// a bounded `strength`. Order-independent and deterministic; never stored.
     #[must_use]
-    pub fn resonance_at(
-        &self,
-        player: (f64, f64),
-        anchors: &[Anchor],
-        budget: &Budget,
-    ) -> Resonance {
+    pub fn resonance_at(&self, player: (f64, f64), anchors: &[Anchor]) -> Resonance {
         let radius = self.cfg.near_radius;
         if radius <= 0.0 {
             return Resonance::empty();
@@ -844,7 +891,7 @@ impl RegionMap {
         let radius2 = radius * radius;
         // Collect near organisms with their squared distance for a stable sort.
         let mut candidates: Vec<(u64, ResonanceNode)> = Vec::new();
-        for org in self.organisms() {
+        for org in self.authoritative_organisms() {
             let dx = org.world_pos.0 - player.0;
             let dy = org.world_pos.1 - player.1;
             let d2 = dx * dx + dy * dy;
@@ -867,7 +914,7 @@ impl RegionMap {
                 .then_with(|| a.1.world_pos.0.to_bits().cmp(&b.1.world_pos.0.to_bits()))
                 .then_with(|| a.1.world_pos.1.to_bits().cmp(&b.1.world_pos.1.to_bits()))
         });
-        candidates.truncate(budget.max_resonance_nodes);
+        candidates.truncate(MAX_RESONANCE_NODES);
         let nodes: Vec<ResonanceNode> = candidates.into_iter().map(|(_, n)| n).collect();
         if nodes.is_empty() {
             return Resonance::empty();
@@ -1206,6 +1253,11 @@ impl RegionMap {
     /// possibility state (ADRs 0008 and 0023). Loading is not an event: nothing
     /// converges and no target moves beyond what the live run would compute.
     pub fn restore_region(&mut self, snap: &world_core::RegionSnapshotRecord) {
+        if self.regions.contains_key(&snap.coord) {
+            self.park_region_fields(snap.coord, &mut FrameStats::default());
+        } else {
+            self.retire_organisms(snap.coord);
+        }
         let mut region = RegionState::new(snap.coord);
         region.current = PossibilityVector { dims: snap.current };
         region.target = region.current;
@@ -1228,6 +1280,12 @@ impl RegionMap {
             region.dirty_layers |= mask;
             if Self::field_active(region) && region.status == GenerationStatus::Ready {
                 region.status = GenerationStatus::Generating;
+            }
+        }
+        if mask & layer_bit(LAYER_ECOLOGY) != 0 {
+            let coords: Vec<_> = self.organisms.keys().copied().collect();
+            for coord in coords {
+                self.retire_organisms(coord);
             }
         }
         // Every in-flight job of an invalidated layer — macro drainage
@@ -1289,11 +1347,16 @@ impl RegionMap {
         timings.time(Pass::Retarget, || {
             self.retarget(player, field, anchors, bias, budget, &mut stats);
         });
-        // Resonance is a pure read of the settled near-window caches, computed
-        // between retarget and converge so the rate sees the current frame's
-        // gate (phase-4-plan.md §8.2). It reads the previous frame's realized
-        // organisms — a transient one-frame view, never stored.
-        let resonance = self.resonance_at(player, anchors, budget);
+        // Publish at most one nearest fresh canonical slot-0 region before any
+        // gameplay read. This fixed semantic pass is independent of visual
+        // density and resource budgets (ADR 0024).
+        timings.time(Pass::Realize, || {
+            self.realize_authoritative_near_window(player, &mut stats);
+        });
+        // Resonance is a pure read of the current canonical near-window view,
+        // computed between retarget and converge so the rate sees this frame's
+        // gate (phase-4-plan.md §8.2; ADR 0024).
+        let resonance = self.resonance_at(player, anchors);
         let transition_scale = if transition_mode {
             TRANSITION_CONVERGE_SCALE
         } else {
@@ -1319,11 +1382,12 @@ impl RegionMap {
         // job dispatched above; integrating again here keeps the headless
         // replay settled within a single frame.
         timings.time(Pass::Integrate, || self.integrate_finished(&mut stats));
-        // Near-field realization: a pure read of the settled caches over the
-        // pinned near window only (phase-3-plan.md §8.3), run after dispatch
-        // settles so it never sees a stale L8 tile.
+        // Expand already-canonical regions to the tier's optional visual
+        // density after integration. A newly ready L8 waits until next frame's
+        // fixed authoritative pass, so presentation capacity cannot accelerate
+        // gameplay availability (ADR 0024).
         timings.time(Pass::Realize, || {
-            self.realize_near_window(player, budget, &mut stats);
+            self.expand_visual_near_window(player, budget, &mut stats);
         });
         stats.pass_ms = timings.ms;
         stats.active_regions = self.regions.len();
@@ -1682,7 +1746,8 @@ impl RegionMap {
                 self.organism_pool.push(organisms);
             }
         }
-        self.organism_keys.remove(&coord);
+        self.authoritative_organism_keys.remove(&coord);
+        self.presentation_organism_keys.remove(&coord);
     }
 
     /// Sweep dependent-tracked caches against field-active consumers. Parked
@@ -2389,116 +2454,173 @@ impl RegionMap {
         Some(Arc::new(snapshot))
     }
 
-    /// The near-field realization pass (phase-3-plan.md §8.3): (re)build the
-    /// organism list of each pinned near region whose L8 tile and complete
-    /// resident roster set are fresh, drop lists of regions that left the near
-    /// window, and cap per-frame organism instantiation by whole regions. A
-    /// pure read of the settled caches — it never mutates tiles and never
-    /// enters the results channel.
-    ///
-    /// Re-realization is keyed on a region's L8 dependency hash: an organism
-    /// list is rebuilt exactly when the aggregate it was sampled from changes
-    /// (distance-based regeneration, §7.6), and is otherwise reused untouched,
-    /// so a pinned region's organism ids hold still across frames.
-    fn realize_near_window(&mut self, player: (f64, f64), budget: &Budget, stats: &mut FrameStats) {
-        let near_radius = self.cfg.near_radius;
-        let near: BTreeSet<RegionCoord> = self
-            .regions
+    /// Field-active regions in the near window, in coordinate order.
+    fn near_realization_coords(&self, player: (f64, f64)) -> BTreeSet<RegionCoord> {
+        self.regions
             .iter()
             .filter(|(_, region)| Self::field_active(region))
             .map(|(&coord, _)| coord)
-            .filter(|&coord| center_distance(coord, player) <= near_radius)
-            .collect();
-        // Offscreen replacement: discard organisms of regions no longer near
-        // (their vectors recycle through the pool, phase-6-plan.md §4.2).
-        let stale: Vec<RegionCoord> = self
-            .organisms
-            .keys()
-            .filter(|c| !near.contains(c))
-            .copied()
+            .filter(|&coord| center_distance(coord, player) <= self.cfg.near_radius)
+            .collect()
+    }
+
+    /// A region's current, recursively fresh Ecology key. Any dirty hint,
+    /// pending job, missing tile, or key mismatch makes it unavailable.
+    fn fresh_ecology_hash(&self, coord: RegionCoord) -> Option<u64> {
+        let region = self.regions.get(&coord)?;
+        let stored = self.cache.get(coord)?.layer_hash(LAYER_ECOLOGY)?;
+        if region.dirty_layers & layer_bit(LAYER_ECOLOGY) != 0
+            || self.in_flight.contains_key(&(coord, LAYER_ECOLOGY))
+            || self.expected_layer_hash(coord, LAYER_ECOLOGY) != Some(stored)
+        {
+            return None;
+        }
+        Some(stored)
+    }
+
+    fn realization_rosters_complete(&self, coord: RegionCoord) -> bool {
+        self.region_signatures
+            .get(&coord)
+            .is_some_and(|signatures| {
+                signatures
+                    .iter()
+                    .all(|&signature| self.roster_cache.get(signature).is_some())
+            })
+    }
+
+    /// Retire offscreen or stale presentation vectors and both currency keys
+    /// before any gameplay read. Empty vectors count as valid completed
+    /// realizations when their two keys are current (ADR 0024).
+    fn retire_invalid_realizations(&mut self, near: &BTreeSet<RegionCoord>) {
+        let mut tracked: BTreeSet<RegionCoord> = self.organisms.keys().copied().collect();
+        tracked.extend(self.authoritative_organism_keys.keys().copied());
+        tracked.extend(self.presentation_organism_keys.keys().copied());
+        let stale: Vec<_> = tracked
+            .into_iter()
+            .filter(|&coord| {
+                if !near.contains(&coord) || !self.organisms.contains_key(&coord) {
+                    return true;
+                }
+                let Some(hash) = self.fresh_ecology_hash(coord) else {
+                    return true;
+                };
+                !self.realization_rosters_complete(coord)
+                    || self.authoritative_organism_keys.get(&coord) != Some(&hash)
+                    || self
+                        .presentation_organism_keys
+                        .get(&coord)
+                        .is_none_or(|&(presentation_hash, _)| presentation_hash != hash)
+            })
             .collect();
         for coord in stale {
-            if let Some(mut organisms) = self.organisms.remove(&coord) {
-                organisms.clear();
-                if self.organism_pool.len() < 256 {
-                    self.organism_pool.push(organisms);
-                }
+            self.retire_organisms(coord);
+        }
+    }
+
+    fn realization_order(
+        near: &BTreeSet<RegionCoord>,
+        player: (f64, f64),
+    ) -> Vec<(u64, RegionCoord)> {
+        let mut order: Vec<_> = near
+            .iter()
+            .map(|&coord| (center_distance(coord, player).to_bits(), coord))
+            .collect();
+        order.sort_unstable();
+        order
+    }
+
+    fn realize_slots(&mut self, coord: RegionCoord, slots: u16) -> Vec<Organism> {
+        let region = &self.regions[&coord];
+        let bias = GenomeBias {
+            morphology: region.current.get(PossibilityDomain::Morphology),
+            behavior: region.current.get(PossibilityDomain::Behavior),
+            aesthetics: region.current.get(PossibilityDomain::Aesthetics),
+        };
+        let revision = region.revision;
+        let mut organisms = self.organism_pool.pop().unwrap_or_default();
+        realize_region_into(
+            coord,
+            self.cache.get(coord).expect("fresh ecology implies tiles"),
+            &self.roster_cache,
+            bias,
+            revision,
+            self.cfg.field_resolution,
+            slots,
+            &mut organisms,
+        );
+        organisms
+    }
+
+    fn publish_organisms(&mut self, coord: RegionCoord, organisms: Vec<Organism>) {
+        if let Some(mut old) = self.organisms.insert(coord, organisms) {
+            old.clear();
+            if self.organism_pool.len() < 256 {
+                self.organism_pool.push(old);
             }
         }
-        self.organism_keys.retain(|c, _| near.contains(c));
+    }
 
-        // Nearest-first, deterministic order.
-        let mut order: Vec<(u64, RegionCoord)> = near
-            .iter()
-            .map(|&c| (center_distance(c, player).to_bits(), c))
-            .collect();
-        order.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
-
-        let resolution = self.cfg.field_resolution;
-        for (_, coord) in order {
-            // L8 must be fresh: present, dirty bit clear, no job in flight.
-            let Some(l8_hash) = self
-                .cache
-                .get(coord)
-                .and_then(|t| t.layer_hash(LAYER_ECOLOGY))
-            else {
+    /// Fixed semantic realization pass: publish slot 0 for at most one nearest
+    /// eligible whole region before capture/resonance can read it. Resource
+    /// tiers and temporal budgets cannot change this admission (ADR 0024).
+    fn realize_authoritative_near_window(&mut self, player: (f64, f64), stats: &mut FrameStats) {
+        let near = self.near_realization_coords(player);
+        self.retire_invalid_realizations(&near);
+        for (_, coord) in Self::realization_order(&near, player) {
+            let Some(l8_hash) = self.fresh_ecology_hash(coord) else {
                 continue;
             };
-            let region = &self.regions[&coord];
-            if region.dirty_layers & layer_bit(LAYER_ECOLOGY) != 0
-                || self.in_flight.contains_key(&(coord, LAYER_ECOLOGY))
-                || self.expected_layer_hash(coord, LAYER_ECOLOGY) != Some(l8_hash)
-            {
+            if self.authoritative_organism_keys.get(&coord) == Some(&l8_hash) {
                 continue;
             }
-            if self.organism_keys.get(&coord) == Some(&l8_hash) {
-                continue; // organisms already reflect the current aggregate
+            if !self.realization_rosters_complete(coord) {
+                continue;
+            }
+            let organisms = self.realize_slots(coord, 1);
+            stats.authoritative_organisms_realized += organisms.len();
+            self.publish_organisms(coord, organisms);
+            self.authoritative_organism_keys.insert(coord, l8_hash);
+            self.presentation_organism_keys.insert(coord, (l8_hash, 1));
+            break;
+        }
+        stats.organisms = self.organism_count();
+    }
+
+    /// Budgeted visual expansion pass. Only a current canonical vector may be
+    /// replaced by the full tier density, and slot 0 is recomputed through the
+    /// identical pure realization path (ADR 0024).
+    fn expand_visual_near_window(
+        &mut self,
+        player: (f64, f64),
+        budget: &Budget,
+        stats: &mut FrameStats,
+    ) {
+        let near = self.near_realization_coords(player);
+        self.retire_invalid_realizations(&near);
+        let target_slots = self.cfg.organisms_per_cell.max(1);
+        for (_, coord) in Self::realization_order(&near, player) {
+            let Some(l8_hash) = self.fresh_ecology_hash(coord) else {
+                continue;
+            };
+            if self.authoritative_organism_keys.get(&coord) != Some(&l8_hash) {
+                continue;
+            }
+            if self.presentation_organism_keys.get(&coord) == Some(&(l8_hash, target_slots)) {
+                continue;
             }
             if stats.organisms_realized >= budget.max_realize_organisms {
-                break; // defer the rest to a later frame (§8.4)
+                break;
             }
-            let Some(signatures) = self.region_signatures.get(&coord) else {
-                continue;
-            };
-            if signatures
-                .iter()
-                .any(|&signature| self.roster_cache.get(signature).is_none())
-            {
-                // Fail closed: preserve the old organism vector and key. The
-                // next capacity pass repairs the required roster set, after
-                // which ordinary realization retries (ADR 0019).
+            if !self.realization_rosters_complete(coord) {
                 continue;
             }
-            let bias = GenomeBias {
-                morphology: region.current.get(PossibilityDomain::Morphology),
-                behavior: region.current.get(PossibilityDomain::Behavior),
-                aesthetics: region.current.get(PossibilityDomain::Aesthetics),
-            };
-            let revision = region.revision;
-            let mut organisms = self.organism_pool.pop().unwrap_or_default();
-            {
-                let tiles = self.cache.get(coord).expect("l8 hash implies tiles");
-                realize_region_into(
-                    coord,
-                    tiles,
-                    &self.roster_cache,
-                    bias,
-                    revision,
-                    resolution,
-                    self.cfg.organisms_per_cell,
-                    &mut organisms,
-                );
-            }
+            let organisms = self.realize_slots(coord, target_slots);
             stats.organisms_realized += organisms.len();
-            if let Some(mut old) = self.organisms.insert(coord, organisms) {
-                old.clear();
-                if self.organism_pool.len() < 256 {
-                    self.organism_pool.push(old);
-                }
-            }
-            self.organism_keys.insert(coord, l8_hash);
+            self.publish_organisms(coord, organisms);
+            self.presentation_organism_keys
+                .insert(coord, (l8_hash, target_slots));
         }
-        stats.organisms = self.organisms.values().map(Vec::len).sum();
+        stats.organisms = self.organism_count();
     }
 
     /// Snapshot a layer's inputs and submit its generation job. Clears the
@@ -2778,7 +2900,7 @@ mod preserve_tests {
         let old_revision = map.get(coord()).unwrap().revision;
         let old_tiles = tile_keys(&map);
         let old_organisms = map.organisms_in(coord()).unwrap().to_vec();
-        let old_key = map.organism_keys[&coord()];
+        let old_key = map.authoritative_organism_keys[&coord()];
 
         // A same-bucket normalization must not retire unrelated work.
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2802,14 +2924,15 @@ mod preserve_tests {
         assert!(map.in_flight.contains_key(&(coord(), LAYER_ECOLOGY)));
         assert!(!cancel.load(Ordering::Relaxed));
         assert!(map.organisms_in(coord()).is_none());
-        assert!(!map.organism_keys.contains_key(&coord()));
+        assert!(!map.authoritative_organism_keys.contains_key(&coord()));
+        assert!(!map.presentation_organism_keys.contains_key(&coord()));
 
         // Remove the synthetic job; normal realization can now rebuild from
         // the unchanged fresh L8 key using the incremented revision.
         map.in_flight.remove(&(coord(), LAYER_ECOLOGY));
         settle(&mut map);
         assert_eq!(tile_keys(&map), old_tiles);
-        assert_eq!(map.organism_keys[&coord()], old_key);
+        assert_eq!(map.authoritative_organism_keys[&coord()], old_key);
         let new_organisms = map.organisms_in(coord()).unwrap();
         assert!(!new_organisms.is_empty());
         assert_ne!(new_organisms, old_organisms);
@@ -2911,7 +3034,7 @@ mod preserve_tests {
         // A non-winning deletion is completely inert outside bookkeeping.
         let before_nonwinner = map.get(coord()).unwrap().clone();
         let before_tiles = tile_keys(&map);
-        let before_key = map.organism_keys[&coord()];
+        let before_key = map.authoritative_organism_keys[&coord()];
         let before_organisms = map.organisms_in(coord()).unwrap().to_vec();
         assert!(map.remove_preserve_contribution(20, coord()));
         assert_eq!(map.effective_preserve(coord()), Some((10, low_signature)));
@@ -2922,7 +3045,7 @@ mod preserve_tests {
         assert_eq!(after_nonwinner.dirty_layers, before_nonwinner.dirty_layers);
         assert_eq!(after_nonwinner.status, before_nonwinner.status);
         assert_eq!(tile_keys(&map), before_tiles);
-        assert_eq!(map.organism_keys[&coord()], before_key);
+        assert_eq!(map.authoritative_organism_keys[&coord()], before_key);
         assert_eq!(map.organisms_in(coord()).unwrap(), before_organisms);
 
         // Re-add then reveal the successor. Its changed Aesthetics bucket
@@ -2941,14 +3064,15 @@ mod preserve_tests {
         assert_eq!(changed.dirty_layers, expected_dirty);
         assert_eq!(changed.status, GenerationStatus::Generating);
         assert!(map.organisms_in(coord()).is_none());
-        assert!(!map.organism_keys.contains_key(&coord()));
+        assert!(!map.authoritative_organism_keys.contains_key(&coord()));
+        assert!(!map.presentation_organism_keys.contains_key(&coord()));
         settle(&mut map);
 
         // Final deletion is a no-snap release: all resident derived state is
         // byte-for-byte untouched until a future travel-fueled convergence.
         let before_final = map.get(coord()).unwrap().clone();
         let before_final_tiles = tile_keys(&map);
-        let before_final_key = map.organism_keys[&coord()];
+        let before_final_key = map.authoritative_organism_keys[&coord()];
         let before_final_organisms = map.organisms_in(coord()).unwrap().to_vec();
         assert!(map.remove_preserve_contribution(20, coord()));
         assert_eq!(map.effective_preserve(coord()), None);
@@ -2960,7 +3084,7 @@ mod preserve_tests {
         assert_eq!(after_final.dirty_layers, before_final.dirty_layers);
         assert_eq!(after_final.status, before_final.status);
         assert_eq!(tile_keys(&map), before_final_tiles);
-        assert_eq!(map.organism_keys[&coord()], before_final_key);
+        assert_eq!(map.authoritative_organism_keys[&coord()], before_final_key);
         assert_eq!(map.organisms_in(coord()).unwrap(), before_final_organisms);
     }
 
@@ -2972,7 +3096,7 @@ mod preserve_tests {
         settle(&mut map);
         let before = map.get(coord()).unwrap().clone();
         let before_tiles = tile_keys(&map);
-        let before_key = map.organism_keys[&coord()];
+        let before_key = map.authoritative_organism_keys[&coord()];
         let before_organisms = map.organisms_in(coord()).unwrap().to_vec();
 
         map.apply_preserve_contribution(10, coord(), signature);
@@ -2984,7 +3108,7 @@ mod preserve_tests {
         assert_eq!(after.dirty_layers, before.dirty_layers);
         assert_eq!(after.status, before.status);
         assert_eq!(tile_keys(&map), before_tiles);
-        assert_eq!(map.organism_keys[&coord()], before_key);
+        assert_eq!(map.authoritative_organism_keys[&coord()], before_key);
         assert_eq!(map.organisms_in(coord()).unwrap(), before_organisms);
     }
 
@@ -3427,8 +3551,40 @@ mod recovery_tests {
     fn settled_map() -> RegionMap {
         let mut map = RegionMap::new(tiny_config());
         settle_inline(&mut map);
+        // Canonical publication intentionally follows prerequisite readiness
+        // on the next frame (ADR 0024).
+        map.update(
+            PLAYER,
+            0.0,
+            &field(),
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
         assert_eq!(map.regions.len(), 1, "fixture must load one region only");
         map
+    }
+
+    fn differing_extra_probe(map: &RegionMap, minimum_slot: u16) -> (Organism, Organism) {
+        map.organisms()
+            .filter(|organism| organism.slot >= minimum_slot)
+            .find_map(|extra| {
+                let coord = RegionCoord::from_world(extra.world_pos.0, extra.world_pos.1);
+                let distance2 = |organism: &Organism| {
+                    let dx = organism.world_pos.0 - extra.world_pos.0;
+                    let dy = organism.world_pos.1 - extra.world_pos.1;
+                    dx * dx + dy * dy
+                };
+                let canonical = map.authoritative_organisms_in(coord).min_by(|a, b| {
+                    distance2(a)
+                        .partial_cmp(&distance2(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })?;
+                (canonical.species != extra.species).then_some((*extra, *canonical))
+            })
+            .expect("extra-slot probe must differ from its nearest canonical species")
     }
 
     fn assert_fully_settled(map: &RegionMap) {
@@ -3869,7 +4025,20 @@ mod recovery_tests {
 
     #[test]
     fn realization_fails_closed_until_required_rosters_are_rebuilt() {
-        let mut map = settled_map();
+        let mut config = tiny_config();
+        config.field_resolution = 16;
+        let mut map = RegionMap::new(config);
+        settle_inline(&mut map);
+        map.update(
+            PLAYER,
+            0.0,
+            &field(),
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
         let old_organisms = map
             .organisms
             .get(&coord())
@@ -3879,28 +4048,22 @@ mod recovery_tests {
             !old_organisms.is_empty(),
             "four realization slots should make the fixture non-vacuous"
         );
-        let old_key = map.organism_keys[&coord()];
-
-        // Land a new L8 key without running capacity maintenance or the
-        // realization pass. This leaves a real old organism vector/key that a
-        // retry is expected to replace.
-        map.bump_layer_revision(LAYER_ECOLOGY);
-        let mut generation_stats = FrameStats::default();
-        map.dispatch_regen(
-            PLAYER,
-            &field(),
-            &Budget::unlimited(),
-            &InlineExecutor,
-            &mut generation_stats,
-        );
-        let new_key = map
-            .cache
-            .get(coord())
-            .and_then(|tiles| tiles.layer_hash(LAYER_ECOLOGY))
-            .expect("new ecology output");
-        assert_ne!(new_key, old_key);
-        assert_eq!(map.organism_keys[&coord()], old_key);
-        assert_eq!(map.organisms[&coord()], old_organisms);
+        let old_canonical: Vec<_> = old_organisms
+            .iter()
+            .copied()
+            .filter(|organism| organism.slot == 0)
+            .collect();
+        assert!(!old_canonical.is_empty(), "canonical fixture population");
+        let old_key = map.authoritative_organism_keys[&coord()];
+        let other_realizations: Vec<_> = map
+            .organisms
+            .keys()
+            .copied()
+            .filter(|&candidate| candidate != coord())
+            .collect();
+        for candidate in other_realizations {
+            map.retire_organisms(candidate);
+        }
 
         let required = map
             .region_signatures
@@ -3922,17 +4085,33 @@ mod recovery_tests {
             })
             .collect();
 
-        // Simulate legacy capacity behavior: all entries disappear, but the
-        // resident Ecology dependent set remains authoritative.
+        // Losing a roster underneath a current-key vector fails closed before
+        // resonance/capture: the vector and both currencies retire together.
         map.roster_cache = RosterCache::default();
         assert!(map.roster_cache.is_empty());
         assert_eq!(map.region_signatures[&coord()], required);
 
         let mut failed_stats = FrameStats::default();
-        map.realize_near_window(PLAYER, &Budget::unlimited(), &mut failed_stats);
+        map.realize_authoritative_near_window(PLAYER, &mut failed_stats);
+        assert_eq!(failed_stats.authoritative_organisms_realized, 0);
         assert_eq!(failed_stats.organisms_realized, 0);
-        assert_eq!(map.organism_keys[&coord()], old_key);
-        assert_eq!(map.organisms[&coord()], old_organisms);
+        assert!(!map.organisms.contains_key(&coord()));
+        assert!(!map.authoritative_organism_keys.contains_key(&coord()));
+        assert!(!map.presentation_organism_keys.contains_key(&coord()));
+        assert!(map
+            .nearest_organism(coord(), old_canonical[0].world_pos)
+            .is_none());
+        assert!(map.resonance_at(PLAYER, &[]).nodes.is_empty());
+        let capture = map
+            .capture_at(
+                old_canonical[0].world_pos,
+                1 << PossibilityDomain::Morphology.index(),
+                AnchorKind::Emphasize,
+                1.0,
+                REGION_SIZE,
+            )
+            .expect("resident region remains environmentally capturable");
+        assert!(!matches!(capture.source, AnchorSource::Organism { .. }));
 
         let protected = map.maintain_roster_working_set();
         assert_eq!(protected, required);
@@ -3948,13 +4127,295 @@ mod recovery_tests {
         }
 
         let mut retry_stats = FrameStats::default();
-        map.realize_near_window(PLAYER, &Budget::unlimited(), &mut retry_stats);
-        assert_eq!(map.organism_keys[&coord()], new_key);
+        map.realize_authoritative_near_window(PLAYER, &mut retry_stats);
+        assert_eq!(map.authoritative_organism_keys[&coord()], old_key);
         assert_eq!(
-            map.organisms[&coord()],
-            old_organisms,
+            map.authoritative_organisms_in(coord())
+                .copied()
+                .collect::<Vec<_>>(),
+            old_canonical,
             "same inputs and exact roster rebuild must realize identically"
         );
+        let mut expansion_stats = FrameStats::default();
+        map.expand_visual_near_window(PLAYER, &Budget::unlimited(), &mut expansion_stats);
+        assert_eq!(map.organisms[&coord()], old_organisms);
+
+        // Revision invalidation also retires authority synchronously. A newly
+        // landed L8 cannot republish while its replacement rosters are absent.
+        map.bump_layer_revision(LAYER_ECOLOGY);
+        assert!(!map.organisms.contains_key(&coord()));
+        assert!(!map.authoritative_organism_keys.contains_key(&coord()));
+        assert!(!map.presentation_organism_keys.contains_key(&coord()));
+        assert!(map.resonance_at(PLAYER, &[]).nodes.is_empty());
+
+        let mut generation_stats = FrameStats::default();
+        map.dispatch_regen(
+            PLAYER,
+            &field(),
+            &Budget::unlimited(),
+            &InlineExecutor,
+            &mut generation_stats,
+        );
+        let new_key = map
+            .cache
+            .get(coord())
+            .and_then(|tiles| tiles.layer_hash(LAYER_ECOLOGY))
+            .expect("new ecology output");
+        assert_ne!(new_key, old_key);
+        let new_required = map
+            .region_signatures
+            .get(&coord())
+            .expect("replacement ecology signatures")
+            .clone();
+        map.roster_cache = RosterCache::default();
+        let mut blocked_stats = FrameStats::default();
+        map.realize_authoritative_near_window(PLAYER, &mut blocked_stats);
+        assert!(!map.organisms.contains_key(&coord()));
+        assert!(map.resonance_at(PLAYER, &[]).nodes.is_empty());
+
+        assert_eq!(map.maintain_roster_working_set(), new_required);
+        let mut repaired_stats = FrameStats::default();
+        map.realize_authoritative_near_window(PLAYER, &mut repaired_stats);
+        assert_eq!(map.authoritative_organism_keys[&coord()], new_key);
+        assert_eq!(
+            map.authoritative_organisms_in(coord())
+                .copied()
+                .collect::<Vec<_>>(),
+            old_canonical,
+            "algorithm revision changes provenance, not realization math"
+        );
+    }
+
+    #[test]
+    fn canonical_admission_is_fixed_while_visual_expansion_obeys_budget() {
+        let mut config = tiny_config();
+        config.field_resolution = 16;
+        let mut blocked = RegionMap::new(config);
+        let mut expanded = RegionMap::new(config);
+        let no_visual = Budget {
+            max_realize_organisms: 0,
+            ..Budget::unlimited()
+        };
+
+        // First frame settles prerequisites after the pre-resonance canonical
+        // pass, so neither map can publish early through visual capacity.
+        for (map, budget) in [
+            (&mut blocked, &no_visual),
+            (&mut expanded, &Budget::unlimited()),
+        ] {
+            let stats = map.update(
+                PLAYER,
+                0.0,
+                &field(),
+                &[],
+                &NO_BIAS,
+                budget,
+                &InlineExecutor,
+                false,
+            );
+            assert_eq!(stats.authoritative_organisms_realized, 0);
+            assert!(map.authoritative_organism_keys.is_empty());
+        }
+
+        let blocked_stats = blocked.update(
+            PLAYER,
+            0.0,
+            &field(),
+            &[],
+            &NO_BIAS,
+            &no_visual,
+            &InlineExecutor,
+            false,
+        );
+        let expanded_stats = expanded.update(
+            PLAYER,
+            0.0,
+            &field(),
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        assert_eq!(
+            blocked_stats.authoritative_organisms_realized,
+            expanded_stats.authoritative_organisms_realized
+        );
+        assert_eq!(blocked_stats.organisms_realized, 0);
+        assert!(expanded_stats.organisms_realized > 0);
+        assert_eq!(
+            blocked.authoritative_organism_keys,
+            expanded.authoritative_organism_keys
+        );
+        assert_eq!(
+            blocked
+                .authoritative_organisms()
+                .copied()
+                .collect::<Vec<_>>(),
+            expanded
+                .authoritative_organisms()
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        assert!(expanded.organism_count() > blocked.organism_count());
+        assert_eq!(
+            blocked_stats.resonance_strength.to_bits(),
+            expanded_stats.resonance_strength.to_bits()
+        );
+        let (extra, canonical) = differing_extra_probe(&expanded, 2);
+        let mask = domain_mask(&[
+            PossibilityDomain::Morphology,
+            PossibilityDomain::Behavior,
+            PossibilityDomain::Aesthetics,
+            PossibilityDomain::Ecology,
+        ]);
+        let blocked_capture = blocked
+            .capture_at(
+                extra.world_pos,
+                mask,
+                AnchorKind::Emphasize,
+                0.8,
+                REGION_SIZE,
+            )
+            .expect("canonical capture under visual backpressure");
+        let expanded_capture = expanded
+            .capture_at(
+                extra.world_pos,
+                mask,
+                AnchorKind::Emphasize,
+                0.8,
+                REGION_SIZE,
+            )
+            .expect("canonical capture after visual expansion");
+        assert_eq!(blocked_capture, expanded_capture);
+        assert!(matches!(
+            blocked_capture.source,
+            AnchorSource::Organism { species } if species == canonical.species
+        ));
+        assert_ne!(extra.species, canonical.species);
+    }
+
+    #[test]
+    fn density_changes_only_presentation_not_capture_or_resonance() {
+        let settled_density = |slots| {
+            let mut config = tiny_config();
+            config.field_resolution = 24;
+            config.organisms_per_cell = slots;
+            let mut map = RegionMap::new(config);
+            settle_inline(&mut map);
+            map.update(
+                PLAYER,
+                0.0,
+                &field(),
+                &[],
+                &NO_BIAS,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+            map
+        };
+        let one = settled_density(1);
+        let four = settled_density(4);
+        assert_eq!(
+            one.authoritative_organisms().copied().collect::<Vec<_>>(),
+            four.authoritative_organisms().copied().collect::<Vec<_>>()
+        );
+        assert!(four.organism_count() > one.organism_count());
+
+        let (extra, canonical) = differing_extra_probe(&four, 2);
+        let mask = domain_mask(&[
+            PossibilityDomain::Morphology,
+            PossibilityDomain::Behavior,
+            PossibilityDomain::Aesthetics,
+            PossibilityDomain::Ecology,
+        ]);
+        let low_capture = one
+            .capture_at(
+                extra.world_pos,
+                mask,
+                AnchorKind::Emphasize,
+                0.8,
+                REGION_SIZE,
+            )
+            .expect("density-one canonical capture");
+        let high_capture = four
+            .capture_at(
+                extra.world_pos,
+                mask,
+                AnchorKind::Emphasize,
+                0.8,
+                REGION_SIZE,
+            )
+            .expect("density-four canonical capture");
+        assert_eq!(low_capture, high_capture);
+        assert!(matches!(
+            high_capture.source,
+            AnchorSource::Organism { species } if species == canonical.species
+        ));
+        assert_ne!(extra.species, canonical.species);
+
+        let low = one.resonance_at(PLAYER, &[]);
+        let high = four.resonance_at(PLAYER, &[]);
+        assert_eq!(low.strength.to_bits(), high.strength.to_bits());
+        assert_eq!(
+            low.anchor_compatibility.to_bits(),
+            high.anchor_compatibility.to_bits()
+        );
+        assert_eq!(low.nodes, high.nodes);
+    }
+
+    #[test]
+    fn canonical_resonance_uses_the_fixed_semantic_ceiling() {
+        let mut config = tiny_config();
+        config.field_resolution = 32;
+        config.organisms_per_cell = 4;
+        config.near_radius = 0.75 * REGION_SIZE;
+        config.far_radius = 0.9 * REGION_SIZE;
+        config.load_radius = 0.8 * REGION_SIZE;
+        config.unload_radius = 1.1 * REGION_SIZE;
+        let mut map = RegionMap::new(config);
+        settle_inline(&mut map);
+        map.update(
+            PLAYER,
+            0.0,
+            &field(),
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        let radius2 = map.config().near_radius * map.config().near_radius;
+        let mut expected: Vec<(u64, ResonanceNode)> = map
+            .authoritative_organisms()
+            .filter_map(|organism| {
+                let dx = organism.world_pos.0 - PLAYER.0;
+                let dy = organism.world_pos.1 - PLAYER.1;
+                let distance2 = dx * dx + dy * dy;
+                (distance2 <= radius2).then_some((
+                    distance2.to_bits(),
+                    ResonanceNode {
+                        world_pos: organism.world_pos,
+                        species: organism.species,
+                        distance: distance2.sqrt(),
+                    },
+                ))
+            })
+            .collect();
+        expected.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.species.cmp(&b.1.species))
+                .then_with(|| a.1.world_pos.0.to_bits().cmp(&b.1.world_pos.0.to_bits()))
+                .then_with(|| a.1.world_pos.1.to_bits().cmp(&b.1.world_pos.1.to_bits()))
+        });
+        assert!(expected.len() > MAX_RESONANCE_NODES);
+        let expected: Vec<_> = expected
+            .into_iter()
+            .take(MAX_RESONANCE_NODES)
+            .map(|(_, node)| node)
+            .collect();
+        assert_eq!(map.resonance_at(PLAYER, &[]).nodes, expected);
     }
 
     #[test]
@@ -3982,7 +4443,8 @@ mod recovery_tests {
         assert!(map.cache.get(coord()).is_none());
         assert!(!map.region_signatures.contains_key(&coord()));
         assert!(!map.organisms.contains_key(&coord()));
-        assert!(!map.organism_keys.contains_key(&coord()));
+        assert!(!map.authoritative_organism_keys.contains_key(&coord()));
+        assert!(!map.presentation_organism_keys.contains_key(&coord()));
 
         map.sweep_dependent_caches(&mut stats);
         assert!(map.macro_cache.is_empty());

@@ -14,10 +14,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
-use world_core::{PossibilityDomain, PossibilityField, POSSIBILITY_DIMS, REGION_SIZE};
+use world_core::{
+    domain_mask, encode_record, Anchor, AnchorKind, AnchorSource, PossibilityDomain,
+    PossibilityField, PossibilityVector, RecordKind, RegionCoord, RouteRecord, POSSIBILITY_DIMS,
+    REGION_SIZE,
+};
 use world_runtime::{
-    full_region_payload_bytes, Budget, FrameStats, GenerationStatus, InlineExecutor, Pass,
-    RegionMap, StreamConfig, TaskExecutor, TaskPriority, PASS_COUNT,
+    full_region_payload_bytes, Budget, FrameStats, GenerationStatus, InlineExecutor, MemoryStorage,
+    Organism, Pass, RegionMap, Resonance, RouteRecorder, StreamConfig, TaskExecutor, TaskPriority,
+    Vault, PASS_COUNT,
 };
 
 use crate::executor::LaneExecutor;
@@ -220,11 +225,13 @@ impl ScaleConfig {
     }
 }
 
-/// Whether every field-active region is fully generated, every parked region
-/// is intentionally quiescent, and no work is queued or in flight.
-fn settled(map: &RegionMap, exec: &QueueExecutor) -> bool {
+/// Whether every field-active region is fully generated, every near canonical
+/// realization is current, every parked region is intentionally quiescent, and
+/// no work is queued or in flight.
+fn settled(map: &RegionMap, exec: &QueueExecutor, player: (f64, f64)) -> bool {
     exec.queue_len() == 0
         && map.jobs_in_flight() == 0
+        && map.authoritative_realization_complete(player)
         && map
             .iter_active()
             .all(|r| r.status != GenerationStatus::Generating)
@@ -335,7 +342,7 @@ pub fn long_haul(cfg: &ScaleConfig) -> ScenarioOutcome {
         let stats = map.update(stop, 0.0, &field, &[], &neutral, &cfg.budget, &exec, false);
         exec.run_jobs(cfg.jobs_per_frame);
         acc.absorb(&stats);
-        if stats.deferred_regens == 0 && stats.deferred_loads == 0 && settled(&map, &exec) {
+        if stats.deferred_regens == 0 && stats.deferred_loads == 0 && settled(&map, &exec, stop) {
             drain_frames = Some(frame + 1);
             break;
         }
@@ -468,7 +475,7 @@ pub fn teleport_storm(cfg: &ScaleConfig) -> ScenarioOutcome {
             let stats = map.update(pos, 0.0, &field, &[], &neutral, &cfg.budget, &exec, false);
             exec.run_jobs(cfg.jobs_per_frame);
             acc.absorb(&stats);
-            if settled(&map, &exec) && stats.loaded == 0 && stats.deferred_loads == 0 {
+            if settled(&map, &exec, pos) && stats.loaded == 0 && stats.deferred_loads == 0 {
                 settle = Some(frame + 1);
                 break;
             }
@@ -557,7 +564,6 @@ pub fn scale_budget(budget: &Budget, factor: f64) -> Budget {
             ((f64::from(budget.max_regen_cost) * factor) as u32).max(1)
         },
         max_realize_organisms: scale_usize(budget.max_realize_organisms),
-        max_resonance_nodes: budget.max_resonance_nodes,
         max_persist_ops: scale_usize(budget.max_persist_ops),
         max_route_attraction_nodes: budget.max_route_attraction_nodes,
         max_retarget_regions: budget.max_retarget_regions,
@@ -576,14 +582,27 @@ fn settle_fixed_point(
     pos: (f64, f64),
     mut per_frame: impl FnMut(&FrameStats),
 ) -> u64 {
+    settle_fixed_point_with_anchors(map, field, budget, executor, pos, &[], &mut per_frame)
+}
+
+fn settle_fixed_point_with_anchors(
+    map: &mut RegionMap,
+    field: &PossibilityField,
+    budget: &Budget,
+    executor: &dyn TaskExecutor,
+    pos: (f64, f64),
+    anchors: &[world_core::Anchor],
+    mut per_frame: impl FnMut(&FrameStats),
+) -> u64 {
     let neutral = [0.0f32; POSSIBILITY_DIMS];
     const SETTLE_LIMIT: u32 = 20_000;
     let mut last = 0u64;
     let mut stable = 0u32;
     for _ in 0..SETTLE_LIMIT {
-        let stats = map.update(pos, 0.0, field, &[], &neutral, budget, executor, false);
+        let stats = map.update(pos, 0.0, field, anchors, &neutral, budget, executor, false);
         per_frame(&stats);
         let quiet = map.jobs_in_flight() == 0
+            && map.authoritative_realization_complete(pos)
             && map
                 .iter_active()
                 .all(|r| r.status != GenerationStatus::Generating);
@@ -1096,7 +1115,7 @@ pub fn tier_stability(tier: world_runtime::ResourceTier, cfg: &ScaleConfig) -> S
         let stats = map.update(stop, 0.0, &field, &[], &neutral, &budget, &exec, false);
         exec.run_jobs(jobs_per_frame);
         acc.absorb(&stats);
-        if stats.deferred_regens == 0 && stats.deferred_loads == 0 && settled(&map, &exec) {
+        if stats.deferred_regens == 0 && stats.deferred_loads == 0 && settled(&map, &exec, stop) {
             drain_frames = Some(frame + 1);
             break;
         }
@@ -1171,20 +1190,19 @@ pub fn tier_stability(tier: world_runtime::ResourceTier, cfg: &ScaleConfig) -> S
     }
 }
 
-/// Tier identity-invariance (§9.3, ADR 0018): the *shared/persisted*
-/// surfaces are identical across tiers outright — the settled center
-/// region's per-layer dependency hashes and its quantized possibility
-/// signature match on every preset, even though radii, budgets, and
-/// realization density differ.
+/// Tier identity-invariance (ADRs 0018 and 0024): generated surfaces,
+/// canonical organisms, capture/resonance, and actual encoded route records
+/// are identical across tiers even though presentation density differs.
 #[must_use]
 pub fn tier_identity(cfg: &ScaleConfig) -> ScenarioOutcome {
     let field = PossibilityField::default();
-    let mut probes: Vec<(&'static str, Vec<u64>, Vec<u16>)> = Vec::new();
-    for tier in [
+    let tiers = [
         world_runtime::ResourceTier::Low,
         world_runtime::ResourceTier::Mid,
         world_runtime::ResourceTier::High,
-    ] {
+    ];
+    let mut maps = Vec::new();
+    for tier in tiers {
         let (stream, budget) = tier_preset(tier, cfg.stream.field_resolution);
         let mut map = RegionMap::new(stream);
         let _ = settle_fixed_point(
@@ -1195,36 +1213,190 @@ pub fn tier_identity(cfg: &ScaleConfig) -> ScenarioOutcome {
             (0.0, 0.0),
             |_| {},
         );
+        maps.push((tier, budget, map));
+    }
+
+    let high = &maps[2].2;
+    let (extra_pos, canonical_species) = high
+        .organisms()
+        .filter(|organism| organism.slot >= 2)
+        .find_map(|extra| {
+            let coord = RegionCoord::from_world(extra.world_pos.0, extra.world_pos.1);
+            let distance2 = |organism: &Organism| {
+                let dx = organism.world_pos.0 - extra.world_pos.0;
+                let dy = organism.world_pos.1 - extra.world_pos.1;
+                dx * dx + dy * dy
+            };
+            let canonical = high.authoritative_organisms_in(coord).min_by(|a, b| {
+                distance2(a)
+                    .partial_cmp(&distance2(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+            (canonical.species != extra.species).then_some((extra.world_pos, canonical.species))
+        })
+        .expect("High tier needs a slot>=2 probe differing from nearest canonical species");
+    let player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+    let capture_mask = domain_mask(&[
+        PossibilityDomain::Morphology,
+        PossibilityDomain::Behavior,
+        PossibilityDomain::Aesthetics,
+        PossibilityDomain::Ecology,
+    ]);
+    let mut anchor_target = PossibilityVector::neutral();
+    anchor_target.set(PossibilityDomain::Aesthetics, 0.8);
+    let gameplay_anchors = [Anchor {
+        world_pos: player,
+        target: anchor_target,
+        mask: domain_mask(&[PossibilityDomain::Aesthetics]),
+        kind: AnchorKind::Emphasize,
+        strength: 0.7,
+        falloff_radius: 8.0 * REGION_SIZE,
+        source: AnchorSource::Manual,
+    }];
+
+    #[derive(Debug)]
+    struct Probe {
+        name: &'static str,
+        hashes: Vec<u64>,
+        signature: Vec<u16>,
+        canonical: Vec<Organism>,
+        resonance: Resonance,
+        capture: world_core::Anchor,
+        route: RouteRecord,
+        route_bytes: Vec<u8>,
+        route_resonant: bool,
+    }
+
+    let mut probes = Vec::new();
+    for (tier, budget, mut map) in maps {
         let center = world_core::RegionCoord::new(0, 0);
-        let hashes: Vec<u64> = map
+        let hashes = map
             .layer_diagnostics(center)
             .expect("center resident")
             .iter()
-            .filter_map(|d| d.stored)
+            .filter_map(|diagnostic| diagnostic.stored)
             .collect();
-        let signature = map
-            .get(center)
-            .map(|r| {
-                world_core::PossibilitySignature::of(r.current)
-                    .buckets
-                    .to_vec()
-            })
-            .unwrap_or_default();
-        probes.push((tier.name(), hashes, signature));
+        let signature = world_core::PossibilitySignature::of(
+            map.get(center).expect("center authority").current,
+        )
+        .buckets
+        .to_vec();
+        let canonical = map.authoritative_organisms().copied().collect();
+        let resonance = map.resonance_at(player, &gameplay_anchors);
+        let capture = map
+            .capture_at(
+                extra_pos,
+                capture_mask,
+                AnchorKind::Emphasize,
+                0.8,
+                2.0 * REGION_SIZE,
+            )
+            .expect("settled extra-slot position is capturable");
+
+        let mut recorder = RouteRecorder::new();
+        let mut route_resonant = true;
+        for index in 0..5_u32 {
+            let waypoint = (128.0 + f64::from(index) * 256.0, 128.0);
+            let _ = settle_fixed_point_with_anchors(
+                &mut map,
+                &field,
+                &budget,
+                &InlineExecutor,
+                waypoint,
+                &gameplay_anchors,
+                |_| {},
+            );
+            let stats = map.update(
+                waypoint,
+                0.0,
+                &field,
+                &gameplay_anchors,
+                &[0.0; POSSIBILITY_DIMS],
+                &budget,
+                &InlineExecutor,
+                false,
+            );
+            route_resonant &= stats.resonance_nodes > 0;
+            recorder.observe(
+                &map,
+                waypoint,
+                if index == 0 { 0.0 } else { 256.0 },
+                &gameplay_anchors,
+                stats.resonance_strength,
+            );
+        }
+        let (nodes, discoveries) = recorder.finish();
+        let mut vault = Vault::open(MemoryStorage::new()).expect("memory vault");
+        let route_id = vault
+            .record_route(nodes, discoveries, "tier expedition".into())
+            .expect("fresh vault sequence");
+        let route = vault.routes()[&route_id].clone();
+        let route_bytes = encode_record(RecordKind::Route, &route);
+        probes.push(Probe {
+            name: tier.name(),
+            hashes,
+            signature,
+            canonical,
+            resonance,
+            capture,
+            route,
+            route_bytes,
+            route_resonant,
+        });
     }
-    let reference = probes[0].clone();
-    let gates = probes
-        .iter()
-        .map(|(name, hashes, signature)| Gate {
-            name: format!("shared surfaces tier-invariant: {name}"),
-            passed: !hashes.is_empty() && *hashes == reference.1 && *signature == reference.2,
+
+    let reference = &probes[0];
+    let mut gates = Vec::new();
+    for probe in &probes {
+        gates.push(Gate {
+            name: format!("generated surfaces tier-invariant: {}", probe.name),
+            passed: !probe.hashes.is_empty()
+                && probe.hashes == reference.hashes
+                && probe.signature == reference.signature,
             detail: format!(
                 "{} layer hashes, first {:#018x}",
-                hashes.len(),
-                hashes.first().copied().unwrap_or(0)
+                probe.hashes.len(),
+                probe.hashes.first().copied().unwrap_or(0)
             ),
-        })
-        .collect();
+        });
+        gates.push(Gate {
+            name: format!("canonical organisms tier-invariant: {}", probe.name),
+            passed: !probe.canonical.is_empty() && probe.canonical == reference.canonical,
+            detail: format!("{} ordered slot-0 organisms", probe.canonical.len()),
+        });
+        gates.push(Gate {
+            name: format!("capture and resonance tier-invariant: {}", probe.name),
+            passed: probe.capture == reference.capture
+                && matches!(
+                    probe.capture.source,
+                    AnchorSource::Organism { species } if species == canonical_species
+                )
+                && probe.resonance.strength.to_bits() == reference.resonance.strength.to_bits()
+                && probe.resonance.anchor_compatibility.to_bits()
+                    == reference.resonance.anchor_compatibility.to_bits()
+                && probe.resonance.nodes == reference.resonance.nodes,
+            detail: format!(
+                "capture {:?}, resonance {:08x}/{} nodes",
+                probe.capture.source,
+                probe.resonance.strength.to_bits(),
+                probe.resonance.nodes.len()
+            ),
+        });
+        gates.push(Gate {
+            name: format!("encoded route record tier-invariant: {}", probe.name),
+            passed: probe.route.nodes == reference.route.nodes
+                && probe.route.id == reference.route.id
+                && probe.route_bytes == reference.route_bytes
+                && probe.route.nodes.len() >= 2
+                && probe.route_resonant,
+            detail: format!(
+                "{} nodes, id {:#018x}, {} bytes",
+                probe.route.nodes.len(),
+                probe.route.id,
+                probe.route_bytes.len()
+            ),
+        });
+    }
     ScenarioOutcome {
         name: "tier-identity",
         frames: 0,
@@ -1275,6 +1447,10 @@ pub fn density_realization(cfg: &ScaleConfig) -> ScenarioOutcome {
     let ids4: std::collections::BTreeSet<u64> = map4.organisms().map(|o| o.id).collect();
     let additive = ids1.is_subset(&ids4);
     let unique = ids4.len() == count4;
+    let canonical_exact = map1.organisms().copied().collect::<Vec<_>>()
+        == map4.authoritative_organisms().copied().collect::<Vec<_>>();
+    let slots_labeled = map1.organisms().all(|organism| organism.slot == 0)
+        && map4.organisms().all(|organism| organism.slot < 4);
 
     let gates = vec![
         Gate {
@@ -1284,9 +1460,9 @@ pub fn density_realization(cfg: &ScaleConfig) -> ScenarioOutcome {
         },
         Gate {
             name: "density-1 identities survive as slot 0 (additive)".into(),
-            passed: additive,
+            passed: additive && canonical_exact && slots_labeled,
             detail: format!(
-                "{} of {} density-1 ids present at density 4",
+                "{} of {} density-1 ids present; exact canonical={canonical_exact}, labeled={slots_labeled}",
                 ids1.intersection(&ids4).count(),
                 ids1.len()
             ),

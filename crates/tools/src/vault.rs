@@ -105,7 +105,9 @@ fn config() -> StreamConfig {
     }
 }
 
-/// One scripted frame (unbudgeted, inline — every frame settles fully).
+/// One scripted frame. Generation dispatch/integration is unbudgeted and
+/// inline; fixed canonical publication may still lag one region per frame, so
+/// the durability scenario explicitly checks its save-point precondition.
 fn step(
     map: &mut RegionMap,
     player: (f64, f64),
@@ -201,6 +203,12 @@ fn scenario_durable() -> VaultReport {
 
     let mut before = RegionMap::new(config());
     run(&mut before, 0, SAVE + 1);
+    if !before.authoritative_realization_complete(script_pos(SAVE)) {
+        record(
+            &mut violations,
+            "save-point source map lacked complete canonical near state".into(),
+        );
+    }
     let mut vault = Vault::open(MemoryStorage::new()).expect("fresh store");
     vault
         .snapshot_session(
@@ -220,23 +228,35 @@ fn scenario_durable() -> VaultReport {
     apply_session_regions(&mut restored, &snap);
     let anchors: Vec<Anchor> = snap.anchors.iter().map(|a| a.to_anchor()).collect();
     let field = PossibilityField::default();
-    let settle = restored.update(
-        snap.player,
-        0.0,
-        &field,
-        &anchors,
-        &snap.bias,
-        &Budget::unlimited(),
-        &InlineExecutor,
-        snap.transition_mode,
-    );
-    if settle.converged != 0 {
+    let settle_limit = restored.len() + 1;
+    for _ in 0..settle_limit {
+        let settle = restored.update(
+            snap.player,
+            0.0,
+            &field,
+            &anchors,
+            &snap.bias,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            snap.transition_mode,
+        );
+        if settle.converged != 0 || settle.loaded != 0 {
+            record(
+                &mut violations,
+                format!(
+                    "restore settled with {} converged / {} loaded regions (loading must not be an event)",
+                    settle.converged, settle.loaded
+                ),
+            );
+        }
+        if restored.authoritative_realization_complete(snap.player) {
+            break;
+        }
+    }
+    if !restored.authoritative_realization_complete(snap.player) {
         record(
             &mut violations,
-            format!(
-                "restore converged {} regions (loading must not be an event)",
-                settle.converged
-            ),
+            "restore did not drain fixed canonical publication at zero travel".into(),
         );
     }
     run(&mut restored, SAVE + 1, FRAMES);

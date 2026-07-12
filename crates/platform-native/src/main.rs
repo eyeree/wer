@@ -645,6 +645,9 @@ impl World {
     /// organisms re-derive over the following frames. `last_player` snaps to
     /// the restored position so the first update after a load is the zero-
     /// travel settle — loading is not an event (phase-5-plan.md §12.2).
+    /// Exact canonical gameplay availability requires further zero-travel
+    /// updates until `authoritative_realization_complete`; the shell guarantees
+    /// the first such update but does not freeze later player input (ADR 0024).
     fn load_session(&mut self) {
         let Some(snap) = self.vault.as_ref().and_then(|v| v.session().cloned()) else {
             log::info!("no saved session in the vault");
@@ -660,7 +663,7 @@ impl World {
         self.transition_mode = snap.transition_mode;
         self.anchors = snap.anchors.iter().map(|a| a.to_anchor()).collect();
         log::info!(
-            "session loaded: {} regions, {} anchors at ({:.0}, {:.0})",
+            "session loaded: {} regions, {} anchors at ({:.0}, {:.0}); canonical organisms settle while held still",
             snap.regions.len(),
             snap.anchors.len(),
             snap.player.0,
@@ -977,8 +980,9 @@ impl App {
             KeyCode::KeyK => {
                 // Capture the feature under the player into a run-local anchor
                 // (phase-4-plan.md §7.1): reads the covering region's baseline,
-                // the nearest realized organism or the environment channels, and
-                // nudges the target toward what makes the discovery distinctive.
+                // the nearest authoritative slot-0 organism or the environment
+                // channels, and nudges the target toward what makes the
+                // discovery distinctive (ADR 0024).
                 let mask = self.capture_category.mask_bit();
                 match self.world.map.capture_at(
                     self.world.player,

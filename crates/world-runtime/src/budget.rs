@@ -19,22 +19,19 @@ pub struct Budget {
     pub max_converge_regions: usize,
     /// Generation cost units dispatched per frame (phase-2-plan.md §8.2).
     pub max_regen_cost: u32,
-    /// Near-field organisms instantiated per frame, so entering a dense biome
-    /// amortizes realization over a few frames rather than hitching
-    /// (phase-3-plan.md §8.4). Budgeted by whole regions: a region realizes
-    /// fully once started, and the pass stops starting new regions past the cap.
+    /// Additional presentation organisms instantiated per frame, so expanding
+    /// a region from canonical slot 0 to the tier's full visual density is
+    /// amortized rather than hitching. Budgeted by whole regions: an expansion
+    /// completes atomically once started, and the pass stops starting new
+    /// regions past the cap. Canonical slot-0 publication is fixed semantic
+    /// work and does not consume this budget (ADR 0024).
     pub max_realize_organisms: usize,
-    /// Contributing nodes the per-frame resonance graph may hold, so a dense
-    /// biome does not build an unbounded graph (phase-4-plan.md §8.3) — the
-    /// analogue of `max_realize_organisms`.
-    pub max_resonance_nodes: usize,
     /// Records the vault encodes and writes per [`crate::vault::Vault::flush`]
     /// call, so persistence obeys temporal budgeting like every other
     /// subsystem and a bulk import never stalls a frame (phase-5-plan.md §7.7).
     pub max_persist_ops: usize,
     /// Route nodes contributing derived attraction anchors per frame
-    /// (phase-5-plan.md §8.2) — the steering-side analogue of
-    /// `max_resonance_nodes`, so a dense recorded corridor stays bounded.
+    /// (phase-5-plan.md §8.2), so a dense recorded corridor stays bounded.
     pub max_route_attraction_nodes: usize,
     /// Resident regions whose steered target is recomputed per frame when the
     /// steering inputs are unchanged (phase-6-plan.md §6.4). Geometric
@@ -63,9 +60,6 @@ impl Budget {
             // A few hundred organisms/frame keeps entering a dense biome smooth
             // while still filling the near window in a handful of frames.
             max_realize_organisms: ((400.0 * scale) as usize).max(1),
-            // The resonance graph is cheap; a few dozen nearest nodes capture
-            // the local density/diversity without an unbounded scan.
-            max_resonance_nodes: 64,
             // Records are ~100 bytes; a handful per frame drains any realistic
             // dirty queue within a second without touching the frame budget.
             max_persist_ops: ((8.0 * scale) as usize).max(1),
@@ -86,7 +80,6 @@ impl Budget {
             max_converge_regions: usize::MAX,
             max_regen_cost: u32::MAX,
             max_realize_organisms: usize::MAX,
-            max_resonance_nodes: usize::MAX,
             max_persist_ops: usize::MAX,
             max_route_attraction_nodes: usize::MAX,
             max_retarget_regions: usize::MAX,

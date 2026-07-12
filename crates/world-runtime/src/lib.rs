@@ -40,7 +40,7 @@ pub use macrocache::MacroCache;
 pub use pool::TilePool;
 pub use realize::{realize_region, realize_region_into, Organism};
 pub use region::{GenerationStatus, RegionState};
-pub use resonance::{Resonance, ResonanceNode};
+pub use resonance::{Resonance, ResonanceNode, MAX_RESONANCE_NODES};
 pub use rostercache::{RosterCache, RosterEntry, RosterEviction, RosterSnapshot};
 pub use route::{RouteRecorder, RouteTracker, MAX_ROUTE_NODES, ROUTE_SAMPLE_SPACING};
 pub use storage::{MemoryStorage, Storage, StorageError};

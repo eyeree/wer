@@ -87,7 +87,6 @@ impl Default for ReplayConfig {
                 max_converge_regions: 512,
                 max_regen_cost: 2048,
                 max_realize_organisms: usize::MAX,
-                max_resonance_nodes: usize::MAX,
                 max_persist_ops: usize::MAX,
                 max_route_attraction_nodes: usize::MAX,
                 max_retarget_regions: usize::MAX,
@@ -283,6 +282,7 @@ pub fn state_hash(map: &RegionMap) -> u64 {
     for organism in map.organisms() {
         h = mix(h, organism.id);
         h = mix(h, organism.species);
+        h = mix(h, u64::from(organism.slot));
     }
     h
 }
@@ -652,6 +652,7 @@ pub fn settle_to_fixed_point(
             false,
         );
         let quiet = map.jobs_in_flight() == 0
+            && map.authoritative_realization_complete(player)
             && map
                 .iter_active()
                 .all(|r| r.status != GenerationStatus::Generating);

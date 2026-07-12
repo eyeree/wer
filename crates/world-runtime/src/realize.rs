@@ -47,6 +47,10 @@ pub struct Organism {
     pub species: u64,
     /// The species' trophic role.
     pub trophic: Trophic,
+    /// Density slot that produced this instance. Slot 0 is the canonical
+    /// gameplay sample; higher slots are additive presentation instances
+    /// (ADR 0024).
+    pub slot: u16,
     /// The cell within the region it was placed in.
     pub cell: LocalPos,
     /// Jittered world-space position.
@@ -190,6 +194,7 @@ pub fn realize_region_into(
                     id,
                     species: species.id,
                     trophic: species.trophic,
+                    slot: slot as u16,
                     cell: LocalPos::new(cx, cy),
                     world_pos,
                     expressed,
@@ -336,6 +341,55 @@ mod tests {
         // A different possibility revision re-rolls identities (succession).
         if let (Some(x), Some(y)) = (a.first(), b.first()) {
             assert_ne!(x.id, y.id);
+        }
+    }
+
+    #[test]
+    fn density_slots_are_explicit_and_additive() {
+        let (map, coord) = settled_map();
+        let tiles = map.cache().get(coord).expect("tiles");
+        let mut density_one = Vec::new();
+        let mut density_four = Vec::new();
+        for (density, out) in [(1, &mut density_one), (4, &mut density_four)] {
+            realize_region_into(
+                coord,
+                tiles,
+                map.roster_cache(),
+                GenomeBias::neutral(),
+                0,
+                16,
+                density,
+                out,
+            );
+        }
+
+        assert!(density_one.iter().all(|organism| organism.slot == 0));
+        let canonical: Vec<_> = density_four
+            .iter()
+            .copied()
+            .filter(|organism| organism.slot == 0)
+            .collect();
+        assert_eq!(canonical, density_one);
+        assert!(density_four.iter().all(|organism| organism.slot < 4));
+
+        let mut ids: Vec<_> = density_four.iter().map(|organism| organism.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), density_four.len());
+
+        let cells = 16_u32 * 16;
+        for organism in &density_four {
+            let feature_index = organism.cell.to_index(16) + u32::from(organism.slot) * cells;
+            assert_eq!(
+                organism.id,
+                feature_hash(&FeatureKey {
+                    world_version: WORLD_ALGORITHM_VERSION,
+                    region: coord,
+                    layer: LAYER_ECOLOGY,
+                    feature_index,
+                    possibility_revision: 0,
+                })
+            );
         }
     }
 }

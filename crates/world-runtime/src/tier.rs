@@ -6,8 +6,9 @@
 //! pacing and capacity presets; identity is tier-invariant.** A tier changes
 //! *when and how much* work happens per frame — and, through
 //! `organisms_per_cell`, how densely the same aggregates realize — never
-//! *what* the world is: dependency hashes, quantized buckets, and every
-//! shared/persisted surface are identical across tiers.
+//! *what* the world is: dependency hashes, quantized buckets, canonical
+//! gameplay organisms, and every shared/persisted surface are identical across
+//! tiers. Higher organism slots are presentation-only (ADR 0024).
 //!
 //! Detection is a pure decision over [`TierInputs`]; the *inputs* (core
 //! count, adapter class, `WER_TIER`/`WER_CACHE_MB` overrides) are gathered
@@ -123,8 +124,8 @@ impl ResourceTier {
 
     /// The tier's frame budget (§7.4). Low is the Phase 5 default; the
     /// bigger tiers spend the headroom the M2–M5 milestones measured
-    /// (docs/perf-baseline.md) on regen throughput, realization, and
-    /// resonance, and amortize the (larger) target-calculation pass over ≤ 4
+    /// (docs/perf-baseline.md) on regen throughput and visual realization, and
+    /// amortize the (larger) target-calculation pass over ≤ 4
     /// frames. Geometric stability remains an all-region, every-frame pass
     /// (ADR 0023).
     #[must_use]
@@ -136,7 +137,6 @@ impl ResourceTier {
                 max_loads: 64,
                 max_regen_cost: 192,
                 max_realize_organisms: 800,
-                max_resonance_nodes: 96,
                 max_retarget_regions: 160,
                 ..base
             },
@@ -144,7 +144,6 @@ impl ResourceTier {
                 max_loads: 96,
                 max_regen_cost: 384,
                 max_realize_organisms: 1_600,
-                max_resonance_nodes: 128,
                 max_retarget_regions: 240,
                 ..base
             },

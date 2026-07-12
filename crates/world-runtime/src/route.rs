@@ -68,9 +68,13 @@ impl RouteRecorder {
     /// Observe one frame: accumulate travel and emit a node every
     /// [`ROUTE_SAMPLE_SPACING`] units. The node captures the covering
     /// region's steered *target* (the possibility-space coordinate), the
-    /// frame's transition cost (`1 − resonance` — difficulty falls out of the
-    /// world model), the region's stability, and the order-independent
+    /// frame's authoritative transition cost (`1 − resonance` — difficulty
+    /// falls out of canonical slot-0 gameplay under ADR 0024), the region's
+    /// stability, and the order-independent
     /// signature of the active anchor set (section 13's node shape).
+    /// `resonance_strength` must be the canonical [`crate::FrameStats`] value
+    /// returned by the immediately preceding map update for this observation,
+    /// never a separately sampled visual-density statistic.
     pub fn observe(
         &mut self,
         map: &RegionMap,
