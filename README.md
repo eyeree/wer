@@ -11,18 +11,18 @@ See the design and architecture documents:
 - [`implementation-plan.md`](implementation-plan.md) — the high-level technical plan.
 - [`docs/adr/`](docs/adr/) — architecture decision records.
 
-This repository is currently at **Phase 5** (routes, persistence, and the
-social model, see [`phase-5-plan.md`](phase-5-plan.md), building on the Phase
-1–4 stacks): the layered environmental generation and invalidation precision
-of Phase 2 (`wer-ledger`), the procedural genetics and ecosystems of Phase 3,
-the trait-capture anchors, plausibility projection, and resonance-gated
-steering of Phase 4 (`wer-anchor`) — and now durable, shareable exploration:
-sessions save and restore state-hash exact, discoveries/preserves/expedition
-routes persist as quantized records that merge lawfully across stores
-(`wer-atlas` bundles — no server), preserves reproduce whole landscapes from a
-few dozen bytes of possibility buckets, and well-worn routes softly attract
-the world toward their remembered character (`wer-vault` machine-checks all of
-it).
+This repository is currently at **Phase 6** (performance and scale, see
+[`phase-6-plan.md`](phase-6-plan.md), building on the Phase 1–5 stacks): the
+layered generation and invalidation precision of Phase 2 (`wer-ledger`), the
+procedural ecosystems of Phase 3, the resonance-gated steering of Phase 4
+(`wer-anchor`), and the durable, shareable exploration of Phase 5
+(`wer-vault`, `wer-atlas`) — now running on the optimization-era substrate:
+a priority-lane executor with cancellation, a tile pool and byte-ceilinged
+caches, SIMD kernels bit-identical to their scalar twins, a GPU-composed
+debug map with refinement octaves (derived presentation only), and Low/Mid/
+High resource tiers that scale world density without changing a single
+generated output (`wer-scale` machine-checks all of it; the measured ledger
+lives in [`docs/perf-baseline.md`](docs/perf-baseline.md)).
 
 ## Workspace layout
 
@@ -35,9 +35,9 @@ hold everything OS/browser-specific (see
 | [`world-core`](crates/world-core) | neutral lib | Deterministic hashing, coordinates, possibility space, the layer graph and every environmental generator. |
 | [`world-runtime`](crates/world-runtime) | neutral lib | Region streaming, convergence, dep-hash staleness, topological cost-budgeted dispatch; abstract storage & task interfaces. |
 | [`renderer`](crates/renderer) | native/gpu lib | wgpu/WGSL renderer (debug-map presentation). |
-| [`platform-native`](crates/platform-native) | bin `wer` | winit window + event loop, input, Rayon executor. |
+| [`platform-native`](crates/platform-native) | bin `wer` | winit window + event loop, input, tier detection, the GPU-map shell. |
 | [`platform-web`](crates/platform-web) | cdylib | wasm-bindgen smoke shell (grows into the browser runtime). |
-| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay`, `wer-ledger`, `wer-anchor`, `wer-atlas`, `wer-vault` | Inspectors, the continuity replay, the phase sign-off harnesses, atlas bundle tooling, and the shared native file-tree storage backend. |
+| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay`, `wer-ledger`, `wer-anchor`, `wer-atlas`, `wer-vault`, `wer-scale` | Inspectors, the continuity replay, the phase sign-off harnesses, the lane executor, atlas bundle tooling, and the shared native file-tree storage backend. |
 
 ## Prerequisites
 
@@ -69,6 +69,10 @@ cargo run --bin wer-anchor
 # Persistence/sharing harness: durable, sparse, shareable, preserves, routes,
 # precision-preserved (phase-5-plan.md §12.3).
 cargo run --bin wer-vault
+
+# Scale harness: schedule independence (ADR 0018), per-tier stability,
+# memory ceilings, density gates; --report prints the perf-baseline table.
+cargo run --release --bin wer-scale -- --report
 
 # Atlas bundles: share discoveries/routes/preserves between record stores.
 cargo run --bin wer-atlas -- export wer-vault my.bundle

@@ -16,7 +16,10 @@ path = "src/bin/inspect.rs"
 
 [dependencies]
 world-core = { path = "../world-core" }
-world-runtime = { path = "../world-runtime" }
+# `pass-timing`: `wer-scale --report` prints the per-pass wall-clock table the
+# committed baseline snapshots (phase-6-plan.md §10, §12). Native-only crate,
+# so the feature is safe here.
+world-runtime = { path = "../world-runtime", features = ["pass-timing"] }
 
 [[bin]]
 name = "wer-replay"
@@ -37,3 +40,7 @@ path = "src/bin/atlas.rs"
 [[bin]]
 name = "wer-vault"
 path = "src/bin/vault.rs"
+
+[[bin]]
+name = "wer-scale"
+path = "src/bin/scale.rs"

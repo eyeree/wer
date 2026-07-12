@@ -63,6 +63,7 @@ fn harness_config() -> StreamConfig {
         converge_per_unit: 0.02,
         converge_rate_cap: 0.25,
         field_resolution: 8,
+        ..StreamConfig::default()
     }
 }
 
@@ -427,6 +428,7 @@ fn realization_budget_scenario() -> EcologyReport {
         max_resonance_nodes: usize::MAX,
         max_persist_ops: usize::MAX,
         max_route_attraction_nodes: usize::MAX,
+        max_retarget_regions: usize::MAX,
     };
 
     let mut map = RegionMap::new(harness_config());

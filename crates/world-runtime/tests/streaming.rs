@@ -26,6 +26,7 @@ fn small_config() -> StreamConfig {
         converge_per_unit: 0.01,
         converge_rate_cap: 0.25,
         field_resolution: 4,
+        ..StreamConfig::default()
     }
 }
 
@@ -174,11 +175,15 @@ fn cost_budgets_are_enforced_per_frame() {
     let budget = Budget {
         max_loads: 5,
         max_converge_regions: 3,
-        max_regen_cost: 12,
+        // One drainage job costs 17 after the M4 recalibration
+        // (phase-6-plan.md §7.2); 20 admits it plus a cheap layer while
+        // still deferring most of a fresh window.
+        max_regen_cost: 20,
         max_realize_organisms: usize::MAX,
         max_resonance_nodes: usize::MAX,
         max_persist_ops: usize::MAX,
         max_route_attraction_nodes: usize::MAX,
+        max_retarget_regions: usize::MAX,
     };
     let mut map = RegionMap::new(small_config());
     let field = PossibilityField::default();
@@ -193,7 +198,7 @@ fn cost_budgets_are_enforced_per_frame() {
         false,
     );
     assert!(stats.loaded <= 5);
-    assert!(stats.regen_cost_spent <= 12);
+    assert!(stats.regen_cost_spent <= 20);
     assert!(stats.deferred_loads > 0, "small budget must defer loads");
     assert!(stats.deferred_regens > 0, "small budget must defer regens");
     let stats = map.update(
@@ -208,7 +213,7 @@ fn cost_budgets_are_enforced_per_frame() {
     );
     assert!(stats.loaded <= 5);
     assert!(stats.converged <= 3);
-    assert!(stats.regen_cost_spent <= 12);
+    assert!(stats.regen_cost_spent <= 20);
 
     // The budget throttles but never starves: the window must fully settle.
     for _ in 0..600 {
@@ -222,7 +227,7 @@ fn cost_budgets_are_enforced_per_frame() {
             &InlineExecutor,
             false,
         );
-        assert!(stats.regen_cost_spent <= 12);
+        assert!(stats.regen_cost_spent <= 20);
         if stats.regen_cost_spent == 0 && stats.loaded == 0 && map.jobs_in_flight() == 0 {
             break;
         }
@@ -364,11 +369,12 @@ fn dispatch_is_topological_under_tiny_budgets() {
     let budget = Budget {
         max_loads: usize::MAX,
         max_converge_regions: usize::MAX,
-        max_regen_cost: 10, // one drainage job, or a few cheap layers
+        max_regen_cost: 17, // exactly one drainage job (M4 costs), or a few cheap layers
         max_realize_organisms: usize::MAX,
         max_resonance_nodes: usize::MAX,
         max_persist_ops: usize::MAX,
         max_route_attraction_nodes: usize::MAX,
+        max_retarget_regions: usize::MAX,
     };
     let mut map = RegionMap::new(StreamConfig {
         load_radius: 1.0 * REGION_SIZE,
@@ -540,4 +546,62 @@ fn staleness_is_tracked_per_tile_by_dep_hash() {
         let biome = tiles.biome.as_ref().expect("biome tile");
         assert_eq!(tiles.layer_hash(LAYER_BIOME), Some(biome.dep_hash));
     }
+}
+
+/// Phase 6 (§6.4): under unchanged steering the retarget pass round-robins
+/// `max_retarget_regions` per frame (deferral reported), while any steering
+/// change refreshes the whole window that same frame — dirty-first.
+#[test]
+fn retarget_amortizes_and_refreshes_on_steering_change() {
+    use world_runtime::InlineExecutor;
+    let field = world_core::PossibilityField::default();
+    let mut map = RegionMap::new(small_config());
+    let neutral = [0.0f32; world_core::POSSIBILITY_DIMS];
+    let budget = Budget {
+        max_retarget_regions: 1,
+        ..Budget::unlimited()
+    };
+    // Settle a window (steering unchanged after the first frame).
+    let mut stats = world_runtime::FrameStats::default();
+    for _ in 0..6 {
+        stats = map.update(
+            (0.0, 0.0),
+            0.0,
+            &field,
+            &[],
+            &neutral,
+            &budget,
+            &InlineExecutor,
+            false,
+        );
+    }
+    // Amortized: all but one region deferred.
+    assert!(stats.active_regions > 2);
+    assert_eq!(stats.retarget_deferred, stats.active_regions - 1);
+
+    // A bias change forces a full refresh this frame: no deferral.
+    let mut bias = neutral;
+    bias[world_core::PossibilityDomain::Ecology.index()] = 0.3;
+    let stats = map.update(
+        (0.0, 0.0),
+        0.0,
+        &field,
+        &[],
+        &bias,
+        &budget,
+        &InlineExecutor,
+        false,
+    );
+    assert_eq!(stats.retarget_deferred, 0);
+    // The refresh took effect: some unpinned region's target moved up in
+    // Ecology versus its raw field sample (the plausibility projection may
+    // damp individual regions, so the assertion is existential).
+    let moved = map.iter_active().any(|region| {
+        region.stability < 1.0
+            && region.target.get(world_core::PossibilityDomain::Ecology)
+                > field
+                    .sample(region.coord)
+                    .get(world_core::PossibilityDomain::Ecology)
+    });
+    assert!(moved, "bias change did not reach any target this frame");
 }

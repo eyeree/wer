@@ -70,6 +70,40 @@ pub fn realize_region(
     resolution: u16,
 ) -> Vec<Organism> {
     let mut out = Vec::new();
+    realize_region_into(
+        coord,
+        tiles,
+        rosters,
+        bias,
+        possibility_revision,
+        resolution,
+        1,
+        &mut out,
+    );
+    out
+}
+
+/// [`realize_region`] writing into a caller-provided vector, so the runtime
+/// can recycle organism allocations through the rebuild-on-L8-change path
+/// (phase-6-plan.md §4.2). `out` is cleared first; content is identical to
+/// [`realize_region`].
+/// `organisms_per_cell` is the Phase 6 density lever (phase-6-plan.md §6.6):
+/// slot 0 derives the exact Phase 5 identity (`feature_index = cell`); slot
+/// `s > 0` derives the additive identity `cell + s·res²` from the same
+/// scheme, each slot independently density-gated so expected population
+/// scales linearly and the aggregate↔entity ratios hold at any density.
+#[allow(clippy::too_many_arguments)]
+pub fn realize_region_into(
+    coord: RegionCoord,
+    tiles: &RegionTiles,
+    rosters: &RosterCache,
+    bias: GenomeBias,
+    possibility_revision: u32,
+    resolution: u16,
+    organisms_per_cell: u16,
+    out: &mut Vec<Organism>,
+) {
+    out.clear();
     let (Some(vegetation), Some(temperature), Some(moisture), Some(fertility), Some(biome_tile)) = (
         tiles.channels[CHANNEL_VEGETATION].as_ref(),
         tiles.channels[CHANNEL_TEMPERATURE].as_ref(),
@@ -77,7 +111,7 @@ pub fn realize_region(
         tiles.channels[CHANNEL_FERTILITY].as_ref(),
         tiles.biome.as_ref(),
     ) else {
-        return out;
+        return;
     };
 
     let (ox, oy) = coord.origin();
@@ -89,60 +123,68 @@ pub fn realize_region(
             if density <= 0.0 {
                 continue;
             }
-            let feature_index = u32::from(cy) * u32::from(resolution) + u32::from(cx);
-            let id = feature_hash(&FeatureKey {
-                world_version: WORLD_ALGORITHM_VERSION,
-                region: coord,
-                layer: LAYER_ECOLOGY,
-                feature_index,
-                possibility_revision,
-            });
-            let mut rng = Rng::new(id);
-            // Presence preserves the aggregate: a cell at density d hosts an
-            // organism with probability d (section 10).
-            if rng.next_f32() >= density {
-                continue;
-            }
-            // Classify the cell's habitat exactly as L8 does, then resolve its
-            // roster/web from the cache the scheduler populated for this region.
-            let c = Climate {
-                temperature: temperature.get(cx, cy),
-                moisture: moisture.get(cx, cy),
-            };
-            let s = Soils {
-                depth: 0.0,
-                fertility: fertility.get(cx, cy),
-            };
-            let signature = HabitatSignature::of(Biome::from_id(biome_tile.get(cx, cy)), &c, &s);
-            let Some(entry) = rosters.get(signature) else {
-                continue;
-            };
-            if entry.roster.species.is_empty() {
-                continue;
-            }
-            let index = sample_species(&entry.roster, &entry.web, &mut rng);
-            let species = &entry.roster.species[index];
-            let mut expressed = species.genome.express(bias);
-            // Clamp expressed body size to what the habitat can feed.
-            expressed.size = expressed.size.min(entry.web.max_body_size);
+            let cell_index = u32::from(cy) * u32::from(resolution) + u32::from(cx);
+            let cells = u32::from(resolution) * u32::from(resolution);
+            for slot in 0..u32::from(organisms_per_cell) {
+                // Slot 0 is the exact Phase 5 identity; higher slots are
+                // additive identities from the same scheme (§6.6).
+                let feature_index = cell_index + slot * cells;
+                let id = feature_hash(&FeatureKey {
+                    world_version: WORLD_ALGORITHM_VERSION,
+                    region: coord,
+                    layer: LAYER_ECOLOGY,
+                    feature_index,
+                    possibility_revision,
+                });
+                let mut rng = Rng::new(id);
+                // Presence preserves the aggregate: each slot of a cell at
+                // density d hosts an organism with probability d (section 10),
+                // so expected population scales linearly with slots.
+                if rng.next_f32() >= density {
+                    continue;
+                }
+                // Classify the cell's habitat exactly as L8 does, then resolve
+                // its roster/web from the cache the scheduler populated for
+                // this region.
+                let c = Climate {
+                    temperature: temperature.get(cx, cy),
+                    moisture: moisture.get(cx, cy),
+                };
+                let s = Soils {
+                    depth: 0.0,
+                    fertility: fertility.get(cx, cy),
+                };
+                let signature =
+                    HabitatSignature::of(Biome::from_id(biome_tile.get(cx, cy)), &c, &s);
+                let Some(entry) = rosters.get(signature) else {
+                    continue;
+                };
+                if entry.roster.species.is_empty() {
+                    continue;
+                }
+                let index = sample_species(&entry.roster, &entry.web, &mut rng);
+                let species = &entry.roster.species[index];
+                let mut expressed = species.genome.express(bias);
+                // Clamp expressed body size to what the habitat can feed.
+                expressed.size = expressed.size.min(entry.web.max_body_size);
 
-            let jx = f64::from(rng.next_f32());
-            let jy = f64::from(rng.next_f32());
-            let world_pos = (
-                ox + (f64::from(cx) + jx) * cell_size,
-                oy + (f64::from(cy) + jy) * cell_size,
-            );
-            out.push(Organism {
-                id,
-                species: species.id,
-                trophic: species.trophic,
-                cell: LocalPos::new(cx, cy),
-                world_pos,
-                expressed,
-            });
+                let jx = f64::from(rng.next_f32());
+                let jy = f64::from(rng.next_f32());
+                let world_pos = (
+                    ox + (f64::from(cx) + jx) * cell_size,
+                    oy + (f64::from(cy) + jy) * cell_size,
+                );
+                out.push(Organism {
+                    id,
+                    species: species.id,
+                    trophic: species.trophic,
+                    cell: LocalPos::new(cx, cy),
+                    world_pos,
+                    expressed,
+                });
+            }
         }
     }
-    out
 }
 
 /// Sample a roster index weighted by per-species biomass (producers dominate;

@@ -30,12 +30,28 @@ impl<T: Copy + Default> FieldTile<T> {
     /// A tile of `resolution × resolution` default-valued samples.
     #[must_use]
     pub fn new(resolution: u16, dep_hash: u64) -> Self {
+        Self::from_buffer(resolution, dep_hash, Vec::new())
+    }
+
+    /// A tile reusing `buffer`'s allocation (phase-6-plan.md §4.2): the
+    /// buffer is cleared and refilled with defaults, so content is identical
+    /// to [`FieldTile::new`] — the tile pool is invisible in every output.
+    #[must_use]
+    pub fn from_buffer(resolution: u16, dep_hash: u64, mut buffer: Vec<T>) -> Self {
         let n = resolution as usize * resolution as usize;
+        buffer.clear();
+        buffer.resize(n, T::default());
         Self {
             resolution,
             dep_hash,
-            samples: vec![T::default(); n],
+            samples: buffer,
         }
+    }
+
+    /// Consume the tile, recovering its sample buffer for reuse (§4.2).
+    #[must_use]
+    pub fn into_samples(self) -> Vec<T> {
+        self.samples
     }
 
     /// Samples per edge.
@@ -64,6 +80,21 @@ impl<T: Copy + Default> FieldTile<T> {
     #[must_use]
     pub fn samples(&self) -> &[T] {
         &self.samples
+    }
+
+    /// One row of samples (the Phase 6 row-kernel unit, phase-6-plan.md §5.1).
+    #[inline]
+    #[must_use]
+    pub fn row(&self, cy: u16) -> &[T] {
+        let w = self.resolution as usize;
+        &self.samples[cy as usize * w..(cy as usize + 1) * w]
+    }
+
+    /// One mutable row of samples.
+    #[inline]
+    pub fn row_mut(&mut self, cy: u16) -> &mut [T] {
+        let w = self.resolution as usize;
+        &mut self.samples[cy as usize * w..(cy as usize + 1) * w]
     }
 
     /// Heap bytes held by the sample buffer (cache telemetry, section 12).

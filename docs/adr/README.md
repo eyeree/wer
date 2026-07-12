@@ -26,3 +26,6 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0013](0013-shareable-records-quantized-at-persistence-boundary.md) | Shareable records are quantized at the persistence boundary | Accepted |
 | [0014](0014-vault-stores-deviations-with-crdt-merge.md) | The vault stores deviations, keyed by content-derived ids, with CRDT merge laws | Accepted |
 | [0015](0015-routes-attract-as-derived-anchors.md) | Routes attract as derived anchors; attraction is soft and saturating | Accepted |
+| [0016](0016-simd-kernels-bit-identical-to-scalar-twins.md) | SIMD kernels are lane-wise bit-identical to their scalar twins | Accepted |
+| [0017](0017-gpu-compute-is-derived-presentation.md) | GPU compute is derived presentation; authoritative state never reads it back | Accepted |
+| [0018](0018-settled-state-is-schedule-independent.md) | Settled world state is schedule-independent; budgets/tiers scale pacing, never identity | Accepted |

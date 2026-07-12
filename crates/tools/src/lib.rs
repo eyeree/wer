@@ -9,9 +9,11 @@
 pub mod anchor;
 pub mod atlas;
 pub mod ecology;
+pub mod executor;
 pub mod filestore;
 pub mod ledger;
 pub mod replay;
+pub mod scale;
 pub mod vault;
 
 pub use anchor::{run_anchor_harness, AnchorReport};
@@ -20,9 +22,11 @@ pub use atlas::{
     RouteQueryReport, VaultPositionReport,
 };
 pub use ecology::{run_ecology_harness, EcologyReport};
+pub use executor::LaneExecutor;
 pub use filestore::FileStorage;
 pub use ledger::{run_invalidation_ledger, ScenarioReport};
 pub use replay::{run_continuity_replay, state_hash, ReplayConfig, ReplayReport};
+pub use scale::{run_scale_harness, ScaleConfig, ScaleReport};
 pub use vault::{run_vault_harness, VaultReport};
 
 use world_core::{feature_hash, Biome, FeatureKey, RegionCoord, WORLD_ALGORITHM_VERSION};

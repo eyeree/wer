@@ -42,6 +42,19 @@ fn bench_ecology(c: &mut Criterion) {
             )
         })
     });
+
+    // The M4 hoist pair (phase-6-plan.md §6.3): table build once per
+    // signature vs the per-cell remainder.
+    let table = world_core::population_table(&roster, &web);
+    c.bench_function("population_from_table", |b| {
+        b.iter(|| {
+            world_core::population_from_table(
+                criterion::black_box(&table),
+                criterion::black_box(0.7),
+                criterion::black_box(0.6),
+            )
+        })
+    });
 }
 
 criterion_group!(benches, bench_ecology);

@@ -16,14 +16,15 @@ path = "src/main.rs"
 
 [dependencies]
 world-core = { path = "../world-core" }
-world-runtime = { path = "../world-runtime" }
+# `pass-timing`: the native shell is a primary consumer of the per-pass
+# telemetry (phase-6-plan.md §5.2); wasm builds never see the feature.
+world-runtime = { path = "../world-runtime", features = ["pass-timing"] }
 # The shared native file-tree Storage backend (phase-5-plan.md §5.3) — the
 # tools crate has no windowing/GPU dependencies, so this stays lightweight.
 tools = { path = "../tools" }
 renderer = { path = "../renderer" }
 winit = { workspace = true }
 pollster = { workspace = true }
-rayon = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 font8x8 = { workspace = true }

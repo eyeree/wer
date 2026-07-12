@@ -81,6 +81,12 @@ pub struct LayerDecl {
     /// being warranted; folded into the dependency hash (phase-2-plan.md §9.2).
     pub algorithm_revision: u16,
     /// Relative generation cost in budget units (phase-2-plan.md §8.2),
+    /// recalibrated at Phase 6 M4 against the post-SIMD criterion benches
+    /// (docs/perf-baseline.md): one unit ≈ 25 µs of a 32² tile on the
+    /// reference machine — terrain/geology/soils/ecology ≈ 2, the cheap
+    /// arithmetic layers ≈ 1, the macro drainage job ≈ 17. Costs are
+    /// scheduling metadata only; they fold into no hash (ADR 0018 lets
+    /// pacing change freely),
     /// calibrated by the criterion benches rather than taste.
     pub cost: u32,
 }
@@ -129,7 +135,7 @@ pub const LAYERS: [LayerDecl; LAYER_COUNT as usize] = [
         // via the quantized anchor-free field base inside the generator.
         domains: 0,
         algorithm_revision: 0,
-        cost: 10,
+        cost: 17,
     },
     LayerDecl {
         id: LAYER_CLIMATE,
@@ -145,7 +151,7 @@ pub const LAYERS: [LayerDecl; LAYER_COUNT as usize] = [
         deps: &[LAYER_TERRAIN, LAYER_DRAINAGE, LAYER_CLIMATE],
         domains: H | P,
         algorithm_revision: 0,
-        cost: 2,
+        cost: 1,
     },
     LayerDecl {
         id: LAYER_SOILS,
@@ -169,7 +175,7 @@ pub const LAYERS: [LayerDecl; LAYER_COUNT as usize] = [
         deps: &[LAYER_CLIMATE, LAYER_SOILS, LAYER_BIOME],
         domains: E,
         algorithm_revision: 0,
-        cost: 2,
+        cost: 1,
     },
     LayerDecl {
         id: LAYER_ECOLOGY,

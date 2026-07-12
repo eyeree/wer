@@ -36,7 +36,7 @@ pub const SEA_LEVEL: f32 = 0.0;
 
 /// How far the Planetary (ocean fraction) dimension can shift the effective
 /// land height relative to sea level, in world units total swing.
-const SEA_SHIFT_RANGE: f32 = 120.0;
+pub(crate) const SEA_SHIFT_RANGE: f32 = 120.0;
 
 /// Deterministic 64-bit seed for the gradient at integer lattice corner
 /// `(ix, iy)` of `octave`.
@@ -73,16 +73,18 @@ const GRADIENTS: [(f32, f32); 8] = [
 ];
 
 /// Gradient vector at a lattice corner, selected by integer hash.
+/// `pub(crate)` for the SIMD row kernels (ADR 0016): the row path fetches
+/// the same gradients through the same hash, just memoized per row.
 #[inline]
 #[must_use]
-fn gradient(ix: i64, iy: i64, octave: u32) -> (f32, f32) {
+pub(crate) fn gradient(ix: i64, iy: i64, octave: u32) -> (f32, f32) {
     GRADIENTS[(gradient_seed(ix, iy, octave) & 7) as usize]
 }
 
 /// Perlin's quintic fade: C2-continuous across lattice cell boundaries, which
 /// is what keeps the heightfield free of visible grid creases.
 #[inline]
-fn fade(t: f32) -> f32 {
+pub(crate) fn fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
@@ -123,7 +125,8 @@ fn gradient_noise(x: f64, y: f64, octave: u32) -> f32 {
 /// derived from the same integer-hash domain as the gradients, so they are
 /// part of the reproducible topology.
 #[inline]
-fn octave_offset(octave: u32) -> (f64, f64) {
+#[must_use]
+pub fn octave_offset(octave: u32) -> (f64, f64) {
     // A distinct corner of the gradient-seed space reserved for offsets.
     let hx = gradient_seed(i64::MIN, 0, octave);
     let hy = gradient_seed(0, i64::MIN, octave);
@@ -162,7 +165,16 @@ pub fn fbm(world_x: f64, world_y: f64) -> f32 {
 /// rather than rearranging it.
 #[must_use]
 pub fn elevation(world_x: f64, world_y: f64, p: &PossibilityVector) -> f32 {
-    let relief = fbm(world_x, world_y);
+    elevation_from_relief(fbm(world_x, world_y), p)
+}
+
+/// The possibility scaling of a precomputed relief sample — the shared tail
+/// of [`elevation`] and the Phase 6 row/batch paths (`simd::elevation_row`,
+/// the drainage elevation fill), so every path runs literally the same
+/// expression (ADR 0016).
+#[inline]
+#[must_use]
+pub(crate) fn elevation_from_relief(relief: f32, p: &PossibilityVector) -> f32 {
     // Geology 0..1 → amplitude scale 0.5..1.5 (quiet plains ↔ young mountains).
     let tectonic = 0.5 + p.get(PossibilityDomain::Geology);
     // Planetary 0..1 → sea shift −60..+60 (more ocean ↔ more land).

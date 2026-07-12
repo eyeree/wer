@@ -12,6 +12,9 @@ workspace = true
 
 [dependencies]
 glam = { workspace = true }
+# Phase 6 SIMD row kernels (simd.rs, ADR 0016); scalar fallback keeps wasm
+# builds clean without simd128.
+wide = { workspace = true }
 # Phase 5 record schema + codec (phase-5-plan.md §4). Both are `no_std`-clean;
 # the wasm CI job enforces that they stay so.
 serde = { workspace = true }

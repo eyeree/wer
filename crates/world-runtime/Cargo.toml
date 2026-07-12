@@ -10,6 +10,13 @@ description = "Platform-neutral region lifecycle, streaming, scheduling, and abs
 [lints]
 workspace = true
 
+[features]
+# Wall-clock pass timings inside `RegionMap::update` (phase-6-plan.md §5.2).
+# Uses `std::time::Instant`, which wasm32-unknown-unknown lacks, so only the
+# native shell and tools enable it; wasm builds compile without it and the
+# `pass_ms` telemetry reports zeros.
+pass-timing = []
+
 [dependencies]
 world-core = { path = "../world-core" }
 # The vault decodes generic record bodies (phase-5-plan.md §5.2).

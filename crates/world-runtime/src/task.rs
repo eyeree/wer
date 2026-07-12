@@ -19,10 +19,13 @@ pub enum TaskPriority {
 
 /// Submits CPU work for parallel execution.
 ///
-/// The interface is intentionally minimal for the bootstrap: a fire-and-forget
-/// submission of a boxed closure with a priority. It will grow dependency
-/// tracking, cancellation handles, and output-revision plumbing as the job
-/// system plan (`job-system-plan.md`) is written.
+/// The interface is deliberately still the Phase 0 minimum: a fire-and-forget
+/// submission of a boxed closure with a priority. As of Phase 6 the priority
+/// is *honored* by the native executor (the lane executor in the `tools`
+/// crate, re-exported by `platform-native`), and cancellation rides inside
+/// the job closures the runtime builds — a token checked on dequeue
+/// (phase-6-plan.md §6.2) — so the trait itself did not need to grow. A
+/// browser Web Worker pool implements this same contract in Phase 7.
 pub trait TaskExecutor {
     /// Submit `job` to run at `priority`. The executor may run it on another
     /// thread/worker, so the closure is `Send`.

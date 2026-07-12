@@ -1,8 +1,10 @@
 //! Layer regeneration and the region field cache (phase-2-plan.md §5.2, §6).
 //!
 //! [`generate_layer`] is a *pure* function of `(coord, layer, inputs,
-//! resolution)`: it takes immutable inputs and returns an owned
-//! [`GeneratedTile`]. Unlike Phase 1 — where every job recomputed its inputs
+//! resolution)`: it returns an owned [`GeneratedTile`] whose content depends
+//! only on those inputs (the `&mut` on `inputs` exists solely to drain the
+//! recycled output buffers, phase-6-plan.md §4.2 — never to vary content).
+//! Unlike Phase 1 — where every job recomputed its inputs
 //! per sample — jobs now receive cheap `Arc` snapshots of their input tiles
 //! (phase-2-plan.md §6.2): with a six-deep graph the recomputation redundancy
 //! compounds, and macro drainage cannot be recomputed per-sample at all. Tiles
@@ -17,10 +19,11 @@ use world_core::layer::{
     LAYER_BIOME, LAYER_CLIMATE, LAYER_DRAINAGE, LAYER_ECOLOGY, LAYER_GEOLOGY, LAYER_HYDROLOGY,
     LAYER_SOILS, LAYER_TERRAIN, LAYER_VEGETATION,
 };
+use world_core::simd::{climate_row, elevation_row, hydrology_row, soils_row, vegetation_row};
 use world_core::{
-    classify, climate, elevation, geology, hydrology, population, soils, vegetation, Biome,
-    Climate, DrainageTile, FieldTile, Geology, HabitatSignature, Hydrology, PossibilityDomain,
-    PossibilityVector, RegionCoord, Soils, REGION_SIZE,
+    classify, geology, population_from_table, Biome, Climate, DrainageTile, FieldTile,
+    HabitatSignature, Hydrology, PossibilityDomain, PossibilityVector, RegionCoord, Soils,
+    REGION_SIZE,
 };
 
 use crate::rostercache::RosterSnapshot;
@@ -159,28 +162,40 @@ impl RegionCache {
     }
 
     /// Store one channel's tile, creating the region entry as needed.
+    /// Returns the superseded tile, if any, so the caller can reclaim its
+    /// buffer through the pool (phase-6-plan.md §4.2).
     pub fn insert_channel(
         &mut self,
         coord: RegionCoord,
         channel: usize,
         tile: Arc<FieldTile<f32>>,
-    ) {
-        self.tiles.entry(coord).or_default().channels[channel] = Some(tile);
+    ) -> Option<Arc<FieldTile<f32>>> {
+        self.tiles.entry(coord).or_default().channels[channel].replace(tile)
     }
 
-    /// Store a region's biome tile.
-    pub fn insert_biome(&mut self, coord: RegionCoord, tile: Arc<FieldTile<u8>>) {
-        self.tiles.entry(coord).or_default().biome = Some(tile);
+    /// Store a region's biome tile, returning the superseded one.
+    pub fn insert_biome(
+        &mut self,
+        coord: RegionCoord,
+        tile: Arc<FieldTile<u8>>,
+    ) -> Option<Arc<FieldTile<u8>>> {
+        self.tiles.entry(coord).or_default().biome.replace(tile)
     }
 
-    /// Store a region's dominant-species index tile.
-    pub fn insert_dominant(&mut self, coord: RegionCoord, tile: Arc<FieldTile<u16>>) {
-        self.tiles.entry(coord).or_default().dominant = Some(tile);
+    /// Store a region's dominant-species index tile, returning the
+    /// superseded one.
+    pub fn insert_dominant(
+        &mut self,
+        coord: RegionCoord,
+        tile: Arc<FieldTile<u16>>,
+    ) -> Option<Arc<FieldTile<u16>>> {
+        self.tiles.entry(coord).or_default().dominant.replace(tile)
     }
 
-    /// Drop every tile for a region (eviction).
-    pub fn remove_region(&mut self, coord: RegionCoord) {
-        self.tiles.remove(&coord);
+    /// Drop every tile for a region (eviction), returning them so their
+    /// buffers can be reclaimed (phase-6-plan.md §4.2).
+    pub fn remove_region(&mut self, coord: RegionCoord) -> Option<RegionTiles> {
+        self.tiles.remove(&coord)
     }
 
     /// Number of regions with at least one cached tile.
@@ -209,6 +224,20 @@ impl RegionCache {
     }
 }
 
+/// Recycled output buffers a generation job fills (phase-6-plan.md §4.2),
+/// popped from the main-thread [`crate::pool::TilePool`] at dispatch. Empty
+/// by default — a job with no pooled buffers allocates fresh ones, so the
+/// pool is purely an optimization and content is identical either way.
+#[derive(Debug, Default)]
+pub struct TileBuffers {
+    /// One buffer per `f32` output channel (order irrelevant — all same size).
+    pub f32_bufs: Vec<Vec<f32>>,
+    /// The biome layer's `u8` buffer.
+    pub u8_buf: Option<Vec<u8>>,
+    /// The ecology layer's dominant-index `u16` buffer.
+    pub u16_buf: Option<Vec<u16>>,
+}
+
 /// Everything a layer generation job consumes, snapshotted at dispatch
 /// (phase-2-plan.md §5.2). The job never touches shared mutable state.
 #[derive(Debug)]
@@ -230,6 +259,9 @@ pub struct LayerInputs {
     /// The tile's provenance-to-be: the dependency hash the scheduler computed
     /// from exactly these inputs (ADR 0008).
     pub dep_hash: u64,
+    /// Recycled output buffers, drained by [`generate_layer`]
+    /// (phase-6-plan.md §4.2).
+    pub buffers: TileBuffers,
 }
 
 impl LayerInputs {
@@ -311,11 +343,15 @@ fn climate_at(
 /// values consumed are the *dequantized* buckets of the layer's declared
 /// domains — undeclared domains read as the neutral constant, so an undeclared
 /// dependency cannot leak into tile content (phase-2-plan.md §4.2).
+///
+/// `inputs` is `&mut` only to drain its recycled output buffers
+/// (phase-6-plan.md §4.2); everything consumed as *input* is untouched, and
+/// output content is bit-identical with or without pooled buffers.
 #[must_use]
 pub fn generate_layer(
     coord: RegionCoord,
     layer: u16,
-    inputs: &LayerInputs,
+    inputs: &mut LayerInputs,
     resolution: u16,
 ) -> GeneratedTile {
     let decl = world_core::layer_decl(layer);
@@ -323,16 +359,29 @@ pub fn generate_layer(
     let mut channels = Vec::new();
     let mut biome_tile = None;
     let mut dominant_tile = None;
-    let new_tile = || FieldTile::<f32>::new(resolution, inputs.dep_hash);
+    let mut buffers = core::mem::take(&mut inputs.buffers);
+    let inputs = &*inputs;
+    let u8_buf = buffers.u8_buf.take().unwrap_or_default();
+    let u16_buf = buffers.u16_buf.take().unwrap_or_default();
+    let mut new_tile = || {
+        FieldTile::<f32>::from_buffer(
+            resolution,
+            inputs.dep_hash,
+            buffers.f32_bufs.pop().unwrap_or_default(),
+        )
+    };
 
     match layer {
         LAYER_TERRAIN => {
+            // Row-kernel path (phase-6-plan.md §6.1, ADR 0016): bit-identical
+            // to the per-cell `elevation` loop, differential-tested.
             let mut tile = new_tile();
+            let xs: Vec<f64> = (0..resolution)
+                .map(|cx| cell_center(coord, resolution, cx, 0).0)
+                .collect();
             for cy in 0..resolution {
-                for cx in 0..resolution {
-                    let (x, y) = cell_center(coord, resolution, cx, cy);
-                    tile.set(cx, cy, elevation(x, y, &p));
-                }
+                let y = cell_center(coord, resolution, 0, cy).1;
+                elevation_row(&xs, y, &p, tile.row_mut(cy));
             }
             channels.push((CHANNEL_ELEVATION, tile));
         }
@@ -354,11 +403,12 @@ pub fn generate_layer(
             let mut temperature = new_tile();
             let mut moisture = new_tile();
             for cy in 0..resolution {
-                for cx in 0..resolution {
-                    let c = climate(elevation_tile.get(cx, cy), &p);
-                    temperature.set(cx, cy, c.temperature);
-                    moisture.set(cx, cy, c.moisture);
-                }
+                climate_row(
+                    elevation_tile.row(cy),
+                    &p,
+                    temperature.row_mut(cy),
+                    moisture.row_mut(cy),
+                );
             }
             channels.push((CHANNEL_TEMPERATURE, temperature));
             channels.push((CHANNEL_MOISTURE, moisture));
@@ -376,17 +426,25 @@ pub fn generate_layer(
             let p_planetary = p.get(PossibilityDomain::Planetary);
             let mut river = new_tile();
             let mut wetness = new_tile();
+            let mut slope_row = vec![0f32; resolution as usize];
+            let mut accum_row = vec![0f32; resolution as usize];
             for cy in 0..resolution {
                 for cx in 0..resolution {
                     let (x, y) = cell_center(coord, resolution, cx, cy);
-                    let e = elevation_tile.get(cx, cy);
-                    let slope = slope_at(elevation_tile, cx, cy, resolution);
-                    let accum = drainage.accum_bilinear(x, y);
-                    let c = climate_at(temperature, moisture, cx, cy);
-                    let h = hydrology(e, slope, accum, &c, p_hydrology, p_planetary);
-                    river.set(cx, cy, h.river);
-                    wetness.set(cx, cy, h.wetness);
+                    slope_row[cx as usize] = slope_at(elevation_tile, cx, cy, resolution);
+                    accum_row[cx as usize] = drainage.accum_bilinear(x, y);
                 }
+                hydrology_row(
+                    elevation_tile.row(cy),
+                    &slope_row,
+                    &accum_row,
+                    temperature.row(cy),
+                    moisture.row(cy),
+                    p_hydrology,
+                    p_planetary,
+                    river.row_mut(cy),
+                    wetness.row_mut(cy),
+                );
             }
             channels.push((CHANNEL_RIVER, river));
             channels.push((CHANNEL_WETNESS, wetness));
@@ -397,7 +455,7 @@ pub fn generate_layer(
                 Some(hardness),
                 Some(temperature),
                 Some(moisture),
-                Some(river),
+                Some(_river),
                 Some(wetness),
             ) = (
                 inputs.channel(CHANNEL_ELEVATION),
@@ -412,28 +470,29 @@ pub fn generate_layer(
             };
             let mut depth = new_tile();
             let mut fertility = new_tile();
+            let mut slope_row = vec![0f32; resolution as usize];
+            // Lithology ids are possibility-independent, so soils reads them
+            // through the pure function rather than a cached channel
+            // (phase-2-plan.md §6.1); hardness — the cached possibility-
+            // dependent expression — comes from the tile.
+            let mut lith_row = vec![0u8; resolution as usize];
             for cy in 0..resolution {
                 for cx in 0..resolution {
                     let (x, y) = cell_center(coord, resolution, cx, cy);
-                    let e = elevation_tile.get(cx, cy);
-                    let slope = slope_at(elevation_tile, cx, cy, resolution);
-                    // Lithology ids are possibility-independent, so soils reads
-                    // them through the pure function rather than a cached
-                    // channel (phase-2-plan.md §6.1); hardness — the cached
-                    // possibility-dependent expression — comes from the tile.
-                    let g = Geology {
-                        lithology: world_core::lithology_id(x, y),
-                        hardness: hardness.get(cx, cy),
-                    };
-                    let c = climate_at(temperature, moisture, cx, cy);
-                    let h = Hydrology {
-                        river: river.get(cx, cy),
-                        wetness: wetness.get(cx, cy),
-                    };
-                    let s = soils(e, slope, &g, &c, &h);
-                    depth.set(cx, cy, s.depth);
-                    fertility.set(cx, cy, s.fertility);
+                    slope_row[cx as usize] = slope_at(elevation_tile, cx, cy, resolution);
+                    lith_row[cx as usize] = world_core::lithology_id(x, y);
                 }
+                soils_row(
+                    elevation_tile.row(cy),
+                    &slope_row,
+                    hardness.row(cy),
+                    &lith_row,
+                    temperature.row(cy),
+                    moisture.row(cy),
+                    wetness.row(cy),
+                    depth.row_mut(cy),
+                    fertility.row_mut(cy),
+                );
             }
             channels.push((CHANNEL_SOIL_DEPTH, depth));
             channels.push((CHANNEL_FERTILITY, fertility));
@@ -459,7 +518,7 @@ pub fn generate_layer(
             else {
                 return missing_inputs(coord, layer, inputs.dep_hash);
             };
-            let mut tile = FieldTile::<u8>::new(resolution, inputs.dep_hash);
+            let mut tile = FieldTile::<u8>::from_buffer(resolution, inputs.dep_hash, u8_buf);
             for cy in 0..resolution {
                 for cx in 0..resolution {
                     let c = climate_at(temperature, moisture, cx, cy);
@@ -501,17 +560,16 @@ pub fn generate_layer(
             let mut density = new_tile();
             let mut canopy = new_tile();
             for cy in 0..resolution {
-                for cx in 0..resolution {
-                    let c = climate_at(temperature, moisture, cx, cy);
-                    let s = Soils {
-                        depth: depth.get(cx, cy),
-                        fertility: fertility.get(cx, cy),
-                    };
-                    let b = Biome::from_id(biome_input.get(cx, cy));
-                    let v = vegetation(b, &c, &s, p_ecology);
-                    density.set(cx, cy, v.density);
-                    canopy.set(cx, cy, v.canopy_height);
-                }
+                vegetation_row(
+                    biome_input.row(cy),
+                    temperature.row(cy),
+                    moisture.row(cy),
+                    depth.row(cy),
+                    fertility.row(cy),
+                    p_ecology,
+                    density.row_mut(cy),
+                    canopy.row_mut(cy),
+                );
             }
             channels.push((CHANNEL_VEGETATION, density));
             channels.push((CHANNEL_CANOPY, canopy));
@@ -544,7 +602,7 @@ pub fn generate_layer(
             let mut herbivore = new_tile();
             let mut predator = new_tile();
             let mut diversity = new_tile();
-            let mut dominant = FieldTile::<u16>::new(resolution, inputs.dep_hash);
+            let mut dominant = FieldTile::<u16>::from_buffer(resolution, inputs.dep_hash, u16_buf);
             for cy in 0..resolution {
                 for cx in 0..resolution {
                     let c = climate_at(temperature, moisture, cx, cy);
@@ -558,9 +616,10 @@ pub fn generate_layer(
                     let signature = HabitatSignature::of(biome, &c, &s);
                     let productivity = vegetation.get(cx, cy);
                     let sample = match rosters.get(&signature) {
-                        Some(entry) => {
-                            population(&entry.roster, &entry.web, productivity, p_ecology)
-                        }
+                        // The hoisted table (phase-6-plan.md §6.3): identical
+                        // values to the per-cell derivation, O(cells) not
+                        // O(cells·roster²).
+                        Some(entry) => population_from_table(&entry.table, productivity, p_ecology),
                         // The scheduler snapshots every signature a cell will
                         // encounter (§8.2); a miss is a scheduler bug, kept
                         // non-fatal on worker threads by emitting a barren cell.
@@ -624,6 +683,7 @@ fn missing_inputs(coord: RegionCoord, layer: u16, dep_hash: u64) -> GeneratedTil
 #[cfg(test)]
 mod tests {
     use super::*;
+    use world_core::climate;
     use world_core::layer::LAYER_COUNT;
 
     fn terrain_inputs(p: &PossibilityVector) -> LayerInputs {
@@ -635,6 +695,7 @@ mod tests {
             drainage: None,
             rosters: None,
             dep_hash: 42,
+            buffers: TileBuffers::default(),
         }
     }
 
@@ -654,8 +715,8 @@ mod tests {
     fn generation_is_pure_and_reproducible() {
         let coord = RegionCoord::new(3, -2);
         let p = PossibilityVector::neutral();
-        let a = generate_layer(coord, LAYER_TERRAIN, &terrain_inputs(&p), 8);
-        let b = generate_layer(coord, LAYER_TERRAIN, &terrain_inputs(&p), 8);
+        let a = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
+        let b = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
         assert_eq!(a.channels.len(), 1);
         for ((ca, ta), (cb, tb)) in a.channels.iter().zip(&b.channels) {
             assert_eq!(ca, cb);
@@ -667,18 +728,19 @@ mod tests {
     fn climate_consumes_the_terrain_input_tile() {
         let coord = RegionCoord::new(1, 1);
         let p = PossibilityVector::neutral();
-        let terrain = generate_layer(coord, LAYER_TERRAIN, &terrain_inputs(&p), 8);
+        let terrain = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
         let (_, elevation_tile) = terrain.channels.into_iter().next().unwrap();
         let decl = world_core::layer_decl(LAYER_CLIMATE);
-        let inputs = LayerInputs {
+        let mut inputs = LayerInputs {
             quantized: p.quantized_domains(decl.domains),
             tiles: vec![(CHANNEL_ELEVATION, Arc::new(elevation_tile.clone()))],
             biome: None,
             drainage: None,
             rosters: None,
             dep_hash: 7,
+            buffers: TileBuffers::default(),
         };
-        let out = generate_layer(coord, LAYER_CLIMATE, &inputs, 8);
+        let out = generate_layer(coord, LAYER_CLIMATE, &mut inputs, 8);
         assert_eq!(out.channels.len(), 2);
         let (channel, temperature) = &out.channels[0];
         assert_eq!(*channel, CHANNEL_TEMPERATURE);
@@ -692,13 +754,29 @@ mod tests {
     }
 
     #[test]
+    fn pooled_buffers_produce_identical_tiles() {
+        // The §4.2 plumbing pin: a dirty recycled buffer changes nothing —
+        // same fill code, same content hash as a fresh allocation.
+        let coord = RegionCoord::new(-4, 9);
+        let p = PossibilityVector::neutral();
+        let fresh = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
+        let mut pooled_inputs = terrain_inputs(&p);
+        pooled_inputs.buffers.f32_bufs.push(vec![f32::NAN; 3]); // dirty, wrong-sized
+        let pooled = generate_layer(coord, LAYER_TERRAIN, &mut pooled_inputs, 8);
+        assert_eq!(
+            fresh.channels[0].1.content_hash(),
+            pooled.channels[0].1.content_hash()
+        );
+    }
+
+    #[test]
     fn cache_round_trip_and_eviction() {
         let mut cache = RegionCache::default();
         let coord = RegionCoord::new(1, 1);
         let out = generate_layer(
             coord,
             LAYER_TERRAIN,
-            &terrain_inputs(&PossibilityVector::neutral()),
+            &mut terrain_inputs(&PossibilityVector::neutral()),
             8,
         );
         for (channel, tile) in out.channels {

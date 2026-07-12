@@ -39,6 +39,7 @@ pub mod possibility;
 pub mod possibility_field;
 pub mod record;
 pub mod route;
+pub mod simd;
 pub mod soils;
 pub mod species;
 pub mod terrain;
@@ -68,7 +69,10 @@ pub use layer::{
     all_layers_mask, dependents_closure, domain_dirty_mask, domain_readers, layer_bit, layer_decl,
     LayerDecl, LAYERS, LAYER_COUNT,
 };
-pub use population::{diversity_of, population, signature_productivity, PopulationSample};
+pub use population::{
+    diversity_of, population, population_from_table, population_table, signature_productivity,
+    PopulationSample, PopulationTable,
+};
 pub use possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS, POSSIBILITY_QUANT};
 pub use possibility_field::PossibilityField;
 pub use record::{

@@ -12,8 +12,8 @@ browser/WebAssembly/WebGPU target) for an exploration game built around
 [`Infinite_World_Exploration_Project_Overview.md`](Infinite_World_Exploration_Project_Overview.md);
 the phased technical plan is in [`implementation-plan.md`](implementation-plan.md).
 
-The repository is at **Phase 5** (routes, persistence, and the social model, see
-[`phase-5-plan.md`](phase-5-plan.md)), built on the landed Phase 2–4 stacks.
+The repository is at **Phase 6** (performance and scale, see
+[`phase-6-plan.md`](phase-6-plan.md)), built on the landed Phase 2–5 stacks.
 Phase 2 is a nine-layer declared dependency graph — terrain, geology,
 macro drainage, climate, hydrology, soils, biome, vegetation, and **ecology
 (L8)** — with dependency-hash staleness (ADR 0008), topological cost-budgeted
@@ -41,12 +41,31 @@ bundles, no server anywhere). Preserves pin regions to their quantized buckets
 (a few dozen bytes reproduce the whole landscape via ADR 0008); routes attract
 as derived weak anchors on the fast domains only (ADR 0015: soft, saturating in
 usage, never steering the stable topology). Save→load→settle is state-hash
-exact, machine-checked by the vault harness (`wer-vault`). Persistence changes
-no generated output, so `WORLD_ALGORITHM_VERSION` stays at 2. The renderer
-still only presents one CPU-composed debug texture, the possibility vector is
-still one scalar per domain, and there is no networking and no browser storage
-backend (Phase 7) — those grow in later phases; do not mistake them for
-finished subsystems.
+exact, machine-checked by the vault harness (`wer-vault`). Phase 6 is the
+optimization phase, and it changes **no generated output for any input**:
+`WORLD_ALGORITHM_VERSION` stays at 2, every `algorithm_revision` stays 0, and
+zero golden fixtures were re-blessed. It adds the measurement layer (per-pass
+timings behind the `pass-timing` feature, the committed
+[`docs/perf-baseline.md`](docs/perf-baseline.md) ledger), the **LaneExecutor**
+(three priority lanes + cancellation tokens, hosted in `tools::executor` so
+the harnesses drive the production scheduler; `rayon` is gone; `wer --inline`
+is the A/B), the **tile pool** and byte-capacity **cache ceilings** with
+deterministic farthest-first eviction, amortized retarget, **SIMD row
+kernels** in `world-core/src/simd.rs` that are *bit-identical* to their
+scalar twins (ADR 0016, differential-tested in CI; `wide`, scalar on wasm
+without `simd128`), the same-math L8 hoist, the **GPU-composed debug map**
+(region-tile atlas, dep-hash-keyed delta uploads, WGSL refinement octaves —
+derived presentation only, no readback API exists, ADR 0017; the CPU
+composer remains the headless/screenshot/test path, `,`/`.` toggle
+compose/refinement, `WER_CPU_MAP=1` starts CPU), and **resource tiers**
+(`world-runtime/src/tier.rs`: Low = the Phase 5 defaults, Mid, High with
+`organisms_per_cell` up to 4 — additive identities, slot 0 keeps Phase 5
+ids; `WER_TIER`/`WER_CACHE_MB` override). Settled world state is proven
+schedule-independent across executor, worker count, budget scale,
+cancellation, amortization, and tier (ADR 0018), machine-checked by the
+scale harness (`wer-scale`). The possibility vector is still one scalar per
+domain, and there is no networking and no browser storage backend (Phase 7)
+— those grow in later phases; do not mistake them for finished subsystems.
 
 ## Toolchain
 
@@ -74,11 +93,12 @@ cargo run --bin wer-inspect -- 300 -10 --steer
 cargo run --bin wer-atlas -- list wer-vault
 
 # Phase sign-off harnesses (headless, CI gates): invalidation precision,
-# Phase 4 steering, and Phase 5 persistence/sharing (durable/sparse/shareable/
-# preserve/routes/precision).
+# Phase 4 steering, Phase 5 persistence/sharing, and the Phase 6 scale gates
+# (schedule independence, per-tier stability, memory ceilings, density).
 cargo run --bin wer-ledger
 cargo run --bin wer-anchor
 cargo run --bin wer-vault
+cargo run --release --bin wer-scale          # add --report for the baseline table
 
 # Run everything, including the determinism golden fixtures.
 cargo test --workspace

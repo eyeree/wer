@@ -32,8 +32,9 @@ use world_core::{
     PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS,
 };
 use world_runtime::{
-    Budget, FrameStats, InlineExecutor, RegionMap, StreamConfig, CHANNEL_CANOPY, CHANNEL_COUNT,
-    CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+    Budget, FrameStats, GenerationStatus, InlineExecutor, RegionMap, StreamConfig, TaskExecutor,
+    CHANNEL_CANOPY, CHANNEL_COUNT, CHANNEL_ELEVATION, CHANNEL_HARDNESS, CHANNEL_RIVER,
+    CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
 };
 
 /// Script + thresholds for one replay run.
@@ -79,6 +80,7 @@ impl Default for ReplayConfig {
                 converge_per_unit: 0.01,
                 converge_rate_cap: 0.2,
                 field_resolution: 8,
+                ..StreamConfig::default()
             },
             budget: Budget {
                 max_loads: 64,
@@ -88,6 +90,7 @@ impl Default for ReplayConfig {
                 max_resonance_nodes: usize::MAX,
                 max_persist_ops: usize::MAX,
                 max_route_attraction_nodes: usize::MAX,
+                max_retarget_regions: usize::MAX,
             },
             velocity: (37.0, 23.0),
             // One converge step moves a dimension ≤ converge_rate; generation
@@ -281,10 +284,33 @@ fn channel_epsilon(cfg: &ReplayConfig, channel: usize) -> f32 {
     }
 }
 
-/// Run the scripted continuity replay and collect violations.
+/// Run the scripted continuity replay and collect violations (inline
+/// executor, the Phase 1–5 behavior; see [`run_continuity_replay_with`] for
+/// the Phase 6 executor-parametric form).
+#[must_use]
+pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
+    run_continuity_replay_with(cfg, &InlineExecutor, false)
+}
+
+/// Run the scripted continuity replay under any executor (phase-6-plan.md
+/// §11.3): the same script and the same continuity assertions must hold
+/// whether jobs run inline or on a thread pool — order-independence is a
+/// contract, not a convention.
+///
+/// With `settle`, the run ends by holding the player still (zero travel,
+/// script tail values) until the map reaches a fixed point — no stale
+/// layers, no in-flight jobs, and a state hash stable across frames. Settled
+/// hashes are what ADR 0018's schedule-independence equalities compare;
+/// mid-flight state legitimately depends on pacing (different work has
+/// completed), so an unsettled hash is only comparable between two runs of
+/// the same schedule.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
+pub fn run_continuity_replay_with(
+    cfg: &ReplayConfig,
+    executor: &dyn TaskExecutor,
+    settle: bool,
+) -> ReplayReport {
     let field = PossibilityField::default();
     let mut map = RegionMap::new(cfg.stream);
     let mut violations = Vec::new();
@@ -323,7 +349,7 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
             &anchors,
             &bias,
             &cfg.budget,
-            &InlineExecutor,
+            executor,
             false,
         );
         peak_regions = peak_regions.max(final_stats.active_regions);
@@ -522,6 +548,16 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
         prev_tiles = tiles_now;
     }
 
+    // -- Optional settle to a fixed point (phase-6-plan.md §9.3): hold the
+    //    player at the final position with zero travel until nothing is
+    //    stale, nothing is in flight, and the state hash is frame-stable.
+    if settle && !settle_to_fixed_point(&mut map, cfg, &field, executor) {
+        record(
+            &mut violations,
+            "settle: map did not reach a fixed point within the settle bound".into(),
+        );
+    }
+
     // -- Macro seam assertion (final frame): river expression across
     //    macro-tile boundaries steps by less than the truncation bound.
     check_macro_seams(&map, cfg, &mut violations);
@@ -534,6 +570,64 @@ pub fn run_continuity_replay(cfg: &ReplayConfig) -> ReplayReport {
         peak_regions,
         peak_cache_bytes,
     }
+}
+
+/// Update at the script's final position (zero travel, tail bias/anchors)
+/// until the map is a fixed point: every region `Ready`, nothing in flight,
+/// and [`state_hash`] unchanged over consecutive frames (which also waits
+/// out budget-paced realization). Returns whether the fixed point was
+/// reached within the bound.
+pub fn settle_to_fixed_point(
+    map: &mut RegionMap,
+    cfg: &ReplayConfig,
+    field: &PossibilityField,
+    executor: &dyn TaskExecutor,
+) -> bool {
+    let player = (
+        f64::from(cfg.frames.saturating_sub(1)) * cfg.velocity.0,
+        f64::from(cfg.frames.saturating_sub(1)) * cfg.velocity.1,
+    );
+    let bias = scripted_bias(cfg.frames, cfg.frames.max(1));
+    let anchors = scripted_anchors(cfg.frames, cfg.frames.max(1), cfg.velocity);
+    const SETTLE_LIMIT: u32 = 20_000;
+    const STABLE_FRAMES: u32 = 3;
+    let mut last_hash = 0u64;
+    let mut stable = 0u32;
+    for _ in 0..SETTLE_LIMIT {
+        map.update(
+            player,
+            0.0,
+            field,
+            &anchors,
+            &bias,
+            &cfg.budget,
+            executor,
+            false,
+        );
+        let quiet = map.jobs_in_flight() == 0
+            && map
+                .iter_active()
+                .all(|r| r.status == GenerationStatus::Ready);
+        if !quiet {
+            // Give a threaded executor's workers a moment to deliver.
+            if executor.parallelism() > 1 {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            stable = 0;
+            continue;
+        }
+        let hash = state_hash(map);
+        if hash == last_hash {
+            stable += 1;
+            if stable >= STABLE_FRAMES {
+                return true;
+            }
+        } else {
+            stable = 0;
+            last_hash = hash;
+        }
+    }
+    false
 }
 
 /// Compare edge-adjacent river samples of neighboring regions that live in

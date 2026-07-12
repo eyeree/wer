@@ -50,24 +50,30 @@ pub struct PopulationSample {
     pub diversity: f32,
 }
 
-/// Aggregate population values for a cell (phase-3-plan.md §7.5).
-///
-/// `primary_productivity` is the cell's aggregate vegetation density; `ecology`
-/// is the dequantized Ecology bucket, both in `[0, 1]`. Herbivore and predator
-/// pressures scale by `productivity · ecology`, so they never exceed the
-/// food-web tier biomass — keeping the coherence invariants (herbivore ≤
-/// α·productivity, predator ≤ β·herbivore) true at the field level (§12.3).
-#[must_use]
-pub fn population(
-    roster: &SpeciesRoster,
-    web: &FoodWeb,
-    primary_productivity: f32,
-    ecology: f32,
-) -> PopulationSample {
-    let pp = primary_productivity.clamp(0.0, 1.0);
-    let eco = ecology.clamp(0.0, 1.0);
-    let scale = pp * eco;
+/// The cell-invariant part of [`population`] (phase-6-plan.md §6.3): the
+/// dominant index, the tier biomasses the pressures scale from, and the
+/// diversity entropy are functions of `(roster, web)` only — computing them
+/// per cell was the L8 hot spot (O(cells·roster²)). The runtime hoists this
+/// table into each memoized roster entry, built once per signature; the
+/// per-cell remainder is [`population_from_table`]. **Same arithmetic, same
+/// order, same `f32` results** as the per-cell path — a memoization, never
+/// an approximation (the goldens and the ecology harness are the proof).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PopulationTable {
+    /// Index of the highest-biomass species (ties to the lowest index).
+    pub dominant: u16,
+    /// Herbivore-tier biomass (`web.tier_biomass[1]`).
+    pub herbivore_base: f32,
+    /// Carnivore-tier biomass (`web.tier_biomass[2]`).
+    pub predator_base: f32,
+    /// Normalized biomass-weighted entropy of the roster.
+    pub diversity: f32,
+}
 
+/// Build the cell-invariant population table for a `(roster, web)` — the
+/// exact loops [`population`] runs, hoisted (phase-6-plan.md §6.3).
+#[must_use]
+pub fn population_table(roster: &SpeciesRoster, web: &FoodWeb) -> PopulationTable {
     // Dominant: the highest-biomass surviving species (producers dominate; ties
     // resolve to the lowest roster index, which is stable and roster-sorted).
     let mut dominant = 0u16;
@@ -79,17 +85,56 @@ pub fn population(
             dominant = i as u16;
         }
     }
-
-    let herbivore = (web.tier_biomass[1] * scale).clamp(0.0, 1.0);
-    let predator = (web.tier_biomass[2] * scale).clamp(0.0, 1.0);
-    let diversity = diversity_of(roster, web);
-
-    PopulationSample {
+    PopulationTable {
         dominant,
-        herbivore,
-        predator,
-        diversity,
+        herbivore_base: web.tier_biomass[1],
+        predator_base: web.tier_biomass[2],
+        diversity: diversity_of(roster, web),
     }
+}
+
+/// The per-cell remainder of [`population`] over a hoisted table
+/// (phase-6-plan.md §6.3): the genuinely cell-varying math only.
+#[must_use]
+pub fn population_from_table(
+    table: &PopulationTable,
+    primary_productivity: f32,
+    ecology: f32,
+) -> PopulationSample {
+    let pp = primary_productivity.clamp(0.0, 1.0);
+    let eco = ecology.clamp(0.0, 1.0);
+    let scale = pp * eco;
+    PopulationSample {
+        dominant: table.dominant,
+        herbivore: (table.herbivore_base * scale).clamp(0.0, 1.0),
+        predator: (table.predator_base * scale).clamp(0.0, 1.0),
+        diversity: table.diversity,
+    }
+}
+
+/// Aggregate population values for a cell (phase-3-plan.md §7.5).
+///
+/// `primary_productivity` is the cell's aggregate vegetation density; `ecology`
+/// is the dequantized Ecology bucket, both in `[0, 1]`. Herbivore and predator
+/// pressures scale by `productivity · ecology`, so they never exceed the
+/// food-web tier biomass — keeping the coherence invariants (herbivore ≤
+/// α·productivity, predator ≤ β·herbivore) true at the field level (§12.3).
+///
+/// Equivalent by construction to `population_from_table(&population_table(…))`
+/// — the runtime uses the split form with the table memoized per signature
+/// (phase-6-plan.md §6.3); this whole-cell form remains the spec.
+#[must_use]
+pub fn population(
+    roster: &SpeciesRoster,
+    web: &FoodWeb,
+    primary_productivity: f32,
+    ecology: f32,
+) -> PopulationSample {
+    population_from_table(
+        &population_table(roster, web),
+        primary_productivity,
+        ecology,
+    )
 }
 
 /// Normalized Shannon entropy of the surviving roster weighted by per-species

@@ -40,6 +40,13 @@ impl MacroCache {
         self.tiles.retain(|coord, _| needed.contains(coord));
     }
 
+    /// Remove one tile (the Phase 6 capacity evictor, phase-6-plan.md §4.3).
+    /// Safe under ADR 0008: the tile re-derives bit-identically whenever a
+    /// dependent next needs it.
+    pub fn remove(&mut self, macro_coord: RegionCoord) -> Option<Arc<DrainageTile>> {
+        self.tiles.remove(&macro_coord)
+    }
+
     /// Number of resident macro tiles.
     #[inline]
     #[must_use]

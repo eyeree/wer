@@ -15,6 +15,7 @@
 pub mod budget;
 pub mod generate;
 pub mod macrocache;
+pub mod pool;
 pub mod realize;
 pub mod region;
 pub mod resonance;
@@ -23,17 +24,20 @@ pub mod route;
 pub mod storage;
 pub mod stream;
 pub mod task;
+pub mod tier;
+pub mod timing;
 pub mod vault;
 
 pub use budget::Budget;
 pub use generate::{
     generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache, RegionTiles,
-    CHANNEL_CANOPY, CHANNEL_COUNT, CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY,
-    CHANNEL_HARDNESS, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER,
-    CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    TileBuffers, CHANNEL_CANOPY, CHANNEL_COUNT, CHANNEL_DIVERSITY, CHANNEL_ELEVATION,
+    CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR,
+    CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 pub use macrocache::MacroCache;
-pub use realize::{realize_region, Organism};
+pub use pool::TilePool;
+pub use realize::{realize_region, realize_region_into, Organism};
 pub use region::{GenerationStatus, RegionState};
 pub use resonance::{Resonance, ResonanceNode};
 pub use rostercache::{RosterCache, RosterEntry, RosterSnapshot};
@@ -43,4 +47,6 @@ pub use stream::{
     stability_for, CellEcology, FrameStats, LayerDiagnostic, RegionMap, StreamConfig,
 };
 pub use task::{InlineExecutor, TaskExecutor, TaskPriority};
+pub use tier::{AdapterClass, ResourceTier, TierInputs};
+pub use timing::{Pass, PassTimings, PASS_COUNT};
 pub use vault::{apply_session_regions, MergeStats, Vault, VaultError, VaultStats};

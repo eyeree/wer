@@ -276,11 +276,24 @@ pub fn drainage(macro_coord: RegionCoord, field: &PossibilityField, dep_hash: u6
     // full 3×3 neighborhood.
     const EDGE: usize = MACRO_GRID + 2;
     let mut elev = vec![0i32; EDGE * EDGE];
+    // Row-kernel fill (phase-6-plan.md §6.1): the relief (fBm) row runs
+    // through the differential-tested SIMD path; the per-region possibility
+    // scaling then applies the identical `elevation_from_relief` expression
+    // the scalar `routing_elevation_cm` applies — same bits, proven by the
+    // drainage routing golden.
+    let xs: Vec<f64> = (0..EDGE)
+        .map(|gx| (f64::from(ox + gx as i32 - 1) + 0.5) * REGION_SIZE)
+        .collect();
+    let mut relief = vec![0f32; EDGE];
     for gy in 0..EDGE {
+        let ry = oy + gy as i32 - 1;
+        let cy = (f64::from(ry) + 0.5) * REGION_SIZE;
+        crate::simd::fbm_row(&xs, cy, &mut relief);
         for gx in 0..EDGE {
             let rx = ox + gx as i32 - 1;
-            let ry = oy + gy as i32 - 1;
-            elev[gy * EDGE + gx] = routing_elevation_cm(field, rx, ry);
+            let p = project_plausible(field.sample(RegionCoord::new(rx, ry))).requantized();
+            elev[gy * EDGE + gx] =
+                quantize_elevation_cm(crate::terrain::elevation_from_relief(relief[gx], &p));
         }
     }
 

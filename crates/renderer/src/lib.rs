@@ -13,6 +13,9 @@
 
 use core::fmt;
 
+pub mod gpumap;
+pub use gpumap::{GpuMap, GpuMapParams, MapTileUpload, RefineOctaveParams};
+
 /// The debug-map presentation shader (fullscreen textured triangle).
 pub const SHADER_DEBUG_MAP: &str = include_str!("../shaders/debug_map.wgsl");
 
@@ -29,6 +32,89 @@ pub fn letterbox_viewport(surface: (u32, u32), image: (u32, u32)) -> (f32, f32, 
     let scale = (sw / iw).min(sh / ih);
     let (w, h) = (iw * scale, ih * scale);
     ((sw - w) * 0.5, (sh - h) * 0.5, w, h)
+}
+
+/// The present mode for the surface: FIFO (vsync) by default — the Phase 6
+/// frame pacer — overridable through `WER_PRESENT_MODE`
+/// (`fifo`/`mailbox`/`immediate`), falling back to FIFO when the platform
+/// does not support the requested mode. FIFO support is guaranteed by the
+/// WebGPU/wgpu contract, so the fallback is always available.
+fn present_mode_from_env(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+    let requested = std::env::var("WER_PRESENT_MODE").ok();
+    let mode = match requested.as_deref() {
+        Some("mailbox") => wgpu::PresentMode::Mailbox,
+        Some("immediate") => wgpu::PresentMode::Immediate,
+        Some("fifo") | None => wgpu::PresentMode::Fifo,
+        Some(other) => {
+            log::warn!("unknown WER_PRESENT_MODE {other:?}; using fifo");
+            wgpu::PresentMode::Fifo
+        }
+    };
+    if caps.present_modes.contains(&mode) {
+        mode
+    } else {
+        log::warn!("present mode {mode:?} unsupported here; using fifo");
+        wgpu::PresentMode::Fifo
+    }
+}
+
+/// Coarse adapter class, for resource-tier detection (phase-6-plan.md §6.7).
+/// A renderer-owned enum so the shell needs no direct wgpu dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbedAdapter {
+    /// A discrete GPU.
+    Discrete,
+    /// An integrated or virtual GPU.
+    Integrated,
+    /// A software rasterizer.
+    Cpu,
+    /// Nothing usable detected.
+    Unknown,
+}
+
+/// Probe the default adapter's class with a throwaway instance (blocking;
+/// used once at startup for tier detection, phase-6-plan.md §6.7).
+#[must_use]
+pub fn probe_adapter() -> ProbedAdapter {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    match pollster_block(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
+        Ok(adapter) => match adapter.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => ProbedAdapter::Discrete,
+            wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::VirtualGpu => {
+                ProbedAdapter::Integrated
+            }
+            wgpu::DeviceType::Cpu => ProbedAdapter::Cpu,
+            wgpu::DeviceType::Other => ProbedAdapter::Unknown,
+        },
+        Err(_) => ProbedAdapter::Unknown,
+    }
+}
+
+/// A tiny local block_on (avoids a pollster dependency here): the adapter
+/// future is driven by wgpu's own executor on native and resolves promptly.
+fn pollster_block<F: core::future::Future>(fut: F) -> F::Output {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn raw() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        RawWaker::new(
+            core::ptr::null(),
+            &RawWakerVTable::new(clone, no_op, no_op, no_op),
+        )
+    }
+    // SAFETY: the vtable functions are all no-ops over a null pointer.
+    let waker = unsafe { Waker::from_raw(raw()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = core::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
 
 /// Errors that can occur bringing the renderer up.
@@ -236,6 +322,11 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     debug_map: DebugMapPipeline,
+    /// Second blit pipeline for the HUD panel strip in the GPU-map path.
+    panel_blit: DebugMapPipeline,
+    /// The Phase 6 atlas-composed map path (phase-6-plan.md §6.5), built
+    /// lazily on the first GPU-mode frame.
+    gpu_map: Option<GpuMap>,
 }
 
 impl fmt::Debug for Renderer {
@@ -305,12 +396,20 @@ impl Renderer {
             log::error!("wgpu uncaptured error: {error}");
         }));
 
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or(RendererError::NoSurfaceConfig)?;
+        // Frame pacing (phase-6-plan.md M1): vsync (FIFO) is the pacer — the
+        // shell blocks in `get_current_texture`/`present` instead of
+        // busy-looping. `WER_PRESENT_MODE` overrides for profiling runs
+        // (`immediate`/`mailbox` uncap the frame rate to expose true frame
+        // cost; wall-clock remains telemetry, never an output input).
+        config.present_mode = present_mode_from_env(&surface.get_capabilities(&adapter));
+        log::info!("present mode: {:?}", config.present_mode);
         surface.configure(&device, &config);
 
         let debug_map = DebugMapPipeline::new(&device, config.format);
+        let panel_blit = DebugMapPipeline::new(&device, config.format);
 
         Ok(Self {
             instance,
@@ -320,6 +419,8 @@ impl Renderer {
             queue,
             config,
             debug_map,
+            panel_blit,
+            gpu_map: None,
         })
     }
 
@@ -496,5 +597,111 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         true
+    }
+
+    /// Present one frame through the Phase 6 GPU-composed map path
+    /// (phase-6-plan.md §6.5): delta-upload changed region tiles into the
+    /// atlas, optionally refresh the CPU-drawn overlay and panel strips, and
+    /// compose per screen pixel in `compose_map.wgsl`.
+    ///
+    /// Returns the bytes uploaded this frame (`None` when no frame was
+    /// drawn). No readback of any kind exists on this path (ADR 0017).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_map_gpu(
+        &mut self,
+        params: &GpuMapParams,
+        slots: &[i32],
+        uploads: &[MapTileUpload],
+        overlay: Option<&[u8]>,
+        panel: Option<(&[u8], u32, u32)>,
+        clear: [f64; 4],
+    ) -> Option<u64> {
+        let span = (2 * params.half_regions + 1) as u32;
+        let side = span * params.resolution;
+        let rebuild = !matches!(
+            &self.gpu_map,
+            Some(m) if m.capacity == span * span && m.resolution == params.resolution && m.side == side
+        );
+        if rebuild {
+            self.gpu_map = Some(GpuMap::new(
+                &self.device,
+                self.config.format,
+                span * span,
+                params.resolution,
+                side,
+            ));
+            log::info!(
+                "gpu map atlas built: {span}x{span} slots at {}²",
+                params.resolution
+            );
+        }
+        let gpu_map = self.gpu_map.as_ref().expect("just ensured");
+
+        let mut bytes = gpu_map.upload_tiles(&self.queue, uploads);
+        if let Some(rgba) = overlay {
+            bytes += gpu_map.upload_overlay(&self.queue, rgba);
+        }
+        gpu_map.write_frame(&self.queue, params, slots);
+        let mut panel_size = self.panel_blit.texture.as_ref().map(|&(_, _, w, h)| (w, h));
+        if let Some((rgba, w, h)) = panel {
+            self.panel_blit
+                .upload(&self.device, &self.queue, rgba, w, h);
+            bytes += u64::from(w) * u64::from(h) * 4;
+            panel_size = Some((w, h));
+        }
+
+        let frame = self.acquire_frame()?;
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wer-frame-gpu-map"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("compose-map"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear[0],
+                            g: clear[1],
+                            b: clear[2],
+                            a: clear[3],
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let panel_w = panel_size.map_or(0, |(w, _)| w);
+            let (x, y, vw, vh) = letterbox_viewport(
+                (self.config.width, self.config.height),
+                (side + panel_w, side),
+            );
+            let scale = vw / (side + panel_w) as f32;
+            let map_w = side as f32 * scale;
+            pass.set_viewport(x, y, map_w, vh, 0.0, 1.0);
+            let gpu_map = self.gpu_map.as_ref().expect("ensured above");
+            gpu_map.draw(&mut pass);
+            if let (Some((pw, _)), Some((_, bind_group, _, _))) =
+                (panel_size, self.panel_blit.texture.as_ref())
+            {
+                pass.set_viewport(x + map_w, y, pw as f32 * scale, vh, 0.0, 1.0);
+                pass.set_pipeline(&self.panel_blit.pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        Some(bytes)
     }
 }

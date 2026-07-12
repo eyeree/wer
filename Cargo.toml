@@ -33,6 +33,10 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 glam = { version = "0.33", default-features = false, features = ["libm"] }
 bytemuck = { version = "1", features = ["derive"] }
+# Portable SIMD on stable Rust (SSE/AVX, NEON, wasm simd128 when enabled,
+# scalar otherwise) for the Phase 6 row kernels (phase-6-plan.md §6.1,
+# ADR 0016). No nightly `std::simd` — the toolchain is pinned stable.
+wide = { version = "0.7", default-features = false }
 
 # Development / benchmarking.
 criterion = "0.5"
@@ -41,7 +45,6 @@ criterion = "0.5"
 wgpu = "29"
 winit = "0.30"
 pollster = "1"
-rayon = "1"
 raw-window-handle = "0.6"
 env_logger = "0.11"
 log = "0.4"

@@ -97,6 +97,26 @@ pub struct PanelInfo<'a> {
     pub fps: u32,
     /// Average `RegionMap::update` time over the last second, ms.
     pub update_ms: f64,
+    /// Average CPU map+HUD composition time over the last second, ms
+    /// (phase-6-plan.md §12).
+    pub compose_ms: f64,
+    /// Average present time over the last second, ms — includes the vsync
+    /// wait under FIFO, i.e. pacing idle, not work.
+    pub render_ms: f64,
+    /// Mean atlas/overlay/panel upload KB per frame (GPU path;
+    /// phase-6-plan.md §12).
+    pub upload_kb: f64,
+    /// Whether the map composed on the GPU this frame (`,` toggles).
+    pub gpu_compose: bool,
+    /// The active resource tier preset (phase-6-plan.md §6.7).
+    pub tier: &'static str,
+    /// The field-cache byte ceiling of the active preset (§4.3).
+    pub cache_ceiling_bytes: usize,
+    /// Mean per-pass update milliseconds over the last second
+    /// (phase-6-plan.md §5.2; zeros without the `pass-timing` feature).
+    pub pass_ms: [f32; world_runtime::PASS_COUNT],
+    /// Executor worker parallelism.
+    pub workers: usize,
     /// The most recent frame's streaming stats.
     pub stats: FrameStats,
     /// Cumulative regenerated-tile counts per layer since startup
@@ -158,6 +178,8 @@ const DOMAIN_SHORT: [&str; POSSIBILITY_DIMS] = [
 pub struct Hud {
     map_side: usize,
     pixels: Vec<u8>,
+    /// Standalone panel strip for the GPU-map path (phase-6-plan.md §6.5).
+    panel_scratch: Vec<u8>,
 }
 
 impl Hud {
@@ -167,6 +189,7 @@ impl Hud {
         Self {
             map_side,
             pixels: vec![0; (map_side + PANEL_WIDTH) * map_side * 4],
+            panel_scratch: Vec::new(),
         }
     }
 
@@ -174,6 +197,46 @@ impl Hud {
     #[must_use]
     pub fn size(&self) -> (u32, u32) {
         ((self.map_side + PANEL_WIDTH) as u32, self.map_side as u32)
+    }
+
+    /// Draw the panel alone into its own strip (the GPU-map path blits it
+    /// beside the GPU-composed map; phase-6-plan.md §6.5). Returns the RGBA
+    /// strip and its size.
+    pub fn panel_image(&mut self, info: &PanelInfo<'_>) -> (&[u8], u32, u32) {
+        // Panel background over the strip region of the combined image.
+        for row in 0..self.map_side {
+            let width = self.map_side + PANEL_WIDTH;
+            let start = (row * width + self.map_side) * 4;
+            for px in self.pixels[start..start + PANEL_WIDTH * 4].chunks_exact_mut(4) {
+                px[0] = BG[0];
+                px[1] = BG[1];
+                px[2] = BG[2];
+                px[3] = 255;
+            }
+        }
+        self.draw_panel(info);
+        // Extract the strip (the panel drawing code addresses the combined
+        // image; a row-wise copy keeps that code untouched).
+        let width = self.map_side + PANEL_WIDTH;
+        self.panel_scratch
+            .resize(PANEL_WIDTH * self.map_side * 4, 0);
+        for row in 0..self.map_side {
+            let src = (row * width + self.map_side) * 4;
+            let dst = row * PANEL_WIDTH * 4;
+            self.panel_scratch[dst..dst + PANEL_WIDTH * 4]
+                .copy_from_slice(&self.pixels[src..src + PANEL_WIDTH * 4]);
+        }
+        (
+            &self.panel_scratch,
+            PANEL_WIDTH as u32,
+            self.map_side as u32,
+        )
+    }
+
+    /// The last strip produced by [`Self::panel_image`].
+    #[must_use]
+    pub fn panel_pixels(&self) -> &[u8] {
+        &self.panel_scratch
     }
 
     /// Blit the map and draw the panel; returns the full RGBA image.
@@ -213,6 +276,68 @@ impl Hud {
             &format!("{}", info.fps),
             "update",
             &format!("{:.2}ms", info.update_ms),
+        );
+        // TIMINGS (phase-6-plan.md §10): per-pass update ms, two per line,
+        // plus the shell-side compose/present split.
+        cur.line(self, "TIMINGS", HEADER);
+        for pair in (0..world_runtime::PASS_COUNT).step_by(2) {
+            let entry = |i: usize| {
+                format!(
+                    "{:<9}{:>6.2}",
+                    world_runtime::Pass::ALL[i].name(),
+                    info.pass_ms[i]
+                )
+            };
+            let row_y = cur.y;
+            self.text(cur.x, row_y, &entry(pair), VALUE);
+            if pair + 1 < world_runtime::PASS_COUNT {
+                self.text(cur.x + 16 * 8 * SCALE, row_y, &entry(pair + 1), VALUE);
+            }
+            cur.y += LINE_HEIGHT;
+        }
+        cur.pair(
+            self,
+            "compose",
+            &format!("{:.2}ms", info.compose_ms),
+            "present",
+            &format!("{:.2}ms", info.render_ms),
+        );
+        cur.pair(
+            self,
+            "map",
+            if info.gpu_compose { "gpu" } else { "cpu" },
+            "upload",
+            &format!("{:.0}KB/f", info.upload_kb),
+        );
+        // TIER (phase-6-plan.md §10): the active preset and how much of its
+        // field-cache ceiling is in use.
+        cur.pair(
+            self,
+            "tier",
+            info.tier,
+            "ceiling",
+            &format!(
+                "{:.0}/{:.0}MB",
+                info.stats.cache_bytes as f64 / (1024.0 * 1024.0),
+                info.cache_ceiling_bytes as f64 / (1024.0 * 1024.0)
+            ),
+        );
+        // EXEC / POOL telemetry (phase-6-plan.md §10). The pool counters are
+        // zeros until M3 lands the tile pool; cancelled counts until M2's
+        // lane executor are zero too — placeholders by design (M1).
+        cur.pair(
+            self,
+            "workers",
+            &format!("{}", info.workers),
+            "cancelled",
+            &format!("{}", info.stats.jobs_cancelled),
+        );
+        cur.pair(
+            self,
+            "pool h/m",
+            &format!("{}/{}", info.stats.pool_hits, info.stats.pool_misses),
+            "pool",
+            &format!("{:.1}MB", info.stats.pool_bytes as f64 / (1024.0 * 1024.0)),
         );
         cur.pair(
             self,

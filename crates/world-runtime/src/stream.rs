@@ -29,6 +29,7 @@
 //! change ripples outward over several frames instead of hitching.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ use world_core::layer::{
     LAYER_DRAINAGE, LAYER_ECOLOGY,
 };
 use world_core::{
-    capture_target, domain_mask, drainage_dep_hash, layer_dep_hash, macro_coord_for,
+    capture_target, domain_mask, drainage_dep_hash, layer_dep_hash, macro_coord_for, mix,
     organism_trait_deviation, project_plausible, steer, Anchor, AnchorKind, AnchorSource, Biome,
     Climate, DrainageTile, Genome, GenomeBias, HabitatSignature, PossibilityDomain,
     PossibilityField, PossibilityVector, RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS,
@@ -46,18 +47,21 @@ use world_core::{
 
 use crate::budget::Budget;
 use crate::generate::{
-    generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache, CHANNEL_DIVERSITY,
-    CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR,
-    CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    generate_layer, layer_channels, GeneratedTile, LayerInputs, RegionCache, RegionTiles,
+    TileBuffers, CHANNEL_DIVERSITY, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE,
+    CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+    CHANNEL_WETNESS,
 };
 use crate::macrocache::MacroCache;
-use crate::realize::{realize_region, Organism};
+use crate::pool::TilePool;
+use crate::realize::{realize_region_into, Organism};
 use crate::region::{GenerationStatus, RegionState};
 use crate::resonance::{
     combine_resonance, density_term, gated_rate, species_entropy, Resonance, ResonanceNode,
 };
 use crate::rostercache::{RosterCache, RosterEntry, RosterSnapshot};
 use crate::task::{TaskExecutor, TaskPriority};
+use crate::timing::{Pass, PassTimings, PASS_COUNT};
 
 /// How far a capture may pull the world past its habitat baseline
 /// (phase-4-plan.md §7.1). Bounds the "distinctiveness" of a captured anchor:
@@ -98,6 +102,27 @@ pub struct StreamConfig {
     pub converge_rate_cap: f32,
     /// Samples per region edge for generated field tiles.
     pub field_resolution: u16,
+    /// Byte ceiling for the field-tile cache (phase-6-plan.md §4.3): after
+    /// the radius sweep, the capacity evictor removes farthest-first until
+    /// under this, exempting preserved regions and everything inside
+    /// `near_radius`; the loader defers non-near loads that would exceed it.
+    /// Always safe — every tile re-derives from its dependency hash
+    /// (ADR 0008) — so a ceiling costs recompute, never correctness.
+    pub max_field_cache_bytes: usize,
+    /// Byte ceiling for the macro drainage cache. Evicted tiles re-derive
+    /// lazily the next time a dependent's hydrology goes stale.
+    pub max_macro_cache_bytes: usize,
+    /// Byte ceiling for the roster cache. Evicted entries rebuild on demand
+    /// (`RosterCache::ensure` — a pure function of the signature).
+    pub max_roster_cache_bytes: usize,
+    /// Near-field organisms realized per cell (phase-6-plan.md §6.6): the
+    /// High-tier density lever. Slot 0 keeps the exact Phase 5 identities;
+    /// slots 1.. derive additive identities (`feature_index = cell +
+    /// slot·res²`) from the same scheme, each independently density-gated so
+    /// expected population scales linearly and the aggregate↔entity ratios
+    /// hold. Presentation state only (ADR 0010): no persisted or shared byte
+    /// changes with this knob.
+    pub organisms_per_cell: u16,
 }
 
 impl Default for StreamConfig {
@@ -112,6 +137,15 @@ impl Default for StreamConfig {
             converge_per_unit: 0.01,
             converge_rate_cap: 0.2,
             field_resolution: world_core::FIELD_RES,
+            // Low-tier ceilings (§7.4). The Phase 5 default window uses
+            // ~34 MB of field tiles, so these change nothing until a tier
+            // (or a misconfigured window) pushes past them.
+            max_field_cache_bytes: 48 * 1024 * 1024,
+            max_macro_cache_bytes: 12 * 1024 * 1024,
+            max_roster_cache_bytes: 8 * 1024 * 1024,
+            // One per cell: the proven Phase 5 realization density; tiers
+            // opt in to more (phase-6-plan.md §6.6).
+            organisms_per_cell: 1,
         }
     }
 }
@@ -166,6 +200,62 @@ pub struct FrameStats {
     pub resonance_nodes: usize,
     /// Active anchors this frame.
     pub anchors_active: usize,
+    /// Milliseconds per update pass, indexed by [`Pass::index`]
+    /// (phase-6-plan.md §5.2). Telemetry only — never gated, never hashed
+    /// (§12.6); all zeros without the `pass-timing` feature. The `Flush`
+    /// slot is filled by the shell around its vault flush.
+    pub pass_ms: [f32; PASS_COUNT],
+    /// Jobs whose cancellation token was flipped (superseded or evicted)
+    /// before their kernel ran — worker time saved, not an error
+    /// (phase-6-plan.md §6.2).
+    pub jobs_cancelled: usize,
+    /// Results that arrived but were dropped as superseded/orphaned. With
+    /// cancellation on, doomed jobs mostly never run, so this falls toward
+    /// zero; the pair (`jobs_cancelled`, `results_dropped`) is the §11.4
+    /// "cancellation reduces jobs-run" counter gate.
+    pub results_dropped: usize,
+    /// Tile-pool buffers served from the pool at dispatch (phase-6-plan.md
+    /// §4.2).
+    pub pool_hits: usize,
+    /// Tile-pool requests that fell back to a fresh allocation.
+    pub pool_misses: usize,
+    /// Heap bytes idling in the tile pool after this frame.
+    pub pool_bytes: usize,
+    /// Regions evicted by the byte-capacity ceiling (beyond the radius sweep;
+    /// phase-6-plan.md §4.3).
+    pub evicted_for_capacity: usize,
+    /// Resident regions whose retarget was deferred to a later frame by
+    /// `max_retarget_regions` (phase-6-plan.md §6.4) — round-robin
+    /// backpressure, not an error.
+    pub retarget_deferred: usize,
+}
+
+/// Order-stable hash of the steering inputs (bias + anchors) — a change
+/// forces a full retarget instead of the amortized round-robin
+/// (phase-6-plan.md §6.4). Bit-exact over every field an anchor steers with.
+fn steering_signature(anchors: &[Anchor], bias: &[f32; POSSIBILITY_DIMS]) -> u64 {
+    let mut h: u64 = 0x5EED_5163_0000_0006;
+    for b in bias {
+        h = mix(h, u64::from(b.to_bits()));
+    }
+    for anchor in anchors {
+        h = mix(h, anchor.world_pos.0.to_bits());
+        h = mix(h, anchor.world_pos.1.to_bits());
+        for d in anchor.target.dims {
+            h = mix(h, u64::from(d.to_bits()));
+        }
+        h = mix(h, u64::from(anchor.mask));
+        h = mix(
+            h,
+            match anchor.kind {
+                AnchorKind::Emphasize => 1,
+                AnchorKind::Suppress => 2,
+            },
+        );
+        h = mix(h, u64::from(anchor.strength.to_bits()));
+        h = mix(h, anchor.falloff_radius.to_bits());
+    }
+    h
 }
 
 /// Distance from the player to a region's center.
@@ -306,9 +396,36 @@ pub struct RegionMap {
     /// LAYER_DRAINAGE)` for macro jobs — macro coords are just `RegionCoord`s
     /// at a higher level. Results whose id no longer matches (superseded,
     /// evicted, or from an evicted-then-reloaded region) are dropped on
-    /// arrival.
-    in_flight: BTreeMap<(RegionCoord, u16), u64>,
+    /// arrival — the correctness gate; the cancellation token is a worker-time
+    /// optimization layered on top (phase-6-plan.md §6.2).
+    in_flight: BTreeMap<(RegionCoord, u16), InFlightJob>,
+    /// Whether supersession/eviction flips cancellation tokens (default on).
+    /// A harness A/B hook (like [`RegionMap::bump_layer_revision`]): settled
+    /// state must be identical either way (ADR 0018), only worker time spent
+    /// on doomed jobs differs.
+    cancellation: bool,
+    /// Recycles tile sample buffers through dispatch→integrate→evict
+    /// (phase-6-plan.md §4.2). Main-thread only.
+    pool: TilePool,
+    /// Recycled organism vectors for the realizer (same story, smaller).
+    organism_pool: Vec<Vec<Organism>>,
+    /// Hash of the steering inputs (bias + anchors) at the last retarget. A
+    /// change forces a full retarget; otherwise the pass round-robins under
+    /// `max_retarget_regions` (phase-6-plan.md §6.4).
+    steer_signature: u64,
+    /// Round-robin position of the amortized retarget.
+    retarget_cursor: Option<RegionCoord>,
     next_job_id: u64,
+}
+
+/// Bookkeeping for one dispatched generation job: its dispatch identity (the
+/// correctness gate for late results) and its cancellation token (the
+/// optimization — flipped when the job is superseded or its region evicted,
+/// checked once by the job closure on dequeue, phase-6-plan.md §6.2).
+#[derive(Debug)]
+struct InFlightJob {
+    id: u64,
+    cancel: Arc<AtomicBool>,
 }
 
 impl RegionMap {
@@ -330,7 +447,82 @@ impl RegionMap {
             results_tx,
             results_rx,
             in_flight: BTreeMap::new(),
+            cancellation: true,
+            pool: TilePool::default(),
+            organism_pool: Vec::new(),
+            steer_signature: 0,
+            retarget_cursor: None,
             next_job_id: 0,
+        }
+    }
+
+    /// Enable or disable cancellation-token flipping (default: enabled). An
+    /// A/B hook for the scale harness's schedule-independence gates
+    /// (ADR 0018): cancellation may only save worker time, never change the
+    /// settled world.
+    pub fn set_cancellation_enabled(&mut self, enabled: bool) {
+        self.cancellation = enabled;
+    }
+
+    /// Flip and forget the in-flight jobs of `coord` whose layer is in
+    /// `mask` — they were dispatched against inputs that just changed, so
+    /// their results are already doomed to be dropped; the token lets them
+    /// skip the kernel work too. Removing the entry lets the layer redispatch
+    /// with fresh inputs immediately; a late result from the cancelled job is
+    /// still rejected by its stale job id. Returns how many were cancelled.
+    fn cancel_in_flight(&mut self, coord: RegionCoord, mask: u32) -> usize {
+        if !self.cancellation || mask == 0 {
+            return 0;
+        }
+        let keys: Vec<(RegionCoord, u16)> = self
+            .in_flight
+            .range((coord, 0)..=(coord, u16::MAX))
+            .filter(|((_, layer), _)| mask & layer_bit(*layer) != 0)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut cancelled = 0;
+        for k in keys {
+            if let Some(job) = self.in_flight.remove(&k) {
+                job.cancel.store(true, Ordering::Relaxed);
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    /// Recover the buffers of a dropped (superseded/orphaned) generation
+    /// result into the pool — the tiles never entered the cache, so they are
+    /// solely owned (phase-6-plan.md §4.2).
+    fn reclaim_generated(&mut self, result: GeneratedTile) {
+        for (_, tile) in result.channels {
+            self.pool.reclaim_f32(tile.into_samples());
+        }
+        if let Some(tile) = result.biome {
+            self.pool.reclaim_u8(tile.into_samples());
+        }
+        if let Some(tile) = result.dominant {
+            self.pool.reclaim_u16(tile.into_samples());
+        }
+    }
+
+    /// Recover every buffer of an evicted region's tiles whose `Arc` the map
+    /// held the last reference to; in-flight readers just delay reclaim
+    /// (§4.2 — the pool falls back to allocation, never blocks).
+    fn reclaim_tiles(&mut self, tiles: RegionTiles) {
+        for tile in tiles.channels.into_iter().flatten() {
+            if let Ok(t) = Arc::try_unwrap(tile) {
+                self.pool.reclaim_f32(t.into_samples());
+            }
+        }
+        if let Some(tile) = tiles.biome {
+            if let Ok(t) = Arc::try_unwrap(tile) {
+                self.pool.reclaim_u8(t.into_samples());
+            }
+        }
+        if let Some(tile) = tiles.dominant {
+            if let Ok(t) = Arc::try_unwrap(tile) {
+                self.pool.reclaim_u16(t.into_samples());
+            }
         }
     }
 
@@ -819,6 +1011,7 @@ impl RegionMap {
     /// the preserved landscape, not a snap of the realized one.
     pub fn set_override(&mut self, coord: RegionCoord, sig: world_core::PossibilitySignature) {
         self.overrides.insert(coord, sig);
+        let mut dirtied = 0u32;
         if let Some(region) = self.regions.get_mut(&coord) {
             let snapped = sig.dequantize();
             let mut flipped = 0u8;
@@ -831,12 +1024,15 @@ impl RegionMap {
             region.target = snapped;
             region.stability = 1.0;
             if flipped != 0 {
-                region.dirty_layers |= domain_dirty_mask(flipped);
+                dirtied = domain_dirty_mask(flipped);
+                region.dirty_layers |= dirtied;
                 if region.status == GenerationStatus::Ready {
                     region.status = GenerationStatus::Generating;
                 }
             }
         }
+        // Superseded in-flight work for the flipped layers stops early (§6.2).
+        self.cancel_in_flight(coord, dirtied);
     }
 
     /// Release a region's possibility override (deleting a preserve). No
@@ -885,6 +1081,17 @@ impl RegionMap {
                 region.status = GenerationStatus::Generating;
             }
         }
+        // Every in-flight job of an invalidated layer — macro drainage
+        // included (its keys carry LAYER_DRAINAGE) — is now stale (§6.2).
+        if self.cancellation {
+            self.in_flight.retain(|(_, l), job| {
+                let keep = mask & layer_bit(*l) == 0;
+                if !keep {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                keep
+            });
+        }
     }
 
     /// One frame of streaming work (see module docs for the step order).
@@ -919,10 +1126,17 @@ impl RegionMap {
         transition_mode: bool,
     ) -> FrameStats {
         let mut stats = FrameStats::default();
-        self.integrate_finished(&mut stats);
-        self.evict(player, &mut stats);
-        self.load(player, field, anchors, bias, budget, &mut stats);
-        self.retarget(player, field, anchors, bias);
+        // Per-pass wall-clock (phase-6-plan.md §5.2): telemetry only, all
+        // zeros without the `pass-timing` feature. Timing changes no behavior.
+        let mut timings = PassTimings::default();
+        timings.time(Pass::Integrate, || self.integrate_finished(&mut stats));
+        timings.time(Pass::Evict, || self.evict(player, &mut stats));
+        timings.time(Pass::Load, || {
+            self.load(player, field, anchors, bias, budget, &mut stats);
+        });
+        timings.time(Pass::Retarget, || {
+            self.retarget(player, field, anchors, bias, budget, &mut stats);
+        });
         // Resonance is a pure read of the settled near-window caches, computed
         // between retarget and converge so the rate sees the current frame's
         // gate (phase-4-plan.md §8.2). It reads the previous frame's realized
@@ -933,31 +1147,42 @@ impl RegionMap {
         } else {
             1.0
         };
-        self.converge(
-            player,
-            travel,
-            resonance.strength,
-            transition_scale,
-            budget,
-            &mut stats,
-        );
+        timings.time(Pass::Converge, || {
+            self.converge(
+                player,
+                travel,
+                resonance.strength,
+                transition_scale,
+                budget,
+                &mut stats,
+            );
+        });
         stats.resonance_strength = resonance.strength;
         stats.resonance_nodes = resonance.nodes.len();
         stats.anchors_active = anchors.len();
-        self.dispatch_regen(player, field, budget, executor, &mut stats);
+        timings.time(Pass::Dispatch, || {
+            self.dispatch_regen(player, field, budget, executor, &mut stats);
+        });
         // A synchronous executor (InlineExecutor) has already finished every
         // job dispatched above; integrating again here keeps the headless
         // replay settled within a single frame.
-        self.integrate_finished(&mut stats);
+        timings.time(Pass::Integrate, || self.integrate_finished(&mut stats));
         // Near-field realization: a pure read of the settled caches over the
         // pinned near window only (phase-3-plan.md §8.3), run after dispatch
         // settles so it never sees a stale L8 tile.
-        self.realize_near_window(player, budget, &mut stats);
+        timings.time(Pass::Realize, || {
+            self.realize_near_window(player, budget, &mut stats);
+        });
+        stats.pass_ms = timings.ms;
         stats.active_regions = self.regions.len();
         stats.cache_bytes = self.cache.bytes();
         stats.macro_cache_bytes = self.macro_cache.bytes();
         stats.rosters_built = self.roster_cache.take_builds();
         stats.roster_cache_bytes = self.roster_cache.bytes();
+        let (pool_hits, pool_misses) = self.pool.take_stats();
+        stats.pool_hits = pool_hits;
+        stats.pool_misses = pool_misses;
+        stats.pool_bytes = self.pool.bytes();
         stats
     }
 
@@ -1041,7 +1266,8 @@ impl RegionMap {
                     tile,
                 } => {
                     let key = (coord, LAYER_DRAINAGE);
-                    if self.in_flight.get(&key) != Some(&job_id) {
+                    if self.in_flight.get(&key).map(|j| j.id) != Some(job_id) {
+                        stats.results_dropped += 1;
                         continue; // superseded or evicted while in flight
                     }
                     self.in_flight.remove(&key);
@@ -1052,49 +1278,83 @@ impl RegionMap {
                     // A regenerated macro tile changes its dependents' expected
                     // hydrology hashes; notify them so the hint stays exact
                     // (phase-2-plan.md §7.8).
+                    let mut dirtied: Vec<RegionCoord> = Vec::new();
                     for (&c, region) in self.regions.iter_mut() {
                         if macro_coord_for(c) == coord {
                             region.dirty_layers |= layer_bit(world_core::layer::LAYER_HYDROLOGY);
                             if region.status == GenerationStatus::Ready {
                                 region.status = GenerationStatus::Generating;
                             }
+                            dirtied.push(c);
                         }
+                    }
+                    // In-flight hydrology jobs of those dependents were built
+                    // from the superseded macro tile: cancel them (§6.2).
+                    for c in dirtied {
+                        stats.jobs_cancelled +=
+                            self.cancel_in_flight(c, layer_bit(world_core::layer::LAYER_HYDROLOGY));
                     }
                 }
                 JobResult::Tile(result) => {
                     let key = (result.coord, result.layer);
-                    if self.in_flight.get(&key) != Some(&result.job_id) {
+                    if self.in_flight.get(&key).map(|j| j.id) != Some(result.job_id) {
+                        stats.results_dropped += 1;
+                        self.reclaim_generated(result);
                         continue; // superseded or evicted while in flight
                     }
                     self.in_flight.remove(&key);
-                    let Some(region) = self.regions.get_mut(&result.coord) else {
-                        continue;
-                    };
-                    if region.dirty_layers & layer_bit(result.layer) != 0 {
-                        // The layer was re-dirtied while this job flew (bucket
-                        // flip, upstream regeneration, or revision bump): its
-                        // expected hash moved on, so the result is stale.
-                        // Dropping it leaves the dirty bit set, which forces a
-                        // redispatch with fresh inputs.
+                    let stale = self
+                        .regions
+                        .get(&result.coord)
+                        .map(|r| r.dirty_layers & layer_bit(result.layer) != 0);
+                    if stale != Some(false) {
+                        // The region evicted, or the layer was re-dirtied
+                        // while this job flew (bucket flip, upstream
+                        // regeneration, revision bump): its expected hash
+                        // moved on, so the result is stale. Dropping it
+                        // leaves the dirty bit set, which forces a redispatch
+                        // with fresh inputs.
+                        stats.results_dropped += 1;
+                        self.reclaim_generated(result);
                         continue;
                     }
+                    let coord = result.coord;
+                    let layer = result.layer;
+                    // Superseded predecessors' buffers go back to the pool
+                    // the moment the map holds their last reference (§4.2).
                     for (channel, tile) in result.channels {
-                        self.cache
-                            .insert_channel(result.coord, channel, Arc::new(tile));
+                        if let Some(old) = self.cache.insert_channel(coord, channel, Arc::new(tile))
+                        {
+                            if let Ok(t) = Arc::try_unwrap(old) {
+                                self.pool.reclaim_f32(t.into_samples());
+                            }
+                        }
                     }
                     if let Some(biome) = result.biome {
-                        self.cache.insert_biome(result.coord, Arc::new(biome));
+                        if let Some(old) = self.cache.insert_biome(coord, Arc::new(biome)) {
+                            if let Ok(t) = Arc::try_unwrap(old) {
+                                self.pool.reclaim_u8(t.into_samples());
+                            }
+                        }
                     }
                     if let Some(dominant) = result.dominant {
-                        self.cache.insert_dominant(result.coord, Arc::new(dominant));
+                        if let Some(old) = self.cache.insert_dominant(coord, Arc::new(dominant)) {
+                            if let Ok(t) = Arc::try_unwrap(old) {
+                                self.pool.reclaim_u16(t.into_samples());
+                            }
+                        }
                     }
                     // Downstream layers' expected hashes changed the moment the
-                    // new tile landed: mark every transitive dependent.
-                    region.dirty_layers |=
-                        dependents_closure(result.layer) & !layer_bit(result.layer);
+                    // new tile landed: mark every transitive dependent — and
+                    // cancel any of them already in flight, since they were
+                    // dispatched against the input this tile just replaced.
+                    let dependents = dependents_closure(layer) & !layer_bit(layer);
+                    if let Some(region) = self.regions.get_mut(&coord) {
+                        region.dirty_layers |= dependents;
+                    }
                     stats.layers_regenerated += 1;
-                    stats.regenerated_by_layer[result.layer as usize] += 1;
-                    let coord = result.coord;
+                    stats.regenerated_by_layer[layer as usize] += 1;
+                    stats.jobs_cancelled += self.cancel_in_flight(coord, dependents);
                     self.refresh_status(coord);
                 }
             }
@@ -1119,9 +1379,10 @@ impl RegionMap {
     }
 
     /// Evict regions beyond `unload_radius`, dropping state, cache tiles, and
-    /// any in-flight bookkeeping together, then sweep macro tiles (and macro
-    /// jobs) that no resident region depends on any more (phase-2-plan.md
-    /// §6.3).
+    /// any in-flight bookkeeping together, then enforce the byte-capacity
+    /// ceilings (phase-6-plan.md §4.3), then sweep macro tiles (and macro
+    /// jobs) and roster entries that no resident region depends on any more
+    /// (phase-2-plan.md §6.3).
     fn evict(&mut self, player: (f64, f64), stats: &mut FrameStats) {
         let unload = self.cfg.unload_radius;
         let gone: Vec<RegionCoord> = self
@@ -1130,35 +1391,136 @@ impl RegionMap {
             .copied()
             .filter(|c| center_distance(*c, player) > unload)
             .collect();
-        if gone.is_empty() {
-            return;
-        }
+        let radius_evicted = !gone.is_empty();
         for coord in gone {
-            self.regions.remove(&coord);
-            self.cache.remove_region(coord);
-            self.region_signatures.remove(&coord);
-            self.organisms.remove(&coord);
-            self.organism_keys.remove(&coord);
-            let keys: Vec<(RegionCoord, u16)> = self
-                .in_flight
-                .range((coord, 0)..=(coord, u16::MAX))
-                .map(|(k, _)| *k)
-                .collect();
-            for k in keys {
-                self.in_flight.remove(&k);
-            }
+            self.drop_region(coord, stats);
             stats.evicted += 1;
         }
+        let capacity_evicted = self.enforce_capacity(player, stats);
+        if radius_evicted || capacity_evicted {
+            self.sweep_dependent_caches(stats);
+        }
+    }
+
+    /// Drop one resident region completely: state, tiles (buffers back to
+    /// the pool), organisms (vector recycled), signature bookkeeping, and
+    /// in-flight jobs (cancelled — they stop costing worker time, §6.2).
+    fn drop_region(&mut self, coord: RegionCoord, stats: &mut FrameStats) {
+        self.regions.remove(&coord);
+        if let Some(tiles) = self.cache.remove_region(coord) {
+            self.reclaim_tiles(tiles);
+        }
+        self.region_signatures.remove(&coord);
+        if let Some(mut organisms) = self.organisms.remove(&coord) {
+            organisms.clear();
+            if self.organism_pool.len() < 256 {
+                self.organism_pool.push(organisms);
+            }
+        }
+        self.organism_keys.remove(&coord);
+        let keys: Vec<(RegionCoord, u16)> = self
+            .in_flight
+            .range((coord, 0)..=(coord, u16::MAX))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            if let Some(job) = self.in_flight.remove(&k) {
+                if self.cancellation {
+                    job.cancel.store(true, Ordering::Relaxed);
+                    stats.jobs_cancelled += 1;
+                }
+            }
+        }
+    }
+
+    /// Sweep the dependent-tracked caches after any region left the window:
+    /// orphaned macro tiles and jobs, and roster entries no resident L8 tile
+    /// references any more (phase-2-plan.md §6.3).
+    fn sweep_dependent_caches(&mut self, stats: &mut FrameStats) {
         self.macro_cache.evict_orphans(self.regions.keys());
         let needed: BTreeSet<RegionCoord> =
             self.regions.keys().map(|&c| macro_coord_for(c)).collect();
-        self.in_flight
-            .retain(|(c, _), _| c.level == 0 || needed.contains(c));
+        let cancellation = self.cancellation;
+        self.in_flight.retain(|(c, _), job| {
+            let keep = c.level == 0 || needed.contains(c);
+            if !keep && cancellation {
+                job.cancel.store(true, Ordering::Relaxed);
+                stats.jobs_cancelled += 1;
+            }
+            keep
+        });
         // Sweep roster entries no resident region's L8 tile references any more
         // (dependent-tracked, the macro cache's shape, §6.3).
         let needed_signatures: BTreeSet<HabitatSignature> =
             self.region_signatures.values().flatten().copied().collect();
         self.roster_cache.evict_unused(&needed_signatures);
+    }
+
+    /// Enforce the byte-capacity ceilings (phase-6-plan.md §4.3): after the
+    /// radius sweep, remove farthest-first — deterministic (distance bits,
+    /// then coord order) — until under ceiling, exempting preserved regions
+    /// and everything inside `near_radius`. Always safe: every evicted tile
+    /// re-derives bit-identically from its dependency hash (ADR 0008), so a
+    /// ceiling costs recompute on revisit, never correctness. Returns
+    /// whether anything was evicted.
+    fn enforce_capacity(&mut self, player: (f64, f64), stats: &mut FrameStats) -> bool {
+        let mut evicted_any = false;
+        let mut field_bytes = self.cache.bytes();
+        if field_bytes > self.cfg.max_field_cache_bytes {
+            let mut order: Vec<(u64, RegionCoord)> = self
+                .regions
+                .keys()
+                .filter(|c| !self.overrides.contains_key(c))
+                .map(|&c| (center_distance(c, player).to_bits(), c))
+                .filter(|&(d, _)| f64::from_bits(d) > self.cfg.near_radius)
+                .collect();
+            // Farthest first, coord tiebreak for determinism.
+            order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            for (_, coord) in order {
+                if field_bytes <= self.cfg.max_field_cache_bytes {
+                    break;
+                }
+                let freed = self.cache.get(coord).map_or(0, RegionTiles::bytes);
+                self.drop_region(coord, stats);
+                field_bytes -= freed;
+                stats.evicted_for_capacity += 1;
+                evicted_any = true;
+            }
+        }
+
+        // Macro ceiling: farthest macro tiles go first; dependents keep
+        // their fresh hydrology tiles, and the macro tile re-derives lazily
+        // if one of them ever goes stale.
+        if self.macro_cache.bytes() > self.cfg.max_macro_cache_bytes {
+            let pmc = macro_coord_for(RegionCoord::from_world(player.0, player.1));
+            let mut tiles: Vec<(u64, RegionCoord)> = self
+                .macro_cache
+                .iter()
+                .map(|(&c, _)| {
+                    let dx = i64::from(c.x) - i64::from(pmc.x);
+                    let dy = i64::from(c.y) - i64::from(pmc.y);
+                    ((dx * dx + dy * dy) as u64, c)
+                })
+                .collect();
+            tiles.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let mut macro_bytes = self.macro_cache.bytes();
+            for (_, coord) in tiles {
+                if macro_bytes <= self.cfg.max_macro_cache_bytes {
+                    break;
+                }
+                if let Some(tile) = self.macro_cache.remove(coord) {
+                    macro_bytes -= tile.bytes();
+                    stats.evicted_for_capacity += 1;
+                }
+            }
+        }
+
+        // Roster ceiling: entries rebuild on demand (pure function of the
+        // signature); eviction order is reverse signature order —
+        // deterministic, which is all that matters here.
+        self.roster_cache
+            .evict_to_bytes(self.cfg.max_roster_cache_bytes);
+        evicted_any
     }
 
     /// Insert missing regions within `load_radius`, nearest-first, up to the
@@ -1193,7 +1555,22 @@ impl RegionMap {
             }
         }
         candidates.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
-        for &(_, coord) in candidates.iter().take(budget.max_loads) {
+        // Capacity awareness (phase-6-plan.md §4.3): a non-near load that
+        // would push the field cache past its ceiling defers instead — the
+        // deterministic complement of the capacity evictor, so the two never
+        // thrash against each other. Near regions always load (the visible
+        // zone is exempt on both sides).
+        let per_region_bytes = {
+            let res = usize::from(self.cfg.field_resolution);
+            res * res * (crate::generate::CHANNEL_COUNT * 4 + 1 + 2)
+        };
+        let mut projected = self.cache.bytes();
+        for &(dist_bits, coord) in candidates.iter().take(budget.max_loads) {
+            let near = f64::from_bits(dist_bits) <= self.cfg.near_radius;
+            if !near && projected + per_region_bytes > self.cfg.max_field_cache_bytes {
+                continue; // deferred by the ceiling; counted below
+            }
+            projected += per_region_bytes;
             let mut region = RegionState::new(coord);
             if let Some(sig) = self.overrides.get(&coord) {
                 // Preserved region: reload from its persisted buckets, pinned
@@ -1210,34 +1587,77 @@ impl RegionMap {
             self.regions.insert(coord, region);
             stats.loaded += 1;
         }
-        stats.deferred_loads = candidates.len().saturating_sub(budget.max_loads);
+        stats.deferred_loads = candidates.len().saturating_sub(stats.loaded);
     }
 
-    /// Recompute stability and target for every resident region. Cheap (a few
-    /// hundred bilinear samples), so it is not budgeted.
+    /// Recompute stability and target for resident regions — amortized
+    /// (phase-6-plan.md §6.4): a steering change (bias or anchor set) always
+    /// refreshes the whole window this frame, because every target may have
+    /// moved; under unchanged steering the pass round-robins
+    /// `max_retarget_regions` per frame in coord order, so the window
+    /// refreshes over a few frames. Settled fixed points are amortization-
+    /// invariant (ADR 0018) — targets are pure functions of unchanged
+    /// inputs, so a deferred refresh recomputes the same values later.
     fn retarget(
         &mut self,
         player: (f64, f64),
         field: &PossibilityField,
         anchors: &[Anchor],
         bias: &[f32; POSSIBILITY_DIMS],
+        budget: &Budget,
+        stats: &mut FrameStats,
     ) {
+        let signature = steering_signature(anchors, bias);
+        let steering_changed = signature != self.steer_signature;
+        self.steer_signature = signature;
+
         let coords: Vec<RegionCoord> = self.regions.keys().copied().collect();
-        for coord in coords {
-            if self.overrides.contains_key(&coord) {
-                // Preserved: pinned to its buckets; neither the distance ramp
-                // nor steering moves it (phase-5-plan.md §7.5).
-                let region = self.regions.get_mut(&coord).expect("resident");
-                region.stability = 1.0;
-                region.target = region.current;
-                continue;
+        if steering_changed || coords.len() <= budget.max_retarget_regions {
+            for coord in coords {
+                self.retarget_one(coord, player, field, anchors, bias);
             }
-            let stability = stability_for(&self.cfg, center_distance(coord, player));
-            let target = self.target_for(coord, field, anchors, bias);
-            let region = self.regions.get_mut(&coord).expect("resident");
-            region.stability = stability;
-            region.target = target;
+            self.retarget_cursor = None;
+            return;
         }
+
+        // Round-robin from the cursor in coord order (deterministic).
+        let split = self
+            .retarget_cursor
+            .map_or(0, |c| coords.partition_point(|&x| x <= c));
+        let mut processed = 0usize;
+        for &coord in coords[split..].iter().chain(coords[..split].iter()) {
+            if processed >= budget.max_retarget_regions {
+                break;
+            }
+            self.retarget_one(coord, player, field, anchors, bias);
+            self.retarget_cursor = Some(coord);
+            processed += 1;
+        }
+        stats.retarget_deferred = coords.len() - processed;
+    }
+
+    /// Refresh one region's stability and steered target.
+    fn retarget_one(
+        &mut self,
+        coord: RegionCoord,
+        player: (f64, f64),
+        field: &PossibilityField,
+        anchors: &[Anchor],
+        bias: &[f32; POSSIBILITY_DIMS],
+    ) {
+        if self.overrides.contains_key(&coord) {
+            // Preserved: pinned to its buckets; neither the distance ramp
+            // nor steering moves it (phase-5-plan.md §7.5).
+            let region = self.regions.get_mut(&coord).expect("resident");
+            region.stability = 1.0;
+            region.target = region.current;
+            return;
+        }
+        let stability = stability_for(&self.cfg, center_distance(coord, player));
+        let target = self.target_for(coord, field, anchors, bias);
+        let region = self.regions.get_mut(&coord).expect("resident");
+        region.stability = stability;
+        region.target = target;
     }
 
     /// Step unpinned regions toward their targets, farthest-first (near
@@ -1280,15 +1700,20 @@ impl RegionMap {
         eligible.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         for &(_, coord) in eligible.iter().take(budget.max_converge_regions) {
             let region = self.regions.get_mut(&coord).expect("resident");
+            let mut dirtied = 0u32;
             if let Some(flipped) = region.converge(rate) {
                 stats.converged += 1;
                 if flipped != 0 {
-                    region.dirty_layers |= domain_dirty_mask(flipped);
+                    dirtied = domain_dirty_mask(flipped);
+                    region.dirty_layers |= dirtied;
                     if region.status == GenerationStatus::Ready {
                         region.status = GenerationStatus::Generating;
                     }
                 }
             }
+            // Bucket flips supersede any in-flight job of the dirtied layers:
+            // its expected hash moved on while it flew (§6.2).
+            stats.jobs_cancelled += self.cancel_in_flight(coord, dirtied);
         }
         stats.deferred_converges = eligible.len().saturating_sub(budget.max_converge_regions);
     }
@@ -1422,12 +1847,25 @@ impl RegionMap {
         let expected = self.expected_macro_hash(mc);
         let job_id = self.next_job_id;
         self.next_job_id += 1;
-        self.in_flight.insert((mc, LAYER_DRAINAGE), job_id);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.in_flight.insert(
+            (mc, LAYER_DRAINAGE),
+            InFlightJob {
+                id: job_id,
+                cancel: Arc::clone(&cancel),
+            },
+        );
         let tx = self.results_tx.clone();
         let field = *field;
         executor.submit(
             priority,
             Box::new(move || {
+                // Checked once, on dequeue: a superseded/evicted job becomes
+                // a no-op before its kernel runs (phase-6-plan.md §6.2). The
+                // job-id check at integration remains the correctness gate.
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 let tile = world_core::drainage(mc, &field, expected);
                 // The receiver may be gone if the map was dropped; the job's
                 // work is simply discarded then.
@@ -1531,8 +1969,22 @@ impl RegionMap {
             .copied()
             .filter(|&c| center_distance(c, player) <= near_radius)
             .collect();
-        // Offscreen replacement: discard organisms of regions no longer near.
-        self.organisms.retain(|c, _| near.contains(c));
+        // Offscreen replacement: discard organisms of regions no longer near
+        // (their vectors recycle through the pool, phase-6-plan.md §4.2).
+        let stale: Vec<RegionCoord> = self
+            .organisms
+            .keys()
+            .filter(|c| !near.contains(c))
+            .copied()
+            .collect();
+        for coord in stale {
+            if let Some(mut organisms) = self.organisms.remove(&coord) {
+                organisms.clear();
+                if self.organism_pool.len() < 256 {
+                    self.organism_pool.push(organisms);
+                }
+            }
+        }
         self.organism_keys.retain(|c, _| near.contains(c));
 
         // Nearest-first, deterministic order.
@@ -1570,12 +2022,27 @@ impl RegionMap {
                 aesthetics: region.current.get(PossibilityDomain::Aesthetics),
             };
             let revision = region.revision;
-            let organisms = {
+            let mut organisms = self.organism_pool.pop().unwrap_or_default();
+            {
                 let tiles = self.cache.get(coord).expect("l8 hash implies tiles");
-                realize_region(coord, tiles, &self.roster_cache, bias, revision, resolution)
-            };
+                realize_region_into(
+                    coord,
+                    tiles,
+                    &self.roster_cache,
+                    bias,
+                    revision,
+                    resolution,
+                    self.cfg.organisms_per_cell,
+                    &mut organisms,
+                );
+            }
             stats.organisms_realized += organisms.len();
-            self.organisms.insert(coord, organisms);
+            if let Some(mut old) = self.organisms.insert(coord, organisms) {
+                old.clear();
+                if self.organism_pool.len() < 256 {
+                    self.organism_pool.push(old);
+                }
+            }
             self.organism_keys.insert(coord, l8_hash);
         }
         stats.organisms = self.organisms.values().map(Vec::len).sum();
@@ -1626,6 +2093,19 @@ impl RegionMap {
                 }
             }
         }
+        // Recycled output buffers ride into the job (phase-6-plan.md §4.2):
+        // the main thread is the only pool toucher, workers fill what they
+        // were given.
+        let mut buffers = TileBuffers::default();
+        for _ in layer_channels(layer) {
+            buffers.f32_bufs.push(self.pool.take_f32());
+        }
+        if layer == world_core::layer::LAYER_BIOME {
+            buffers.u8_buf = Some(self.pool.take_u8());
+        }
+        if layer == LAYER_ECOLOGY {
+            buffers.u16_buf = Some(self.pool.take_u16());
+        }
         let region = self.regions.get_mut(&coord).expect("resident");
         let inputs = LayerInputs {
             quantized: region.current.quantized_domains(decl.domains),
@@ -1634,19 +2114,34 @@ impl RegionMap {
             drainage,
             rosters,
             dep_hash: expected,
+            buffers,
         };
         region.dirty_layers &= !layer_bit(layer);
         region.status = GenerationStatus::Generating;
 
         let job_id = self.next_job_id;
         self.next_job_id += 1;
-        self.in_flight.insert((coord, layer), job_id);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.in_flight.insert(
+            (coord, layer),
+            InFlightJob {
+                id: job_id,
+                cancel: Arc::clone(&cancel),
+            },
+        );
         let resolution = self.cfg.field_resolution;
         let tx = self.results_tx.clone();
         executor.submit(
             priority,
             Box::new(move || {
-                let mut out = generate_layer(coord, layer, &inputs, resolution);
+                // Checked once, on dequeue: a superseded/evicted job becomes
+                // a no-op before its kernel runs (phase-6-plan.md §6.2). The
+                // job-id check at integration remains the correctness gate.
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut inputs = inputs;
+                let mut out = generate_layer(coord, layer, &mut inputs, resolution);
                 out.job_id = job_id;
                 // The receiver may be gone if the map was dropped; the job's
                 // work is simply discarded then.

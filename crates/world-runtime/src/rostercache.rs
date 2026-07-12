@@ -13,11 +13,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use world_core::{
-    food_web, signature_productivity, species_roster, FoodWeb, HabitatSignature, SpeciesRoster,
+    food_web, population_table, signature_productivity, species_roster, FoodWeb, HabitatSignature,
+    PopulationTable, SpeciesRoster,
 };
 
-/// One cached habitat: its deterministic roster and the food web projected over
-/// it at the signature's representative productivity (§6.3).
+/// One cached habitat: its deterministic roster, the food web projected over
+/// it at the signature's representative productivity (§6.3), and the hoisted
+/// cell-invariant population table (phase-6-plan.md §6.3) the L8 per-cell
+/// loop reads instead of re-deriving per cell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RosterEntry {
     /// The habitat this entry is a function of.
@@ -26,6 +29,10 @@ pub struct RosterEntry {
     pub roster: SpeciesRoster,
     /// The plausibility-constrained food web over the roster.
     pub web: FoodWeb,
+    /// Cell-invariant population values (dominant, tier biomasses,
+    /// diversity), hoisted once per signature — same math, same results as
+    /// the per-cell derivation (phase-6-plan.md §6.3).
+    pub table: PopulationTable,
 }
 
 impl RosterEntry {
@@ -35,10 +42,12 @@ impl RosterEntry {
     pub fn build(signature: HabitatSignature) -> Self {
         let roster = species_roster(signature);
         let web = food_web(&roster, signature_productivity(signature));
+        let table = population_table(&roster, &web);
         Self {
             signature,
             roster,
             web,
+            table,
         }
     }
 
@@ -95,6 +104,20 @@ impl RosterCache {
     /// eviction, §6.3).
     pub fn evict_unused(&mut self, needed: &BTreeSet<HabitatSignature>) {
         self.entries.retain(|sig, _| needed.contains(sig));
+    }
+
+    /// Evict entries (highest signature first — deterministic) until total
+    /// bytes fit under `ceiling` (the Phase 6 capacity ceiling,
+    /// phase-6-plan.md §4.3). Safe: an entry rebuilds on demand as a pure
+    /// function of its signature.
+    pub fn evict_to_bytes(&mut self, ceiling: usize) {
+        let mut bytes = self.bytes();
+        while bytes > ceiling {
+            let Some((_, entry)) = self.entries.pop_last() else {
+                return;
+            };
+            bytes = bytes.saturating_sub(entry.bytes());
+        }
     }
 
     /// Number of resident entries.

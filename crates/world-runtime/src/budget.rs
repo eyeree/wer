@@ -36,6 +36,14 @@ pub struct Budget {
     /// (phase-5-plan.md §8.2) — the steering-side analogue of
     /// `max_resonance_nodes`, so a dense recorded corridor stays bounded.
     pub max_route_attraction_nodes: usize,
+    /// Resident regions whose stability/target are recomputed per frame when
+    /// the steering inputs are unchanged (phase-6-plan.md §6.4). A steering
+    /// change (bias/anchor edit) always refreshes the whole window this
+    /// frame; otherwise the pass round-robins, so the window refreshes over
+    /// `ceil(regions / max_retarget_regions)` frames. `usize::MAX` keeps the
+    /// Phase 5 every-frame behavior — the Low-tier default; settled fixed
+    /// points are amortization-invariant (ADR 0018).
+    pub max_retarget_regions: usize,
 }
 
 impl Budget {
@@ -65,6 +73,9 @@ impl Budget {
             // A few dozen nearest corridor nodes bound route steering the same
             // way the resonance graph is bounded.
             max_route_attraction_nodes: 32,
+            // Every frame (the proven Phase 5 behavior); tiers with bigger
+            // windows amortize (phase-6-plan.md §6.4, §7.4).
+            max_retarget_regions: usize::MAX,
         }
     }
 
@@ -79,6 +90,7 @@ impl Budget {
             max_resonance_nodes: usize::MAX,
             max_persist_ops: usize::MAX,
             max_route_attraction_nodes: usize::MAX,
+            max_retarget_regions: usize::MAX,
         }
     }
 }

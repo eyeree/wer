@@ -498,6 +498,82 @@ impl MapComposer {
         &self.pixels
     }
 
+    /// Compose only the sparse overlay content into a transparent RGBA
+    /// buffer for the GPU-composed map (phase-6-plan.md §6.5): pinned-flash
+    /// fills, undiscovered dimming, routes, preserve outlines, organisms,
+    /// rings, and the player marker. The base field painting and the grid
+    /// move to the GPU; the pinned-violation detector keeps running here —
+    /// it reads world state, not pixels (ADR 0017).
+    pub fn compose_overlays(
+        &mut self,
+        map: &RegionMap,
+        player: (f64, f64),
+        overlays: Overlays,
+        decor: &MapDecor,
+    ) -> &[u8] {
+        self.detect_pinned_changes(map);
+        self.pixels.fill(0);
+        let center = RegionCoord::from_world(player.0, player.1);
+        if overlays.pinned_flash {
+            let flashing: Vec<RegionCoord> = self.flash.keys().copied().collect();
+            for coord in flashing {
+                // 60% red, matching the CPU path's lerp toward [255, 30, 30].
+                self.fill_region(center, coord, [255, 30, 30], 153);
+            }
+        }
+        if overlays.discovered {
+            if let Some(seen) = &decor.seen {
+                for row in 0..=(2 * self.half_regions) {
+                    let ry = center.y + self.half_regions - row;
+                    for col in 0..=(2 * self.half_regions) {
+                        let rx = center.x - self.half_regions + col;
+                        let coord = RegionCoord::new(rx, ry);
+                        if !seen.contains(&coord) {
+                            // alpha 113/255 ≈ keep 5/9, the CPU dim factor.
+                            self.fill_region(center, coord, [0, 0, 0], 113);
+                        }
+                    }
+                }
+            }
+        }
+        for (path, usage) in &decor.routes {
+            self.draw_route(player, path, *usage);
+        }
+        for &coord in &decor.preserves {
+            self.outline_region(center, coord, PRESERVE_OUTLINE);
+        }
+        if overlays.organisms {
+            self.draw_organisms(map, player);
+        }
+        if overlays.rings {
+            self.draw_rings(map, player);
+        }
+        self.draw_player_marker(player);
+        &self.pixels
+    }
+
+    /// Blend `rgb` at `alpha` over one region's pixel block (overlay mode).
+    fn fill_region(&mut self, center: RegionCoord, coord: RegionCoord, rgb: [u8; 3], alpha: u8) {
+        let row_region = center.y + self.half_regions - coord.y;
+        let col_region = coord.x - center.x + self.half_regions;
+        let span = 2 * self.half_regions;
+        if !(0..=span).contains(&row_region) || !(0..=span).contains(&col_region) {
+            return;
+        }
+        let res = self.resolution as usize;
+        let side = self.side() as usize;
+        for py in row_region as usize * res..(row_region as usize + 1) * res {
+            let row = py * side;
+            for px in col_region as usize * res..(col_region as usize + 1) * res {
+                let offset = (row + px) * 4;
+                self.pixels[offset] = rgb[0];
+                self.pixels[offset + 1] = rgb[1];
+                self.pixels[offset + 2] = rgb[2];
+                self.pixels[offset + 3] = alpha;
+            }
+        }
+    }
+
     /// Dim every view region the explorer has never visited (phase-5-plan.md
     /// §11): the discovered world reads bright, the unknown reads dark — the
     /// first appearance of the atlas map.

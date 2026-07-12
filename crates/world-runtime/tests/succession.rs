@@ -20,6 +20,7 @@ fn config() -> StreamConfig {
         converge_per_unit: 0.02,
         converge_rate_cap: 0.25,
         field_resolution: 8,
+        ..StreamConfig::default()
     }
 }
 

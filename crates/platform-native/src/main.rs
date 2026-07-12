@@ -4,8 +4,9 @@
 //! Opens a window and drives the frame loop: player input moves through the
 //! infinite world, keys nudge possibility dimensions and drop anchors, and the
 //! renderer presents a top-down false-color map of the streaming window. The
-//! platform crate owns windowing, timing, and the concrete Rayon
-//! [`world_runtime::TaskExecutor`]; `world-core`/`world-runtime` stay neutral.
+//! platform crate owns windowing, timing, and the concrete lane-executor
+//! [`world_runtime::TaskExecutor`] (`--inline` for the synchronous A/B);
+//! `world-core`/`world-runtime` stay neutral.
 //!
 //! Controls:
 //! - `WASD` / arrows — move (hold `Shift` to sprint)
@@ -41,6 +42,7 @@
 //! at the given position and writes the composed map + panel as a binary PPM.
 
 mod executor;
+mod gpumap;
 mod panel;
 mod viz;
 
@@ -60,13 +62,14 @@ use world_core::{
     POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    apply_session_regions, Budget, FrameStats, GenerationStatus, RegionMap, RouteRecorder,
-    RouteTracker, StreamConfig, Vault, VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION,
-    CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH,
-    CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    apply_session_regions, AdapterClass, Budget, FrameStats, GenerationStatus, RegionMap,
+    ResourceTier, RouteRecorder, RouteTracker, StreamConfig, TierInputs, Vault, VaultStats,
+    CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE,
+    CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
-use executor::RayonExecutor;
+use executor::LaneExecutor;
+use gpumap::AtlasManager;
 use panel::{CursorInfo, EcologyInfo, Hud, PanelInfo, VaultInfo};
 use tools::FileStorage;
 use viz::{Channel, MapComposer, MapDecor, Overlays};
@@ -108,12 +111,15 @@ struct World {
     tracker: RouteTracker,
     /// Whether recorded routes project their attraction field (`U` toggles).
     route_attraction: bool,
-    executor: RayonExecutor,
+    /// The lane executor by default; `wer --inline` swaps in the synchronous
+    /// [`world_runtime::InlineExecutor`] for A/B comparison (ADR 0018 makes
+    /// the settled world identical either way — only pacing differs).
+    executor: Box<dyn world_runtime::TaskExecutor>,
     budget: Budget,
 }
 
 impl World {
-    fn new() -> Self {
+    fn new(inline: bool, tier: ResourceTier) -> Self {
         // The store location: WER_VAULT_DIR, or ./wer-vault next to the cwd.
         let vault_dir =
             std::env::var("WER_VAULT_DIR").unwrap_or_else(|_| String::from("wer-vault"));
@@ -139,8 +145,17 @@ impl World {
                 None
             }
         };
+        // Tier presets scale pacing and capacity, never identity (ADR 0018);
+        // WER_CACHE_MB overrides the field-cache ceiling for profiling runs.
+        let mut stream = tier.stream_config();
+        if let Some(mb) = std::env::var("WER_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            stream.max_field_cache_bytes = mb * 1024 * 1024;
+        }
         let mut world = Self {
-            map: RegionMap::new(StreamConfig::default()),
+            map: RegionMap::new(stream),
             field: PossibilityField::default(),
             anchors: Vec::new(),
             bias: [0.0; POSSIBILITY_DIMS],
@@ -152,8 +167,12 @@ impl World {
             recorder: None,
             tracker: RouteTracker::new(),
             route_attraction: true,
-            executor: RayonExecutor,
-            budget: Budget::per_frame(16.6),
+            executor: if inline {
+                Box::new(world_runtime::InlineExecutor)
+            } else {
+                Box::new(LaneExecutor::auto())
+            },
+            budget: tier.budget(),
         };
         // A preserved region realizes its recorded buckets from the very
         // first frame, wherever the run begins (phase-5-plan.md §7.5).
@@ -180,14 +199,14 @@ impl World {
                 ));
             }
         }
-        let stats = self.map.update(
+        let mut stats = self.map.update(
             self.player,
             travel,
             &self.field,
             &effective,
             &self.bias,
             &self.budget,
-            &self.executor,
+            self.executor.as_ref(),
             self.transition_mode,
         );
         // Expedition recording samples the frame the map just produced (§7.3);
@@ -202,6 +221,9 @@ impl World {
             );
         }
         if let Some(vault) = self.vault.as_mut() {
+            // The persistence work is the pipeline's Flush pass; the shell
+            // times it into the same per-pass table (phase-6-plan.md §5.2).
+            let flush_start = Instant::now();
             // Seen-set recording (phase-5-plan.md §5.3): the region under the
             // player is discovered. O(1) and idempotent.
             vault.mark_seen(RegionCoord::from_world(self.player.0, self.player.1));
@@ -215,6 +237,8 @@ impl World {
             // Budgeted trickle of dirty records (§7.7); saves marked by `O`
             // and event-driven records drain here.
             self.vault_stats = vault.flush(&self.budget);
+            stats.pass_ms[world_runtime::Pass::Flush.index()] +=
+                flush_start.elapsed().as_secs_f32() * 1000.0;
         }
         stats
     }
@@ -429,6 +453,20 @@ struct App {
     capture_category: TraitCategory,
     /// Whether a capture emphasizes or suppresses, toggled with `Y`.
     capture_polarity: AnchorKind,
+    /// The detected (or overridden) resource tier (phase-6-plan.md §6.7).
+    tier: ResourceTier,
+    /// GPU-composed map (phase-6-plan.md §6.5) vs the CPU composer; `,`
+    /// toggles for the A/B parity eyeball. CPU-only channels fall back
+    /// automatically.
+    gpu_compose: bool,
+    /// GPU refinement octaves above FIELD_RES (`.` toggles; GPU mode only).
+    refinement: bool,
+    /// Atlas slot assignment + delta-upload keys for the GPU map.
+    atlas: AtlasManager,
+    /// Content hashes of the last uploaded overlay/panel strips, so an
+    /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
+    overlay_hash: u64,
+    panel_hash: u64,
     keys_down: HashSet<KeyCode>,
     modifiers: ModifiersState,
     /// Mouse position in window physical pixels, when over the window.
@@ -436,32 +474,54 @@ struct App {
     /// Cumulative regenerated-tile counts per layer (panel telemetry).
     regen_totals: [u64; LAYER_COUNT as usize],
     last_frame: Instant,
-    // Rolling telemetry (phase-1-plan.md section 12), displayed by the info
-    // panel; per-second counters are no longer logged.
+    // Rolling telemetry (phase-1-plan.md section 12; phase-6-plan.md §12),
+    // displayed by the info panel; per-second counters are no longer logged.
     stats_frames: u32,
     update_time_accum: f64,
+    compose_time_accum: f64,
+    render_time_accum: f64,
+    pass_ms_accum: [f32; world_runtime::PASS_COUNT],
     last_telemetry: Instant,
     /// Snapshot of the last completed telemetry second, for the HUD.
     fps: u32,
     update_ms: f64,
+    /// CPU map+HUD composition ms over the last second (phase-6-plan.md §12).
+    compose_ms: f64,
+    /// Present ms over the last second — includes the vsync wait, which is
+    /// idle pacing, not work (separable now that the busy-loop is gone).
+    render_ms: f64,
+    /// Mean per-pass ms over the last second.
+    pass_ms: [f32; world_runtime::PASS_COUNT],
+    upload_accum: u64,
+    /// Mean atlas/overlay/panel upload KB per frame over the last second
+    /// (GPU path; phase-6-plan.md §12).
+    upload_kb: f64,
 }
 
 impl App {
-    fn new() -> Self {
-        let cfg = StreamConfig::default();
+    fn new(inline: bool, tier: ResourceTier) -> Self {
+        let cfg = tier.stream_config();
         let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
         let composer = MapComposer::new(half_regions, cfg.field_resolution);
         let hud = Hud::new(composer.side() as usize);
         Self {
             window: None,
             renderer: None,
-            world: World::new(),
+            world: World::new(inline, tier),
+            tier,
             composer,
             hud,
             channel: Channel::Composite,
             overlays: Overlays::default(),
             capture_category: TraitCategory::Morphology,
             capture_polarity: AnchorKind::Emphasize,
+            // GPU-composed map by default; `,` toggles live, WER_CPU_MAP=1
+            // starts in CPU mode (profiling A/B, phase-6-plan.md §6.5).
+            gpu_compose: std::env::var_os("WER_CPU_MAP").is_none(),
+            refinement: tier.refinement(),
+            atlas: AtlasManager::default(),
+            overlay_hash: 0,
+            panel_hash: 0,
             keys_down: HashSet::new(),
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
@@ -469,9 +529,17 @@ impl App {
             last_frame: Instant::now(),
             stats_frames: 0,
             update_time_accum: 0.0,
+            compose_time_accum: 0.0,
+            render_time_accum: 0.0,
+            pass_ms_accum: [0.0; world_runtime::PASS_COUNT],
             last_telemetry: Instant::now(),
             fps: 0,
             update_ms: 0.0,
+            compose_ms: 0.0,
+            render_ms: 0.0,
+            pass_ms: [0.0; world_runtime::PASS_COUNT],
+            upload_accum: 0,
+            upload_kb: 0.0,
         }
     }
 
@@ -655,6 +723,20 @@ impl App {
             KeyCode::KeyM => {
                 self.overlays.organisms = !self.overlays.organisms;
             }
+            KeyCode::Comma => {
+                self.gpu_compose = !self.gpu_compose;
+                log::info!(
+                    "map compose: {} (A/B parity toggle, phase-6-plan.md §6.5)",
+                    if self.gpu_compose { "GPU" } else { "CPU" }
+                );
+            }
+            KeyCode::Period => {
+                self.refinement = !self.refinement;
+                log::info!(
+                    "GPU refinement octaves {}",
+                    if self.refinement { "on" } else { "off" }
+                );
+            }
             KeyCode::Escape => event_loop.exit(),
             _ => {}
         }
@@ -770,18 +852,51 @@ impl App {
     }
 
     /// Roll per-frame timings into the once-a-second fps / update-time
-    /// snapshot the info panel displays (phase-1-plan.md section 12). The
-    /// panel replaced the old periodic telemetry log line; continuity
+    /// snapshot the info panel displays (phase-1-plan.md section 12;
+    /// phase-6-plan.md §12 adds the per-pass, compose, and present splits).
+    /// The panel replaced the old periodic telemetry log line; continuity
     /// violations still warn via the composer's detector.
-    fn update_telemetry(&mut self, update_seconds: f64) {
+    fn update_telemetry(
+        &mut self,
+        update_seconds: f64,
+        compose_seconds: f64,
+        render_seconds: f64,
+        pass_ms: &[f32; world_runtime::PASS_COUNT],
+        upload_bytes: u64,
+    ) {
         self.stats_frames += 1;
         self.update_time_accum += update_seconds;
+        self.compose_time_accum += compose_seconds;
+        self.render_time_accum += render_seconds;
+        self.upload_accum += upload_bytes;
+        for (accum, &ms) in self.pass_ms_accum.iter_mut().zip(pass_ms) {
+            *accum += ms;
+        }
 
         if self.last_telemetry.elapsed().as_secs_f64() >= 1.0 && self.stats_frames > 0 {
+            let frames = f64::from(self.stats_frames);
             self.fps = self.stats_frames;
-            self.update_ms = 1000.0 * self.update_time_accum / f64::from(self.stats_frames);
+            self.update_ms = 1000.0 * self.update_time_accum / frames;
+            self.compose_ms = 1000.0 * self.compose_time_accum / frames;
+            self.render_ms = 1000.0 * self.render_time_accum / frames;
+            self.upload_kb = self.upload_accum as f64 / 1024.0 / frames;
+            self.upload_accum = 0;
+            log::debug!(
+                "telemetry: fps {} update {:.2}ms compose {:.2}ms present {:.2}ms upload {:.0}KB/f",
+                self.fps,
+                self.update_ms,
+                self.compose_ms,
+                self.render_ms,
+                self.upload_kb
+            );
+            for (avg, accum) in self.pass_ms.iter_mut().zip(&mut self.pass_ms_accum) {
+                *avg = *accum / self.stats_frames as f32;
+                *accum = 0.0;
+            }
             self.stats_frames = 0;
             self.update_time_accum = 0.0;
+            self.compose_time_accum = 0.0;
+            self.render_time_accum = 0.0;
             self.last_telemetry = Instant::now();
         }
     }
@@ -809,17 +924,40 @@ impl App {
             .map(|world| Self::sample_cursor(&self.world.map, world));
 
         let decor = self.build_decor();
-        self.composer.compose(
-            &self.world.map,
-            self.world.player,
-            self.channel,
-            self.overlays,
-            &self.world.anchors,
-            &decor,
-        );
+        let gpu_channel = gpumap::gpu_channel(self.channel);
+        let use_gpu = self.gpu_compose && gpu_channel.is_some() && self.renderer.is_some();
+        let compose_start = Instant::now();
+        if use_gpu {
+            // GPU path (phase-6-plan.md §6.5): CPU draws only the sparse
+            // overlay; the field false-color composes per screen pixel from
+            // the atlas.
+            self.composer.compose_overlays(
+                &self.world.map,
+                self.world.player,
+                self.overlays,
+                &decor,
+            );
+        } else {
+            self.composer.compose(
+                &self.world.map,
+                self.world.player,
+                self.channel,
+                self.overlays,
+                &self.world.anchors,
+                &decor,
+            );
+        }
         let info = PanelInfo {
             fps: self.fps,
             update_ms: self.update_ms,
+            compose_ms: self.compose_ms,
+            render_ms: self.render_ms,
+            upload_kb: self.upload_kb,
+            gpu_compose: use_gpu,
+            tier: self.tier.name(),
+            cache_ceiling_bytes: self.world.map.config().max_field_cache_bytes,
+            pass_ms: self.pass_ms,
+            workers: self.world.executor.parallelism(),
             stats,
             regen_totals: &self.regen_totals,
             macro_tiles: self.world.map.macro_cache().len(),
@@ -842,13 +980,73 @@ impl App {
             }),
             cursor,
         };
-        let (width, height) = self.hud.size();
-        let pixels = self.hud.compose(self.composer.pixels(), &info);
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.render_map(pixels, width, height, CLEAR_COLOR);
-        }
+        let mut upload_bytes = 0u64;
+        let (compose_seconds, render_seconds) = if use_gpu {
+            // Delta uploads: only regions whose dependency-hash key changed,
+            // plus the overlay/panel strips only when their bytes changed.
+            let (panel_w, panel_h) = {
+                let (panel, w, h) = self.hud.panel_image(&info);
+                let hash = hash_bytes(panel);
+                let changed = hash != self.panel_hash;
+                self.panel_hash = hash;
+                (changed.then_some(w).map(|w| (w, h)), (w, h))
+            };
+            let _ = panel_h;
+            let overlay_hash = hash_bytes(self.composer.pixels());
+            let overlay_changed = overlay_hash != self.overlay_hash;
+            self.overlay_hash = overlay_hash;
 
-        self.update_telemetry(update_seconds);
+            let center = RegionCoord::from_world(self.world.player.0, self.world.player.1);
+            let half = self.composer.half_regions();
+            let res = self.world.map.config().field_resolution;
+            let (slots, uploads) = self.atlas.sync(&self.world.map, center, half, res);
+            let (west, north) = (
+                f64::from(center.x - half) * REGION_SIZE,
+                f64::from(center.y + half + 1) * REGION_SIZE,
+            );
+            let (refine, refine_count) = if self.refinement {
+                gpumap::refinement_octaves(west, north, res, 3)
+            } else {
+                (Default::default(), 0)
+            };
+            let params = renderer::GpuMapParams {
+                half_regions: half,
+                resolution: u32::from(res),
+                channel: gpu_channel.expect("use_gpu checked"),
+                grid: self.overlays.grid,
+                refine,
+                refine_count,
+            };
+            let compose_seconds = compose_start.elapsed().as_secs_f64();
+            let render_start = Instant::now();
+            if let Some(renderer) = self.renderer.as_mut() {
+                let overlay = overlay_changed.then(|| self.composer.pixels());
+                let panel = panel_w.map(|(w, h)| (self.hud.panel_pixels(), w, h));
+                if let Some(bytes) =
+                    renderer.render_map_gpu(&params, &slots, &uploads, overlay, panel, CLEAR_COLOR)
+                {
+                    upload_bytes = bytes;
+                }
+            }
+            (compose_seconds, render_start.elapsed().as_secs_f64())
+        } else {
+            let (width, height) = self.hud.size();
+            let pixels = self.hud.compose(self.composer.pixels(), &info);
+            let compose_seconds = compose_start.elapsed().as_secs_f64();
+            let render_start = Instant::now();
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.render_map(pixels, width, height, CLEAR_COLOR);
+            }
+            (compose_seconds, render_start.elapsed().as_secs_f64())
+        };
+
+        self.update_telemetry(
+            update_seconds,
+            compose_seconds,
+            render_seconds,
+            &stats.pass_ms,
+            upload_bytes,
+        );
     }
 }
 
@@ -937,6 +1135,23 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Order-stable content hash of a pixel strip, for skipping unchanged
+/// overlay/panel uploads (phase-6-plan.md §6.5).
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0x0DDB_1A5E_D0F0_0006;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        h = world_core::mix(
+            h,
+            u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")),
+        );
+    }
+    for &b in chunks.remainder() {
+        h = world_core::mix(h, u64::from(b));
+    }
+    h
+}
+
 /// Headless screenshot: settle the streaming window at `pos` and write the
 /// composed false-color map as a binary PPM (P6). No window, no GPU — the map
 /// is CPU-composed, which is exactly what makes it inspectable in tests and
@@ -984,6 +1199,14 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64)) -> Result<(), S
     let info = PanelInfo {
         fps: 0,
         update_ms: 0.0,
+        compose_ms: 0.0,
+        render_ms: 0.0,
+        upload_kb: 0.0,
+        gpu_compose: false,
+        tier: "low",
+        cache_ceiling_bytes: cfg.max_field_cache_bytes,
+        pass_ms: stats.pass_ms,
+        workers: 1,
         stats,
         regen_totals: &regen_totals,
         macro_tiles: map.macro_cache().len(),
@@ -1047,10 +1270,46 @@ fn build_event_loop() -> EventLoop<()> {
     EventLoop::new().expect("failed to create event loop")
 }
 
+/// Gather the tier inputs (phase-6-plan.md §6.7) — cores, adapter class via
+/// a throwaway wgpu probe, and the `WER_TIER` override — and decide the tier
+/// through the pure `world-runtime` table.
+fn detect_tier() -> ResourceTier {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let adapter = match renderer::probe_adapter() {
+        renderer::ProbedAdapter::Discrete => AdapterClass::Discrete,
+        renderer::ProbedAdapter::Integrated => AdapterClass::Integrated,
+        renderer::ProbedAdapter::Cpu => AdapterClass::Cpu,
+        renderer::ProbedAdapter::Unknown => AdapterClass::Unknown,
+    };
+    let override_tier = std::env::var("WER_TIER")
+        .ok()
+        .and_then(|v| ResourceTier::parse(&v));
+    let tier = ResourceTier::detect(&TierInputs {
+        cores,
+        adapter,
+        override_tier,
+    });
+    log::info!(
+        "resource tier: {} ({cores} cores, adapter {adapter:?}{})",
+        tier.name(),
+        if override_tier.is_some() {
+            ", WER_TIER override"
+        } else {
+            ""
+        }
+    );
+    tier
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--inline`: run generation synchronously on the main thread (the
+    // harness substrate) instead of the LaneExecutor — the A/B switch for
+    // schedule-independence spot checks (phase-6-plan.md §5.3).
+    let inline = args.iter().any(|a| a == "--inline");
+    args.retain(|a| a != "--inline");
     if let Some(rest) = args
         .split_first()
         .and_then(|(first, rest)| (first == "--screenshot").then_some(rest))
@@ -1087,9 +1346,13 @@ fn main() {
     }
 
     let event_loop = build_event_loop();
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Frame pacing (phase-6-plan.md M1): the redraw chain — present under
+    // FIFO/vsync, then `request_redraw` — is the pacer, so the event loop
+    // sleeps between events instead of busy-polling.
+    event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::new();
+    let tier = detect_tier();
+    let mut app = App::new(inline, tier);
     if let Err(err) = event_loop.run_app(&mut app) {
         log::error!("event loop exited with error: {err}");
     }
