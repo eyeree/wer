@@ -24,8 +24,11 @@
 //! - `B` — record the most recent anchor into the vault as a named discovery
 //! - `I` — summon every vault discovery as an active anchor (shared steering)
 //! - `P` — preserve the pinned near window (or delete the preserve you stand in)
-//! - `J` — start / finish recording an expedition route
+//! - `H` — toggle persistent path tracking (off by default; enables route
+//!   recording, traversal detection, the attraction field, and map polylines)
+//! - `J` — start / finish recording an expedition route (needs `H` on)
 //! - `U` — toggle the route attraction field (recorded corridors steer softly)
+//! - `Delete` — clear all recorded routes from the vault
 //! - `F` — toggle the discovered-region dimming overlay
 //! - `V` — cycle the visualized channel (includes the anchor `influence`
 //!   field); `G` grid, `N` rings, `X` changed-while-pinned flash
@@ -121,7 +124,14 @@ struct World {
     recorder: Option<RouteRecorder>,
     /// Traversal detection over the recorded routes (usage bumps, §7.4).
     tracker: RouteTracker,
-    /// Whether recorded routes project their attraction field (`U` toggles).
+    /// Master switch for the persistent path subsystem (`H` toggles, off by
+    /// default): route recording, traversal tracking, the attraction field,
+    /// and the map polylines are all dormant while this is false. Recorded
+    /// routes stay in the vault either way — the records are the truth
+    /// (ADR 0015); `Delete` clears them.
+    path_tracking: bool,
+    /// Whether recorded routes project their attraction field (`U` toggles;
+    /// only effective while [`Self::path_tracking`] is on).
     route_attraction: bool,
     /// The lane executor by default; `wer --inline` swaps in the synchronous
     /// [`world_runtime::InlineExecutor`] for A/B comparison (ADR 0018 makes
@@ -178,6 +188,7 @@ impl World {
             vault_stats: VaultStats::default(),
             recorder: None,
             tracker: RouteTracker::new(),
+            path_tracking: false,
             route_attraction: true,
             executor: if inline {
                 Box::new(world_runtime::InlineExecutor)
@@ -202,7 +213,7 @@ impl World {
         // player contribute derived weak anchors, riding the same
         // order-independent steer as the player's own.
         let mut effective = self.anchors.clone();
-        if self.route_attraction {
+        if self.path_tracking && self.route_attraction {
             if let Some(vault) = self.vault.as_ref() {
                 effective.extend(world_core::attraction_anchors(
                     vault.routes().values(),
@@ -240,11 +251,13 @@ impl World {
             // player is discovered. O(1) and idempotent.
             vault.mark_seen(RegionCoord::from_world(self.player.0, self.player.1));
             // Traversal detection: re-walking a recorded corridor bumps its
-            // usage once per leg (§7.4).
-            let traversed = self.tracker.observe(vault.routes().values(), self.player);
-            for id in traversed {
-                vault.bump_route_usage(id);
-                log::info!("route {id:#018x} traversed (usage bumped)");
+            // usage once per leg (§7.4). Dormant while path tracking is off.
+            if self.path_tracking {
+                let traversed = self.tracker.observe(vault.routes().values(), self.player);
+                for id in traversed {
+                    vault.bump_route_usage(id);
+                    log::info!("route {id:#018x} traversed (usage bumped)");
+                }
             }
             // Budgeted trickle of dirty records (§7.7); saves marked by `O`
             // and event-driven records drain here.
@@ -255,8 +268,45 @@ impl World {
         stats
     }
 
+    /// The `H` key: turn the persistent path subsystem on or off. Turning it
+    /// off mid-recording discards the unfinished expedition (nothing was
+    /// persisted yet); routes already in the vault are untouched.
+    fn toggle_path_tracking(&mut self) {
+        self.path_tracking = !self.path_tracking;
+        if !self.path_tracking && self.recorder.take().is_some() {
+            log::info!("path tracking off; in-progress recording discarded");
+        }
+        log::info!(
+            "path tracking {}",
+            if self.path_tracking { "on" } else { "off" }
+        );
+    }
+
+    /// The `Delete` key: erase every recorded route from the vault (and any
+    /// in-progress recording). Discoveries, preserves, and the seen set are
+    /// untouched — this clears paths only.
+    fn clear_routes(&mut self) {
+        if self.recorder.take().is_some() {
+            log::info!("in-progress recording discarded");
+        }
+        let Some(vault) = self.vault.as_mut() else {
+            log::warn!("no vault open; no recorded paths to clear");
+            return;
+        };
+        let ids: Vec<u64> = vault.routes().keys().copied().collect();
+        for &id in &ids {
+            vault.remove_route(id);
+        }
+        self.tracker.retain(|_| false);
+        log::info!("cleared {} recorded route(s)", ids.len());
+    }
+
     /// The `J` key: start recording an expedition, or finish and persist it.
     fn toggle_route_recording(&mut self) {
+        if !self.path_tracking {
+            log::info!("path tracking is off (H to enable)");
+            return;
+        }
         match self.recorder.take() {
             None => {
                 self.recorder = Some(RouteRecorder::new());
@@ -715,6 +765,8 @@ impl App {
             KeyCode::KeyI => self.world.summon_discoveries(),
             KeyCode::KeyP => self.world.toggle_preserve(),
             KeyCode::KeyJ => self.world.toggle_route_recording(),
+            KeyCode::KeyH => self.world.toggle_path_tracking(),
+            KeyCode::Delete => self.world.clear_routes(),
             KeyCode::KeyU => {
                 self.world.route_attraction = !self.world.route_attraction;
                 log::info!(
@@ -787,19 +839,26 @@ impl App {
             .values()
             .flat_map(|p| p.regions.iter().map(|(coord, _)| *coord))
             .collect();
-        let routes = vault
-            .routes()
-            .values()
-            .map(|r| {
-                (
-                    r.nodes
-                        .iter()
-                        .map(|n| (n.pos_q.0 as f64, n.pos_q.1 as f64))
-                        .collect(),
-                    r.usage,
-                )
-            })
-            .collect();
+        // Route polylines are part of the optional path subsystem: while
+        // tracking is off the map shows no paths (the records stay in the
+        // vault, just undrawn).
+        let routes = if self.world.path_tracking {
+            vault
+                .routes()
+                .values()
+                .map(|r| {
+                    (
+                        r.nodes
+                            .iter()
+                            .map(|n| (n.pos_q.0 as f64, n.pos_q.1 as f64))
+                            .collect(),
+                        r.usage,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         MapDecor {
             seen: Some(seen),
             preserves,

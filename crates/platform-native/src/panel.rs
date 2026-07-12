@@ -609,6 +609,7 @@ impl Hud {
             ("E / Q / C", "anchors, clear"),
             ("T Y K", "categ,polar,capture"),
             ("R", "transition mode"),
+            ("H J U Del", "paths: on,rec,attr,clr"),
             ("V G N X M", "channel,overlays"),
             ("scroll", "zoom (organism info)"),
         ] {

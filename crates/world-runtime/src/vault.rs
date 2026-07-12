@@ -372,6 +372,18 @@ impl<S: Storage> Vault<S> {
         false
     }
 
+    /// Delete a route record. Returns whether it existed. (Mirrors
+    /// [`Self::remove_preserve`]: deletion is rare, so the stored key is
+    /// removed eagerly rather than resurrecting the record on next open.)
+    pub fn remove_route(&mut self, id: u64) -> bool {
+        if self.routes.remove(&id).is_some() {
+            self.dirty.remove(&DirtyKey::Route(id));
+            let _ = self.store.remove(&route_key(id));
+            return true;
+        }
+        false
+    }
+
     /// Persist a recorded expedition (phase-5-plan.md §7.3). Returns the id.
     pub fn record_route(
         &mut self,

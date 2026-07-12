@@ -124,7 +124,9 @@ world drifts toward it only as you move (sprinting drifts it faster).
 | `O` / `L` | Save / load the session (store at `WER_VAULT_DIR`, default `./wer-vault`) |
 | `B` / `I` | Record the latest anchor as a named discovery / summon vault discoveries as anchors |
 | `P` | Preserve the pinned near window (or delete the preserve you stand in) |
-| `J` / `U` | Start/finish recording an expedition route / toggle route attraction |
+| `H` | Toggle persistent path tracking (off by default; gates route recording, traversal detection, attraction, and map polylines) |
+| `J` / `U` | Start/finish recording an expedition route / toggle route attraction (effective while path tracking is on) |
+| `Delete` | Clear all recorded routes from the vault |
 | `V` | Cycle the visualized channel (composite, layers, ecology, influence, stability, …) |
 | `G` / `N` / `X` / `M` / `F` | Toggle region grid / stability rings / changed-while-pinned flash / organism markers / discovered-region dimming |
 | Mouse wheel | Zoom the map view in/out (x1–x16); zoomed in past x4, hovering an organism marker shows that organism's details in the panel instead of the region info |
