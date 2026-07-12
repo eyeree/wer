@@ -11,8 +11,13 @@ use world_runtime::FrameStats;
 
 use crate::viz::Channel;
 
-/// Panel width in pixels: 30 columns of scale-2 (16 px) glyphs.
-pub const PANEL_WIDTH: usize = 480;
+/// Panel width in pixels: three stat columns of scale-2 (16 px) glyphs plus
+/// the margins. Three-up rows keep the panel short enough that the cursor
+/// and steering blocks stay visible on the Low-tier map strip.
+pub const PANEL_WIDTH: usize = 3 * COL_CHARS * 8 * SCALE + 2 * MARGIN;
+
+/// Column stride of the three-column stat grid, in glyphs.
+const COL_CHARS: usize = 17;
 
 /// Glyph scale (8 px font cells × 2 = 16 px).
 const SCALE: usize = 2;
@@ -301,17 +306,18 @@ impl Hud {
         cur.line(self, "INFINITE WORLD  PHASE 4", TITLE);
         cur.rule(self);
 
-        cur.pair(
+        cur.triple(
             self,
-            "fps",
-            &format!("{}", info.fps),
-            "update",
-            &format!("{:.2}ms", info.update_ms),
+            [
+                ("fps", &format!("{}", info.fps)),
+                ("update", &format!("{:.2}ms", info.update_ms)),
+                ("workers", &format!("{}", info.workers)),
+            ],
         );
-        // TIMINGS (phase-6-plan.md §10): per-pass update ms, two per line,
+        // TIMINGS (phase-6-plan.md §10): per-pass update ms, three per line,
         // plus the shell-side compose/present split.
         cur.line(self, "TIMINGS", HEADER);
-        for pair in (0..world_runtime::PASS_COUNT).step_by(2) {
+        for group in (0..world_runtime::PASS_COUNT).step_by(3) {
             let entry = |i: usize| {
                 format!(
                     "{:<9}{:>6.2}",
@@ -320,104 +326,106 @@ impl Hud {
                 )
             };
             let row_y = cur.y;
-            self.text(cur.x, row_y, &entry(pair), VALUE);
-            if pair + 1 < world_runtime::PASS_COUNT {
-                self.text(cur.x + 16 * 8 * SCALE, row_y, &entry(pair + 1), VALUE);
+            for (slot, i) in (group..(group + 3).min(world_runtime::PASS_COUNT)).enumerate() {
+                self.text(
+                    cur.x + slot * COL_CHARS * 8 * SCALE,
+                    row_y,
+                    &entry(i),
+                    VALUE,
+                );
             }
             cur.y += LINE_HEIGHT;
         }
-        cur.pair(
+        cur.triple(
             self,
-            "compose",
-            &format!("{:.2}ms", info.compose_ms),
-            "present",
-            &format!("{:.2}ms", info.render_ms),
-        );
-        cur.pair(
-            self,
-            "map",
-            if info.gpu_compose { "gpu" } else { "cpu" },
-            "upload",
-            &format!("{:.0}KB/f", info.upload_kb),
+            [
+                ("compose", &format!("{:.2}ms", info.compose_ms)),
+                ("present", &format!("{:.2}ms", info.render_ms)),
+                ("upload", &format!("{:.0}KB/f", info.upload_kb)),
+            ],
         );
         // TIER (phase-6-plan.md §10): the active preset and how much of its
         // field-cache ceiling is in use.
-        cur.pair(
+        cur.triple(
             self,
-            "tier",
-            info.tier,
-            "ceiling",
-            &format!(
-                "{:.0}/{:.0}MB",
-                info.stats.cache_bytes as f64 / (1024.0 * 1024.0),
-                info.cache_ceiling_bytes as f64 / (1024.0 * 1024.0)
-            ),
+            [
+                ("map", if info.gpu_compose { "gpu" } else { "cpu" }),
+                ("tier", info.tier),
+                (
+                    "ceiling",
+                    &format!(
+                        "{:.0}/{:.0}MB",
+                        info.stats.cache_bytes as f64 / (1024.0 * 1024.0),
+                        info.cache_ceiling_bytes as f64 / (1024.0 * 1024.0)
+                    ),
+                ),
+            ],
         );
         // EXEC / POOL telemetry (phase-6-plan.md §10). The pool counters are
         // zeros until M3 lands the tile pool; cancelled counts until M2's
         // lane executor are zero too — placeholders by design (M1).
-        cur.pair(
+        cur.triple(
             self,
-            "workers",
-            &format!("{}", info.workers),
-            "cancelled",
-            &format!("{}", info.stats.jobs_cancelled),
+            [
+                ("cancelled", &format!("{}", info.stats.jobs_cancelled)),
+                (
+                    "pool h/m",
+                    &format!("{}/{}", info.stats.pool_hits, info.stats.pool_misses),
+                ),
+                (
+                    "pool",
+                    &format!("{:.1}MB", info.stats.pool_bytes as f64 / (1024.0 * 1024.0)),
+                ),
+            ],
         );
-        cur.pair(
+        cur.triple(
             self,
-            "pool h/m",
-            &format!("{}/{}", info.stats.pool_hits, info.stats.pool_misses),
-            "pool",
-            &format!("{:.1}MB", info.stats.pool_bytes as f64 / (1024.0 * 1024.0)),
+            [
+                ("regions", &format!("{}", info.stats.active_regions)),
+                (
+                    "cache",
+                    &format!(
+                        "{:.1}MB",
+                        (info.stats.cache_bytes + info.stats.macro_cache_bytes) as f64
+                            / (1024.0 * 1024.0)
+                    ),
+                ),
+                ("jobs", &format!("{}", info.jobs_in_flight)),
+            ],
         );
-        cur.pair(
+        cur.triple(
             self,
-            "regions",
-            &format!("{}", info.stats.active_regions),
-            "cache",
-            &format!(
-                "{:.1}MB",
-                (info.stats.cache_bytes + info.stats.macro_cache_bytes) as f64 / (1024.0 * 1024.0)
-            ),
+            [
+                ("deferred", &format!("{}", info.stats.deferred_regens)),
+                ("converged", &format!("{}", info.stats.converged)),
+                ("cost", &format!("{}", info.stats.regen_cost_spent)),
+            ],
         );
-        cur.pair(
+        cur.triple(
             self,
-            "jobs",
-            &format!("{}", info.jobs_in_flight),
-            "deferred",
-            &format!("{}", info.stats.deferred_regens),
+            [
+                ("organisms", &format!("{}", info.organisms)),
+                ("realized", &format!("{}", info.stats.organisms_realized)),
+                (
+                    "resonance",
+                    &format!("{:.2}", info.stats.resonance_strength),
+                ),
+            ],
         );
-        cur.pair(
+        cur.triple(
             self,
-            "converged",
-            &format!("{}", info.stats.converged),
-            "cost",
-            &format!("{}", info.stats.regen_cost_spent),
-        );
-        cur.pair(
-            self,
-            "organisms",
-            &format!("{}", info.organisms),
-            "realized",
-            &format!("{}", info.stats.organisms_realized),
-        );
-        cur.pair(
-            self,
-            "resonance",
-            &format!("{:.2}", info.stats.resonance_strength),
-            "mode",
-            if info.transition_mode {
-                "trans"
-            } else {
-                "free"
-            },
-        );
-        cur.pair(
-            self,
-            "macro tiles",
-            &format!("{}", info.macro_tiles),
-            "rosters",
-            &format!("{}", info.rosters),
+            [
+                (
+                    "mode",
+                    if info.transition_mode {
+                        "trans"
+                    } else {
+                        "free"
+                    },
+                ),
+                ("macro tiles", &format!("{}", info.macro_tiles)),
+                ("rosters", &format!("{}", info.rosters)),
+            ],
         );
         match info.vault {
             Some(v) => {
@@ -447,11 +455,11 @@ impl Hud {
         );
         cur.rule(self);
 
-        // Cumulative per-layer regen counters, two layers per line
+        // Cumulative per-layer regen counters, three layers per line
         // (phase-2-plan.md §11): watching these is how invalidation precision
         // is eyeballed live — an Ecology nudge must tick vegetation only.
         cur.line(self, "REGEN BY LAYER", HEADER);
-        for pair in (0..LAYER_COUNT as usize).step_by(2) {
+        for group in (0..LAYER_COUNT as usize).step_by(3) {
             let entry = |layer: usize| {
                 format!(
                     "{:<9}{:>6}",
@@ -460,9 +468,13 @@ impl Hud {
                 )
             };
             let row_y = cur.y;
-            self.text(cur.x, row_y, &entry(pair), VALUE);
-            if pair + 1 < LAYER_COUNT as usize {
-                self.text(cur.x + 16 * 8 * SCALE, row_y, &entry(pair + 1), VALUE);
+            for (slot, layer) in (group..(group + 3).min(LAYER_COUNT as usize)).enumerate() {
+                self.text(
+                    cur.x + slot * COL_CHARS * 8 * SCALE,
+                    row_y,
+                    &entry(layer),
+                    VALUE,
+                );
             }
             cur.y += LINE_HEIGHT;
         }
@@ -494,24 +506,24 @@ impl Hud {
             cur.line(self, &format!("ORGANISM{zoom_suffix}"), HEADER);
             cur.label_value(self, "id", &format!("{:016x}", o.id), VALUE);
             cur.label_value(self, "species", &format!("{:016x}", o.species), VALUE);
-            // "decomposer" overflows a pair's first column, so trophic gets
-            // the whole line.
+            // "decomposer" overflows a stat column, so trophic gets the
+            // whole line.
             cur.label_value(self, "trophic", o.trophic, ACTIVE);
-            cur.pair(
+            cur.triple(
                 self,
-                "size",
-                &format!("{:.2}", o.size),
-                "hue",
-                &format!("{:.2}", o.hue),
+                [
+                    ("size", &format!("{:.2}", o.size)),
+                    ("hue", &format!("{:.2}", o.hue)),
+                    ("lumin", &format!("{:.2}", o.luminance)),
+                ],
             );
             cur.pair(
                 self,
-                "lumin",
-                &format!("{:.2}", o.luminance),
                 "activity",
                 &format!("{:.2}", o.activity),
+                "aggression",
+                &format!("{:.2}", o.aggression),
             );
-            cur.label_value(self, "aggression", &format!("{:.2}", o.aggression), VALUE);
             cur.label_value(
                 self,
                 "world",
@@ -524,9 +536,9 @@ impl Hud {
         }
 
         cur.line(self, "BIAS  1-8 up, shift down, Z", HEADER);
-        for pair in (0..POSSIBILITY_DIMS).step_by(2) {
+        for group in (0..POSSIBILITY_DIMS).step_by(3) {
             let row_y = cur.y;
-            for (slot, i) in (pair..(pair + 2).min(POSSIBILITY_DIMS)).enumerate() {
+            for (slot, i) in (group..(group + 3).min(POSSIBILITY_DIMS)).enumerate() {
                 let value = info.bias[i];
                 let color = if value.abs() > f32::EPSILON {
                     ACTIVE
@@ -534,7 +546,7 @@ impl Hud {
                     LABEL
                 };
                 self.text(
-                    cur.x + slot * 15 * 8 * SCALE,
+                    cur.x + slot * COL_CHARS * 8 * SCALE,
                     row_y,
                     &format!("{} {} {:+.2}", i + 1, DOMAIN_SHORT[i], value),
                     color,
@@ -634,69 +646,74 @@ impl Hud {
                 );
                 match (c.elevation, c.temperature, c.moisture) {
                     (Some(e), Some(t), Some(m)) => {
-                        cur.pair(
+                        cur.triple(
                             self,
-                            "elev",
-                            &format!("{e:.0}"),
-                            "temp",
-                            &format!("{t:.1}C"),
+                            [
+                                ("elev", &format!("{e:.0}")),
+                                ("temp", &format!("{t:.1}C")),
+                                ("moisture", &format!("{m:.2}")),
+                            ],
+                        );
+                        cur.triple(
+                            self,
+                            [
+                                (
+                                    "rock",
+                                    &c.hardness.map_or("-".into(), |h| format!("{h:.2}")),
+                                ),
+                                ("river", &c.river.map_or("-".into(), |r| format!("{r:.2}"))),
+                                ("wet", &c.wetness.map_or("-".into(), |w| format!("{w:.2}"))),
+                            ],
+                        );
+                        cur.triple(
+                            self,
+                            [
+                                (
+                                    "soil",
+                                    &c.soil_depth.map_or("-".into(), |d| format!("{d:.2}")),
+                                ),
+                                (
+                                    "fert",
+                                    &c.fertility.map_or("-".into(), |f| format!("{f:.2}")),
+                                ),
+                                (
+                                    "veg",
+                                    &c.vegetation.map_or("-".into(), |v| format!("{v:.2}")),
+                                ),
+                            ],
                         );
                         cur.pair(
                             self,
-                            "moisture",
-                            &format!("{m:.2}"),
-                            "rock",
-                            &c.hardness.map_or("-".into(), |h| format!("{h:.2}")),
-                        );
-                        cur.pair(
-                            self,
-                            "river",
-                            &c.river.map_or("-".into(), |r| format!("{r:.2}")),
-                            "wet",
-                            &c.wetness.map_or("-".into(), |w| format!("{w:.2}")),
-                        );
-                        cur.pair(
-                            self,
-                            "soil",
-                            &c.soil_depth.map_or("-".into(), |d| format!("{d:.2}")),
-                            "fert",
-                            &c.fertility.map_or("-".into(), |f| format!("{f:.2}")),
-                        );
-                        cur.pair(
-                            self,
-                            "veg",
-                            &c.vegetation.map_or("-".into(), |v| format!("{v:.2}")),
                             "canopy",
                             &c.canopy.map_or("-".into(), |h| format!("{h:.1}m")),
+                            "biome",
+                            c.biome.unwrap_or("?"),
                         );
-                        cur.label_value(self, "biome", c.biome.unwrap_or("?"), ACTIVE);
                     }
                     _ => cur.line(self, "(tiles not generated yet)", LABEL),
                 }
                 if let Some(e) = &c.ecology {
-                    cur.pair(
+                    cur.triple(
                         self,
-                        "species",
-                        &format!("{}", e.roster_size),
-                        "domspp",
-                        &format!("{:04x}", e.dominant_id & 0xFFFF),
+                        [
+                            ("species", &format!("{}", e.roster_size)),
+                            ("domspp", &format!("{:04x}", e.dominant_id & 0xFFFF)),
+                            ("herb", &format!("{:.3}", e.herbivore)),
+                        ],
                     );
-                    cur.pair(
+                    cur.triple(
                         self,
-                        "herb",
-                        &format!("{:.3}", e.herbivore),
-                        "pred",
-                        &format!("{:.3}", e.predator),
-                    );
-                    cur.pair(
-                        self,
-                        "diversity",
-                        &format!("{:.2}", e.diversity),
-                        "P/H/C",
-                        &format!(
-                            "{}/{}/{}",
-                            e.trophic_counts[0], e.trophic_counts[1], e.trophic_counts[3]
-                        ),
+                        [
+                            ("pred", &format!("{:.3}", e.predator)),
+                            ("diversity", &format!("{:.2}", e.diversity)),
+                            (
+                                "P/H/C",
+                                &format!(
+                                    "{}/{}/{}",
+                                    e.trophic_counts[0], e.trophic_counts[1], e.trophic_counts[3]
+                                ),
+                            ),
+                        ],
                     );
                 }
             }
@@ -774,13 +791,26 @@ impl PanelCursor {
         self.y += LINE_HEIGHT;
     }
 
-    /// Two label/value pairs on one line (fixed second column).
+    /// Two label/value pairs on one line (fixed second column). The second
+    /// value may run past its column, so pairs suit lines whose tail entry
+    /// is open-ended (biome names, vault hints).
     fn pair(&mut self, hud: &mut Hud, l1: &str, v1: &str, l2: &str, v2: &str) {
         hud.text(self.x, self.y, l1, LABEL);
         hud.text(self.x + (l1.len() + 1) * 8 * SCALE, self.y, v1, VALUE);
-        let col2 = self.x + 15 * 8 * SCALE;
+        let col2 = self.x + COL_CHARS * 8 * SCALE;
         hud.text(col2, self.y, l2, LABEL);
         hud.text(col2 + (l2.len() + 1) * 8 * SCALE, self.y, v2, VALUE);
+        self.y += LINE_HEIGHT;
+    }
+
+    /// Three label/value pairs on one line — the stat-grid row that keeps the
+    /// panel's vertical extent inside the Low-tier map strip.
+    fn triple(&mut self, hud: &mut Hud, entries: [(&str, &str); 3]) {
+        for (slot, (label, value)) in entries.into_iter().enumerate() {
+            let x = self.x + slot * COL_CHARS * 8 * SCALE;
+            hud.text(x, self.y, label, LABEL);
+            hud.text(x + (label.len() + 1) * 8 * SCALE, self.y, value, VALUE);
+        }
         self.y += LINE_HEIGHT;
     }
 
