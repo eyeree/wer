@@ -7,8 +7,8 @@ one seamless journey across an infinite landscape of possible worlds, steered by
 
 See the design and architecture documents:
 
-- [`Infinite_World_Exploration_Project_Overview.md`](Infinite_World_Exploration_Project_Overview.md) — the game vision.
-- [`implementation-plan.md`](implementation-plan.md) — the high-level technical plan.
+- [`docs/Infinite_World_Exploration_Project_Overview.md`](docs/Infinite_World_Exploration_Project_Overview.md) — the game vision.
+- [`docs/plans/prototype/implementation-plan.md`](docs/plans/prototype/implementation-plan.md) — the high-level technical plan.
 - [`docs/adr/`](docs/adr/) — architecture decision records.
 
 This repository is currently at **Phase 6** (performance and scale, see

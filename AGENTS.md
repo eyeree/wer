@@ -9,8 +9,8 @@ that assumes you will edit code.
 The **Infinite World Exploration Game** — a native Rust engine (with a planned
 browser/WebAssembly/WebGPU target) for an exploration game built around
 *continuous travel through possibility space*. The design vision is in
-[`Infinite_World_Exploration_Project_Overview.md`](Infinite_World_Exploration_Project_Overview.md);
-the phased technical plan is in [`implementation-plan.md`](implementation-plan.md).
+[`docs/Infinite_World_Exploration_Project_Overview.md`](./docs/Infinite_World_Exploration_Project_Overview.md);
+the phased technical plan is in [`implementation-plan.md`](docs/plans/prototype/implementation-plan.mdimplementation-plan.md).
 
 The repository is at **Phase 6** (performance and scale, see
 [`phase-6-plan.md`](phase-6-plan.md)), built on the landed Phase 2–5 stacks.
@@ -216,8 +216,7 @@ persistence formats), check whether an ADR already governs it.
 
 ## Where to look
 
-- Vision / gameplay: `Infinite_World_Exploration_Project_Overview.md`
-- Technical plan and phases: `implementation-plan.md` (Phase 0 is current; the
-  central question the prototype must answer is section 22)
+- Vision / gameplay: `docs/Infinite_World_Exploration_Project_Overview.md`
+- Technical plan and phases: `docs/plans`
 - Why the structure is the way it is: `docs/adr/`
 - Human-facing build/run/browser-smoke instructions: `README.md`
