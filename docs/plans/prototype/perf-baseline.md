@@ -141,3 +141,24 @@ priority); the kernels themselves are 1.7× faster end-to-end (M4 settle-cold
 Together that exceeds the 4× regen-throughput bar the High budget
 (`max_regen_cost` 96 → 384) spends. Wall-clock remains locally verified via
 `wer-scale --report`; CI gates only the counts, bytes, and hashes above.
+
+## 3D-1 — POV terrain (3d-phase-1-plan.md §9)
+
+Measured on the reference machine (WSL2/llvmpipe, X11, default window,
+`--release`, radius 3 = 49 chunks). Presentation-only work: no generated
+output changed, zero fixtures re-blessed.
+
+| metric | value |
+|---|---|
+| mesh time, worker-side | 26.8 ms for 49 chunks ≈ **0.55 ms/chunk** (4,489 `elevation_row` samples + color packing per chunk) |
+| chunk vertex data | 4,485 verts × 28 B = **123 KB/chunk** (~6 MB at radius 3, pooled) |
+| shared index buffer | 26,112 × u32 = 102 KB, built once for every chunk ever drawn |
+| cold entry | 49 chunks meshed, integrated at the 4-uploads/frame cap (~13 frames to full ring); ~56 KB/frame mean upload during the first second |
+| steady state | **0 remeshes, 0 uploads, 0 buffer allocations** (dep-hash + terrain-bucket keying; pool warm) |
+| llvmpipe frame rate, POV radius 3 | ~160 fps (present 5.2 ms, update 0.6 ms) |
+| llvmpipe frame rate, 2D GPU-map baseline | ~155 fps (compose 3.5 ms + present 2.0 ms) — POV is not the bottleneck |
+| `wer --inline` A/B | identical lifecycle (49 meshed, 0 remeshed at rest); meshing runs synchronously inside the frame, pacing differs only (ADR 0018 posture) |
+
+The 2D map path is pixel-identical to pre-3D-1: a `--screenshot` byte-diff
+against the previous commit shows **0 differing map pixels** (the info panel
+legitimately gains the `mesh` pass row).

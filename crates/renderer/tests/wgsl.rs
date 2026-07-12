@@ -23,3 +23,8 @@ fn debug_map_shader_validates() {
 fn compose_map_shader_validates() {
     validate("compose_map.wgsl", renderer::gpumap::SHADER_COMPOSE_MAP);
 }
+
+#[test]
+fn pov_terrain_shader_validates() {
+    validate("pov_terrain.wgsl", renderer::SHADER_POV_TERRAIN);
+}

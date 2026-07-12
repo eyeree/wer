@@ -32,6 +32,12 @@
 //! - `F` — toggle the discovered-region dimming overlay
 //! - `V` — cycle the visualized channel (includes the anchor `influence`
 //!   field); `G` grid, `N` rings, `X` changed-while-pinned flash
+//! - `Tab` — toggle the 3D POV mode (3d-phase-1-plan.md): a fly camera over
+//!   the meshed near-field terrain. In POV: mouse look under cursor grab,
+//!   `WASD` along view/strafe, `Space`/`LShift` up/down, wheel adjusts fly
+//!   speed, `Esc` releases the mouse (click to re-grab; `Esc` again quits).
+//!   Every map binding above is map-mode-only. `WER_POV=1` starts in POV;
+//!   `WER_POV_RADIUS` sets the chunk draw radius in regions (default 3).
 //! - `Esc` — quit
 //! - Mouse over the map — the info panel shows the cell under the cursor
 //!   (world/region coordinates, streaming state, field samples, biome)
@@ -52,6 +58,7 @@
 mod executor;
 mod gpumap;
 mod panel;
+mod pov;
 mod viz;
 
 use std::collections::HashSet;
@@ -60,10 +67,10 @@ use std::time::Instant;
 
 use renderer::{letterbox_viewport, Renderer};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 use world_core::{
     bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, Biome, PossibilityDomain,
     PossibilityField, PossibilitySignature, RegionCoord, TraitCategory, Trophic, LAYER_COUNT,
@@ -79,6 +86,7 @@ use world_runtime::{
 use executor::LaneExecutor;
 use gpumap::AtlasManager;
 use panel::{CursorInfo, EcologyInfo, Hud, OrganismInfo, PanelInfo, VaultInfo};
+use pov::{PovCamera, PovChunkManager, PovCounters};
 use tools::FileStorage;
 use viz::{Channel, MapComposer, MapDecor, Overlays};
 
@@ -101,6 +109,14 @@ const MAX_ZOOM: u32 = 16;
 /// Zoom level at (and past) which hovering an organism marker shows that
 /// organism in the panel instead of the region info.
 const ORGANISM_INFO_ZOOM: u32 = 4;
+
+/// Which presentation the shell drives (3d-phase-1-plan.md §8.1). Map mode
+/// is byte-for-byte the pre-POV path; POV renders the meshed terrain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Map,
+    Pov,
+}
 
 /// The world-simulation half of the app (everything that isn't winit/wgpu).
 struct World {
@@ -525,6 +541,19 @@ struct App {
     refinement: bool,
     /// Atlas slot assignment + delta-upload keys for the GPU map.
     atlas: AtlasManager,
+    /// Map vs POV presentation; `Tab` toggles (3d-phase-1-plan.md §8.1).
+    view_mode: ViewMode,
+    /// The POV fly camera (presentation-side state only).
+    pov_camera: PovCamera,
+    /// POV chunk lifecycle: keying, Background-lane meshing, amortized
+    /// upload, farthest-first eviction (3d-phase-1-plan.md §7).
+    pov_chunks: PovChunkManager,
+    /// Chunk draw radius in regions (`WER_POV_RADIUS`, default 3).
+    pov_radius: i32,
+    /// Whether the cursor is grabbed for mouse look (POV only).
+    pov_grabbed: bool,
+    /// The previous telemetry second's POV counters, for the delta log line.
+    pov_counters_last: PovCounters,
     /// Content hashes of the last uploaded overlay/panel strips, so an
     /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
     overlay_hash: u64,
@@ -590,6 +619,20 @@ impl App {
             gpu_compose: std::env::var_os("WER_CPU_MAP").is_none(),
             refinement: tier.refinement(),
             atlas: AtlasManager::default(),
+            view_mode: if std::env::var_os("WER_POV").is_some_and(|v| v != "0") {
+                ViewMode::Pov
+            } else {
+                ViewMode::Map
+            },
+            pov_camera: PovCamera::new(),
+            pov_chunks: PovChunkManager::new(),
+            // The llvmpipe escape hatch (3d-phase-1-plan.md §8.5).
+            pov_radius: std::env::var("WER_POV_RADIUS")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .map_or(3, |r| r.clamp(1, 8)),
+            pov_grabbed: false,
+            pov_counters_last: PovCounters::default(),
             overlay_hash: 0,
             panel_hash: 0,
             keys_down: HashSet::new(),
@@ -642,8 +685,110 @@ impl App {
         self.world.player.1 += dy * step;
     }
 
+    /// Toggle Map ↔ POV (`Tab`, 3d-phase-1-plan.md §8.1). Entering POV
+    /// places the camera at eye level over the player and grabs the cursor;
+    /// leaving always releases the grab. Chunks are kept across toggles
+    /// (cheap to hold, instant on re-entry; §7.4).
+    fn toggle_view_mode(&mut self) {
+        match self.view_mode {
+            ViewMode::Map => {
+                self.view_mode = ViewMode::Pov;
+                let ground = pov::entry_ground(&self.world.map, self.world.player);
+                self.pov_camera.enter_at(self.world.player, ground);
+                self.set_pov_grab(true);
+                log::info!(
+                    "view: POV at ({:.0}, {:.0}) radius {} (Tab returns to the map; Esc releases the mouse)",
+                    self.world.player.0,
+                    self.world.player.1,
+                    self.pov_radius
+                );
+            }
+            ViewMode::Pov => {
+                self.view_mode = ViewMode::Map;
+                self.set_pov_grab(false);
+                log::info!("view: map");
+            }
+        }
+    }
+
+    /// Grab or release the cursor for mouse look (plan §8.2): `Locked`,
+    /// falling back to `Confined` (X11 under WSL2 — the primary dev
+    /// environment — supports Confined; `CursorMoved` re-centers under it).
+    /// Raw-look deltas arrive via `device_event` regardless, so a failed
+    /// grab degrades to a visible-cursor fly, not a dead camera.
+    fn set_pov_grab(&mut self, grab: bool) {
+        let Some(window) = self.window.as_ref() else {
+            self.pov_grabbed = grab;
+            return;
+        };
+        if grab {
+            if let Err(err) = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+            {
+                log::warn!("cursor grab unavailable ({err}); mouse look continues ungrabbed");
+            }
+            window.set_cursor_visible(false);
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+        self.pov_grabbed = grab;
+    }
+
+    /// Fly movement from held keys (plan §8.3): `W`/`S` along the full 3D
+    /// view direction (it is a fly camera), `A`/`D` strafe in the yaw plane,
+    /// `Space`/`LShift` world up/down. No collision of any kind — the camera
+    /// flies through hills until 3D-2. Bypasses `apply_movement` entirely.
+    fn apply_pov_movement(&mut self, dt: f64) {
+        let down = |code| self.keys_down.contains(&code);
+        let mut mv = glam::DVec3::ZERO;
+        if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
+            mv += self.pov_camera.forward();
+        }
+        if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
+            mv -= self.pov_camera.forward();
+        }
+        if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
+            mv += self.pov_camera.right();
+        }
+        if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
+            mv -= self.pov_camera.right();
+        }
+        if down(KeyCode::Space) {
+            mv.z += 1.0;
+        }
+        if down(KeyCode::ShiftLeft) {
+            mv.z -= 1.0;
+        }
+        if mv != glam::DVec3::ZERO {
+            self.pov_camera.pos += mv.normalize() * (self.pov_camera.speed * dt);
+        }
+    }
+
     /// One-shot actions on key press.
     fn handle_press(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
+        // The POV keybinding gate (3d-phase-1-plan.md §8.4): in POV only
+        // `Tab` and `Escape` are handled; every map binding below stays
+        // map-mode-only. This gate is the whole guarantee that map mode is
+        // pixel-identical — no map state can even be touched from POV.
+        if self.view_mode == ViewMode::Pov {
+            match code {
+                KeyCode::Tab => self.toggle_view_mode(),
+                KeyCode::Escape if self.pov_grabbed => {
+                    // First press frees the mouse (stay in POV, look frozen);
+                    // a click re-grabs, a second press exits as usual.
+                    self.set_pov_grab(false);
+                }
+                KeyCode::Escape => event_loop.exit(),
+                _ => {}
+            }
+            return;
+        }
+        if code == KeyCode::Tab {
+            self.toggle_view_mode();
+            return;
+        }
         let nudge_domain = match code {
             KeyCode::Digit1 => Some(PossibilityDomain::Planetary),
             KeyCode::Digit2 => Some(PossibilityDomain::Climate),
@@ -1019,7 +1164,17 @@ impl App {
         let dt = (now - self.last_frame).as_secs_f64().min(0.1);
         self.last_frame = now;
 
-        self.apply_movement(dt);
+        match self.view_mode {
+            ViewMode::Map => self.apply_movement(dt),
+            ViewMode::Pov => {
+                // The POV camera *is* the player (plan §8.1): recenter the
+                // world before `update` so streaming, retarget, and
+                // realization follow the camera — travel-fueled drift works
+                // identically to map-mode travel.
+                self.apply_pov_movement(dt);
+                self.world.player = (self.pov_camera.pos.x, self.pov_camera.pos.y);
+            }
+        }
 
         let update_start = Instant::now();
         let stats = self.world.update();
@@ -1030,6 +1185,11 @@ impl App {
             .zip(&stats.regenerated_by_layer)
         {
             *total += count as u64;
+        }
+
+        if self.view_mode == ViewMode::Pov {
+            self.frame_pov(stats, update_seconds);
+            return;
         }
 
         let cursor_world = self.cursor_world();
@@ -1173,6 +1333,67 @@ impl App {
             upload_bytes,
         );
     }
+
+    /// The POV half of [`Self::frame`] (3d-phase-1-plan.md §8.1): sync the
+    /// chunk lifecycle, build the frame parameters with glam, and present
+    /// through [`Renderer::render_pov`]. HUD, panel, and cursor info are
+    /// skipped in POV (design §2.1); the telemetry accumulators still run.
+    fn frame_pov(&mut self, mut stats: FrameStats, update_seconds: f64) {
+        // The frame-side POV work (scheduling + amortized integration) fills
+        // the Mesh pass, following the Flush precedent (plan §8.1); the
+        // worker-side mesh milliseconds ride the manager's counters instead.
+        let mesh_start = Instant::now();
+        let (uploads, removes) = self.pov_chunks.sync(
+            &self.world.map,
+            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            self.pov_radius,
+            self.world.executor.as_ref(),
+        );
+        let upload_bytes = (uploads.len()
+            * renderer::pov::VERTS_PER_CHUNK
+            * core::mem::size_of::<renderer::PovVertex>()) as u64;
+        stats.pass_ms[world_runtime::Pass::Mesh.index()] +=
+            mesh_start.elapsed().as_secs_f32() * 1000.0;
+
+        let render_start = Instant::now();
+        if let Some(renderer) = self.renderer.as_mut() {
+            let (w, h) = renderer.size();
+            let params = pov::frame_params(
+                &self.pov_camera,
+                w as f32 / h.max(1) as f32,
+                self.pov_radius,
+                CLEAR_COLOR,
+            );
+            renderer.render_pov(&params, &uploads, &removes, CLEAR_COLOR);
+        }
+        let render_seconds = render_start.elapsed().as_secs_f64();
+
+        // The once-per-second POV log line (plan §7.5): the steady-state
+        // exit criterion reads these — travel stopped ⇒ remeshed stays flat.
+        if self.last_telemetry.elapsed().as_secs_f64() >= 1.0 {
+            let c = self.pov_chunks.counters();
+            let last = self.pov_counters_last;
+            log::info!(
+                "pov: {} chunks | +meshed {} +remeshed {} +cancelled {} +stale {} +deferred {} | mesh {:.1}ms worker total | fly {:.0}u/s",
+                self.pov_chunks.len(),
+                c.meshed - last.meshed,
+                c.remeshed - last.remeshed,
+                c.cancelled - last.cancelled,
+                c.dropped_stale - last.dropped_stale,
+                c.uploads_deferred - last.uploads_deferred,
+                c.mesh_ms,
+                self.pov_camera.speed,
+            );
+            self.pov_counters_last = c;
+        }
+        self.update_telemetry(
+            update_seconds,
+            0.0,
+            render_seconds,
+            &stats.pass_ms,
+            upload_bytes,
+        );
+    }
 }
 
 impl ApplicationHandler for App {
@@ -1209,6 +1430,14 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
+        // `WER_POV=1` starts directly in POV (plan §8.5): place the camera
+        // and grab the cursor now that the window exists.
+        if self.view_mode == ViewMode::Pov {
+            let ground = pov::entry_ground(&self.world.map, self.world.player);
+            self.pov_camera.enter_at(self.world.player, ground);
+            self.set_pov_grab(true);
+            log::info!("starting in POV (WER_POV set), radius {}", self.pov_radius);
+        }
         self.last_frame = Instant::now();
     }
 
@@ -1225,9 +1454,31 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some((position.x, position.y));
+                // Under the Confined grab fallback (X11/WSL2, plan §8.2) the
+                // cursor still moves; re-center it so it never reaches the
+                // window edge. Look input reads raw deltas, not this.
+                if self.view_mode == ViewMode::Pov && self.pov_grabbed {
+                    if let Some(window) = self.window.as_ref() {
+                        let size = window.inner_size();
+                        let (cx, cy) = (f64::from(size.width) / 2.0, f64::from(size.height) / 2.0);
+                        if (position.x - cx).abs() > 1.0 || (position.y - cy).abs() > 1.0 {
+                            let _ = window
+                                .set_cursor_position(winit::dpi::PhysicalPosition::new(cx, cy));
+                        }
+                    }
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_pos = None;
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            } => {
+                // A click inside the window re-grabs after Escape (plan §8.2).
+                if self.view_mode == ViewMode::Pov && !self.pov_grabbed {
+                    self.set_pov_grab(true);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.scroll_accum += match delta {
@@ -1235,6 +1486,19 @@ impl ApplicationHandler for App {
                     // Touchpads scroll in pixels; ~40 px per wheel notch.
                     MouseScrollDelta::PixelDelta(pos) => pos.y / 40.0,
                 };
+                if self.view_mode == ViewMode::Pov {
+                    // Wheel = fly-speed multiplier in POV (plan §8.3); the
+                    // map zoom below stays map-mode-only.
+                    while self.scroll_accum >= 1.0 {
+                        self.pov_camera.scroll_speed(true);
+                        self.scroll_accum -= 1.0;
+                    }
+                    while self.scroll_accum <= -1.0 {
+                        self.pov_camera.scroll_speed(false);
+                        self.scroll_accum += 1.0;
+                    }
+                    return;
+                }
                 let before = self.zoom;
                 while self.scroll_accum >= 1.0 {
                     self.zoom = (self.zoom * 2).min(MAX_ZOOM);
@@ -1283,6 +1547,18 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Raw mouse deltas for POV mouse look (3d-phase-1-plan.md §8.2):
+    /// `WindowEvent::CursorMoved` is clamped/warped under a grab, so look
+    /// input must come from the device stream. Active only in POV with the
+    /// grab held.
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if self.view_mode == ViewMode::Pov && self.pov_grabbed {
+                self.pov_camera.look(dx, dy);
+            }
         }
     }
 }

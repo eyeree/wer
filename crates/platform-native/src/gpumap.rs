@@ -57,8 +57,9 @@ impl AtlasManager {
     /// present and which inputs they were generated from. Regenerating a tile
     /// changes its dep hash; settling back to identical inputs reproduces the
     /// same key — and, by ADR 0008, the same bytes, so skipping the upload is
-    /// exact, not approximate.
-    fn region_key(map: &RegionMap, coord: RegionCoord) -> Option<u64> {
+    /// exact, not approximate. `pub(crate)`: the POV chunk key folds this
+    /// with the terrain buckets (3d-phase-1-plan.md §7.1).
+    pub(crate) fn region_key(map: &RegionMap, coord: RegionCoord) -> Option<u64> {
         let tiles = map.cache().get(coord)?;
         let mut h: u64 = 0xA71A_50FF_EE00_0006;
         let mut presence = 0u64;

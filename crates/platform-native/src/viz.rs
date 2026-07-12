@@ -401,6 +401,28 @@ fn composite_color(e: f32, biome: Biome, river: f32, wetness: f32) -> [u8; 3] {
     lerp_rgb(rgb, [130, 125, 120], ((e - 500.0) / 400.0).clamp(0.0, 1.0))
 }
 
+/// The full per-cell Composite color — [`composite_color`] plus the
+/// dominant-species land tint — shared by the 2D map's `paint_region` and the
+/// 3D mesher's per-vertex material (3d-phase-1-plan.md §6.4), so the POV
+/// ground reads as the same world the map shows. `dominant` is the resolved
+/// species id ([`world_runtime::RegionMap::dominant_species_id`]); `None`
+/// paints untinted, exactly as the 2D path does before ecology settles.
+pub(crate) fn composite_cell_color(
+    e: f32,
+    biome: Biome,
+    river: f32,
+    wetness: f32,
+    dominant: Option<u64>,
+) -> [u8; 3] {
+    let rgb = composite_color(e, biome, river, wetness);
+    // Tint land by dominant-species colour so ecosystem zonation reads at a
+    // glance (phase-3-plan.md §11); open water keeps the depth ramp.
+    match dominant {
+        Some(id) if e >= SEA_LEVEL => lerp_rgb(rgb, species_color(id), 0.18),
+        _ => rgb,
+    }
+}
+
 /// Composes the active window into an RGBA8 image, one pixel per field cell,
 /// and tracks pinned-region revisions for the changed-while-pinned detector.
 #[derive(Debug)]
@@ -844,23 +866,13 @@ impl MapComposer {
                         None => missing_color(cx, cy),
                     },
                     Channel::Composite => match (elevation, biome, river, wetness) {
-                        (Some(e), Some(b), Some(r), Some(w)) => {
-                            let elev = e.get(cx, cy);
-                            let mut rgb = composite_color(
-                                elev,
-                                Biome::from_id(b.get(cx, cy)),
-                                r.get(cx, cy),
-                                w.get(cx, cy),
-                            );
-                            // Tint land by dominant-species colour so ecosystem
-                            // zonation reads at a glance (phase-3-plan.md §11).
-                            if elev >= SEA_LEVEL {
-                                if let Some(id) = map.dominant_species_id(coord, cx, cy) {
-                                    rgb = lerp_rgb(rgb, species_color(id), 0.18);
-                                }
-                            }
-                            rgb
-                        }
+                        (Some(e), Some(b), Some(r), Some(w)) => composite_cell_color(
+                            e.get(cx, cy),
+                            Biome::from_id(b.get(cx, cy)),
+                            r.get(cx, cy),
+                            w.get(cx, cy),
+                            map.dominant_species_id(coord, cx, cy),
+                        ),
                         _ => missing_color(cx, cy),
                     },
                 };
@@ -995,6 +1007,116 @@ impl MapComposer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use world_core::{PossibilityField, POSSIBILITY_DIMS};
+    use world_runtime::{Budget, InlineExecutor, StreamConfig};
+
+    /// A small fully-settled window (the `gpumap.rs` test fixture).
+    fn settled_map() -> RegionMap {
+        let cfg = StreamConfig {
+            near_radius: 1.5 * REGION_SIZE,
+            far_radius: 3.0 * REGION_SIZE,
+            load_radius: 3.0 * REGION_SIZE,
+            unload_radius: 4.0 * REGION_SIZE,
+            field_resolution: 8,
+            ..StreamConfig::default()
+        };
+        let field = PossibilityField::default();
+        let bias = [0.0f32; POSSIBILITY_DIMS];
+        let mut map = RegionMap::new(cfg);
+        for _ in 0..6 {
+            map.update(
+                (0.0, 0.0),
+                0.0,
+                &field,
+                &[],
+                &bias,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn composite_paint_matches_the_pre_hoist_logic() {
+        // Pins the `composite_cell_color` hoist (3d-phase-1-plan.md §6.4):
+        // the refactored `paint_region` must be byte-identical to the old
+        // inline logic, replicated here verbatim, for a settled window.
+        let map = settled_map();
+        let player = (0.0, 0.0);
+        let mut composer = MapComposer::new(1, 8);
+        let overlays = Overlays {
+            grid: false,
+            rings: false,
+            pinned_flash: false,
+            organisms: false,
+            discovered: false,
+        };
+        composer.compose(
+            &map,
+            player,
+            Channel::Composite,
+            overlays,
+            &[],
+            &MapDecor::default(),
+        );
+        // The player cross is drawn on top; skip its pixels.
+        let side = composer.side() as usize;
+        let cell = REGION_SIZE / 8.0;
+        let (west, north) = composer.view_origin(player);
+        let ppx = ((player.0 - west) / cell) as i64;
+        let ppy = ((north - player.1) / cell) as i64;
+        let on_marker = |px: i64, py: i64| {
+            (py == ppy && (px - ppx).abs() <= 3) || (px == ppx && (py - ppy).abs() <= 3)
+        };
+
+        let center = RegionCoord::from_world(player.0, player.1);
+        let res = 8u16;
+        let mut checked = 0u32;
+        for row_region in 0..3i32 {
+            let ry = center.y + 1 - row_region;
+            for col_region in 0..3i32 {
+                let rx = center.x - 1 + col_region;
+                let coord = RegionCoord::new(rx, ry);
+                let tiles = map.cache().get(coord).expect("settled window");
+                let elevation = tiles.channels[CHANNEL_ELEVATION].as_ref().expect("tile");
+                let river = tiles.channels[CHANNEL_RIVER].as_ref().expect("tile");
+                let wetness = tiles.channels[CHANNEL_WETNESS].as_ref().expect("tile");
+                let biome = tiles.biome.as_ref().expect("tile");
+                for cy in 0..res {
+                    for cx in 0..res {
+                        // The pre-hoist Composite arm, verbatim.
+                        let elev = elevation.get(cx, cy);
+                        let mut expected = composite_color(
+                            elev,
+                            Biome::from_id(biome.get(cx, cy)),
+                            river.get(cx, cy),
+                            wetness.get(cx, cy),
+                        );
+                        if elev >= SEA_LEVEL {
+                            if let Some(id) = map.dominant_species_id(coord, cx, cy) {
+                                expected = lerp_rgb(expected, species_color(id), 0.18);
+                            }
+                        }
+                        let px = col_region as usize * 8 + cx as usize;
+                        let py = row_region as usize * 8 + (7 - cy) as usize;
+                        if on_marker(px as i64, py as i64) {
+                            continue;
+                        }
+                        let offset = (py * side + px) * 4;
+                        assert_eq!(
+                            &composer.pixels[offset..offset + 3],
+                            &expected,
+                            "pixel ({px}, {py}) diverged from the pre-hoist logic"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 500, "the sweep must cover the window");
+    }
 
     #[test]
     fn zoom_preserves_the_view_center() {

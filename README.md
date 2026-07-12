@@ -130,6 +130,7 @@ world drifts toward it only as you move (sprinting drifts it faster).
 | `V` | Cycle the visualized channel (composite, layers, ecology, influence, stability, …) |
 | `G` / `N` / `X` / `M` / `F` | Toggle region grid / stability rings / changed-while-pinned flash / organism markers / discovered-region dimming |
 | Mouse wheel | Zoom the map view in/out (x1–x16); zoomed in past x4, hovering an organism marker shows that organism's details in the panel instead of the region info |
+| `Tab` | Toggle the 3D POV mode: a fly camera over lit, fogged terrain meshed from the same authoritative fields the map shows. In POV: mouse look (cursor grabbed), `WASD` along view/strafe, `Space`/`LShift` up/down, wheel adjusts fly speed, `Esc` frees the mouse (click to re-grab; `Esc` again quits). All map bindings above are map-mode-only. `WER_POV=1` starts in POV; `WER_POV_RADIUS` (1–8, default 3) sets the chunk draw radius |
 | `Esc` | Quit |
 
 The white and orange rings are the near (pinned) and far (free) stability

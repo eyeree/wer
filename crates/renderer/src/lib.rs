@@ -14,7 +14,9 @@
 use core::fmt;
 
 pub mod gpumap;
+pub mod pov;
 pub use gpumap::{GpuMap, GpuMapParams, MapTileUpload, RefineOctaveParams};
+pub use pov::{PovFrameParams, PovVertex, TerrainChunkUpload, SHADER_POV_TERRAIN};
 
 /// The debug-map presentation shader (fullscreen textured triangle).
 pub const SHADER_DEBUG_MAP: &str = include_str!("../shaders/debug_map.wgsl");
@@ -327,6 +329,9 @@ pub struct Renderer {
     /// The Phase 6 atlas-composed map path (phase-6-plan.md §6.5), built
     /// lazily on the first GPU-mode frame.
     gpu_map: Option<GpuMap>,
+    /// The POV terrain path (3d-phase-1-plan.md §5), built lazily on the
+    /// first POV frame. Owns the renderer's only depth target.
+    pov: Option<pov::Pov>,
 }
 
 impl fmt::Debug for Renderer {
@@ -421,6 +426,7 @@ impl Renderer {
             debug_map,
             panel_blit,
             gpu_map: None,
+            pov: None,
         })
     }
 
@@ -457,6 +463,11 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        // The POV depth target tracks the surface size (3d-phase-1-plan.md
+        // §5.1); the 2D passes keep no depth attachment and are untouched.
+        if let Some(pov) = self.pov.as_mut() {
+            pov.ensure_depth(&self.device, width, height);
+        }
     }
 
     /// Acquire the next surface frame, handling transient states
@@ -703,5 +714,55 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Some(bytes)
+    }
+
+    /// Present one POV terrain frame (3d-phase-1-plan.md §5.4), mirroring
+    /// [`Self::render_map_gpu`]'s shape: lazily build the POV state on first
+    /// call, apply `removes` (vertex buffers return to the pool) and
+    /// `uploads` (a re-upload to a live handle swaps contents in place),
+    /// write the frame uniform, then one depth-tested pass that clears color
+    /// + depth and draws every resident chunk with the shared index buffer.
+    ///
+    /// Returns `false` when no frame was drawn (surface loss), like the
+    /// other entry points. No readback, no API that could ever produce one
+    /// (ADR 0017).
+    pub fn render_pov(
+        &mut self,
+        frame: &PovFrameParams,
+        uploads: &[TerrainChunkUpload],
+        removes: &[u64],
+        clear: [f64; 4],
+    ) -> bool {
+        if self.pov.is_none() {
+            self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.config.format));
+            log::info!(
+                "pov pipeline built: {} verts/chunk, {} indices shared",
+                pov::VERTS_PER_CHUNK,
+                pov::INDICES_PER_CHUNK
+            );
+        }
+        let pov = self.pov.as_mut().expect("just ensured");
+        pov.ensure_depth(&self.device, self.config.width, self.config.height);
+        pov.apply(&self.device, &self.queue, uploads, removes);
+        let draws = pov.write_frame(&self.device, &self.queue, frame);
+
+        let Some(surface_frame) = self.acquire_frame() else {
+            return false;
+        };
+        let view = surface_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wer-frame-pov"),
+            });
+        self.pov
+            .as_ref()
+            .expect("ensured above")
+            .draw(&mut encoder, &view, &draws, clear);
+        self.queue.submit(Some(encoder.finish()));
+        surface_frame.present();
+        true
     }
 }

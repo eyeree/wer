@@ -33,10 +33,14 @@ pub enum Pass {
     /// Vault record flush — timed by the shell (the vault is driven by the
     /// caller, not by `update`), reported through the same table.
     Flush,
+    /// POV chunk sync (scheduling + amortized mesh integration) — timed by
+    /// the shell, following the `Flush` precedent (3d-phase-1-plan.md §8.1).
+    /// Derived presentation work; zero whenever POV mode is off.
+    Mesh,
 }
 
 /// Number of [`Pass`] variants (the length of `FrameStats::pass_ms`).
-pub const PASS_COUNT: usize = 8;
+pub const PASS_COUNT: usize = 9;
 
 impl Pass {
     /// Every pass, in pipeline order.
@@ -49,6 +53,7 @@ impl Pass {
         Pass::Dispatch,
         Pass::Realize,
         Pass::Flush,
+        Pass::Mesh,
     ];
 
     /// Index into `pass_ms`.
@@ -70,6 +75,7 @@ impl Pass {
             Pass::Dispatch => "dispatch",
             Pass::Realize => "realize",
             Pass::Flush => "flush",
+            Pass::Mesh => "mesh",
         }
     }
 }
