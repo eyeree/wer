@@ -2167,11 +2167,16 @@ into one implementation unit.
     remain readable with explicit unknown-current/zero-distance semantics.
     Ordered route traversal remains a separate roadmap concern.
 
-13. **Expand the verification surface alongside these fixes** (finding 33).
-    Add frame-slicing, all-cache-ceiling, cross-tier persistence, full settled
-    state, ordinary border, multi-node route, all-biome SIMD, and executed-wasm
-    cases. This is a cross-cutting exit criterion for the preceding correctness
-    work, not a substitute for it.
+13. **Completed: Expand the verification surface alongside these fixes**
+    ([Improvement A.13](plans/prototype/improvement_A_13_verification_surface.md);
+    finding 33). `wer-scale` now includes frame-slicing, all-cache-ceiling,
+    and cross-tier persistence scenarios. The shared settled-state hash covers
+    organism position and expression fields, route tests cover multi-node
+    softness, SIMD differential coverage enumerates every biome id, and wasm
+    parity remains an executed Node suite. Executor queues and in-flight
+    closures remain outside settled equality and must be empty before hashing;
+    logical cache byte ceilings remain separate from full heap accounting
+    (finding 32), and ordered route traversal remains separate roadmap work.
 
 #### B. Performance and memory usage
 
@@ -2895,33 +2900,37 @@ The published macro-tile estimate is also stale: a 48-by-48 `u8 + u32` tile is
 
 #### 33. Some advertised verification is absent or narrower than stated
 
-**Status:** Open. Improvements A.1 and A.4 close the focused cache-recovery,
-dependency-provenance, and field-capacity authority gaps described below.
+**Status:** Resolved by Improvements A.1, A.4, A.8, A.12, and A.13. The
+verification surface now covers the advertised contracts directly enough for
+the current prototype.
 
-The scale harness checks executor counts, budget scale, cancellation, retarget
-amortization, and per-frame tight-versus-roomy regional history, but has no
-alternate frame-slicing case despite the ADR claim. Its memory scenario
-pressures only the field cache rather than all caches together. Its tier
-identity scenario does not record routes or captures. The full hash now begins
-with coordinate/current/target/stability/revision authority, but deliberately
-omits derived field-admission status and still omits overrides, full organism
-position/expression, and executor queues, so equality is not equality of every
-stated component.
+`wer-scale` checks executor choice, worker count, budget scale, cancellation,
+retarget amortization, alternate frame slicing, simultaneous field/macro/roster
+cache pressure with realization/pool churn, tier identity, cross-tier session
+persistence compatibility, and density additivity. The all-cache case proves
+that logical cache ceilings can evict or rebuild disposable caches while the
+return-trip near-window output is reproduced; it does not claim full
+process-memory accounting, which remains finding 32.
 
-Focused runtime tests now pressure field/macro/roster ceilings, reserve full
-field payload before queued work integrates, reject stale results for every
-layer shape, exercise cell inspection and realization recovery, and assert
-stored versus expected keys in those scenarios. This does not turn `wer-scale`
-into a simultaneous all-cache test or make its hash cover external queues and
-every derived presentation detail.
+The shared settled-state hash covers regional authority, field/biome/dominant
+tiles, macro cache, roster cache, and realized organisms including trophic
+role, slot, cell, exact world position bits, and expressed presentation fields.
+Executor queues, worker closures, and GPU presentation are not part of settled
+state; schedule and persistence harnesses settle first and require no in-flight
+work before comparing hashes.
 
-Add the remaining frame-slicing, all-cache-ceiling, cross-tier persistence, and
-full settled-state scenarios. A.8 now runs wasm parity exports in Node and adds
-ordinary divergent-history border tests through Terrain, Slope, Hydrology,
-Soils, and Biome; the remaining verification gaps include multi-node route
-softness. The SIMD differential generator should also sample
-all 12 biome ids; it currently calls `next_below(11)`, so Ice (id 11) is never
-exercised there.
+Focused runtime tests cover field/macro/roster recovery, stale-result rejection
+for every layer shape, ordinary divergent-history borders through Terrain,
+Slope, Hydrology, Soils, and Biome, and preserve/radius-drop edge paths. Route
+tests now include a recorded multi-node path that attracts softly near distinct
+nodes and segments, stays corridor-bounded, respects `ROUTE_PULL_CAP`, and
+does not replace the target outright. SIMD differential tests enumerate all 12
+biome ids, including Ice. Wasm parity is still an executed
+`wasm-pack test --node crates/platform-web` suite, not only a compile check.
+
+Remaining limitations are explicit: ordered route traversal is not implemented
+by the route-softness tests, and cache byte ceilings are logical payload
+budgets rather than complete heap ceilings.
 
 #### 34. GPU refinement is safely derived, but its parity story can improve
 

@@ -10,7 +10,7 @@ use world_core::simd::{
     hydrology_row, hydrology_row_scalar, soils_row, soils_row_scalar, vegetation_row,
     vegetation_row_scalar,
 };
-use world_core::{PossibilityDomain, PossibilityVector, Rng};
+use world_core::{PossibilityDomain, PossibilityVector, Rng, BIOME_COUNT};
 
 const ROW: usize = 37; // deliberately not a multiple of the lane width
 
@@ -169,7 +169,12 @@ fn hydrology_row_is_bit_identical() {
 fn vegetation_row_is_bit_identical() {
     let mut rng = Rng::new(0x0EC0_0016);
     for _ in 0..64 {
-        let biome: Vec<u8> = (0..ROW).map(|_| rng.next_below(11) as u8).collect();
+        let mut biome: Vec<u8> = (0..ROW)
+            .map(|_| rng.next_below(BIOME_COUNT as u32) as u8)
+            .collect();
+        for id in 0..BIOME_COUNT as u8 {
+            biome[usize::from(id)] = id;
+        }
         let temperature: Vec<f32> = (0..ROW).map(|_| rng.next_f32() * 60.0 - 20.0).collect();
         let moisture: Vec<f32> = (0..ROW).map(|_| rng.next_f32()).collect();
         let depth: Vec<f32> = (0..ROW).map(|_| rng.next_f32()).collect();

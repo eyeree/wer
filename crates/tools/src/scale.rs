@@ -16,13 +16,14 @@ use std::fmt;
 
 use world_core::{
     domain_mask, encode_record, Anchor, AnchorKind, AnchorSource, PossibilityDomain,
-    PossibilityField, PossibilityVector, RecordKind, RegionCoord, RouteRecord, POSSIBILITY_DIMS,
-    REGION_SIZE,
+    PossibilityField, PossibilityVector, RecordKind, RegionCoord, RouteRecord,
+    RouteTrackerSnapshot, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    full_region_payload_bytes, Budget, FrameStats, GenerationStatus, InlineExecutor, MemoryStorage,
-    Organism, Pass, RegionMap, Resonance, RouteRecorder, StreamConfig, TaskExecutor, TaskPriority,
-    Vault, PASS_COUNT,
+    apply_session_regions, compare_session_runtime, full_region_payload_bytes,
+    session_runtime_record, Budget, FrameStats, GenerationStatus, InlineExecutor, MemoryStorage,
+    Organism, Pass, RegionMap, Resonance, ResourceTier, RouteRecorder, SessionCompatibility,
+    SessionSnapshotInput, StreamConfig, TaskExecutor, TaskPriority, Vault, PASS_COUNT,
 };
 
 use crate::executor::LaneExecutor;
@@ -760,6 +761,129 @@ pub fn schedule_independence(cfg: &ScaleConfig) -> ScenarioOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SliceMode {
+    Normal,
+    Split,
+    Coalesced,
+}
+
+fn frame_sliced_hash(cfg: &ScaleConfig, mode: SliceMode) -> (u64, u32) {
+    let field = PossibilityField::default();
+    let mut map = RegionMap::new(cfg.stream);
+    let budget = Budget::unlimited();
+    let speed = f64::hypot(cfg.velocity.0, cfg.velocity.1);
+    let logical = (cfg.long_haul_frames / 6).max(12);
+    let runout = ((2.5 * cfg.stream.unload_radius / speed).ceil() as u32).max(8);
+    let neutral = [0.0f32; POSSIBILITY_DIMS];
+    let mut physical = 0u32;
+    let update = |map: &mut RegionMap, frame: u32, fraction: f64, travel: f64| {
+        let pos = (
+            (f64::from(frame) + fraction) * cfg.velocity.0,
+            (f64::from(frame) + fraction) * cfg.velocity.1,
+        );
+        map.update(
+            pos,
+            travel,
+            &field,
+            &[],
+            &storm_bias(frame),
+            &budget,
+            &InlineExecutor,
+            false,
+        );
+        pos
+    };
+    let mut stop = (0.0, 0.0);
+    match mode {
+        SliceMode::Normal => {
+            for frame in 0..logical {
+                stop = update(&mut map, frame, 0.0, if frame == 0 { 0.0 } else { speed });
+                physical += 1;
+            }
+        }
+        SliceMode::Split => {
+            for frame in 0..logical {
+                for part in 0..4 {
+                    let travel = if frame == 0 && part == 0 {
+                        0.0
+                    } else {
+                        speed * 0.25
+                    };
+                    stop = update(&mut map, frame, f64::from(part) * 0.25, travel);
+                    physical += 1;
+                }
+            }
+        }
+        SliceMode::Coalesced => {
+            let mut frame = 0;
+            while frame < logical {
+                let merged = if frame + 1 < logical { 2 } else { 1 };
+                let travel = if frame == 0 {
+                    speed * f64::from(merged - 1)
+                } else {
+                    speed * f64::from(merged)
+                };
+                stop = update(&mut map, frame + merged - 1, 0.0, travel);
+                physical += 1;
+                frame += merged;
+            }
+        }
+    }
+    for frame in logical..(logical + runout) {
+        stop = (
+            f64::from(frame) * cfg.velocity.0,
+            f64::from(frame) * cfg.velocity.1,
+        );
+        map.update(
+            stop,
+            speed,
+            &field,
+            &[],
+            &neutral,
+            &budget,
+            &InlineExecutor,
+            false,
+        );
+        physical += 1;
+    }
+    (
+        settle_fixed_point(&mut map, &field, &budget, &InlineExecutor, stop, |_| {}),
+        physical,
+    )
+}
+
+#[must_use]
+pub fn frame_slicing(cfg: &ScaleConfig) -> ScenarioOutcome {
+    let (normal, normal_updates) = frame_sliced_hash(cfg, SliceMode::Normal);
+    let (split, split_updates) = frame_sliced_hash(cfg, SliceMode::Split);
+    let (coalesced, coalesced_updates) = frame_sliced_hash(cfg, SliceMode::Coalesced);
+    let gates = vec![
+        Gate {
+            name: "split travel frames settle to the normal hash".into(),
+            passed: split == normal,
+            detail: format!("normal {normal:#018x}, split {split:#018x}"),
+        },
+        Gate {
+            name: "coalesced travel frames settle to the normal hash".into(),
+            passed: coalesced == normal,
+            detail: format!("normal {normal:#018x}, coalesced {coalesced:#018x}"),
+        },
+    ];
+    ScenarioOutcome {
+        name: "frame-slicing",
+        frames: normal_updates + split_updates + coalesced_updates,
+        gates,
+        metrics: vec![
+            ("normal updates".into(), f64::from(normal_updates)),
+            ("split updates".into(), f64::from(split_updates)),
+            ("coalesced updates".into(), f64::from(coalesced_updates)),
+        ],
+        pass_ms_avg: [0.0; PASS_COUNT],
+        pass_ms_max: [0.0; PASS_COUNT],
+    }
+}
+
 /// Content hashes of every generated tile of the regions within the near
 /// radius of `pos` — the return-trip probe set (always resident, ceiling-
 /// exempt).
@@ -1058,6 +1182,150 @@ pub fn memory_ceiling(cfg: &ScaleConfig) -> ScenarioOutcome {
         frames: acc.frames,
         gates,
         metrics,
+        pass_ms_avg: acc.pass_avg(),
+        pass_ms_max: acc.pass_max,
+    }
+}
+
+#[must_use]
+pub fn all_cache_ceiling(cfg: &ScaleConfig) -> ScenarioOutcome {
+    let per_region = full_region_payload_bytes(cfg.stream.field_resolution);
+    let tight_stream = StreamConfig {
+        max_field_cache_bytes: 24 * per_region,
+        max_macro_cache_bytes: 2 * 1024 * 1024,
+        max_roster_cache_bytes: 24 * 1024,
+        organisms_per_cell: 4,
+        ..cfg.stream
+    };
+    let roomy_stream = StreamConfig {
+        max_field_cache_bytes: usize::MAX,
+        max_macro_cache_bytes: usize::MAX,
+        max_roster_cache_bytes: usize::MAX,
+        organisms_per_cell: 4,
+        ..cfg.stream
+    };
+    let run = |stream: StreamConfig| {
+        let field = PossibilityField::default();
+        let mut map = RegionMap::new(stream);
+        let mut acc = Accum::default();
+        let mut evictions = 0usize;
+        let mut roster_builds = 0usize;
+        let mut peak_pool = 0usize;
+        let origin = (0.0, 0.0);
+        let budget = Budget::unlimited();
+        let track = |stats: &FrameStats,
+                     acc: &mut Accum,
+                     evictions: &mut usize,
+                     roster_builds: &mut usize,
+                     peak_pool: &mut usize| {
+            acc.absorb(stats);
+            *evictions += stats.evicted_for_capacity;
+            *roster_builds += stats.rosters_built;
+            *peak_pool = (*peak_pool).max(stats.pool_bytes);
+        };
+        let _ = settle_fixed_point(&mut map, &field, &budget, &InlineExecutor, origin, |s| {
+            track(
+                s,
+                &mut acc,
+                &mut evictions,
+                &mut roster_builds,
+                &mut peak_pool,
+            );
+        });
+        let before = probe_content_hashes(&map, origin);
+        let speed = f64::hypot(cfg.velocity.0, cfg.velocity.1);
+        let out_frames = ((2.0 * stream.unload_radius) / speed).ceil() as u32;
+        for frame in 0..(2 * out_frames) {
+            let t = if frame < out_frames {
+                f64::from(frame)
+            } else {
+                f64::from(2 * out_frames - frame)
+            };
+            let pos = (t * cfg.velocity.0, t * cfg.velocity.1);
+            let stats = map.update(
+                pos,
+                speed,
+                &field,
+                &[],
+                &[0.0; POSSIBILITY_DIMS],
+                &budget,
+                &InlineExecutor,
+                false,
+            );
+            track(
+                &stats,
+                &mut acc,
+                &mut evictions,
+                &mut roster_builds,
+                &mut peak_pool,
+            );
+        }
+        let hash = settle_fixed_point(&mut map, &field, &budget, &InlineExecutor, origin, |s| {
+            track(
+                s,
+                &mut acc,
+                &mut evictions,
+                &mut roster_builds,
+                &mut peak_pool,
+            );
+        });
+        (map, hash, before, acc, evictions, roster_builds, peak_pool)
+    };
+    let (tight, tight_hash, before, acc, evictions, roster_builds, peak_pool) = run(tight_stream);
+    let (_roomy, roomy_hash, _, _, _, _, roomy_peak_pool) = run(roomy_stream);
+    let after = probe_content_hashes(&tight, (0.0, 0.0));
+    let tight_macro_bounded = tight.macro_cache().bytes() <= tight_stream.max_macro_cache_bytes;
+    let tight_roster_bounded = tight.roster_cache().bytes() <= tight_stream.max_roster_cache_bytes;
+    let gates = vec![
+        Gate {
+            name: "all cache families observed pressure".into(),
+            passed: evictions > 0 && roster_builds > 0 && peak_pool > 0 && tight_macro_bounded,
+            detail: format!(
+                "{evictions} field parks, {roster_builds} roster builds, pool peak {peak_pool} B, macro {} B",
+                tight.macro_cache().bytes()
+            ),
+        },
+        Gate {
+            name: "tight cache ceilings are respected after settle".into(),
+            passed: tight_macro_bounded && tight_roster_bounded,
+            detail: format!(
+                "macro {} / {}, roster {} / {} B",
+                tight.macro_cache().bytes(),
+                tight_stream.max_macro_cache_bytes,
+                tight.roster_cache().bytes(),
+                tight_stream.max_roster_cache_bytes
+            ),
+        },
+        Gate {
+            name: "near-window content survives all-cache pressure".into(),
+            passed: !before.is_empty() && before == after,
+            detail: format!(
+                "{} probe regions; tight hash {tight_hash:#018x}, roomy reference hash {roomy_hash:#018x}",
+                after.len()
+            ),
+        },
+        Gate {
+            name: "pool churn remains bounded under high density".into(),
+            passed: peak_pool <= roomy_peak_pool.max(1),
+            detail: format!("tight peak {peak_pool} B, roomy peak {roomy_peak_pool} B"),
+        },
+    ];
+    ScenarioOutcome {
+        name: "all-cache-ceiling",
+        frames: acc.frames,
+        gates,
+        metrics: vec![
+            ("field capacity parks".into(), evictions as f64),
+            ("roster builds".into(), roster_builds as f64),
+            (
+                "final macro KB".into(),
+                tight.macro_cache().bytes() as f64 / 1024.0,
+            ),
+            (
+                "final roster KB".into(),
+                tight.roster_cache().bytes() as f64 / 1024.0,
+            ),
+        ],
         pass_ms_avg: acc.pass_avg(),
         pass_ms_max: acc.pass_max,
     }
@@ -1436,6 +1704,140 @@ pub fn tier_identity(cfg: &ScaleConfig) -> ScenarioOutcome {
     }
 }
 
+fn persistence_tier_stream(tier: ResourceTier, resolution: u16) -> (StreamConfig, Budget) {
+    let mut stream = StreamConfig {
+        near_radius: 2.0 * REGION_SIZE,
+        far_radius: 4.0 * REGION_SIZE,
+        load_radius: 5.0 * REGION_SIZE,
+        unload_radius: 6.0 * REGION_SIZE,
+        field_resolution: resolution,
+        organisms_per_cell: tier.stream_config().organisms_per_cell,
+        ..StreamConfig::default()
+    };
+    stream.max_field_cache_bytes = usize::MAX;
+    stream.max_macro_cache_bytes = usize::MAX;
+    stream.max_roster_cache_bytes = usize::MAX;
+    (stream, tier.budget())
+}
+
+fn canonical_ids(map: &RegionMap) -> std::collections::BTreeSet<u64> {
+    map.authoritative_organisms()
+        .map(|organism| organism.id)
+        .collect()
+}
+
+#[must_use]
+pub fn cross_tier_persistence(cfg: &ScaleConfig) -> ScenarioOutcome {
+    let field = PossibilityField::default();
+    let tiers = [ResourceTier::Low, ResourceTier::Mid, ResourceTier::High];
+    let mut gates = Vec::new();
+    for source in tiers {
+        let (source_stream, source_budget) =
+            persistence_tier_stream(source, cfg.stream.field_resolution);
+        let mut source_map = RegionMap::new(source_stream);
+        let player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+        let _ = settle_fixed_point(
+            &mut source_map,
+            &field,
+            &source_budget,
+            &InlineExecutor,
+            player,
+            |_| {},
+        );
+        let source_ids = canonical_ids(&source_map);
+        let mut vault = Vault::open(MemoryStorage::new()).expect("memory vault");
+        vault
+            .snapshot_session(SessionSnapshotInput {
+                map: &source_map,
+                player,
+                last_player: player,
+                bias: &[0.0; POSSIBILITY_DIMS],
+                transition_mode: false,
+                anchors: &[],
+                runtime: session_runtime_record(
+                    &source_stream,
+                    &source_budget,
+                    Some(source),
+                    true,
+                    true,
+                ),
+                recorder: None,
+                tracker: RouteTrackerSnapshot::default(),
+            })
+            .expect("session sequence");
+        vault.flush_all().expect("session flush");
+        let vault = Vault::open(vault.store().clone()).expect("reopen");
+        let snap = vault.session().expect("saved session");
+        for dest in tiers {
+            let (dest_stream, dest_budget) =
+                persistence_tier_stream(dest, cfg.stream.field_resolution);
+            let compatibility = compare_session_runtime(
+                &snap.runtime,
+                &dest_stream,
+                &dest_budget,
+                Some(dest),
+                true,
+                true,
+            );
+            let mut loaded = RegionMap::new(dest_stream);
+            apply_session_regions(&mut loaded, snap);
+            let _ = settle_fixed_point(
+                &mut loaded,
+                &field,
+                &dest_budget,
+                &InlineExecutor,
+                snap.player,
+                |_| {},
+            );
+            let loaded_ids = canonical_ids(&loaded);
+            let exact_expected = source == dest;
+            gates.push(Gate {
+                name: format!("session compatibility {} -> {}", source.name(), dest.name()),
+                passed: if exact_expected {
+                    compatibility == SessionCompatibility::Exact
+                } else {
+                    compatibility == SessionCompatibility::Incompatible
+                },
+                detail: format!("{compatibility:?}"),
+            });
+            gates.push(Gate {
+                name: format!(
+                    "canonical identities survive {} -> {}",
+                    source.name(),
+                    dest.name()
+                ),
+                passed: !source_ids.is_empty() && source_ids == loaded_ids,
+                detail: format!("{} slot-0 organisms", loaded_ids.len()),
+            });
+            if dest.stream_config().organisms_per_cell >= source.stream_config().organisms_per_cell
+            {
+                gates.push(Gate {
+                    name: format!(
+                        "higher-density load is additive {} -> {}",
+                        source.name(),
+                        dest.name()
+                    ),
+                    passed: loaded.organism_count() >= source_map.organism_count()
+                        && source_ids.is_subset(&loaded.organisms().map(|o| o.id).collect()),
+                    detail: format!(
+                        "{} source organisms, {} loaded organisms",
+                        source_map.organism_count(),
+                        loaded.organism_count()
+                    ),
+                });
+            }
+        }
+    }
+    ScenarioOutcome {
+        name: "cross-tier-persistence",
+        frames: 0,
+        gates,
+        metrics: Vec::new(),
+        pass_ms_avg: [0.0; PASS_COUNT],
+        pass_ms_max: [0.0; PASS_COUNT],
+    }
+}
+
 /// The density lever's coherence gates (§6.6, §11.4): at
 /// `organisms_per_cell = 4`, realized population scales ≈ 4× linearly, the
 /// density-1 identities survive as slot 0 (additivity — no existing identity
@@ -1521,8 +1923,11 @@ pub fn run_scale_harness(cfg: &ScaleConfig) -> ScaleReport {
             long_haul(cfg),
             teleport_storm(cfg),
             schedule_independence(cfg),
+            frame_slicing(cfg),
             memory_ceiling(cfg),
+            all_cache_ceiling(cfg),
             tier_identity(cfg),
+            cross_tier_persistence(cfg),
             density_realization(cfg),
             tier_stability(world_runtime::ResourceTier::Low, cfg),
             tier_stability(world_runtime::ResourceTier::Mid, cfg),

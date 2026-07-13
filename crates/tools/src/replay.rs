@@ -245,8 +245,10 @@ pub fn regional_history_hash(map: &RegionMap) -> u64 {
     h
 }
 
-/// Order-stable hash of a map's full authoritative + derived state (regions,
-/// field cache, biome/dominant tiles, macro cache, roster cache, organisms).
+/// Order-stable hash of a map's settled authoritative + derived state
+/// (regions, field cache, biome/dominant tiles, macro cache, roster cache,
+/// organisms). Executor queues and live closures are outside this definition;
+/// schedule-independence callers settle first and assert no work remains.
 /// Two runs of the same script must produce the same value — and a
 /// save→load→settle run must reproduce the uninterrupted run's value
 /// (phase-5-plan.md §12.2), which is what makes durability *exact* rather than
@@ -282,7 +284,17 @@ pub fn state_hash(map: &RegionMap) -> u64 {
     for organism in map.organisms() {
         h = mix(h, organism.id);
         h = mix(h, organism.species);
+        h = mix(h, organism.trophic as u64);
         h = mix(h, u64::from(organism.slot));
+        h = mix(h, u64::from(organism.cell.cx));
+        h = mix(h, u64::from(organism.cell.cy));
+        h = mix(h, organism.world_pos.0.to_bits());
+        h = mix(h, organism.world_pos.1.to_bits());
+        h = mix(h, u64::from(organism.expressed.hue.to_bits()));
+        h = mix(h, u64::from(organism.expressed.luminance.to_bits()));
+        h = mix(h, u64::from(organism.expressed.size.to_bits()));
+        h = mix(h, u64::from(organism.expressed.activity.to_bits()));
+        h = mix(h, u64::from(organism.expressed.aggression.to_bits()));
     }
     h
 }
