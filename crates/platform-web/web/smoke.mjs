@@ -4,8 +4,11 @@ import { join } from "node:path";
 const dist = process.argv[2] ?? "target/web-dist";
 const required = [
   "index.html",
+  "help/index.html",
+  "docs/world-model.html",
   "assets/app.css",
   "assets/app.js",
+  "assets/commands.js",
   "assets/manifest.json",
   "generated/platform_web.js",
   "generated/platform_web_bg.wasm",
@@ -28,6 +31,21 @@ if (/https?:\/\//.test(app)) {
 }
 if (!app.includes("origin_feature_hash")) {
   throw new Error("app.js does not call the origin feature hash parity export");
+}
+
+const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
+for (const heading of ["World Model", "Possibility", "Terrain"]) {
+  if (!docs.includes(heading)) {
+    throw new Error(`generated world-model docs missing expected text ${heading}`);
+  }
+}
+
+const commands = await readFile(join(dist, "assets/commands.js"), "utf8");
+const help = await readFile(join(dist, "help/index.html"), "utf8");
+for (const match of commands.matchAll(/id: "([^"]+)"/g)) {
+  if (!help.includes(`data-help-command="${match[1]}"`)) {
+    throw new Error(`help page missing command ${match[1]}`);
+  }
 }
 
 JSON.parse(await readFile(join(dist, "assets/manifest.json"), "utf8"));

@@ -1,3 +1,5 @@
+import { commandById } from "./commands.js";
+
 const fields = new Map(
   Array.from(document.querySelectorAll("[data-field]"), (node) => [node.dataset.field, node]),
 );
@@ -74,6 +76,9 @@ const initWasm = async () => {
 };
 
 for (const control of document.querySelectorAll("[data-command]")) {
+  if (!commandById.has(control.dataset.command)) {
+    appendDiagnostic(`unregistered-command:${control.dataset.command}`);
+  }
   control.addEventListener("click", () => {
     appendDiagnostic(`command:${control.dataset.command}`);
   });

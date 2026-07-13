@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Infinite World Exploration Help</title>
+    <link rel="stylesheet" href="../assets/app.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../">Infinite World Exploration</a>
+      <nav aria-label="Site">
+        <a href="../">Viewer</a>
+        <a href="../docs/world-model.html">World Model</a>
+        <a href="./">Help</a>
+      </nav>
+    </header>
+    <main class="doc-page">
+      <h1>Browser Help</h1>
+      <p>
+        The browser shell runs as static files. It keeps generated world state in
+        memory until IndexedDB storage lands, and it never talks to a server.
+      </p>
+      <h2>Controls</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Key</th><th>Control</th></tr>
+        </thead>
+        <tbody>
+          <tr data-help-command="channel:composite"><td>Composite channel</td><td>V</td><td>Composite button</td></tr>
+          <tr data-help-command="toggle:compose"><td>Toggle GPU compose</td><td>,</td><td>Compose toggle</td></tr>
+          <tr data-help-command="toggle:refinement"><td>Toggle refinement</td><td>.</td><td>Refine toggle</td></tr>
+          <tr data-help-command="tier"><td>Resource tier override</td><td>none</td><td>Tier select</td></tr>
+        </tbody>
+      </table>
+      <h2>Feature Tiers</h2>
+      <p>
+        WebLow favors small caches and inline execution, WebMid targets ordinary
+        desktop browsers, and WebHigh enables larger visible windows and
+        refinement where supported. Tiers change budgets and presentation only.
+      </p>
+      <h2>Storage</h2>
+      <p>
+        This milestone reports memory storage. IndexedDB vault persistence,
+        import, export, reset, and reload recovery are Phase 7 storage
+        milestones.
+      </p>
+      <h2>Browser Requirements</h2>
+      <p>
+        WebGPU is optional for the current static scaffold. Workers and shared
+        memory are detected later; the inline path remains the deterministic
+        fallback.
+      </p>
+      <h2>Unsupported</h2>
+      <p>
+        Networking, accounts, hosted worlds, multiplayer, and authoritative GPU
+        simulation are outside Phase 7.
+      </p>
+    </main>
+  </body>
+</html>

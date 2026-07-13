@@ -149,6 +149,49 @@ pre {
   color: var(--muted);
 }
 
+.doc-page {
+  width: min(960px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 28px 0 56px;
+  line-height: 1.6;
+}
+
+.doc-page h1,
+.doc-page h2,
+.doc-page h3 {
+  line-height: 1.2;
+}
+
+.doc-page h1 {
+  margin: 0 0 18px;
+  font-size: 32px;
+}
+
+.doc-page h2 {
+  margin-top: 32px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-size: 22px;
+}
+
+.doc-page table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+}
+
+.doc-page th,
+.doc-page td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.doc-page th {
+  background: var(--panel-2);
+}
+
 .ok {
   color: var(--accent);
 }
