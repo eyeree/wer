@@ -61,12 +61,15 @@ const initWasm = async () => {
   try {
     const mod = await import("../generated/platform_web.js");
     await mod.default();
+    const app = new mod.WebApp(JSON.stringify({ tier: "auto", storage: false }));
+    window.__werApp = app;
     const hash = mod.origin_feature_hash();
     const hex = `0x${hash.toString(16).padStart(16, "0")}`;
     write("wasm-status", "wasm loaded", "ok");
     write("origin-hash", `origin ${hex}`, "ok");
     appendDiagnostic(`origin_feature_hash=${hex}`);
     document.body.dataset.originFeatureHash = hex;
+    updateSnapshot(JSON.parse(app.info_snapshot()));
   } catch (error) {
     write("wasm-status", "wasm failed", "err");
     write("origin-hash", "origin hash unavailable", "err");
@@ -75,20 +78,51 @@ const initWasm = async () => {
   }
 };
 
+const updateSnapshot = (snapshot) => {
+  write("region", `${snapshot.region[0]}, ${snapshot.region[1]}`);
+  write("tier", snapshot.tier);
+  write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
+  write("storage", snapshot.storage.mode);
+  appendDiagnostic(`settle_hash=${snapshot.settle_hash}`);
+};
+
+const dispatchCommand = (id, value) => {
+  const app = window.__werApp;
+  if (!app) return;
+  const snapshot = JSON.parse(app.apply_command(JSON.stringify({ id, value })));
+  updateSnapshot(snapshot);
+};
+
 for (const control of document.querySelectorAll("[data-command]")) {
   if (!commandById.has(control.dataset.command)) {
     appendDiagnostic(`unregistered-command:${control.dataset.command}`);
   }
   control.addEventListener("click", () => {
     appendDiagnostic(`command:${control.dataset.command}`);
+    dispatchCommand(control.dataset.command);
   });
   control.addEventListener("change", () => {
     if (control.dataset.command === "tier") {
       write("tier", control.value);
       appendDiagnostic(`tier:${control.value}`);
+      dispatchCommand("tier", control.value);
     }
   });
 }
+
+window.addEventListener("keydown", (event) => {
+  if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
+    return;
+  }
+  for (const command of commandById.values()) {
+    if (command.key && event.key === command.key) {
+      event.preventDefault();
+      dispatchCommand(command.id);
+      appendDiagnostic(`key:${command.key}`);
+      break;
+    }
+  }
+});
 
 drawBootCanvas();
 probeWebGpu();

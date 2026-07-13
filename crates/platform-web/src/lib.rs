@@ -28,6 +28,7 @@ use world_core::{
     species::{species_roster, species_seed},
     terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, WORLD_ALGORITHM_VERSION,
 };
+use world_runtime::task::{InlineExecutor, TaskExecutor};
 
 /// Shared native/wasm parity expectations. The wasm integration suite imports
 /// these exact constants, so the two execution gates cannot drift apart.
@@ -334,6 +335,175 @@ pub fn route_attraction_sample() -> u64 {
     h
 }
 
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+struct WebAppState {
+    frame_index: u64,
+    world_pos: (f64, f64),
+    possibility: PossibilityVector,
+    target: PossibilityVector,
+    active_channel: u8,
+    tier: &'static str,
+    worker_mode: &'static str,
+    storage: &'static str,
+    warnings: Vec<String>,
+    executor_parallelism: usize,
+    last_command: String,
+}
+
+impl Default for WebAppState {
+    fn default() -> Self {
+        Self {
+            frame_index: 0,
+            world_pos: (0.0, 0.0),
+            possibility: PossibilityVector::neutral(),
+            target: PossibilityVector::neutral(),
+            active_channel: 0,
+            tier: "WebLow",
+            worker_mode: "inline",
+            storage: "memory",
+            warnings: Vec::new(),
+            executor_parallelism: InlineExecutor.parallelism(),
+            last_command: String::new(),
+        }
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+impl WebAppState {
+    fn new(config: &str) -> Self {
+        let mut state = Self::default();
+        if config.contains("\"tier\":\"mid\"") {
+            state.tier = "WebMid";
+        } else if config.contains("\"tier\":\"high\"") {
+            state.tier = "WebHigh";
+        }
+        if config.contains("\"storage\":true") {
+            state.storage = "indexeddb-pending";
+            state
+                .warnings
+                .push(String::from("IndexedDB storage lands in Phase 7-7"));
+        }
+        state
+    }
+
+    fn update(&mut self, dt_ms: f64, input: &str) {
+        self.frame_index = self.frame_index.wrapping_add(1);
+        let step = (dt_ms / 16.666_667).clamp(0.0, 4.0);
+        let speed = 3.0 * step;
+        if input.contains("\"move_x\":1") {
+            self.world_pos.0 += speed;
+        }
+        if input.contains("\"move_x\":-1") {
+            self.world_pos.0 -= speed;
+        }
+        if input.contains("\"move_y\":1") {
+            self.world_pos.1 += speed;
+        }
+        if input.contains("\"move_y\":-1") {
+            self.world_pos.1 -= speed;
+        }
+    }
+
+    fn apply_command(&mut self, command: &str) {
+        self.last_command.clear();
+        self.last_command.push_str(command);
+        if command.contains("channel:composite") {
+            self.active_channel = 0;
+        } else if command.contains("toggle:refinement") {
+            self.target.set(PossibilityDomain::Aesthetics, 0.625);
+        } else if command.contains("toggle:compose") {
+            self.target.set(PossibilityDomain::Planetary, 0.5625);
+        } else if command.contains("\"tier\":\"mid\"") || command.contains("\"value\":\"mid\"") {
+            self.tier = "WebMid";
+        } else if command.contains("\"tier\":\"high\"") || command.contains("\"value\":\"high\"") {
+            self.tier = "WebHigh";
+        } else if command.contains("\"tier\":\"low\"") || command.contains("\"value\":\"low\"") {
+            self.tier = "WebLow";
+        }
+    }
+
+    fn region(&self) -> RegionCoord {
+        RegionCoord::from_world(self.world_pos.0, self.world_pos.1)
+    }
+
+    fn settle_hash(&self) -> u64 {
+        let region = self.region();
+        let mut h = mix(0xB207_0000_0000_0003, origin_feature_hash());
+        h = mix(h, region.x as u32 as u64);
+        h = mix(h, region.y as u32 as u64);
+        for dim in self.possibility.dims {
+            h = mix(h, u64::from(dim.to_bits()));
+        }
+        h
+    }
+
+    fn snapshot_json(&self) -> String {
+        let region = self.region();
+        format!(
+            concat!(
+                "{{",
+                "\"frame_index\":{},",
+                "\"world_pos\":[{:.3},{:.3}],",
+                "\"region\":[{},{}],",
+                "\"possibility\":{},",
+                "\"target\":{},",
+                "\"active_channel\":{},",
+                "\"cache\":{{\"regions\":1,\"bytes\":0}},",
+                "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"backlog\":0}},",
+                "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":0,\"failures\":0}},",
+                "\"tier\":\"{}\",",
+                "\"settle_hash\":\"{:#018x}\",",
+                "\"last_command\":\"{}\",",
+                "\"warnings\":[{}]",
+                "}}"
+            ),
+            self.frame_index,
+            self.world_pos.0,
+            self.world_pos.1,
+            region.x,
+            region.y,
+            vector_json(self.possibility),
+            vector_json(self.target),
+            self.active_channel,
+            self.worker_mode,
+            self.executor_parallelism,
+            self.storage,
+            self.tier,
+            self.settle_hash(),
+            json_escape(&self.last_command),
+            self.warnings
+                .iter()
+                .map(|warning| format!("\"{}\"", json_escape(warning)))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn vector_json(vector: PossibilityVector) -> String {
+    format!(
+        "[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}]",
+        vector.dims[0],
+        vector.dims[1],
+        vector.dims[2],
+        vector.dims[3],
+        vector.dims[4],
+        vector.dims[5],
+        vector.dims[6],
+        vector.dims[7]
+    )
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -439,6 +609,73 @@ mod wasm {
     pub fn route_attraction_sample() -> u64 {
         super::route_attraction_sample()
     }
+
+    /// Phase 7 browser application facade. JS sends batched commands/input and
+    /// reads compact JSON snapshots, keeping DOM/browser APIs out of neutral
+    /// crates and avoiding per-field wasm calls in the frame loop.
+    #[wasm_bindgen]
+    #[derive(Debug)]
+    pub struct WebApp {
+        state: super::WebAppState,
+        shutdown: bool,
+    }
+
+    #[wasm_bindgen]
+    impl WebApp {
+        /// Create a browser app with inline execution. Worker/storage/GPU modes
+        /// are surfaced as explicit runtime status until later Phase 7 steps
+        /// wire their browser adapters.
+        #[wasm_bindgen(constructor)]
+        pub fn new(config: JsValue) -> Result<WebApp, JsValue> {
+            let config = config.as_string().unwrap_or_default();
+            Ok(WebApp {
+                state: super::WebAppState::new(&config),
+                shutdown: false,
+            })
+        }
+
+        /// Advance the browser facade by one batched input update.
+        pub fn update(&mut self, dt_ms: f64, input: JsValue) -> Result<JsValue, JsValue> {
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            self.state
+                .update(dt_ms, &input.as_string().unwrap_or_default());
+            Ok(JsValue::from_str(&self.state.snapshot_json()))
+        }
+
+        /// Bootstrap CPU-map placeholder; the pixel-producing map renderer
+        /// lands in Phase 7-4.
+        pub fn render_cpu_map(&mut self) -> Result<JsValue, JsValue> {
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            Ok(JsValue::from_str(
+                "{\"kind\":\"bootstrap\",\"width\":0,\"height\":0}",
+            ))
+        }
+
+        /// Apply one normalized command from the shared browser command
+        /// registry.
+        pub fn apply_command(&mut self, command: JsValue) -> Result<JsValue, JsValue> {
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            self.state
+                .apply_command(&command.as_string().unwrap_or_default());
+            Ok(JsValue::from_str(&self.state.snapshot_json()))
+        }
+
+        /// Return the most recent structured snapshot as JSON.
+        pub fn info_snapshot(&self) -> Result<JsValue, JsValue> {
+            Ok(JsValue::from_str(&self.state.snapshot_json()))
+        }
+
+        /// Stop accepting frame updates.
+        pub fn shutdown(&mut self) {
+            self.shutdown = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -497,5 +734,18 @@ mod tests {
         anchors.reverse();
         assert_eq!(forward, world_core::anchor_set_signature(&anchors));
         assert_eq!(forward, super::canonical_anchor_signature_sample());
+    }
+
+    #[test]
+    fn web_app_snapshot_tracks_inline_state() {
+        let mut app = super::WebAppState::new("{\"tier\":\"mid\"}");
+        app.update(16.666_667, "{\"move_x\":1}");
+        app.apply_command("{\"id\":\"toggle:refinement\"}");
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"tier\":\"WebMid\""));
+        assert!(snapshot.contains("\"region\":[0,0]"));
+        assert!(snapshot.contains("\"executor\":{\"mode\":\"inline\""));
+        assert!(snapshot.contains("\"settle_hash\":\"0x"));
+        assert!(snapshot.contains("\"last_command\":\"{\\\"id\\\":\\\"toggle:refinement\\\"}\""));
     }
 }

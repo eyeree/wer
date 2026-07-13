@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 world-core = { path = "../world-core" }
+world-runtime = { path = "../world-runtime" }
 log = { workspace = true }
 
 # Browser-only dependencies. Gating them to the wasm target keeps a native

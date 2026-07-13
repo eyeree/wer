@@ -32,6 +32,9 @@ if (/https?:\/\//.test(app)) {
 if (!app.includes("origin_feature_hash")) {
   throw new Error("app.js does not call the origin feature hash parity export");
 }
+if (!app.includes("new mod.WebApp")) {
+  throw new Error("app.js does not construct the WebApp facade");
+}
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
 for (const heading of ["World Model", "Possibility", "Terrain"]) {

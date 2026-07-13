@@ -1705,6 +1705,7 @@ dependencies = [
  "wasm-bindgen-test",
  "web-sys",
  "world-core",
+ "world-runtime",
 ]
 
 [[package]]
