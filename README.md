@@ -193,8 +193,14 @@ GitHub Pages. To build and serve it locally:
 cargo run --bin web-build
 node crates/platform-web/web/smoke.mjs target/web-dist
 cargo run --bin web-signoff
-python3 -m http.server --directory target/web-dist 8080
+cargo run --bin web-serve            # optional: [port] [dir], default 8080 target/web-dist
 ```
+
+`web-serve` exists because browsers refuse ES modules and wasm from `file://`
+URLs (CORS) — the viewer needs an HTTP origin. It serves loopback-only with
+correct MIME types (including `application/wasm`) and the
+cross-origin-isolation headers the shared-memory worker mode needs, which a
+generic `python3 -m http.server` does not send.
 
 Open <http://localhost:8080> and check the console for
 `[wer] wasm smoke ok — origin feature hash: …`. The viewer status bar also
