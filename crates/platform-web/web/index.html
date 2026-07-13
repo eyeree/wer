@@ -36,6 +36,8 @@
           <button type="button" data-command="storage:export">Export</button>
           <button type="button" data-command="storage:import">Import</button>
           <button type="button" data-command="storage:reset">Reset</button>
+          <button type="button" data-command="mode:map" aria-pressed="true">Map</button>
+          <button type="button" data-command="mode:pov" aria-pressed="false">POV</button>
         </div>
         <canvas id="world-canvas" width="960" height="540" tabindex="0" aria-label="World map"></canvas>
         <div class="status-bar" role="status">
@@ -57,6 +59,8 @@
           <dd data-field="storage">memory</dd>
           <dt>Cursor</dt>
           <dd data-field="cursor">none</dd>
+          <dt>View</dt>
+          <dd data-field="view">map</dd>
         </dl>
         <pre data-field="diagnostics">initializing browser runtime</pre>
       </aside>

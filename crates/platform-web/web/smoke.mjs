@@ -53,6 +53,9 @@ if (!app.includes("openVault")) {
 if (!app.includes("runStartupBenchmark")) {
   throw new Error("app.js does not run startup benchmark");
 }
+if (!html.includes('data-command="mode:pov"')) {
+  throw new Error("index.html does not expose POV mode control");
+}
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
 for (const heading of ["World Model", "Possibility", "Terrain"]) {

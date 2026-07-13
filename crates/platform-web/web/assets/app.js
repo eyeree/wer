@@ -135,6 +135,7 @@ const updateSnapshot = (snapshot) => {
   write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
   write("storage", snapshot.storage.mode);
   write("webgpu-status", `${snapshot.renderer.mode} / refine ${snapshot.renderer.refinement}`);
+  write("view", `${snapshot.view.mode}${snapshot.view.pov_supported ? "" : " / pov unavailable"}`);
   appendDiagnostic(`settle_hash=${snapshot.settle_hash}`);
 };
 

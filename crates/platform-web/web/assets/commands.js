@@ -119,6 +119,24 @@ export const COMMANDS = [
     label: "Reset local vault",
     group: "Storage",
   },
+  {
+    id: "mode:map",
+    key: "",
+    label: "Map mode",
+    group: "View",
+  },
+  {
+    id: "mode:pov",
+    key: "Tab",
+    label: "POV mode",
+    group: "View",
+  },
+  {
+    id: "pov:pointer-lock",
+    key: "",
+    label: "Pointer lock",
+    group: "View",
+  },
 ];
 
 export const commandById = new Map(COMMANDS.map((command) => [command.id, command]));

@@ -359,6 +359,9 @@ struct WebAppState {
     record_count: u32,
     session_snapshot: Option<String>,
     renderer: &'static str,
+    view_mode: &'static str,
+    pov_supported: bool,
+    pointer_lock: bool,
     compose_enabled: bool,
     refinement_enabled: bool,
     device_losses: u32,
@@ -390,6 +393,9 @@ impl Default for WebAppState {
             record_count: 0,
             session_snapshot: None,
             renderer: "cpu-fallback",
+            view_mode: "map",
+            pov_supported: false,
+            pointer_lock: false,
             compose_enabled: true,
             refinement_enabled: false,
             device_losses: 0,
@@ -503,6 +509,20 @@ impl WebAppState {
             self.set_tier(ResourceTier::Low);
         } else if command.contains("tier:benchmark") {
             self.benchmark_ms = 1.0 + self.workers as f32;
+        } else if command.contains("mode:pov") {
+            if self.pov_supported {
+                self.view_mode = "pov";
+            } else {
+                self.view_mode = "map";
+                self.warnings.push(String::from(
+                    "POV renderer unavailable; staying in map mode",
+                ));
+            }
+        } else if command.contains("mode:map") {
+            self.view_mode = "map";
+            self.pointer_lock = false;
+        } else if command.contains("pov:pointer-lock") {
+            self.pointer_lock = self.pov_supported;
         }
     }
 
@@ -551,6 +571,7 @@ impl WebAppState {
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
                 "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
+                "\"view\":{{\"mode\":\"{}\",\"pov_supported\":{},\"pointer_lock\":{}}},",
                 "\"tier\":{{\"name\":\"{}\",\"runtime\":\"{}\",\"cache_ceiling_mb\":{},\"benchmark_ms\":{:.3}}},",
                 "\"settle_hash\":\"{:#018x}\",",
                 "\"last_command\":\"{}\",",
@@ -579,6 +600,9 @@ impl WebAppState {
             self.compose_enabled,
             self.refinement_enabled,
             self.device_losses,
+            self.view_mode,
+            self.pov_supported,
+            self.pointer_lock,
             self.tier,
             self.runtime_tier.name(),
             self.cache_ceiling_mb,
@@ -967,5 +991,16 @@ mod tests {
         assert!(snapshot.contains("\"mode\":\"indexeddb\""));
         assert!(snapshot.contains("\"records\":1"));
         assert!(snapshot.contains("\"failures\":0"));
+    }
+
+    #[test]
+    fn unavailable_pov_keeps_map_mode() {
+        let mut app = super::WebAppState::default();
+        let before = app.settle_hash();
+        app.apply_command("mode:pov");
+        let snapshot = app.snapshot_json();
+        assert_eq!(before, app.settle_hash());
+        assert!(snapshot.contains("\"view\":{\"mode\":\"map\""));
+        assert!(snapshot.contains("POV renderer unavailable"));
     }
 }
