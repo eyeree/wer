@@ -2,5 +2,6 @@
 channel = "stable"
 components = ["rustfmt", "clippy"]
 # The wasm32 target is required so `world-core` can be checked for the browser
-# runtime continuously (see docs/adr/0002 and the CI workflow).
-targets = ["wasm32-unknown-unknown"]
+# runtime continuously (see docs/adr/0002 and the CI workflow). The Windows
+# MSVC target lets Linux CI produce the native `.exe` through cargo-xwin.
+targets = ["wasm32-unknown-unknown", "x86_64-pc-windows-msvc"]

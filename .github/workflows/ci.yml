@@ -13,6 +13,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  XWIN_CACHE_DIR: ${{ github.workspace }}/target/xwin-cache
 
 jobs:
   # Native: format, lint, build, and run the determinism/unit tests.
@@ -66,3 +67,28 @@ jobs:
         with:
           name: web-dist
           path: target/web-dist
+
+  # Windows desktop build from Linux: use the MSVC ABI through cargo-xwin
+  # instead of the MinGW/GNU target, so the generated executable matches the
+  # native Windows Rust tier used by wgpu/winit users.
+  windows:
+    name: windows x64 MSVC exe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain + target
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup target add x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Install LLVM linker toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --version 0.23.0 --locked
+      - name: Build wer.exe
+        run: cargo xwin build --release --bin wer --target x86_64-pc-windows-msvc
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: wer-windows-x86_64-msvc
+          path: target/x86_64-pc-windows-msvc/release/wer.exe

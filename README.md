@@ -109,6 +109,27 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 ```
 
+## Native Windows executable
+
+CI builds the Windows desktop app from Linux as a native MSVC executable, not
+with the MinGW/GNU target. The build uses
+[`cargo-xwin`](https://github.com/rust-cross/cargo-xwin), which drives
+`clang-cl`/`lld-link` against the Microsoft CRT and Windows SDK import libraries
+that `xwin` downloads. This matches Rust's first-class Windows MSVC target and
+is the preferred path for the wgpu/winit desktop app.
+
+Local Linux build:
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+cargo install cargo-xwin --version 0.23.0 --locked
+cargo xwin build --release --bin wer --target x86_64-pc-windows-msvc
+```
+
+The executable is written to
+`target/x86_64-pc-windows-msvc/release/wer.exe`. CI uploads the same file as the
+`wer-windows-x86_64-msvc` artifact.
+
 ## Driving the prototype
 
 `cargo run --release --bin wer` opens a top-down false-color map of the
