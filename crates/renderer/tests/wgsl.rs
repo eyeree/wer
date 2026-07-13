@@ -28,3 +28,8 @@ fn compose_map_shader_validates() {
 fn pov_terrain_shader_validates() {
     validate("pov_terrain.wgsl", renderer::SHADER_POV_TERRAIN);
 }
+
+#[test]
+fn pov_water_shader_validates() {
+    validate("pov_water.wgsl", renderer::SHADER_POV_WATER);
+}

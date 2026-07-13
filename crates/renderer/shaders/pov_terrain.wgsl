@@ -33,6 +33,9 @@ struct PovParams {
     // chunk-local units, and the apparent-slope amplitude (the shell folds
     // the terrain spectrum's continuation and the normal exaggeration in).
     detail: array<vec4<f32>, 3>,
+    // Water frame state (3d-phase-3-plan.md §4.3), consumed by
+    // pov_water.wgsl; declared here so both modules share one uniform layout.
+    water: vec4<f32>,
 }
 
 // The chunk's region origin relative to the camera (f64 subtraction on the
@@ -67,9 +70,13 @@ struct VsOut {
     @location(0) normal: vec3<f32>,
     @location(1) color: vec4<f32>,
     @location(2) dist: f32,
-    @location(3) light: vec2<f32>,
+    // Baked sun visibility, ambient occlusion, river, wetness (the last two
+    // drive the 3D-3 wet specular; 3d-phase-3-plan.md §5).
+    @location(3) light: vec4<f32>,
     // Chunk-local x, y for the detail-noise lattice.
     @location(4) local: vec2<f32>,
+    // Camera-relative position, for the wet-specular view direction.
+    @location(5) pos: vec3<f32>,
 }
 
 @vertex
@@ -80,8 +87,9 @@ fn vs_main(in: VsIn) -> VsOut {
     out.normal = in.normal;
     out.color = in.color;
     out.dist = length(pos);
-    out.light = in.light.xy;
+    out.light = in.light;
     out.local = in.position.xy;
+    out.pos = pos;
     return out;
 }
 
@@ -224,6 +232,12 @@ fn detail_noise_grad(base_ix: vec2<u32>, base_iy: vec2<u32>, u: f32, v: f32, oct
 // slope contrast is the point of the low sun.
 const SUN_STRENGTH: f32 = 1.2;
 
+// Wet-ground specular (3d-phase-3-plan.md §5.2): tight-ish lobe, modest
+// strength — the gloss is the part of the water response the 2D map cannot
+// express, so it carries the whole "reads as water" job on the material pass.
+const WET_GLINT_POWER: f32 = 40.0;
+const WET_GLINT_STRENGTH: f32 = 0.5;
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Cheap sRGB decode (pow 2.2, noted in plan §5.6): the vertex bytes are
@@ -247,7 +261,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // ambient occlusion dims the hemisphere fill in gullies and hollows.
     let sun = SUN_STRENGTH * max(dot(n, -params.sun_dir), 0.0) * in.light.x;
     let ambient = mix(params.ground_ambient, params.sky_ambient, n.z * 0.5 + 0.5) * in.light.y;
-    let lit = albedo * (vec3<f32>(sun) + ambient);
+    // The 3D-3 wet response (3d-phase-3-plan.md §5.2): a specular sun glint
+    // gated by wetness and the baked sun visibility. Rivers dominate;
+    // wetlands get a weaker version. Albedo is untouched — the color half of
+    // the response already rides composite_cell_color, and doubling it here
+    // would desynchronize the 3D ground from the 2D map.
+    let wet = max(in.light.z, 0.6 * in.light.w);
+    let view = -in.pos / max(in.dist, 1e-3);
+    let glint = pow(max(dot(reflect(params.sun_dir, n), view), 0.0), WET_GLINT_POWER);
+    let lit = albedo * (vec3<f32>(sun) + ambient)
+        + vec3<f32>(glint * wet * in.light.x * WET_GLINT_STRENGTH);
     let fog = smoothstep(params.fog_start, params.fog_end, in.dist);
     return vec4<f32>(mix(lit, params.fog_color, fog), 1.0);
 }

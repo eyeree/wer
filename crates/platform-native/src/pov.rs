@@ -144,6 +144,19 @@ const POV_WALK_SPEED_RANGE: (f64, f64) = (1.0, 60.0);
 /// with walk speed keeps the feel constant under the scroll multiplier.
 const POV_CLIMB_FACTOR: f64 = 3.0;
 
+/// River intensity where the overlay ribbon begins (3d-phase-3-plan.md
+/// §6.4): a core triangle joins the overlay when any corner reaches this.
+/// The shader feathers alpha to zero exactly here (`pov_water.wgsl`
+/// `RIVER_OVERLAY_MIN` must match), so the selection edge is invisible; the
+/// feather's top (`RIVER_OVERLAY_FULL`) and the lift (`RIVER_LIFT`) are
+/// shader-side constants in the same file. Raised from the plan's 0.08 after
+/// measurement: the feather leaves everything below ~0.12 at alpha ≤ 0.04,
+/// so selecting the broad 0.08–0.12 drainage band was invisible llvmpipe
+/// fill (48% → 31% of a river-basin ring's core triangles; the wide
+/// remainder is the honest field — this world's hydrology paints broad
+/// 0.2–0.5 river swaths that the 2D map colors blue too).
+pub const RIVER_OVERLAY_MIN: f32 = 0.12;
+
 /// Mouse-look sensitivity, radians per raw device pixel.
 const LOOK_SENSITIVITY: f32 = 0.0025;
 
@@ -306,12 +319,19 @@ impl Default for PovCamera {
 /// REGION_SIZE`, fog color = the clear color so geometry dissolves into sky,
 /// the fixed sun ([`SUN_DIR`]) and hemisphere ambients tuned so flat ground
 /// roughly matches the 2D palette's value range.
+///
+/// `time` is the water-wobble clock in seconds, already wrapped by the
+/// caller at `renderer::pov::WOBBLE_PERIOD` (3d-phase-3-plan.md §7.1);
+/// captures pass `0.0` so snapshots stay reproducible. The sea plane's
+/// camera-relative height is computed here — the shell owns `SEA_LEVEL`,
+/// the renderer stays world-agnostic (plan §4.1).
 #[must_use]
 pub fn frame_params(
     camera: &PovCamera,
     aspect: f32,
     radius: i32,
     clear: [f64; 4],
+    time: f32,
 ) -> PovFrameParams {
     let reach = (f64::from(radius) + 0.5) * REGION_SIZE;
     let sun = glam::Vec3::from_array(SUN_DIR);
@@ -320,6 +340,8 @@ pub fn frame_params(
         camera_pos: [camera.pos.x, camera.pos.y, camera.pos.z],
         sun_dir: [sun.x, sun.y, sun.z],
         detail: detail_octaves(),
+        time,
+        water_z: (f64::from(world_core::SEA_LEVEL) - camera.pos.z) as f32,
         fog_color: [clear[0] as f32, clear[1] as f32, clear[2] as f32],
         fog_start: (0.55 * reach) as f32,
         fog_end: (0.95 * reach) as f32,
@@ -460,6 +482,13 @@ pub struct ChunkMesh {
     pub vertices: Vec<PovVertex>,
     /// 65×65 core vertex heights, row-major (`j * POV_GRID + i`).
     pub heights: Vec<f32>,
+    /// River-overlay triangles (3d-phase-3-plan.md §6.1): index triples into
+    /// `vertices`, a subset of the shared core topology (same order, same
+    /// diagonal split, same winding) selected where any corner's river
+    /// intensity reaches [`RIVER_OVERLAY_MIN`] and at least one corner is at
+    /// or above sea level (fully submerged cells are already under the sea
+    /// plane). Empty for most chunks.
+    pub river_indices: Vec<u32>,
 }
 
 /// Mesh one region chunk (plan §6). Deterministic by construction: a pure
@@ -555,6 +584,7 @@ pub fn mesh_region_chunk_cancellable(
 
     let mut vertices = Vec::with_capacity(VERTS_PER_CHUNK);
     let mut heights = Vec::with_capacity(CORE_VERTS);
+    let mut rivers = Vec::with_capacity(CORE_VERTS);
     for j in 0..POV_GRID {
         for i in 0..POV_GRID {
             // Sample-grid index of vertex (i, j) is (i + MARGIN, j + MARGIN).
@@ -577,14 +607,17 @@ pub fn mesh_region_chunk_cancellable(
                 position: [lx as f32, ly as f32, e],
                 normal,
                 color: [rgb[0], rgb[1], rgb[2], 255],
+                // The zw bytes carry river/wetness for the 3D-3 wet material
+                // and overlay feather (3d-phase-3-plan.md §5.1).
                 light: [
                     quantize_light(sunvis[j * POV_GRID + i]),
                     quantize_light(vertex_ao(&occlusion, lx, ly)),
-                    0,
-                    0,
+                    quantize_light(river),
+                    quantize_light(wetness),
                 ],
             });
             heights.push(e);
+            rivers.push(river);
         }
     }
     // The skirt bottom ring (plan §6.5): same (x, y), normal, color, and
@@ -598,7 +631,38 @@ pub fn mesh_region_chunk_cancellable(
         }
     }
     debug_assert_eq!(vertices.len(), VERTS_PER_CHUNK);
-    Some(ChunkMesh { vertices, heights })
+    let river_indices = river_overlay_indices(&rivers, &heights);
+    Some(ChunkMesh {
+        vertices,
+        heights,
+        river_indices,
+    })
+}
+
+/// The river-overlay triangle selection (3d-phase-3-plan.md §6.1), walking
+/// the same quad loop and v00→v11 diagonal split as
+/// `renderer::pov::chunk_indices` so every emitted triple is a core triangle
+/// of the drawn topology. Pure and deterministic, like the mesher it serves.
+fn river_overlay_indices(rivers: &[f32], heights: &[f32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut tri = |a: usize, b: usize, c: usize| {
+        let river = rivers[a].max(rivers[b]).max(rivers[c]);
+        let e = heights[a].max(heights[b]).max(heights[c]);
+        if river >= RIVER_OVERLAY_MIN && e >= world_core::SEA_LEVEL {
+            out.extend_from_slice(&[a as u32, b as u32, c as u32]);
+        }
+    };
+    for j in 0..POV_MESH_RES {
+        for i in 0..POV_MESH_RES {
+            let v00 = j * POV_GRID + i;
+            let v10 = v00 + 1;
+            let v01 = v00 + POV_GRID;
+            let v11 = v01 + 1;
+            tri(v00, v10, v11);
+            tri(v00, v11, v01);
+        }
+    }
+    out
 }
 
 /// Baked sun visibility per core vertex — the terrain self-shadow term of
@@ -1076,6 +1140,7 @@ impl PovChunkManager {
                 origin: [ox, oy],
                 detail_base: detail_base(result.coord),
                 vertices: result.mesh.vertices,
+                river_indices: result.mesh.river_indices,
             });
         }
         self.counters.uploads_deferred += self.pending.len() as u64;
@@ -1511,6 +1576,7 @@ mod tests {
         );
         let bits = |h: &[f32]| h.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&a.heights), bits(&b.heights));
+        assert_eq!(a.river_indices, b.river_indices);
     }
 
     fn bytemuck_bytes(vertices: &[PovVertex]) -> &[u8] {
@@ -1760,10 +1826,110 @@ mod tests {
             lit * 2 > CORE_VERTS,
             "most open-terrain vertices are sunlit, got {lit}/{CORE_VERTS}"
         );
-        assert!(mesh
-            .vertices
-            .iter()
-            .all(|v| v.light[2] == 0 && v.light[3] == 0));
+    }
+
+    #[test]
+    fn light_bytes_pack_bilinear_river_and_wetness() {
+        // 3d-phase-3-plan.md §9 test 2: light.zw carry the same bilinear
+        // river/wetness the albedo used, quantized; at cell centers they
+        // equal the quantized tile values exactly (bilinear-at-center
+        // identity).
+        let map = settled_map();
+        let coord = RegionCoord::new(0, 0);
+        let snap = Snapshot::of(&map, coord);
+        let mesh = mesh_region_chunk(&snap.inputs());
+        for j in 0..POV_GRID {
+            for i in 0..POV_GRID {
+                let (lx, ly) = (i as f64 * SPACING, j as f64 * SPACING);
+                let v = mesh.vertices[j * POV_GRID + i];
+                assert_eq!(
+                    v.light[2],
+                    quantize_light(bilinear(&snap.river, lx, ly)),
+                    "river byte at ({i}, {j})"
+                );
+                assert_eq!(
+                    v.light[3],
+                    quantize_light(bilinear(&snap.wetness, lx, ly)),
+                    "wetness byte at ({i}, {j})"
+                );
+            }
+        }
+        let res = map.config().field_resolution;
+        let stride = POV_GRID / usize::from(res);
+        for cy in 0..res {
+            for cx in 0..res {
+                let i = usize::from(cx) * stride + stride / 2;
+                let j = usize::from(cy) * stride + stride / 2;
+                let v = mesh.vertices[j * POV_GRID + i];
+                assert_eq!(v.light[2], quantize_light(snap.river.get(cx, cy)));
+                assert_eq!(v.light[3], quantize_light(snap.wetness.get(cx, cy)));
+            }
+        }
+    }
+
+    #[test]
+    fn river_overlay_selection_matches_the_rule_and_the_drawn_topology() {
+        // 3d-phase-3-plan.md §9 test 3. Synthetic lattices exercise the rule
+        // edges; the drawn-topology containment guard runs on a real mesh.
+        let flat = vec![10.0f32; CORE_VERTS]; // all land
+        let dry = vec![0.0f32; CORE_VERTS];
+        assert!(
+            river_overlay_indices(&dry, &flat).is_empty(),
+            "an all-zero river lattice emits no overlay"
+        );
+        let wet = vec![1.0f32; CORE_VERTS];
+        assert_eq!(
+            river_overlay_indices(&wet, &flat).len(),
+            POV_MESH_RES * POV_MESH_RES * 2 * 3,
+            "saturated river over land emits every core triangle"
+        );
+        let sunken = vec![-5.0f32; CORE_VERTS];
+        assert!(
+            river_overlay_indices(&wet, &sunken).is_empty(),
+            "fully submerged cells are already under the sea plane"
+        );
+        // A single wet vertex pulls in exactly the triangles that touch it
+        // (any-corner rule): vertex (1, 1) sits on 6 core triangles.
+        let mut spot = dry;
+        spot[POV_GRID + 1] = RIVER_OVERLAY_MIN;
+        let indices = river_overlay_indices(&spot, &flat);
+        assert_eq!(indices.len(), 6 * 3);
+        assert!(indices
+            .chunks_exact(3)
+            .all(|t| t.contains(&((POV_GRID + 1) as u32))));
+
+        // Every emitted triple of a real mesh is a core triangle of the
+        // shared drawn topology, same order and winding — the guard that the
+        // overlay and the terrain share one diagonal split.
+        let map = settled_map();
+        let snap = Snapshot::of(&map, RegionCoord::new(0, 0));
+        let mesh = mesh_region_chunk(&snap.inputs());
+        let indices = chunk_indices();
+        let core: std::collections::HashSet<[u32; 3]> = indices[..POV_MESH_RES * POV_MESH_RES * 6]
+            .chunks_exact(3)
+            .map(|t| [t[0], t[1], t[2]])
+            .collect();
+        for tri in mesh.river_indices.chunks_exact(3) {
+            assert!(
+                core.contains(&[tri[0], tri[1], tri[2]]),
+                "overlay triangle {tri:?} is not a drawn core triangle"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_params_carry_time_and_the_camera_relative_sea_plane() {
+        // 3d-phase-3-plan.md §9 test 6: water_z = SEA_LEVEL − camera.z in
+        // f64, time passes through verbatim (captures pass 0.0).
+        let mut cam = PovCamera::new();
+        cam.pos = glam::DVec3::new(1.0e6, -2.0e6, 137.5);
+        let params = frame_params(&cam, 1.5, 3, [0.1, 0.2, 0.3, 1.0], 7.25);
+        assert_eq!(params.time, 7.25);
+        assert_eq!(
+            params.water_z,
+            (f64::from(world_core::SEA_LEVEL) - 137.5) as f32
+        );
+        assert_eq!(frame_params(&cam, 1.5, 3, [0.0; 4], 0.0).time, 0.0);
     }
 
     #[test]
@@ -1920,6 +2086,7 @@ mod tests {
                 VERTS_PER_CHUNK
             ],
             heights: vec![0.0; CORE_VERTS],
+            river_indices: Vec::new(),
         };
         manager
             .tx

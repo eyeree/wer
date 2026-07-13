@@ -18,6 +18,24 @@ use std::collections::HashMap;
 /// The POV terrain shader (vertex-lit, fogged; plan §5.6).
 pub const SHADER_POV_TERRAIN: &str = include_str!("../shaders/pov_terrain.wgsl");
 
+/// The POV water shader (3d-phase-3-plan.md): the sea plane and the river
+/// overlay, both translucent, depth-tested, depth-write-off.
+pub const SHADER_POV_WATER: &str = include_str!("../shaders/pov_water.wgsl");
+
+/// The water wobble's time period in seconds (3d-phase-3-plan.md §4.3). The
+/// shell wraps its clock at this period before filling
+/// [`PovFrameParams::time`]; every wobble frequency in `pov_water.wgsl` is an
+/// integer number of cycles per period, so the wrap is seamless and f32 never
+/// accumulates precision loss. A property of the shader, owned here.
+pub const WOBBLE_PERIOD: f32 = 32.0;
+
+/// Spatial tiling of the wobble in world units: `write_frame` anchors the
+/// sea's wobble with `camera mod WOBBLE_TILE` computed in f64 (the same
+/// far-from-origin discipline as the chunk offsets), and every wobble
+/// wavelength in `pov_water.wgsl` divides this, so anchor jumps at tile
+/// crossings are whole periods — invisible (3d-phase-3-plan.md §4.3).
+const WOBBLE_TILE: f64 = 64.0;
+
 /// Detail octaves the fragment shader continues above the authoritative
 /// terrain spectrum for **normal perturbation only** — the POV analogue of
 /// the map's refinement octaves (ADR 0017: derived presentation; vertices
@@ -137,6 +155,13 @@ pub struct TerrainChunkUpload {
     pub detail_base: [[u32; 4]; DETAIL_OCTAVES],
     /// Exactly [`VERTS_PER_CHUNK`] vertices in the shared topology's order.
     pub vertices: Vec<PovVertex>,
+    /// River-overlay triangles (3d-phase-3-plan.md §6): index triples into
+    /// `vertices` — a subset of the core terrain topology, selected by the
+    /// mesher. Empty for most chunks ⇒ no overlay draw. Unlike the vertex
+    /// buffer this is variable-size, so its GPU buffer is exact-size and
+    /// unpooled (§6.3); steady-state remesh traffic is zero, so steady state
+    /// allocates nothing.
+    pub river_indices: Vec<u32>,
 }
 
 /// Per-frame POV parameters (plan §5.2). All plain arrays: the shell computes
@@ -164,6 +189,15 @@ pub struct PovFrameParams {
     /// each — opaque to the renderer; the shell derives them from the
     /// terrain spectrum (see its `detail_octaves`).
     pub detail: [[f32; 4]; DETAIL_OCTAVES],
+    /// Shader time in seconds, wrapped by the shell at [`WOBBLE_PERIOD`].
+    /// Display-only animation (frame time reaches nothing but the water
+    /// shader); captures pass 0.0 so snapshots stay reproducible
+    /// (3d-phase-3-plan.md §4.3).
+    pub time: f32,
+    /// Camera-relative height of the sea plane (the shell computes
+    /// `SEA_LEVEL − camera.z` in f64 and truncates; the renderer never
+    /// learns `SEA_LEVEL` — 3d-phase-3-plan.md §4.1).
+    pub water_z: f32,
 }
 
 /// std140-compatible mirror of the WGSL `PovParams`.
@@ -180,6 +214,9 @@ struct PovParamsRaw {
     ground_ambient: [f32; 3],
     _pad1: f32,
     detail: [[f32; 4]; DETAIL_OCTAVES],
+    /// `(time, water_z, wobble anchor frac x, frac y)` — the WGSL `water`
+    /// vec4 (3d-phase-3-plan.md §4.3).
+    water: [f32; 4],
 }
 
 /// std140-compatible mirror of the WGSL `ChunkOffset`, written at a fixed
@@ -214,6 +251,11 @@ struct ChunkSlot<B> {
     buffer: B,
     origin: [f64; 2],
     detail_base: [[u32; 4]; DETAIL_OCTAVES],
+    /// River-overlay index buffer and its index count (3d-phase-3-plan.md
+    /// §6.3): variable-size, exact-size, **not pooled** — dropped on evict
+    /// and replaced wholesale on re-upload (including `Some → None` when a
+    /// remesh loses its river). Only the fixed-size vertex buffer pools.
+    overlay: Option<(B, u32)>,
 }
 
 impl<B> Default for ChunkTable<B> {
@@ -247,10 +289,20 @@ impl<B> ChunkTable<B> {
             buffer: self.free.pop().unwrap_or_else(create),
             origin,
             detail_base,
+            overlay: None,
         });
         slot.origin = origin;
         slot.detail_base = detail_base;
         &mut slot.buffer
+    }
+
+    /// Replace `handle`'s river-overlay buffer wholesale (`None` clears it).
+    /// The old buffer is dropped, never pooled (3d-phase-3-plan.md §6.3).
+    /// Unknown handles are ignored, like `remove`.
+    fn set_overlay(&mut self, handle: u64, overlay: Option<(B, u32)>) {
+        if let Some(slot) = self.chunks.get_mut(&handle) {
+            slot.overlay = overlay;
+        }
     }
 
     fn len(&self) -> usize {
@@ -263,6 +315,14 @@ impl<B> ChunkTable<B> {
 #[derive(Debug)]
 pub(crate) struct Pov {
     pipeline: wgpu::RenderPipeline,
+    /// River-overlay pipeline (3d-phase-3-plan.md §6.2): the terrain vertex
+    /// layout drawn through per-chunk overlay index buffers, lifted and
+    /// shaded as water. Blended, depth-write off.
+    overlay_pipeline: wgpu::RenderPipeline,
+    /// Sea-plane pipeline (3d-phase-3-plan.md §4.1): a vertex-shader-generated
+    /// camera-centered quad. Blended, depth-write off, cull-off (the camera
+    /// may stand on the sea floor and look up).
+    sea_pipeline: wgpu::RenderPipeline,
     frame_uniform: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     chunk_bgl: wgpu::BindGroupLayout,
@@ -326,6 +386,49 @@ impl Pov {
             bind_group_layouts: &[Some(&frame_bgl), Some(&chunk_bgl)],
             immediate_size: 0,
         });
+        // The 32-byte PovVertex layout, shared by the terrain pipeline and
+        // the river-overlay pipeline (which re-draws the same buffers).
+        let vertex_attributes = [
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Unorm8x4,
+                offset: 24,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Unorm8x4,
+                offset: 28,
+                shader_location: 3,
+            },
+        ];
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: core::mem::size_of::<PovVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &vertex_attributes,
+        };
+        // Water passes test against terrain depth but never write it
+        // (3d-phase-3-plan.md §4.4).
+        let water_depth = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        };
+        let blended_target = wgpu::ColorTargetState {
+            format,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("pov-terrain-pipeline"),
             layout: Some(&layout),
@@ -333,32 +436,7 @@ impl Pov {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: core::mem::size_of::<PovVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 12,
-                            shader_location: 1,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Unorm8x4,
-                            offset: 24,
-                            shader_location: 2,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Unorm8x4,
-                            offset: 28,
-                            shader_location: 3,
-                        },
-                    ],
-                }],
+                buffers: core::slice::from_ref(&vertex_layout),
             },
             primitive: wgpu::PrimitiveState {
                 cull_mode: Some(wgpu::Face::Back),
@@ -382,6 +460,66 @@ impl Pov {
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let water_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pov-water-shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_POV_WATER.into()),
+        });
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pov-water-overlay-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &water_shader,
+                entry_point: Some("vs_overlay"),
+                compilation_options: Default::default(),
+                buffers: core::slice::from_ref(&vertex_layout),
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(water_depth.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &water_shader,
+                entry_point: Some("fs_overlay"),
+                compilation_options: Default::default(),
+                targets: &[Some(blended_target.clone())],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sea_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pov-water-sea-layout"),
+            bind_group_layouts: &[Some(&frame_bgl)],
+            immediate_size: 0,
+        });
+        let sea_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pov-water-sea-pipeline"),
+            layout: Some(&sea_layout),
+            vertex: wgpu::VertexState {
+                module: &water_shader,
+                entry_point: Some("vs_sea"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(water_depth),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &water_shader,
+                entry_point: Some("fs_sea"),
+                compilation_options: Default::default(),
+                targets: &[Some(blended_target)],
             }),
             multiview_mask: None,
             cache: None,
@@ -419,6 +557,8 @@ impl Pov {
 
         Self {
             pipeline,
+            overlay_pipeline,
+            sea_pipeline,
             frame_uniform,
             frame_bind_group,
             chunk_bgl,
@@ -517,6 +657,21 @@ impl Pov {
                     });
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&upload.vertices));
             bytes += CHUNK_BUFFER_BYTES;
+            // The river-overlay index list (3d-phase-3-plan.md §6.3):
+            // exact-size, unpooled, replaced wholesale — including
+            // `Some → None` when a remesh loses its river.
+            let overlay = (!upload.river_indices.is_empty()).then(|| {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("pov-river-overlay-indices"),
+                    size: (upload.river_indices.len() * 4) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&upload.river_indices));
+                bytes += (upload.river_indices.len() * 4) as u64;
+                (buffer, upload.river_indices.len() as u32)
+            });
+            self.table.set_overlay(upload.handle, overlay);
         }
         bytes
     }
@@ -542,6 +697,16 @@ impl Pov {
             ground_ambient: frame.ground_ambient,
             _pad1: 0.0,
             detail: frame.detail,
+            // The wobble's world anchor: `camera mod WOBBLE_TILE` in f64, so
+            // the f32 the shader adds to camera-relative positions is small
+            // and exact-enough at any world coordinate; jumps at tile
+            // crossings are whole wobble periods (3d-phase-3-plan.md §4.3).
+            water: [
+                frame.time,
+                frame.water_z,
+                frame.camera_pos[0].rem_euclid(WOBBLE_TILE) as f32,
+                frame.camera_pos[1].rem_euclid(WOBBLE_TILE) as f32,
+            ],
         };
         queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&raw));
 
@@ -583,8 +748,11 @@ impl Pov {
         draws
     }
 
-    /// Record the terrain pass: clear color + depth, draw every resident
-    /// chunk with the shared index buffer.
+    /// Record the POV pass: clear color + depth, draw every resident chunk
+    /// with the shared index buffer, then the translucent water passes in
+    /// fixed order — river overlay, then sea (3d-phase-3-plan.md §4.4): the
+    /// overlay hugs the terrain, so wherever both cover a pixel the sea is
+    /// the nearer surface when the camera is above water.
     pub(crate) fn draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -630,6 +798,29 @@ impl Pov {
             pass.set_vertex_buffer(0, slot.buffer.slice(..));
             pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
+        // River overlays: the same vertex buffers through each chunk's own
+        // index list (3d-phase-3-plan.md §6.2). Most chunks have none.
+        let mut overlay_bound = false;
+        for &(handle, dynamic_offset) in draws {
+            let slot = &self.table.chunks[&handle];
+            let Some((indices, count)) = &slot.overlay else {
+                continue;
+            };
+            if !overlay_bound {
+                pass.set_pipeline(&self.overlay_pipeline);
+                overlay_bound = true;
+            }
+            pass.set_bind_group(1, &self.chunk_bind_group, &[dynamic_offset]);
+            pass.set_vertex_buffer(0, slot.buffer.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..*count, 0, 0..1);
+        }
+        // The sea plane, always last (3d-phase-3-plan.md §4.4). Drawn even
+        // with zero resident chunks: below-sea frontier holes legitimately
+        // show water, above-sea ones cover when their terrain lands —
+        // transient, and mostly inside fog (plan §4.1).
+        pass.set_pipeline(&self.sea_pipeline);
+        pass.draw(0..4, 0..1);
     }
 }
 
@@ -857,5 +1048,35 @@ mod tests {
         // Removing an unknown handle is a no-op.
         table.remove(99);
         assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn overlay_buffers_replace_wholesale_and_never_pool() {
+        // 3d-phase-3-plan.md §9 test 7: the river-overlay slot is replaced
+        // wholesale on re-upload (including Some → None when a remesh loses
+        // its river), dropped on remove, and never feeds the vertex pool.
+        let mut table: ChunkTable<u32> = ChunkTable::default();
+        let mut next = 0u32;
+        let mut create = || {
+            next += 1;
+            next
+        };
+        let base = [[0u32; 4]; DETAIL_OCTAVES];
+        let vertex = *table.upsert(1, [0.0, 0.0], base, &mut create);
+        assert!(table.chunks[&1].overlay.is_none(), "chunks start dry");
+        table.set_overlay(1, Some((77, 12)));
+        assert_eq!(table.chunks[&1].overlay, Some((77, 12)));
+        // A re-upload that lost its river clears the overlay.
+        let again = *table.upsert(1, [0.0, 0.0], base, &mut create);
+        assert_eq!(again, vertex);
+        table.set_overlay(1, None);
+        assert!(table.chunks[&1].overlay.is_none());
+        // Remove pools only the vertex buffer; a live overlay is dropped.
+        table.set_overlay(1, Some((88, 6)));
+        table.remove(1);
+        assert_eq!(table.free, vec![vertex], "overlay buffers never pool");
+        // Unknown handles are ignored (superseded-then-evicted uploads).
+        table.set_overlay(99, Some((5, 3)));
+        assert_eq!(table.len(), 0);
     }
 }

@@ -176,6 +176,27 @@ a top-down radius-8 sweep now shows zero gap pixels.
 lookup, four `f32` reads, and a handful of multiplies — with no measurable
 frame-time change (verified on the llvmpipe reference environment).
 
+## 3D-3 — water (3d-phase-3-plan.md §8)
+
+Measured on the reference machine (WSL2/llvmpipe, `--release`), same-machine
+A/B against `main` at the time of the change. Presentation-only: no
+generated output changed, zero fixtures re-blessed, no new lifecycle events
+(keying, scheduling, and eviction untouched — steady state remains 0
+remeshes / 0 uploads / 0 allocations).
+
+| metric | value |
+|---|---|
+| mesh time, worker-side (radius-1 ring over the (3050, 100) river basin) | 2.62 ms/chunk before, 2.66 ms/chunk after — the light-byte packing and overlay selection are noise against the shadow/AO march |
+| river-overlay indices, same river-basin ring (9 chunks, 6 with overlay) | 69 531 indices ≈ **271 KB** at `RIVER_OVERLAY_MIN = 0.12`; riverless regions carry zero |
+| threshold calibration | the plan's 0.08 selected 48% of the ring's core triangles, of which the 0.08–0.12 band renders at alpha ≤ 0.04 (invisible fill); 0.12 selects 31% — the wide remainder is the honest field (hydrology paints broad 0.2–0.5 river swaths that the 2D map colors blue too) |
+| sea plane | 4 vertices, no vertex buffer, one blended pass; capture-path snapshots over an ocean vantage at 960×600 render without measurable wall-time regression vs. terrain-only |
+| new GPU state | 2 pipelines + one vec4 in the frame uniform; overlay index buffers are exact-size and unpooled (replaced wholesale on remesh, dropped on evict) |
+
+Verified with the ADR 0021 capture harness: waterline sits exactly where the
+sediment ramp meets the beach; walk mode stands on the sea floor at
+`z < 0` with the surface visible from below; a `RIVER_LIFT` exaggeration A/B
+confirmed the overlay pipeline draws through the terrain vertex buffers.
+
 ## Improvement A.8 — fixed routing and halo Terrain
 
 Measured on the same local execution machine with the release Criterion

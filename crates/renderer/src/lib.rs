@@ -16,7 +16,10 @@ use core::fmt;
 pub mod gpumap;
 pub mod pov;
 pub use gpumap::{GpuMap, GpuMapParams, MapTileUpload, RefineOctaveParams};
-pub use pov::{PovFrameParams, PovVertex, TerrainChunkUpload, DETAIL_OCTAVES, SHADER_POV_TERRAIN};
+pub use pov::{
+    PovFrameParams, PovVertex, TerrainChunkUpload, DETAIL_OCTAVES, SHADER_POV_TERRAIN,
+    SHADER_POV_WATER,
+};
 
 /// The debug-map presentation shader (fullscreen textured triangle).
 pub const SHADER_DEBUG_MAP: &str = include_str!("../shaders/debug_map.wgsl");

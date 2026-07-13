@@ -367,6 +367,14 @@ pub const RIVER_OVERLAY_FULL: f32 = 0.30;
 pub const RIVER_LIFT: f32 = 0.2;
 ```
 
+> **As landed:** `RIVER_OVERLAY_MIN` was raised to **0.12** during M3
+> tuning. The feather leaves everything below ~0.12 at alpha ≤ 0.04, so the
+> 0.08–0.12 band was invisible llvmpipe fill (48% → 31% of a river-basin
+> ring's core triangles; see the perf-baseline 3D-3 section). Only
+> `RIVER_OVERLAY_MIN` lives in Rust (the mesher's selection); `FULL` and
+> `LIFT` are shader-side constants in `pov_water.wgsl` — a `pub const` a bin
+> crate never reads would trip `-D warnings` dead-code.
+
 The 2D map draws the river channel continuously (`river · 0.8` color lerp,
 no threshold); the overlay threshold is a new, overlay-only constant. The
 design's "same tiles, same threshold" exit criterion is met at the data
@@ -485,6 +493,13 @@ Each lands independently green on the full CI matrix.
   telemetry byte accounting. *Exit:* ribbons read as water surfaces from
   eye level; no z-fighting at any distance within fog; steady-state
   traffic still zero.
+
+  > **Decision (as landed): built.** Capture-harness assessment: the
+  > material pass alone left river reaches as static tinted ground; the
+  > overlay's wobble, Fresnel, and glint carry the "reads as water" job on
+  > and over the channels (aerial ribbons show animated water texture; a
+  > `RIVER_LIFT` exaggeration A/B confirmed the pipeline draws). Threshold
+  > raised per §6.4's as-landed note.
 - **M4 — Sign-off.** `docs/perf-baseline.md` water numbers, README line,
   the §9 manual walkthrough, design-doc exit-criteria check (§11).
 

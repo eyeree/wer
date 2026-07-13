@@ -803,6 +803,10 @@ struct App {
     /// dump ([`dump`]) — the live frame consumes its stats by value.
     last_stats: FrameStats,
     last_frame: Instant,
+    /// App start, for the water-wobble clock (3d-phase-3-plan.md §7.1):
+    /// wrapped at `renderer::pov::WOBBLE_PERIOD` before it reaches the
+    /// shader. Display-only animation; captures pass 0.0 instead.
+    start: Instant,
     // Rolling telemetry (phase-1-plan.md section 12; phase-6-plan.md §12),
     // displayed by the info panel; per-second counters are no longer logged.
     stats_frames: u32,
@@ -873,6 +877,7 @@ impl App {
             regen_totals: [0; LAYER_COUNT as usize],
             last_stats: FrameStats::default(),
             last_frame: Instant::now(),
+            start: Instant::now(),
             stats_frames: 0,
             update_time_accum: 0.0,
             compose_time_accum: 0.0,
@@ -1634,7 +1639,11 @@ impl App {
         );
         let upload_bytes = (uploads.len()
             * renderer::pov::VERTS_PER_CHUNK
-            * core::mem::size_of::<renderer::PovVertex>()) as u64;
+            * core::mem::size_of::<renderer::PovVertex>()
+            + uploads
+                .iter()
+                .map(|u| u.river_indices.len() * 4)
+                .sum::<usize>()) as u64;
         stats.pass_ms[world_runtime::Pass::Mesh.index()] +=
             mesh_start.elapsed().as_secs_f32() * 1000.0;
         self.last_stats = stats;
@@ -1642,11 +1651,19 @@ impl App {
         let render_start = Instant::now();
         if let Some(renderer) = self.renderer.as_mut() {
             let (w, h) = renderer.size();
+            // The water-wobble clock (3d-phase-3-plan.md §7.1): wrapped at
+            // the shader's period so f32 never loses phase precision.
+            let time = self
+                .start
+                .elapsed()
+                .as_secs_f64()
+                .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
             let params = pov::frame_params(
                 &self.pov_camera,
                 w as f32 / h.max(1) as f32,
                 self.pov_radius,
                 CLEAR_COLOR,
+                time,
             );
             renderer.render_pov(&params, &uploads, &removes, CLEAR_COLOR);
         }
@@ -2079,7 +2096,9 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                     }
                 }
                 let aspect = size.0 as f32 / size.1 as f32;
-                let params = pov::frame_params(&camera, aspect, radius, CLEAR_COLOR);
+                // Time-frozen captures (3d-phase-3-plan.md §4.3): two snaps
+                // of the same pose are byte-comparable.
+                let params = pov::frame_params(&camera, aspect, radius, CLEAR_COLOR, 0.0);
                 let rgba = cap.snapshot(&params, CLEAR_COLOR);
                 dump::write_ppm(std::path::Path::new(&path), &rgba, size.0, size.1)?;
                 log::info!(

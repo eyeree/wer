@@ -230,7 +230,8 @@ impl App {
             }
         }
         let aspect = width as f32 / height.max(1) as f32;
-        let params = pov::frame_params(&self.pov_camera, aspect, self.pov_radius, CLEAR_COLOR);
+        // Time-frozen like every capture (3d-phase-3-plan.md §4.3).
+        let params = pov::frame_params(&self.pov_camera, aspect, self.pov_radius, CLEAR_COLOR, 0.0);
         let rgba = cap.snapshot(&params, CLEAR_COLOR);
         write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
         Ok(format!(
