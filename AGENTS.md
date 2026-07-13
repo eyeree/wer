@@ -12,7 +12,8 @@ browser/WebAssembly/WebGPU target) for an exploration game built around
 [`docs/Infinite_World_Exploration_Project_Overview.md`](./docs/Infinite_World_Exploration_Project_Overview.md);
 the phased technical plan is in [`implementation-plan.md`](docs/plans/prototype/implementation-plan.mdimplementation-plan.md).
 
-The repository is at **Phase 6** (performance and scale, see
+The repository has landed the Phase 7 static browser runtime scaffold on top of
+**Phase 6** (performance and scale, see
 [`phase-6-plan.md`](phase-6-plan.md)), built on the landed Phase 2–5 stacks.
 Phase 2 is a nine-layer declared dependency graph — terrain, geology,
 macro drainage, climate, hydrology, soils, biome, vegetation, and **ecology
@@ -64,8 +65,11 @@ ids; `WER_TIER`/`WER_CACHE_MB` override). Settled world state is proven
 schedule-independent across executor, worker count, budget scale,
 cancellation, amortization, and tier (ADR 0018), machine-checked by the
 scale harness (`wer-scale`). The possibility vector is still one scalar per
-domain, and there is no networking and no browser storage backend (Phase 7)
-— those grow in later phases; do not mistake them for finished subsystems.
+domain, and there is no networking or account/server subsystem.
+The browser shell now builds to `target/web-dist` with viewer/docs/help routes,
+wasm facade snapshots, CPU map presentation, WebGPU/worker/storage/tier/POV
+fallback controls, and a `web-signoff` harness. Browser networking and accounts
+still do not exist; POV remains gated on the shared 3D renderer surface.
 
 Post-Phase-6 Improvement A.8 deliberately changes Terrain and Drainage output
 under their layer-local version boundary: `WORLD_ALGORITHM_VERSION` remains 2,

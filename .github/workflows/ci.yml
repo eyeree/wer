@@ -61,3 +61,8 @@ jobs:
         run: cargo run --bin web-build
       - name: static browser smoke
         run: node crates/platform-web/web/smoke.mjs target/web-dist
+      - name: upload static browser artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: target/web-dist

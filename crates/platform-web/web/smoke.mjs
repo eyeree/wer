@@ -73,4 +73,8 @@ for (const match of commands.matchAll(/id: "([^"]+)"/g)) {
 }
 
 JSON.parse(await readFile(join(dist, "assets/manifest.json"), "utf8"));
+const generatedJs = await readFile(join(dist, "generated/platform_web.js"), "utf8");
+if (generatedJs.includes("crates/platform-web/web")) {
+  throw new Error("generated wasm glue contains a source-tree asset path");
+}
 console.log(`web smoke ok: ${dist}`);

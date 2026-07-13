@@ -171,6 +171,7 @@ GitHub Pages. To build and serve it locally:
 ```sh
 cargo run --bin web-build
 node crates/platform-web/web/smoke.mjs target/web-dist
+cargo run --bin web-signoff
 python3 -m http.server --directory target/web-dist 8080
 ```
 
@@ -181,6 +182,25 @@ output — the determinism guarantee the browser port depends on.
 
 CI also pins `wasm-pack` 0.13.1 and executes the complete parity suite in Node,
 including signed fixed routing elevations and three complete macro tiles.
+
+### Static deployment
+
+Publish `target/web-dist` as-is. The artifact is subpath-safe: pages link to
+`./assets`, `./generated`, `./docs/world-model.html`, and `./help/` with
+relative URLs, so GitHub Pages can serve it from a project path. Runtime storage
+uses browser APIs only; there is no server, socket, filesystem, or generated
+world cache in the deployment.
+
+Browser compatibility tiers:
+
+| Tier | Expected support | Behavior |
+|------|------------------|----------|
+| WebLow | no WebGPU or weak worker/storage support | CPU map, inline execution, small cache ceiling |
+| WebMid | ordinary desktop browser | WebGPU atlas mode when available, worker mode selectable |
+| WebHigh | strong desktop with stable WebGPU | larger cache ceiling and refinement default |
+
+Unsupported WebGPU, worker, storage, and POV paths fall back visibly in the
+HTML status/info panel and do not change settled hashes.
 
 ## Determinism
 
