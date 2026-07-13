@@ -161,24 +161,23 @@ to override the graphics backend (the renderer honors the standard wgpu
 environment variables). Rendering may run on Mesa's `llvmpipe` software
 rasterizer in WSL — the debug map is a single texture blit, so it stays fast.
 
-## Browser smoke test
+## Browser static app
 
-`platform-web` compiles the deterministic core to `wasm32` and logs the origin
-feature hash. To build and serve it locally:
+`platform-web` builds as a static browser artifact under `target/web-dist`.
+The artifact contains ordinary relative links (`index.html`, `assets/`,
+`generated/`) so it can run from a repository subpath on a static host such as
+GitHub Pages. To build and serve it locally:
 
 ```sh
-cargo install wasm-bindgen-cli   # once
-cargo build -p platform-web --target wasm32-unknown-unknown --release
-wasm-bindgen target/wasm32-unknown-unknown/release/platform_web.wasm \
-  --out-dir crates/platform-web/web/generated --target web
-# then serve crates/platform-web/web over http (WebGPU needs a secure context)
-python3 -m http.server --directory crates/platform-web/web 8080
+cargo run --bin web-build
+node crates/platform-web/web/smoke.mjs target/web-dist
+python3 -m http.server --directory target/web-dist 8080
 ```
 
 Open <http://localhost:8080> and check the console for
-`[wer] wasm smoke ok — origin feature hash: …`. That value **must** match the
-native `wer-inspect 0 0` output — the determinism guarantee the browser port
-depends on.
+`[wer] wasm smoke ok — origin feature hash: …`. The viewer status bar also
+prints the same hash. That value **must** match the native `wer-inspect 0 0`
+output — the determinism guarantee the browser port depends on.
 
 CI also pins `wasm-pack` 0.13.1 and executes the complete parity suite in Node,
 including signed fixed routing elevations and three complete macro tiles.

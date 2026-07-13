@@ -3,51 +3,53 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>wer — wasm smoke test</title>
-    <style>
-      body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 40rem; line-height: 1.5; }
-      code { background: #f0f0f3; padding: 0.1em 0.3em; border-radius: 4px; }
-      .ok { color: #1a7f37; } .warn { color: #b35900; } .err { color: #b3261e; }
-      pre { background: #f0f0f3; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    </style>
+    <title>Infinite World Exploration</title>
+    <link rel="stylesheet" href="./assets/app.css" />
   </head>
   <body>
-    <h1>Infinite World Exploration — wasm smoke test</h1>
-    <p>
-      This page loads the <code>platform-web</code> wasm module and confirms that
-      the deterministic core computes the expected value in the browser.
-      See the build steps in the repository <code>README.md</code>.
-    </p>
-    <pre id="out">loading wasm module…</pre>
-
-    <script type="module">
-      const out = document.getElementById("out");
-      const line = (cls, msg) => {
-        const span = document.createElement("span");
-        span.className = cls;
-        span.textContent = msg + "\n";
-        out.appendChild(span);
-      };
-
-      // WebGPU availability (the eventual renderer target; not required for the
-      // core smoke computation).
-      if ("gpu" in navigator) line("ok", "WebGPU: available");
-      else line("warn", "WebGPU: not available (fine for the core smoke test)");
-
-      try {
-        // Produced by `wasm-bindgen ... --target web` (see README).
-        const mod = await import("./generated/platform_web.js");
-        await mod.default();
-        const hash = mod.origin_feature_hash();
-        const hex = "0x" + hash.toString(16).padStart(16, "0");
-        line("ok", "core loaded — origin feature hash: " + hex);
-        line("ok", "this must equal native `wer-inspect 0 0`.");
-      } catch (e) {
-        out.textContent = "";
-        line("err", "failed to load wasm module:");
-        line("err", String(e));
-        line("warn", "did you run the wasm-bindgen build step from the README?");
-      }
-    </script>
+    <header class="site-header">
+      <a class="brand" href="./">Infinite World Exploration</a>
+      <nav aria-label="Site">
+        <a href="./">Viewer</a>
+        <a href="./docs/world-model.html">World Model</a>
+        <a href="./help/">Help</a>
+      </nav>
+    </header>
+    <main class="app-shell" data-view="viewer">
+      <section class="viewer">
+        <div class="toolbar" aria-label="Viewer controls">
+          <button type="button" data-command="channel:composite" aria-pressed="true">Composite</button>
+          <button type="button" data-command="toggle:compose" aria-pressed="true">Compose</button>
+          <button type="button" data-command="toggle:refinement" aria-pressed="false">Refine</button>
+          <select data-command="tier" aria-label="Resource tier">
+            <option value="auto">Auto tier</option>
+            <option value="low">WebLow</option>
+            <option value="mid">WebMid</option>
+            <option value="high">WebHigh</option>
+          </select>
+        </div>
+        <canvas id="world-canvas" width="960" height="540" tabindex="0" aria-label="World map"></canvas>
+        <div class="status-bar" role="status">
+          <span data-field="wasm-status">Loading wasm</span>
+          <span data-field="origin-hash">origin hash pending</span>
+          <span data-field="webgpu-status">WebGPU probing</span>
+        </div>
+      </section>
+      <aside class="info-panel" aria-label="World information">
+        <h1>Viewer</h1>
+        <dl>
+          <dt>Region</dt>
+          <dd data-field="region">0, 0</dd>
+          <dt>Tier</dt>
+          <dd data-field="tier">auto</dd>
+          <dt>Executor</dt>
+          <dd data-field="executor">inline</dd>
+          <dt>Storage</dt>
+          <dd data-field="storage">memory</dd>
+        </dl>
+        <pre data-field="diagnostics">initializing browser runtime</pre>
+      </aside>
+    </main>
+    <script type="module" src="./assets/app.js"></script>
   </body>
 </html>

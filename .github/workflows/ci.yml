@@ -57,3 +57,7 @@ jobs:
         run: cargo check -p platform-web --target wasm32-unknown-unknown
       - name: execute parity probes in Node
         run: wasm-pack test --node crates/platform-web
+      - name: build static browser artifact
+        run: cargo run --bin web-build
+      - name: static browser smoke
+        run: node crates/platform-web/web/smoke.mjs target/web-dist
