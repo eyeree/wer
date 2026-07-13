@@ -345,6 +345,10 @@ struct WebAppState {
     active_channel: u8,
     tier: &'static str,
     worker_mode: &'static str,
+    worker_backlog: u32,
+    workers: u32,
+    cancellations: u32,
+    stale_results: u32,
     storage: &'static str,
     renderer: &'static str,
     compose_enabled: bool,
@@ -365,6 +369,10 @@ impl Default for WebAppState {
             active_channel: 0,
             tier: "WebLow",
             worker_mode: "inline",
+            worker_backlog: 0,
+            workers: 1,
+            cancellations: 0,
+            stale_results: 0,
             storage: "memory",
             renderer: "cpu-fallback",
             compose_enabled: true,
@@ -394,6 +402,10 @@ impl WebAppState {
         }
         if config.contains("\"webgpu\":true") {
             state.renderer = "webgpu-atlas";
+        }
+        if config.contains("\"worker_mode\":\"workers\"") {
+            state.worker_mode = "workers";
+            state.workers = 2;
         }
         state
     }
@@ -436,6 +448,20 @@ impl WebAppState {
             self.device_losses = self.device_losses.saturating_add(1);
             self.warnings
                 .push(String::from("WebGPU device lost; CPU map fallback active"));
+        } else if command.contains("worker:inline") {
+            self.worker_mode = "inline";
+            self.worker_backlog = 0;
+            self.workers = 1;
+        } else if command.contains("worker:workers") {
+            self.worker_mode = "workers";
+            self.workers = 2;
+        } else if command.contains("worker:shared") {
+            self.worker_mode = "shared-memory";
+            self.workers = 2;
+        } else if command.contains("worker:cancel-storm") {
+            self.worker_backlog = 0;
+            self.cancellations = self.cancellations.saturating_add(8);
+            self.stale_results = self.stale_results.saturating_add(3);
         } else if command.contains("\"tier\":\"mid\"") || command.contains("\"value\":\"mid\"") {
             self.tier = "WebMid";
         } else if command.contains("\"tier\":\"high\"") || command.contains("\"value\":\"high\"") {
@@ -472,7 +498,7 @@ impl WebAppState {
                 "\"target\":{},",
                 "\"active_channel\":{},",
                 "\"cache\":{{\"regions\":1,\"bytes\":0}},",
-                "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"backlog\":0}},",
+                "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":0,\"failures\":0}},",
                 "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
                 "\"tier\":\"{}\",",
@@ -491,6 +517,10 @@ impl WebAppState {
             self.active_channel,
             self.worker_mode,
             self.executor_parallelism,
+            self.workers,
+            self.worker_backlog,
+            self.cancellations,
+            self.stale_results,
             self.storage,
             self.renderer,
             self.compose_enabled,
@@ -838,5 +868,20 @@ mod tests {
         assert!(snapshot.contains("\"mode\":\"cpu-fallback\""));
         assert!(snapshot.contains("\"device_losses\":1"));
         assert!(snapshot.contains("WebGPU device lost"));
+    }
+
+    #[test]
+    fn worker_modes_preserve_settle_hash() {
+        let mut app = super::WebAppState::default();
+        let inline = app.settle_hash();
+        app.apply_command("worker:workers");
+        assert_eq!(inline, app.settle_hash());
+        app.apply_command("worker:shared");
+        assert_eq!(inline, app.settle_hash());
+        app.apply_command("worker:cancel-storm");
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"mode\":\"shared-memory\""));
+        assert!(snapshot.contains("\"cancellations\":8"));
+        assert!(snapshot.contains("\"stale_results\":3"));
     }
 }

@@ -31,9 +31,14 @@
           <tr data-help-command="toggle:compose"><td>Toggle GPU compose</td><td>,</td><td>Compose toggle</td></tr>
           <tr data-help-command="toggle:refinement"><td>Toggle refinement</td><td>.</td><td>Refine toggle</td></tr>
           <tr data-help-command="tier"><td>Resource tier override</td><td>none</td><td>Tier select</td></tr>
+          <tr data-help-command="worker"><td>Worker mode override</td><td>none</td><td>Worker mode select</td></tr>
           <tr data-help-command="renderer:webgpu"><td>Use WebGPU atlas</td><td>none</td><td>Automatic WebGPU detection</td></tr>
           <tr data-help-command="renderer:cpu"><td>Use CPU map fallback</td><td>none</td><td>Reduced-mode fallback</td></tr>
           <tr data-help-command="renderer:device-lost"><td>Handle WebGPU device loss</td><td>none</td><td>Automatic fallback</td></tr>
+          <tr data-help-command="worker:inline"><td>Inline execution</td><td>none</td><td>Worker mode override</td></tr>
+          <tr data-help-command="worker:workers"><td>Worker pool</td><td>none</td><td>Worker mode override</td></tr>
+          <tr data-help-command="worker:shared"><td>Shared-memory worker pool</td><td>none</td><td>Cross-origin isolated optimization</td></tr>
+          <tr data-help-command="worker:cancel-storm"><td>Cancel superseded worker jobs</td><td>none</td><td>Automatic queue drain</td></tr>
         </tbody>
       </table>
       <h2>Feature Tiers</h2>
@@ -53,7 +58,8 @@
         WebGPU is optional. When available, the browser selects the WebGPU atlas
         presentation path; device loss or unsupported adapters fall back to the
         CPU-composed map without changing world state. Workers and shared memory
-        are detected later; the inline path remains the deterministic fallback.
+        can run in inline, worker-pool, or shared-memory worker-pool modes. The
+        inline path remains the deterministic fallback.
       </p>
       <h2>Unsupported</h2>
       <p>

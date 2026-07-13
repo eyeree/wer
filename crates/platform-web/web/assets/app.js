@@ -4,6 +4,8 @@ const fields = new Map(
   Array.from(document.querySelectorAll("[data-field]"), (node) => [node.dataset.field, node]),
 );
 
+let workerProbe;
+
 const write = (name, value, cls) => {
   const node = fields.get(name);
   if (!node) return;
@@ -95,6 +97,16 @@ const initWasm = async () => {
   }
 };
 
+const initWorkerProbe = () => {
+  if (!("Worker" in window)) {
+    appendDiagnostic("Worker: unavailable; inline executor active");
+    return;
+  }
+  workerProbe = new Worker("./assets/worker.js", { type: "module" });
+  workerProbe.onmessage = (event) => appendDiagnostic(`worker:${event.data.kind}`);
+  workerProbe.postMessage({ kind: "ping", mode: "workers" });
+};
+
 const renderMap = () => {
   const app = window.__werApp;
   if (!app) return;
@@ -131,6 +143,9 @@ for (const control of document.querySelectorAll("[data-command]")) {
       write("tier", control.value);
       appendDiagnostic(`tier:${control.value}`);
       dispatchCommand("tier", control.value);
+    } else if (control.dataset.command === "worker") {
+      appendDiagnostic(`worker:${control.value}`);
+      dispatchCommand(`worker:${control.value}`);
     }
   });
 }
@@ -159,4 +174,5 @@ document.getElementById("world-canvas").addEventListener("pointermove", (event) 
 
 drawBootCanvas();
 probeWebGpu();
+initWorkerProbe();
 await initWasm();

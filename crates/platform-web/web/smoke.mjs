@@ -9,6 +9,7 @@ const required = [
   "assets/app.css",
   "assets/app.js",
   "assets/commands.js",
+  "assets/worker.js",
   "assets/manifest.json",
   "generated/platform_web.js",
   "generated/platform_web_bg.wasm",
@@ -40,6 +41,9 @@ if (!app.includes("render_cpu_map")) {
 }
 if (!app.includes("renderer:webgpu")) {
   throw new Error("app.js does not expose WebGPU renderer selection");
+}
+if (!app.includes("new Worker")) {
+  throw new Error("app.js does not initialize the worker probe");
 }
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");

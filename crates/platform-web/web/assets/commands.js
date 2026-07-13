@@ -41,6 +41,36 @@ export const COMMANDS = [
     label: "Handle WebGPU device loss",
     group: "Renderer",
   },
+  {
+    id: "worker",
+    key: "",
+    label: "Worker mode override",
+    group: "Runtime",
+  },
+  {
+    id: "worker:inline",
+    key: "",
+    label: "Inline execution",
+    group: "Runtime",
+  },
+  {
+    id: "worker:workers",
+    key: "",
+    label: "Worker pool",
+    group: "Runtime",
+  },
+  {
+    id: "worker:shared",
+    key: "",
+    label: "Shared-memory worker pool",
+    group: "Runtime",
+  },
+  {
+    id: "worker:cancel-storm",
+    key: "",
+    label: "Cancel superseded worker jobs",
+    group: "Runtime",
+  },
 ];
 
 export const commandById = new Map(COMMANDS.map((command) => [command.id, command]));
