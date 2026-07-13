@@ -109,7 +109,7 @@ use world_runtime::{
 use executor::LaneExecutor;
 use gpumap::AtlasManager;
 use panel::{CursorInfo, EcologyInfo, Hud, OrganismInfo, PanelInfo, VaultInfo};
-use pov::{PovCamera, PovChunkManager, PovCounters};
+use pov::{PovCamera, PovChunkManager, PovCounters, PovToggles};
 use tools::FileStorage;
 use viz::{Channel, MapComposer, MapDecor, Overlays};
 
@@ -781,6 +781,12 @@ struct App {
     pov_look_from: Option<(f64, f64)>,
     /// The previous telemetry second's POV counters, for the delta log line.
     pov_counters_last: PovCounters,
+    /// Live POV diagnostic toggles (`B` baked light, `N` detail normals,
+    /// `V` water) — presentation-only switches for chasing llvmpipe CPU.
+    pov_toggles: PovToggles,
+    /// The POV FPS chip, rebuilt only when the displayed value changes:
+    /// `(rgba, width, height, fps it shows)`.
+    pov_fps_chip: Option<(Vec<u8>, u32, u32, u32)>,
     /// Content hashes of the last uploaded overlay/panel strips, so an
     /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
     overlay_hash: u64,
@@ -867,6 +873,8 @@ impl App {
                 .map_or(3, |r| r.clamp(1, 8)),
             pov_look_from: None,
             pov_counters_last: PovCounters::default(),
+            pov_toggles: PovToggles::default(),
+            pov_fps_chip: None,
             overlay_hash: 0,
             panel_hash: 0,
             keys_down: HashSet::new(),
@@ -1045,15 +1053,36 @@ impl App {
     /// One-shot actions on key press.
     fn handle_press(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
         // The POV keybinding gate (3d-phase-1-plan.md §8.4): in POV only
-        // `Tab`, `F` (walk ↔ fly, 3d-phase-2-plan.md §6.1), `Escape`, and
-        // the `F12` debug dump are handled; every map binding below stays
-        // map-mode-only. This gate is the whole guarantee
-        // that map mode is pixel-identical — no map state can even be touched
-        // from POV (the dump only reads and writes files).
+        // `Tab`, `F` (walk ↔ fly, 3d-phase-2-plan.md §6.1), the `B`/`N`/`V`
+        // diagnostic toggles, `Escape`, and the `F12` debug dump are handled;
+        // every map binding below stays map-mode-only. This gate is the whole
+        // guarantee that map mode is pixel-identical — no map state can even
+        // be touched from POV (the dump only reads and writes files).
         if self.view_mode == ViewMode::Pov {
             match code {
                 KeyCode::Tab => self.toggle_view_mode(),
                 KeyCode::KeyF => self.toggle_walk(),
+                KeyCode::KeyB => {
+                    self.pov_toggles.baked_light = !self.pov_toggles.baked_light;
+                    log::info!(
+                        "pov: baked lighting {} (shader-side; mesh cost unchanged)",
+                        onoff(self.pov_toggles.baked_light)
+                    );
+                }
+                KeyCode::KeyN => {
+                    self.pov_toggles.detail_normals = !self.pov_toggles.detail_normals;
+                    log::info!(
+                        "pov: detail normals {} (per-fragment lattice hashing)",
+                        onoff(self.pov_toggles.detail_normals)
+                    );
+                }
+                KeyCode::KeyV => {
+                    self.pov_toggles.water = !self.pov_toggles.water;
+                    log::info!(
+                        "pov: water passes {} (sea plane + river overlays)",
+                        onoff(self.pov_toggles.water)
+                    );
+                }
                 KeyCode::F12 => self.debug_dump(),
                 KeyCode::Escape => event_loop.exit(),
                 _ => {}
@@ -1664,8 +1693,20 @@ impl App {
                 self.pov_radius,
                 CLEAR_COLOR,
                 time,
+                self.pov_toggles,
             );
-            renderer.render_pov(&params, &uploads, &removes, CLEAR_COLOR);
+            // The corner FPS chip, rebuilt only when the value changes
+            // (the once-per-second telemetry roll updates `self.fps`).
+            let fps = self.fps;
+            if !matches!(&self.pov_fps_chip, Some((_, _, _, shown)) if *shown == fps) {
+                let (rgba, cw, ch) = panel::hud_chip(&format!("{fps:>4} fps"));
+                self.pov_fps_chip = Some((rgba, cw, ch, fps));
+            }
+            let hud = self
+                .pov_fps_chip
+                .as_ref()
+                .map(|(rgba, cw, ch, _)| (rgba.as_slice(), *cw, *ch));
+            renderer.render_pov(&params, &uploads, &removes, CLEAR_COLOR, hud);
         }
         let render_seconds = render_start.elapsed().as_secs_f64();
 
@@ -2097,8 +2138,15 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                 }
                 let aspect = size.0 as f32 / size.1 as f32;
                 // Time-frozen captures (3d-phase-3-plan.md §4.3): two snaps
-                // of the same pose are byte-comparable.
-                let params = pov::frame_params(&camera, aspect, radius, CLEAR_COLOR, 0.0);
+                // of the same pose are byte-comparable; toggles all-on.
+                let params = pov::frame_params(
+                    &camera,
+                    aspect,
+                    radius,
+                    CLEAR_COLOR,
+                    0.0,
+                    pov::PovToggles::default(),
+                );
                 let rgba = cap.snapshot(&params, CLEAR_COLOR);
                 dump::write_ppm(std::path::Path::new(&path), &rgba, size.0, size.1)?;
                 log::info!(
@@ -2116,6 +2164,15 @@ fn run_pov_script(script: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// "on"/"off" for toggle log lines.
+fn onoff(v: bool) -> &'static str {
+    if v {
+        "on"
+    } else {
+        "off"
+    }
 }
 
 /// Build the event loop, preferring X11 over Wayland under WSL.

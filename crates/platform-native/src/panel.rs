@@ -37,6 +37,46 @@ const ACTIVE: [u8; 3] = [255, 200, 90];
 const ALERT: [u8; 3] = [255, 90, 90];
 const KEY: [u8; 3] = [170, 220, 170];
 
+/// Rasterize a small opaque HUD chip (panel palette, scale-2 glyphs) for the
+/// POV mode's corner FPS counter — POV has no panel strip, so this is the
+/// one piece of text it shows. Returns the RGBA8 image and its size; the
+/// renderer blits it pixel-exact, so the chip is built at final size.
+#[must_use]
+pub fn hud_chip(text: &str) -> (Vec<u8>, u32, u32) {
+    let pad = 6usize;
+    let width = text.chars().count() * 8 * SCALE + 2 * pad;
+    let height = 8 * SCALE + 2 * pad;
+    let mut rgba = vec![0u8; width * height * 4];
+    for px in rgba.chunks_exact_mut(4) {
+        px.copy_from_slice(&[BG[0], BG[1], BG[2], 255]);
+    }
+    let mut pen_x = pad;
+    for ch in text.chars() {
+        let glyph = BASIC_LEGACY[if ch.is_ascii() {
+            ch as usize
+        } else {
+            b'?' as usize
+        }];
+        for (gy, row) in glyph.iter().enumerate() {
+            for gx in 0..8usize {
+                if row >> gx & 1 == 0 {
+                    continue;
+                }
+                for sy in 0..SCALE {
+                    for sx in 0..SCALE {
+                        let px = pen_x + gx * SCALE + sx;
+                        let py = pad + gy * SCALE + sy;
+                        let offset = (py * width + px) * 4;
+                        rgba[offset..offset + 3].copy_from_slice(&VALUE);
+                    }
+                }
+            }
+        }
+        pen_x += 8 * SCALE;
+    }
+    (rgba, width as u32, height as u32)
+}
+
 /// Everything the panel shows about the cell under the mouse.
 #[derive(Debug, Clone)]
 pub struct CursorInfo {
@@ -849,6 +889,19 @@ impl PanelCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hud_chip_rasterizes_opaque_text_at_final_size() {
+        let text = " 123 fps";
+        let (rgba, w, h) = hud_chip(text);
+        assert_eq!(w as usize, text.chars().count() * 8 * SCALE + 12);
+        assert_eq!(h as usize, 8 * SCALE + 12);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        // Fully opaque, background-filled, with some glyph pixels lit.
+        assert!(rgba.chunks_exact(4).all(|px| px[3] == 255));
+        assert!(rgba.chunks_exact(4).any(|px| px[..3] == VALUE));
+        assert!(rgba.chunks_exact(4).any(|px| px[..3] == BG));
+    }
 
     fn info<'a>(
         regen: &'a [u64; LAYER_COUNT as usize],

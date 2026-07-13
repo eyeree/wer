@@ -36,6 +36,9 @@ struct PovParams {
     // Water frame state (3d-phase-3-plan.md §4.3), consumed by
     // pov_water.wgsl; declared here so both modules share one uniform layout.
     water: vec4<f32>,
+    // Live diagnostic toggles (1.0/0.0): x = baked sun-visibility/AO,
+    // y = per-fragment detail normals, z/w reserved.
+    toggles: vec4<f32>,
 }
 
 // The chunk's region origin relative to the camera (f64 subtraction on the
@@ -248,19 +251,28 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Detail normals: sum the continued spectrum's apparent-slope gradient
     // and fold it into the interpolated normal (reconstruct the surface
     // gradient, add, renormalize). Shading only — geometry is untouched.
-    var dgrad = vec2<f32>(0.0);
-    for (var k = 0u; k < 3u; k = k + 1u) {
-        let d = params.detail[k];
-        let u = in.local.x * d.z + d.x;
-        let v = in.local.y * d.z + d.y;
-        let base = chunk.detail_base[k];
-        dgrad = dgrad + d.w * detail_noise_grad(base.xy, base.zw, u, v, 5u + k);
+    // Behind the `N` diagnostic toggle: the lattice hashing below is the
+    // heaviest per-fragment work this shader does, which matters on a
+    // software rasterizer (llvmpipe), where fragment cost IS CPU cost.
+    if (params.toggles.y > 0.5) {
+        var dgrad = vec2<f32>(0.0);
+        for (var k = 0u; k < 3u; k = k + 1u) {
+            let d = params.detail[k];
+            let u = in.local.x * d.z + d.x;
+            let v = in.local.y * d.z + d.y;
+            let base = chunk.detail_base[k];
+            dgrad = dgrad + d.w * detail_noise_grad(base.xy, base.zw, u, v, 5u + k);
+        }
+        n = normalize(vec3<f32>(n.x - dgrad.x * n.z, n.y - dgrad.y * n.z, n.z));
     }
-    n = normalize(vec3<f32>(n.x - dgrad.x * n.z, n.y - dgrad.y * n.z, n.z));
     // Baked terms: sun visibility gates the direct term (terrain shadows);
     // ambient occlusion dims the hemisphere fill in gullies and hollows.
-    let sun = SUN_STRENGTH * max(dot(n, -params.sun_dir), 0.0) * in.light.x;
-    let ambient = mix(params.ground_ambient, params.sky_ambient, n.z * 0.5 + 0.5) * in.light.y;
+    // The `B` toggle neutralizes both (their cost is mesh-time, not
+    // per-frame — the toggle answers "how does it look", instantly).
+    let sunvis = mix(1.0, in.light.x, params.toggles.x);
+    let ao = mix(1.0, in.light.y, params.toggles.x);
+    let sun = SUN_STRENGTH * max(dot(n, -params.sun_dir), 0.0) * sunvis;
+    let ambient = mix(params.ground_ambient, params.sky_ambient, n.z * 0.5 + 0.5) * ao;
     // The 3D-3 wet response (3d-phase-3-plan.md §5.2): a specular sun glint
     // gated by wetness and the baked sun visibility. Rivers dominate;
     // wetlands get a weaker version. Albedo is untouched — the color half of
@@ -270,7 +282,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let view = -in.pos / max(in.dist, 1e-3);
     let glint = pow(max(dot(reflect(params.sun_dir, n), view), 0.0), WET_GLINT_POWER);
     let lit = albedo * (vec3<f32>(sun) + ambient)
-        + vec3<f32>(glint * wet * in.light.x * WET_GLINT_STRENGTH);
+        + vec3<f32>(glint * wet * sunvis * WET_GLINT_STRENGTH);
     let fog = smoothstep(params.fog_start, params.fog_end, in.dist);
     return vec4<f32>(mix(lit, params.fog_color, fog), 1.0);
 }

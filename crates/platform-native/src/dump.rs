@@ -230,8 +230,17 @@ impl App {
             }
         }
         let aspect = width as f32 / height.max(1) as f32;
-        // Time-frozen like every capture (3d-phase-3-plan.md §4.3).
-        let params = pov::frame_params(&self.pov_camera, aspect, self.pov_radius, CLEAR_COLOR, 0.0);
+        // Time-frozen like every capture (3d-phase-3-plan.md §4.3), with the
+        // live diagnostic toggles applied so the dump shows what the window
+        // shows.
+        let params = pov::frame_params(
+            &self.pov_camera,
+            aspect,
+            self.pov_radius,
+            CLEAR_COLOR,
+            0.0,
+            self.pov_toggles,
+        );
         let rgba = cap.snapshot(&params, CLEAR_COLOR);
         write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
         Ok(format!(
@@ -386,6 +395,11 @@ impl App {
         }
         writeln!(s, "chunk_radius      : {} regions", self.pov_radius)?;
         writeln!(s, "resident_chunks   : {}", self.pov_chunks.len())?;
+        writeln!(
+            s,
+            "toggles           : baked_light {}, detail_normals {}, water {}",
+            self.pov_toggles.baked_light, self.pov_toggles.detail_normals, self.pov_toggles.water
+        )?;
         if self.view_mode == ViewMode::Map {
             writeln!(
                 s,

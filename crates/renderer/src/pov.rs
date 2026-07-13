@@ -198,6 +198,15 @@ pub struct PovFrameParams {
     /// `SEA_LEVEL − camera.z` in f64 and truncates; the renderer never
     /// learns `SEA_LEVEL` — 3d-phase-3-plan.md §4.1).
     pub water_z: f32,
+    /// Apply the baked per-vertex sun-visibility/AO terms (off = fully lit).
+    /// A live diagnostic toggle; shader-side, so no remesh is needed.
+    pub baked_light: bool,
+    /// Evaluate the per-fragment detail normals (the heaviest fragment work
+    /// on a software rasterizer — 64-bit lattice hashing per octave).
+    pub detail_normals: bool,
+    /// Draw the sea plane and river overlays at all (off skips the blended
+    /// passes entirely — fill-rate diagnostic).
+    pub water: bool,
 }
 
 /// std140-compatible mirror of the WGSL `PovParams`.
@@ -217,6 +226,9 @@ struct PovParamsRaw {
     /// `(time, water_z, wobble anchor frac x, frac y)` — the WGSL `water`
     /// vec4 (3d-phase-3-plan.md §4.3).
     water: [f32; 4],
+    /// `(baked light on, detail normals on, reserved, reserved)` — the WGSL
+    /// `toggles` vec4; 1.0/0.0 flags for the live diagnostic switches.
+    toggles: [f32; 4],
 }
 
 /// std140-compatible mirror of the WGSL `ChunkOffset`, written at a fixed
@@ -707,6 +719,12 @@ impl Pov {
                 frame.camera_pos[0].rem_euclid(WOBBLE_TILE) as f32,
                 frame.camera_pos[1].rem_euclid(WOBBLE_TILE) as f32,
             ],
+            toggles: [
+                f32::from(frame.baked_light),
+                f32::from(frame.detail_normals),
+                0.0,
+                0.0,
+            ],
         };
         queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&raw));
 
@@ -759,6 +777,7 @@ impl Pov {
         view: &wgpu::TextureView,
         draws: &[(u64, u32)],
         clear: [f64; 4],
+        water: bool,
     ) {
         let (depth_view, _, _) = self.depth.as_ref().expect("ensure_depth ran");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -797,6 +816,11 @@ impl Pov {
             pass.set_bind_group(1, &self.chunk_bind_group, &[dynamic_offset]);
             pass.set_vertex_buffer(0, slot.buffer.slice(..));
             pass.draw_indexed(0..self.index_count, 0, 0..1);
+        }
+        // The water passes can be skipped wholesale (the `V` diagnostic
+        // toggle): no blended fill, no wobble — terrain only.
+        if !water {
+            return;
         }
         // River overlays: the same vertex buffers through each chunk's own
         // index list (3d-phase-3-plan.md §6.2). Most chunks have none.
@@ -925,7 +949,8 @@ impl PovCapture {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("pov-capture-frame"),
             });
-        self.pov.draw(&mut encoder, &view, &draws, clear);
+        self.pov
+            .draw(&mut encoder, &view, &draws, clear, frame.water);
 
         // Copy out with the mandatory 256-byte row alignment, then un-pad.
         let padded = (self.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);

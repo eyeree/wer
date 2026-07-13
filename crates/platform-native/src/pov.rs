@@ -34,7 +34,7 @@ use world_runtime::{
 };
 
 use crate::gpumap::AtlasManager;
-use crate::viz::composite_cell_color;
+use crate::viz::{composite_cell_color, pov_sediment_color};
 
 /// Vertex spacing in world units (`REGION_SIZE / POV_MESH_RES` = 4.0).
 const SPACING: f64 = REGION_SIZE / POV_MESH_RES as f64;
@@ -314,6 +314,34 @@ impl Default for PovCamera {
     }
 }
 
+/// Live POV feature toggles — presentation-only diagnostic switches for
+/// chasing llvmpipe (software rasterizer) CPU cost, flipped by POV-mode keys
+/// and defaulted all-on. `baked_light` and `detail_normals` gate shader
+/// terms; `water` skips the sea/overlay draws entirely. Note the baked
+/// terms cost CPU at *mesh* time (the shadow march), so their toggle mostly
+/// answers "how does it look", while `detail_normals` (per-fragment 64-bit
+/// hashing) and `water` (a blended near-fullscreen pass) are the per-frame
+/// suspects on a software rasterizer.
+#[derive(Debug, Clone, Copy)]
+pub struct PovToggles {
+    /// `B`: baked sun-visibility shadows and ambient occlusion.
+    pub baked_light: bool,
+    /// `N`: per-fragment detail normals (the continued terrain spectrum).
+    pub detail_normals: bool,
+    /// `V`: the sea plane and river overlays.
+    pub water: bool,
+}
+
+impl Default for PovToggles {
+    fn default() -> Self {
+        Self {
+            baked_light: true,
+            detail_normals: true,
+            water: true,
+        }
+    }
+}
+
 /// The per-frame renderer parameters for the camera at `radius` regions
 /// (plan §4): fog from `0.55·R` to `0.95·R` with `R = (radius + 0.5) ·
 /// REGION_SIZE`, fog color = the clear color so geometry dissolves into sky,
@@ -332,6 +360,7 @@ pub fn frame_params(
     radius: i32,
     clear: [f64; 4],
     time: f32,
+    toggles: PovToggles,
 ) -> PovFrameParams {
     let reach = (f64::from(radius) + 0.5) * REGION_SIZE;
     let sun = glam::Vec3::from_array(SUN_DIR);
@@ -342,6 +371,9 @@ pub fn frame_params(
         detail: detail_octaves(),
         time,
         water_z: (f64::from(world_core::SEA_LEVEL) - camera.pos.z) as f32,
+        baked_light: toggles.baked_light,
+        detail_normals: toggles.detail_normals,
+        water: toggles.water,
         fog_color: [clear[0] as f32, clear[1] as f32, clear[2] as f32],
         fog_start: (0.55 * reach) as f32,
         fog_end: (0.95 * reach) as f32,
@@ -602,18 +634,33 @@ pub fn mesh_region_chunk_cancellable(
             let (cx, cy) = (nearest_cell(res, lx), nearest_cell(res, ly));
             let biome = Biome::from_id(inputs.biome.get(cx, cy));
             let id = inputs.dominant_ids[usize::from(cy) * usize::from(res) + usize::from(cx)];
-            let rgb = composite_cell_color(e, biome, river, wetness, (id != 0).then_some(id));
+            let submerged = e < world_core::SEA_LEVEL;
+            // Land matches the 2D Composite exactly (3d-phase-1-plan.md
+            // §6.4); the sea floor gets a real sediment ramp instead of the
+            // map's blue depth legend, so the ocean reads as water over sand
+            // rather than blue terrain (`pov_sediment_color`).
+            let rgb = if submerged {
+                pov_sediment_color(e)
+            } else {
+                composite_cell_color(e, biome, river, wetness, (id != 0).then_some(id))
+            };
+            // The zw bytes carry river/wetness for the 3D-3 wet material and
+            // overlay feather (3d-phase-3-plan.md §5.1) — zeroed underwater:
+            // the sea surface owns the specular there, and a submerged wet
+            // glint just blows out through the translucent plane.
             vertices.push(PovVertex {
                 position: [lx as f32, ly as f32, e],
                 normal,
                 color: [rgb[0], rgb[1], rgb[2], 255],
-                // The zw bytes carry river/wetness for the 3D-3 wet material
-                // and overlay feather (3d-phase-3-plan.md §5.1).
                 light: [
                     quantize_light(sunvis[j * POV_GRID + i]),
                     quantize_light(vertex_ao(&occlusion, lx, ly)),
-                    quantize_light(river),
-                    quantize_light(wetness),
+                    if submerged { 0 } else { quantize_light(river) },
+                    if submerged {
+                        0
+                    } else {
+                        quantize_light(wetness)
+                    },
                 ],
             });
             heights.push(e);
@@ -1918,18 +1965,88 @@ mod tests {
     }
 
     #[test]
-    fn frame_params_carry_time_and_the_camera_relative_sea_plane() {
+    fn underwater_vertices_use_sediment_and_drop_wet_bytes() {
+        // 3D-3 follow-up: the sea floor gets a real sediment ramp instead of
+        // the 2D map's blue depth legend, and its river/wetness bytes are
+        // zeroed (the sea surface owns the specular there). Find a settled
+        // coastal region so both branches assert.
+        use crate::viz::pov_sediment_color;
+        let map = settled_map();
+        let mut straddling = None;
+        'search: for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                let coord = RegionCoord::new(dx, dy);
+                if map.cache().get(coord).is_none() || map.terrain_possibility_halo(coord).is_none()
+                {
+                    continue;
+                }
+                let snap = Snapshot::of(&map, coord);
+                let mesh = mesh_region_chunk(&snap.inputs());
+                let wet = mesh.heights.iter().any(|&e| e < world_core::SEA_LEVEL);
+                let dry = mesh.heights.iter().any(|&e| e >= world_core::SEA_LEVEL);
+                if wet && dry {
+                    straddling = Some((snap, mesh));
+                    break 'search;
+                }
+            }
+        }
+        let (snap, mesh) = straddling.expect("a settled coastal region in the fixture window");
+        let mut submerged = 0usize;
+        for j in 0..POV_GRID {
+            for i in 0..POV_GRID {
+                let v = mesh.vertices[j * POV_GRID + i];
+                let e = v.position[2];
+                let (lx, ly) = (i as f64 * SPACING, j as f64 * SPACING);
+                if e < world_core::SEA_LEVEL {
+                    submerged += 1;
+                    let rgb = pov_sediment_color(e);
+                    assert_eq!([v.color[0], v.color[1], v.color[2]], rgb);
+                    assert_eq!(v.light[2], 0, "submerged river byte at ({i}, {j})");
+                    assert_eq!(v.light[3], 0, "submerged wetness byte at ({i}, {j})");
+                } else {
+                    assert_eq!(v.light[2], quantize_light(bilinear(&snap.river, lx, ly)));
+                    assert_eq!(v.light[3], quantize_light(bilinear(&snap.wetness, lx, ly)));
+                }
+            }
+        }
+        assert!(submerged > 0, "the straddling search found underwater land");
+    }
+
+    #[test]
+    fn frame_params_carry_time_sea_plane_and_toggles() {
         // 3d-phase-3-plan.md §9 test 6: water_z = SEA_LEVEL − camera.z in
-        // f64, time passes through verbatim (captures pass 0.0).
+        // f64, time passes through verbatim (captures pass 0.0), and the
+        // diagnostic toggles ride along.
         let mut cam = PovCamera::new();
         cam.pos = glam::DVec3::new(1.0e6, -2.0e6, 137.5);
-        let params = frame_params(&cam, 1.5, 3, [0.1, 0.2, 0.3, 1.0], 7.25);
+        let params = frame_params(
+            &cam,
+            1.5,
+            3,
+            [0.1, 0.2, 0.3, 1.0],
+            7.25,
+            PovToggles::default(),
+        );
         assert_eq!(params.time, 7.25);
         assert_eq!(
             params.water_z,
             (f64::from(world_core::SEA_LEVEL) - 137.5) as f32
         );
-        assert_eq!(frame_params(&cam, 1.5, 3, [0.0; 4], 0.0).time, 0.0);
+        assert!(params.baked_light && params.detail_normals && params.water);
+        let off = frame_params(
+            &cam,
+            1.5,
+            3,
+            [0.0; 4],
+            0.0,
+            PovToggles {
+                baked_light: false,
+                detail_normals: false,
+                water: false,
+            },
+        );
+        assert_eq!(off.time, 0.0);
+        assert!(!off.baked_light && !off.detail_normals && !off.water);
     }
 
     #[test]
