@@ -740,6 +740,11 @@ impl Renderer {
     /// pixel-exact into the top-right corner after the POV pass — the shell's
     /// FPS counter. World-agnostic like every upload: the renderer just
     /// draws the image it is handed.
+    ///
+    /// `pov_scale` (already clamped by the shell, `WER_POV_SCALE`) renders
+    /// the POV pass at a fraction of the surface resolution and stretches it
+    /// up with a linear blit — on a software rasterizer fragment cost is CPU
+    /// cost, so 0.5 cuts the raster bill ~4×. The HUD chip stays full-res.
     pub fn render_pov(
         &mut self,
         frame: &PovFrameParams,
@@ -747,6 +752,7 @@ impl Renderer {
         removes: &[u64],
         clear: [f64; 4],
         hud: Option<(&[u8], u32, u32)>,
+        pov_scale: f32,
     ) -> bool {
         if self.pov.is_none() {
             self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.config.format));
@@ -756,8 +762,13 @@ impl Renderer {
                 pov::INDICES_PER_CHUNK
             );
         }
+        let scaled_active = pov_scale < 1.0;
+        let (rw, rh) = pov::Pov::render_size(self.config.width, self.config.height, pov_scale);
         let pov = self.pov.as_mut().expect("just ensured");
-        pov.ensure_depth(&self.device, self.config.width, self.config.height);
+        pov.ensure_depth(&self.device, rw, rh);
+        if scaled_active {
+            pov.ensure_scaled(&self.device, rw, rh);
+        }
         pov.apply(&self.device, &self.queue, uploads, removes);
         let draws = pov.write_frame(&self.device, &self.queue, frame);
 
@@ -772,13 +783,16 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("wer-frame-pov"),
             });
-        self.pov.as_ref().expect("ensured above").draw(
-            &mut encoder,
-            &view,
-            &draws,
-            clear,
-            frame.water,
-        );
+        {
+            let pov = self.pov.as_ref().expect("ensured above");
+            if scaled_active {
+                let target = pov.scaled_view().expect("ensure_scaled ran");
+                pov.draw(&mut encoder, target, &draws, clear, frame.water);
+                pov.blit_scaled(&mut encoder, &view);
+            } else {
+                pov.draw(&mut encoder, &view, &draws, clear, frame.water);
+            }
+        }
         // The HUD chip: a second tiny pass loading the POV result and
         // blitting the image into the top-right corner, pixel-exact.
         if let Some((rgba, w, h)) = hud {

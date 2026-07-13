@@ -322,6 +322,100 @@ impl<B> ChunkTable<B> {
     }
 }
 
+/// The scaled offscreen color target for `WER_POV_SCALE < 1.0`: the POV
+/// pass rasterizes into this smaller texture and a linear-filtered blit
+/// stretches it onto the surface. On a software rasterizer fragment cost is
+/// CPU cost and scales with pixel count, so half resolution cuts the raster
+/// bill ~4× — the practical llvmpipe knob the shading toggles are not.
+#[derive(Debug)]
+pub(crate) struct ScaledTarget {
+    pub(crate) view: wgpu::TextureView,
+    pub(crate) bind_group: wgpu::BindGroup,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// The upscale blit for [`ScaledTarget`]: the debug-map fullscreen-triangle
+/// shader over a **linear** sampler (the debug-map path samples nearest;
+/// an upscale wants smoothing).
+#[derive(Debug)]
+pub(crate) struct UpscaleBlit {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl UpscaleBlit {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pov-upscale-shader"),
+            source: wgpu::ShaderSource::Wgsl(crate::SHADER_DEBUG_MAP.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pov-upscale-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pov-upscale-layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pov-upscale-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pov-upscale-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Self {
+            pipeline,
+            layout,
+            sampler,
+        }
+    }
+}
+
 /// GPU state for the POV pass: pipeline, depth target, frame + per-chunk
 /// uniforms, the shared index buffer, and the pooled chunk table.
 #[derive(Debug)]
@@ -347,6 +441,13 @@ pub(crate) struct Pov {
     table: ChunkTable<wgpu::Buffer>,
     /// `(view, width, height)`; recreated when the surface size changes.
     depth: Option<(wgpu::TextureView, u32, u32)>,
+    /// The linear-filtered upscale blit for reduced-resolution rendering.
+    upscale: UpscaleBlit,
+    /// The scaled offscreen color target (`WER_POV_SCALE < 1.0`); `None`
+    /// at full resolution. Recreated when the target size changes.
+    scaled: Option<ScaledTarget>,
+    /// Surface format, for recreating the scaled target.
+    format: wgpu::TextureFormat,
 }
 
 /// Vertex buffer byte size (fixed for every chunk — the pool invariant).
@@ -581,7 +682,100 @@ impl Pov {
             index_count: indices.len() as u32,
             table: ChunkTable::default(),
             depth: None,
+            upscale: UpscaleBlit::new(device, format),
+            scaled: None,
+            format,
         }
+    }
+
+    /// The POV pass's render size for a surface of `width`×`height` at
+    /// `scale` (clamped by the shell): the scaled offscreen size, or the
+    /// surface itself at scale 1.
+    pub(crate) fn render_size(width: u32, height: u32, scale: f32) -> (u32, u32) {
+        if scale >= 1.0 {
+            (width, height)
+        } else {
+            (
+                ((width as f32 * scale).round() as u32).max(1),
+                ((height as f32 * scale).round() as u32).max(1),
+            )
+        }
+    }
+
+    /// (Re)create the scaled offscreen target when reduced-resolution
+    /// rendering is active and the size changed. Returns whether the scaled
+    /// path is active.
+    pub(crate) fn ensure_scaled(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if matches!(&self.scaled, Some(t) if t.width == width && t.height == height) {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pov-scaled-color"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pov-scaled-bind-group"),
+            layout: &self.upscale.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.upscale.sampler),
+                },
+            ],
+        });
+        self.scaled = Some(ScaledTarget {
+            view,
+            bind_group,
+            width,
+            height,
+        });
+    }
+
+    /// The scaled offscreen target's view, when reduced-resolution rendering
+    /// is active ([`Self::ensure_scaled`] ran this frame).
+    pub(crate) fn scaled_view(&self) -> Option<&wgpu::TextureView> {
+        self.scaled.as_ref().map(|t| &t.view)
+    }
+
+    /// Record the upscale blit: stretch the scaled offscreen target over the
+    /// full surface with linear filtering.
+    pub(crate) fn blit_scaled(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        let scaled = self.scaled.as_ref().expect("ensure_scaled ran");
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("pov-upscale"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    // The blit covers every pixel; Load value is irrelevant.
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.upscale.pipeline);
+        pass.set_bind_group(0, &scaled.bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     fn chunk_uniform_for(
@@ -940,6 +1134,26 @@ impl PovCapture {
     /// row-major, `width × height × 4`) — for writing an image file.
     #[must_use]
     pub fn snapshot(&mut self, frame: &PovFrameParams, clear: [f64; 4]) -> Vec<u8> {
+        self.snapshot_at_scale(frame, clear, 1.0)
+    }
+
+    /// [`Self::snapshot`] through the reduced-resolution path (`WER_POV_SCALE`):
+    /// rasterize at `scale`, upscale-blit to the full-size capture — the same
+    /// flow the live `render_pov` runs, so a scaled frame can be inspected
+    /// headlessly.
+    #[must_use]
+    pub fn snapshot_at_scale(
+        &mut self,
+        frame: &PovFrameParams,
+        clear: [f64; 4],
+        scale: f32,
+    ) -> Vec<u8> {
+        let scaled_active = scale < 1.0;
+        let (rw, rh) = Pov::render_size(self.width, self.height, scale);
+        self.pov.ensure_depth(&self.device, rw, rh);
+        if scaled_active {
+            self.pov.ensure_scaled(&self.device, rw, rh);
+        }
         let draws = self.pov.write_frame(&self.device, &self.queue, frame);
         let view = self
             .color
@@ -949,8 +1163,15 @@ impl PovCapture {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("pov-capture-frame"),
             });
-        self.pov
-            .draw(&mut encoder, &view, &draws, clear, frame.water);
+        if scaled_active {
+            let target = self.pov.scaled_view().expect("ensure_scaled ran");
+            self.pov
+                .draw(&mut encoder, target, &draws, clear, frame.water);
+            self.pov.blit_scaled(&mut encoder, &view);
+        } else {
+            self.pov
+                .draw(&mut encoder, &view, &draws, clear, frame.water);
+        }
 
         // Copy out with the mandatory 256-byte row alignment, then un-pad.
         let padded = (self.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
