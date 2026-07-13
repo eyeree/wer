@@ -350,6 +350,10 @@ struct WebAppState {
     cancellations: u32,
     stale_results: u32,
     storage: &'static str,
+    pending_writes: u32,
+    storage_failures: u32,
+    record_count: u32,
+    session_snapshot: Option<String>,
     renderer: &'static str,
     compose_enabled: bool,
     refinement_enabled: bool,
@@ -374,6 +378,10 @@ impl Default for WebAppState {
             cancellations: 0,
             stale_results: 0,
             storage: "memory",
+            pending_writes: 0,
+            storage_failures: 0,
+            record_count: 0,
+            session_snapshot: None,
             renderer: "cpu-fallback",
             compose_enabled: true,
             refinement_enabled: false,
@@ -462,6 +470,24 @@ impl WebAppState {
             self.worker_backlog = 0;
             self.cancellations = self.cancellations.saturating_add(8);
             self.stale_results = self.stale_results.saturating_add(3);
+        } else if command.contains("storage:enable") {
+            self.storage = "indexeddb";
+        } else if command.contains("storage:disable") {
+            self.storage = "memory";
+        } else if command.contains("storage:save") {
+            self.pending_writes = self.pending_writes.saturating_add(1);
+            self.record_count = self.record_count.saturating_add(1);
+            self.session_snapshot = Some(self.snapshot_json());
+            self.pending_writes = self.pending_writes.saturating_sub(1);
+        } else if command.contains("storage:reload") {
+            if self.session_snapshot.is_none() {
+                self.storage_failures = self.storage_failures.saturating_add(1);
+            }
+        } else if command.contains("storage:reset") {
+            self.record_count = 0;
+            self.session_snapshot = None;
+        } else if command.contains("storage:import") {
+            self.record_count = self.record_count.saturating_add(1);
         } else if command.contains("\"tier\":\"mid\"") || command.contains("\"value\":\"mid\"") {
             self.tier = "WebMid";
         } else if command.contains("\"tier\":\"high\"") || command.contains("\"value\":\"high\"") {
@@ -499,7 +525,7 @@ impl WebAppState {
                 "\"active_channel\":{},",
                 "\"cache\":{{\"regions\":1,\"bytes\":0}},",
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
-                "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":0,\"failures\":0}},",
+                "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
                 "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
                 "\"tier\":\"{}\",",
                 "\"settle_hash\":\"{:#018x}\",",
@@ -522,6 +548,9 @@ impl WebAppState {
             self.cancellations,
             self.stale_results,
             self.storage,
+            self.pending_writes,
+            self.storage_failures,
+            self.record_count,
             self.renderer,
             self.compose_enabled,
             self.refinement_enabled,
@@ -883,5 +912,20 @@ mod tests {
         assert!(snapshot.contains("\"mode\":\"shared-memory\""));
         assert!(snapshot.contains("\"cancellations\":8"));
         assert!(snapshot.contains("\"stale_results\":3"));
+    }
+
+    #[test]
+    fn storage_save_reload_preserves_settle_hash() {
+        let mut app = super::WebAppState::default();
+        app.update(16.0, "{\"move_x\":1}");
+        let before = app.settle_hash();
+        app.apply_command("storage:enable");
+        app.apply_command("storage:save");
+        app.apply_command("storage:reload");
+        let snapshot = app.snapshot_json();
+        assert_eq!(before, app.settle_hash());
+        assert!(snapshot.contains("\"mode\":\"indexeddb\""));
+        assert!(snapshot.contains("\"records\":1"));
+        assert!(snapshot.contains("\"failures\":0"));
     }
 }

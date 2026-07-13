@@ -39,6 +39,13 @@
           <tr data-help-command="worker:workers"><td>Worker pool</td><td>none</td><td>Worker mode override</td></tr>
           <tr data-help-command="worker:shared"><td>Shared-memory worker pool</td><td>none</td><td>Cross-origin isolated optimization</td></tr>
           <tr data-help-command="worker:cancel-storm"><td>Cancel superseded worker jobs</td><td>none</td><td>Automatic queue drain</td></tr>
+          <tr data-help-command="storage:enable"><td>Enable IndexedDB storage</td><td>none</td><td>Automatic storage detection</td></tr>
+          <tr data-help-command="storage:disable"><td>Disable browser storage</td><td>none</td><td>Reduced storage mode</td></tr>
+          <tr data-help-command="storage:save"><td>Save session</td><td>none</td><td>Save button</td></tr>
+          <tr data-help-command="storage:reload"><td>Reload session</td><td>none</td><td>Reload recovery</td></tr>
+          <tr data-help-command="storage:export"><td>Export atlas bundle</td><td>none</td><td>Export button</td></tr>
+          <tr data-help-command="storage:import"><td>Import atlas bundle</td><td>none</td><td>Import button</td></tr>
+          <tr data-help-command="storage:reset"><td>Reset local vault</td><td>none</td><td>Reset button</td></tr>
         </tbody>
       </table>
       <h2>Feature Tiers</h2>
@@ -49,9 +56,9 @@
       </p>
       <h2>Storage</h2>
       <p>
-        This milestone reports memory storage. IndexedDB vault persistence,
-        import, export, reset, and reload recovery are Phase 7 storage
-        milestones.
+        IndexedDB is used when the browser allows it. The app stores sparse
+        vault/session records only, never generated terrain, organisms, or
+        renderer output. Export/import remains file based and server-free.
       </p>
       <h2>Browser Requirements</h2>
       <p>

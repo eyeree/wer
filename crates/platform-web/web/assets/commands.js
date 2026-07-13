@@ -71,6 +71,48 @@ export const COMMANDS = [
     label: "Cancel superseded worker jobs",
     group: "Runtime",
   },
+  {
+    id: "storage:enable",
+    key: "",
+    label: "Enable IndexedDB storage",
+    group: "Storage",
+  },
+  {
+    id: "storage:disable",
+    key: "",
+    label: "Disable browser storage",
+    group: "Storage",
+  },
+  {
+    id: "storage:save",
+    key: "",
+    label: "Save session",
+    group: "Storage",
+  },
+  {
+    id: "storage:reload",
+    key: "",
+    label: "Reload session",
+    group: "Storage",
+  },
+  {
+    id: "storage:export",
+    key: "",
+    label: "Export atlas bundle",
+    group: "Storage",
+  },
+  {
+    id: "storage:import",
+    key: "",
+    label: "Import atlas bundle",
+    group: "Storage",
+  },
+  {
+    id: "storage:reset",
+    key: "",
+    label: "Reset local vault",
+    group: "Storage",
+  },
 ];
 
 export const commandById = new Map(COMMANDS.map((command) => [command.id, command]));

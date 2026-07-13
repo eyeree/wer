@@ -1,10 +1,12 @@
 import { commandById } from "./commands.js";
+import { exportSnapshot, openVault } from "./storage.js";
 
 const fields = new Map(
   Array.from(document.querySelectorAll("[data-field]"), (node) => [node.dataset.field, node]),
 );
 
 let workerProbe;
+let lastSnapshot;
 
 const write = (name, value, cls) => {
   const node = fields.get(name);
@@ -107,6 +109,12 @@ const initWorkerProbe = () => {
   workerProbe.postMessage({ kind: "ping", mode: "workers" });
 };
 
+const initStorage = async () => {
+  const state = await openVault();
+  appendDiagnostic(`storage:${state.mode}`);
+  if (state.available) dispatchCommand("storage:enable");
+};
+
 const renderMap = () => {
   const app = window.__werApp;
   if (!app) return;
@@ -114,6 +122,7 @@ const renderMap = () => {
 };
 
 const updateSnapshot = (snapshot) => {
+  lastSnapshot = snapshot;
   write("region", `${snapshot.region[0]}, ${snapshot.region[1]}`);
   write("tier", snapshot.tier);
   write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
@@ -150,6 +159,16 @@ for (const control of document.querySelectorAll("[data-command]")) {
   });
 }
 
+const exportButton = document.querySelector('[data-command="storage:export"]');
+if (exportButton) {
+  exportButton.addEventListener("click", () => {
+    if (!lastSnapshot) return;
+    const href = exportSnapshot(lastSnapshot);
+    appendDiagnostic(`export:${href.slice(0, 16)}`);
+    URL.revokeObjectURL(href);
+  });
+}
+
 window.addEventListener("keydown", (event) => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
     return;
@@ -176,3 +195,4 @@ drawBootCanvas();
 probeWebGpu();
 initWorkerProbe();
 await initWasm();
+await initStorage();
