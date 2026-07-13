@@ -27,3 +27,4 @@ node_modules
 *.swp
 
 wer-vault/
+.worktrees/
