@@ -1305,13 +1305,12 @@ impl RegionMap {
         }
     }
 
-    /// Restore one region from a session snapshot (phase-5-plan.md §12.2):
-    /// bit-exact `current`, stability, and revision, target = current (the
-    /// next field admission recomputes it from the live inputs). Restored
-    /// authority begins parked; admission later dirties every layer so caches,
-    /// rosters, and organisms re-derive deterministically from the restored
-    /// possibility state (ADRs 0008 and 0023). Loading is not an event: nothing
-    /// converges and no target moves beyond what the live run would compute.
+    /// Restore one region from a session snapshot: bit-exact `current`,
+    /// bit-exact target, stability, and revision. Restored authority begins
+    /// parked; admission later dirties every layer so caches, rosters, and
+    /// organisms re-derive deterministically from the restored possibility
+    /// state (ADRs 0008 and 0023). Session metadata says whether exact
+    /// continuation is being attempted under matching runtime inputs.
     pub fn restore_region(&mut self, snap: &world_core::RegionSnapshotRecord) {
         let old_pair = self.effective_terrain_pair(snap.coord);
         if self.regions.contains_key(&snap.coord) {
@@ -1321,7 +1320,7 @@ impl RegionMap {
         }
         let mut region = RegionState::new(snap.coord);
         region.current = PossibilityVector { dims: snap.current };
-        region.target = region.current;
+        region.target = PossibilityVector { dims: snap.target };
         region.stability = snap.stability;
         region.revision = snap.revision;
         region.dirty_layers = 0;
@@ -3307,16 +3306,26 @@ mod preserve_tests {
         let snapshot = world_core::RegionSnapshotRecord {
             coord: coord(),
             current: snapshot_current.dims,
+            target: snapshot_current.dims,
             stability: 0.25,
             revision: 41,
         };
         let session = world_core::SessionSnapshot {
+            runtime: crate::vault::session_runtime_record(
+                map.config(),
+                &Budget::unlimited(),
+                None,
+                false,
+                false,
+            ),
             player: PLAYER,
             last_player: PLAYER,
             bias: NO_BIAS,
             transition_mode: false,
             anchors: Vec::new(),
             regions: vec![snapshot],
+            recorder: None,
+            tracker: world_core::RouteTrackerSnapshot::default(),
             sequence: 1,
         };
         crate::vault::apply_session_regions(&mut map, &session);
@@ -3604,7 +3613,23 @@ mod preserve_tests {
 
         let mut vault = Vault::open(MemoryStorage::new()).expect("memory vault");
         vault
-            .snapshot_session(&map, PLAYER, PLAYER, &NO_BIAS, false, &[])
+            .snapshot_session(crate::vault::SessionSnapshotInput {
+                map: &map,
+                player: PLAYER,
+                last_player: PLAYER,
+                bias: &NO_BIAS,
+                transition_mode: false,
+                anchors: &[],
+                runtime: crate::vault::session_runtime_record(
+                    map.config(),
+                    &Budget::unlimited(),
+                    None,
+                    false,
+                    false,
+                ),
+                recorder: None,
+                tracker: world_core::RouteTrackerSnapshot::default(),
+            })
             .expect("session sequence");
         let session = vault.session().expect("session").clone();
         assert_eq!(session.regions.len(), 1);
@@ -5701,6 +5726,11 @@ mod recovery_tests {
         let restored = world_core::RegionSnapshotRecord {
             coord: source,
             current: PossibilitySignature {
+                buckets: [1_900; POSSIBILITY_DIMS],
+            }
+            .dequantize()
+            .dims,
+            target: PossibilitySignature {
                 buckets: [1_900; POSSIBILITY_DIMS],
             }
             .dequantize()

@@ -5,8 +5,8 @@
 //! round trip.
 
 use world_core::{
-    anchor_influence_profile, attraction_anchors, PossibilityField, RegionCoord, POSSIBILITY_DIMS,
-    REGION_SIZE, ROUTE_PULL_CAP,
+    anchor_influence_profile, attraction_anchors, encode_record, PossibilityField, RecordKind,
+    RegionCoord, POSSIBILITY_DIMS, REGION_SIZE, ROUTE_PULL_CAP,
 };
 use world_runtime::{
     Budget, InlineExecutor, MemoryStorage, RegionMap, RouteRecorder, StreamConfig, Vault,
@@ -52,20 +52,27 @@ fn a_recorded_route_persists_and_attracts_softly_within_its_corridor() {
         recorder.observe(&map, player, 100.0, &[], stats.resonance_strength);
     }
     let (nodes, discoveries) = recorder.finish();
-    assert!(
-        nodes.len() >= 10,
-        "24 × 100 units at 192-unit spacing must sample well over 10 nodes, got {}",
-        nodes.len()
+    assert_eq!(
+        nodes.len(),
+        13,
+        "initial node plus every crossed 192-unit interval over 2400 units"
     );
+    assert_eq!(nodes[0].distance_q, 0);
+    for node in &nodes[1..] {
+        assert_eq!(node.distance_q, 192);
+        assert!(node.current_signature.is_some());
+    }
 
     // Persist it and reopen — the record survives, difficulty is defined.
     let mut vault = Vault::open(MemoryStorage::new()).unwrap();
     let id = vault
         .record_route(nodes, discoveries, "trek".into())
         .unwrap();
+    let encoded_before = encode_record(RecordKind::Route, &vault.routes()[&id]);
     vault.flush_all().unwrap();
     let mut vault = Vault::open(vault.store().clone()).unwrap();
     let route = vault.routes()[&id].clone();
+    assert_eq!(encode_record(RecordKind::Route, &route), encoded_before);
     let difficulty = world_core::route_difficulty(&route.nodes);
     assert!((0.0..=1.0).contains(&difficulty));
 

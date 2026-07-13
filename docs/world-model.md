@@ -577,16 +577,18 @@ usage selects `max`, and seen bitmaps use bitwise union. These operations are
 commutative, associative, and idempotent for non-colliding ids.
 
 The session tier is deliberately different. It stores the exact IEEE float
-bits for player state, anchors, and every authoritative resident region's
-realized vector, stability, and revision, parked residents included. It is
-local to one run/platform, is never included in an atlas bundle, and restores
-those regions parked before live admission re-derives their targets and tiles.
-An exact save→load→settle comparison requires canonical near state to be
-complete at save and zero travel after load until
+bits for player state, anchors, active route-recorder state, active route-
+tracker leg state, runtime metadata, and every authoritative resident region's
+realized `current`, steered `target`, stability, and revision, parked residents
+included. It is local to one run/platform, is never included in an atlas
+bundle, and restores those regions parked before live admission re-derives
+tiles. An exact save→load→settle comparison requires matching metadata,
+canonical near state to be complete at save, and zero travel after load until
 `authoritative_realization_complete`. Otherwise authoritative regional history
-is still restored exactly, but transient gameplay availability rebuilds one
-ready near region per update because the session does not persist organism
-vectors or bypass the fixed scheduler.
+is still restored, but transient gameplay availability rebuilds one ready near
+region per update because the session does not persist executor queues,
+in-flight jobs, caches, rosters, organism vectors, or bypass the fixed
+scheduler.
 
 ### 2.9 Three grades of determinism
 
@@ -679,12 +681,12 @@ There are two independent version axes:
 
 * `WORLD_ALGORITHM_VERSION = 2` changes the identity of the generated base
   world; and
-* `RECORD_FORMAT_VERSION = 1` changes the serialized record schema.
+* `RECORD_FORMAT_VERSION = 2` changes the serialized record schema.
 
-Each generation layer also has an `algorithm_revision`, currently zero for all
-nine layers. A local algorithm revision invalidates only that layer and its
-dependents, whereas changing the world version invalidates the entire generated
-contract.
+Each generation layer also has an `algorithm_revision`: Terrain and Drainage
+are currently at 1 after A.8, and the other layers remain at 0. A local
+algorithm revision invalidates only that layer and its dependents, whereas
+changing the world version invalidates the entire generated contract.
 
 The central data-structure choice is ordered maps. Region state, tiles, macro
 tiles, rosters, organisms, records, and in-flight jobs are keyed in `BTreeMap`s
@@ -715,8 +717,9 @@ authority exists with no admitted field working set; `Generating` and `Ready`
 are field-active. A newly created ordinary authority computes its target and
 sets `current = target`. Capacity reactivation instead retains `current` and
 revision, recomputes target and geometry, marks every layer dirty, and rebuilds
-derived fields. A restored session region recovers exact `current`, stability,
-and revision as parked authority and follows that same live admission path.
+derived fields. A restored session region recovers exact `current`, `target`,
+stability, and revision as parked authority and follows that same live
+admission path.
 
 ### 3.3 Anchors and trait capture
 
@@ -894,34 +897,45 @@ banking delayed change.
 
 ### 3.7 Routes through physical and possibility space
 
-A [`RouteRecorder`](crates/world-runtime/src/route.rs) samples a journey after
-each accumulated 192 world units, up to 1024 nodes. The first node is immediate.
-Each node stores:
+A [`RouteRecorder`](crates/world-runtime/src/route.rs) samples a journey at
+every crossed 192-world-unit interval, up to 1024 nodes, carrying any remainder
+into the next frame. The first node is immediate. Later nodes are interpolated
+between the recorder's previous and current player positions in travel order;
+if the due sample's covering region is not resident, the recorder keeps that
+interval due and retries instead of moving later samples earlier. Each v2 node
+stores:
 
 * position rounded to integer world units;
-* the covering region's quantized *target* vector;
+* the covering region's quantized aspirational *target* vector;
+* the covering region's quantized visible `current` vector, with `None` only
+  for migrated v1 records that did not encode it;
 * transition cost `floor(255 * (1 - resonance))`;
-* stability in an 8-bit band; and
-* a canonical multiset signature of the effective anchors.
+* stability in an 8-bit band;
+* a canonical multiset signature of the effective anchors; and
+* rounded segment distance since the previous node, with zero for the first
+  node and migrated v1 nodes.
 
 Transition cost uses the canonical `FrameStats::resonance_strength` from the
-immediately preceding map update. Higher visual organism slots therefore do
-not change route nodes, content ids, or encoded shared bytes.
+immediately preceding map update. If one frame emits several interval samples,
+all of them use that frame-level resonance and effective-anchor set; recomputing
+per-interpolated-position resonance is outside the current model. Higher visual
+organism slots therefore do not change route nodes, content ids, or encoded
+shared bytes.
 
 The anchor summary folds cardinality and the complete raw-bit steering key for
 every occurrence, retaining duplicates and excluding source/unmasked target
 metadata. It covers the exact effective slice used by the immediately
 preceding map update: the player's explicit anchors plus any selected route-
 derived anchors when attraction is active. Route records also contain
-discovery ids, a usage count, name, and journal. Difficulty is the arithmetic
-mean of node costs divided by 255.
+discovery ids, a usage count, name, and journal. Difficulty is distance-
+weighted by `distance_q` for v2 records; migrated v1 records without distance
+metadata keep the old arithmetic mean of node costs divided by 255.
 
 The stored target is not necessarily the world then visible to the player.
-Near regions can remain pinned at `current` while their target retargets, so a
-node may pair an aspirational possibility signature with a cost measured from
-the currently realized ecology. Recording while old-route attraction is active
-includes that attraction in both the resulting target and the node's anchor
-summary.
+Near regions can remain pinned at `current` while their target retargets, so v2
+records encode both the aspirational possibility signature and the visible
+current signature. Recording while old-route attraction is active includes that
+attraction in both the resulting target and the node's anchor summary.
 
 When route attraction is enabled, nodes from every route in the open vault that
 lie within 768 world units become derived Emphasize anchors. They affect
@@ -955,7 +969,9 @@ anchors (ADR 0026).
 [`RouteTracker`](crates/world-runtime/src/route.rs) treats one continuous stay
 inside a route corridor as a leg. On corridor exit, the leg increments usage if
 it visited at least 60% of the route's distinct nodes. Firing on exit debounces
-camping or lingering.
+camping or lingering. Active leg state is part of the run-local session tier
+when path tracking is enabled, but traversal remains unordered proximity, not
+ordered segment progress.
 
 `RouteGraph` is a rebuilt read-only view over all record nodes. A query scans
 every node, computes Manhattan distance in the eight 12-bit possibility
@@ -1612,20 +1628,24 @@ Envelope { format_version, world_version, record_kind }
 ```
 
 and both envelope and body use `serde` plus `postcard`. Readers reject a newer
-format, a wrong kind, corrupt data, and trailing bytes. The schema has a
-migration hook but no older version yet exists.
+format, a wrong kind, corrupt data, and trailing bytes. Version 1 route and
+session bodies migrate explicitly into the v2 in-memory shape: legacy route
+nodes have unknown visible-current signatures and zero segment distance, while
+legacy session region targets are labelled as target-equals-current.
 
 The record types are:
 
 * `DiscoveryRecord`: source, habitat-signature seed, target signature, mask,
   polarity, quantized strength, integer radius and position, mutable name and
   journal;
-* `RouteRecord`: ordered quantized nodes, discovery references, usage, mutable
-  name and journal;
+* `RouteRecord`: ordered quantized nodes carrying target signature, optional
+  visible-current signature, segment distance, discovery references, usage,
+  mutable name and journal;
 * `PreserveRecord`: coordinate-sorted region/signature pairs plus metadata;
 * `SeenRecord`: a four-word bitmap for one 16 by 16 region chunk;
-* `SessionSnapshot`: exact player state, anchors, and authoritative resident
-  region states, parked entries included;
+* `SessionSnapshot`: runtime metadata, exact player state, anchors,
+  authoritative resident `current` and `target` region states, active route
+  recorder state, and active route-tracker leg state, parked entries included;
   and
 * `AtlasBundle`: discoveries, routes, and preserves sorted by id.
 
@@ -1640,8 +1660,20 @@ the resident without snapping it back.
 Content ids exclude mutable names, journals, sequence counters, and route
 usage. Discovery ids include every quantized steering field and position;
 route ids include ordered nodes and discovery references; preserve ids include
-the sorted coordinate/signature list. The merge rank for mutable text is the
+the sorted coordinate/signature list. Migrated v1 routes whose nodes all have
+unknown current signatures and zero distance preserve the v1 node fold and
+therefore their legacy ids. New v2 route ids cover current-signature presence
+and value plus segment distance. The merge rank for mutable text is the
 lexicographic maximum of store-local sequence and a deterministic content hash.
+
+Session metadata records the world/record versions through the envelope plus
+the effective streaming config, frame budget, resource-tier label when known,
+path-tracking toggle, route-attraction toggle, cache ceilings, and organism
+density knob. Compatibility checks distinguish exact-compatible, compatible
+but not exact, and incompatible loads. Executor queues, in-flight generation
+jobs, disposable caches, rosters, realized organism vectors, renderer state,
+and GPU resources are not persisted; exactness resumes after the documented
+zero-travel settle under matching metadata, not by replaying worker queues.
 
 ### 3.22 Vault and storage
 
@@ -2125,10 +2157,15 @@ into one implementation unit.
     retry deterministically. Fairness, bounded queues, and proactive removal of
     cancelled queued closures remain future backpressure work.
 
-12. **State and encode the truth of snapshots and route samples** (findings 22
-    and 29). Persist the configuration required for exact session restoration,
-    distinguish a route's aspirational target from visible `current` state, and
-    sample every crossed route interval without discarding travel remainder.
+12. **Completed: State and encode the truth of snapshots and route samples**
+    ([Improvement A.12](plans/prototype/improvement_A_12_snapshot_route_truth.md);
+    findings 22 and 29). Record format v2 stores session runtime metadata,
+    resident targets, active recorder state, and active tracker legs; load
+    paths compare metadata before claiming exact continuation. Route nodes now
+    distinguish target from visible current, carry segment distance, and
+    sample every crossed interval with retained remainder. Migrated v1 records
+    remain readable with explicit unknown-current/zero-distance semantics.
+    Ordered route traversal remains a separate roadmap concern.
 
 13. **Expand the verification surface alongside these fixes** (finding 33).
     Add frame-slicing, all-cache-ceiling, cross-tier persistence, full settled
@@ -2634,24 +2671,32 @@ explicit-plus-selected-route vector alive through `RouteRecorder::observe`.
 Field-sensitivity/multiplicity tests and a real native update/recording gate
 prove the summary matches the inputs that produced target and resonance.
 
-#### 22. Route recording and traversal depend on frame sampling
+#### 22. Partly resolved: route recording now states sample truth
 
-A frame that crosses several 192-unit intervals emits at most one node, resets
-accumulated travel to zero, and discards overshoot. Record exact previous
-position, carry the remainder, and interpolate every crossed sample up to the
-node cap.
+**Status:** Recording/sample truth resolved by
+[Improvement A.12](plans/prototype/improvement_A_12_snapshot_route_truth.md);
+ordered traversal semantics remain open.
 
-The node's possibility signature is the covering region's target, while its
-difficulty is measured from the currently realized resonance. In a pinned near
-region these can describe an unseen aspiration and the visible world
-respectively. That is defensible as a route through possibility space, but the
-schema and user-facing language should state the distinction explicitly.
+Previously, a frame that crossed several 192-unit intervals emitted at most one
+node, reset accumulated travel to zero, and discarded overshoot. The node's
+possibility signature was the covering region's target, while difficulty was
+measured from currently realized resonance; in pinned near regions those can
+describe an unseen aspiration and the visible world respectively.
 
-Traversal requires 60% of nodes in one broad corridor leg but not ordered
+RouteRecorder now stores its previous observed position, carries distance
+remainder, interpolates every crossed interval up to the node cap, and leaves a
+missing due interval pending until its covering authority is resident. V2 route
+nodes encode target signature, optional visible-current signature, segment
+distance, stability, cost, position, and anchor-set signature. New records set
+current signature and nonzero distance for non-initial interval nodes; migrated
+v1 nodes explicitly carry unknown current and zero distance while preserving
+legacy ids. Route difficulty is distance-weighted when distance metadata
+exists and keeps the v1 arithmetic mean fallback otherwise.
+
+Traversal still requires 60% of nodes in one broad corridor leg but not ordered
 progress, direction, or continuous path coverage; clustered nodes can be
 credited together. Track route-segment progress if usage is meant to represent
-following an expedition. Route difficulty should then be distance-weighted
-rather than an unweighted mean of frame-dependent nodes.
+following an expedition.
 
 #### 23. Route queries and per-frame scans do not scale with an atlas
 
@@ -2786,14 +2831,24 @@ exercise the ordering, bounded-reporting, retry, deletion, and sequence
 contracts. This does not add CRDT tombstones or resolve the synchronous eager
 interface/browser backend limitation in finding 27.
 
-#### 29. Session exactness has narrower preconditions than its headline
+#### 29. Resolved: session exactness preconditions are encoded
 
-The snapshot omits resource tier/configuration, target vectors, unfinished
-route recording, route-tracker leg state, executor queue state, and caches.
-Exact restoration is demonstrated for the same algorithm, field,
-configuration, platform, anchors, and scripted follow-up—not arbitrary builds
-or hardware modes. Encode those preconditions in metadata or narrow the stated
-contract.
+**Status:** Resolved by
+[Improvement A.12](plans/prototype/improvement_A_12_snapshot_route_truth.md).
+
+Previously, the snapshot omitted resource tier/configuration, target vectors,
+unfinished route recording, route-tracker leg state, executor queue state, and
+caches. Exact restoration was demonstrated for the same algorithm, field,
+configuration, platform, anchors, and scripted follow-up, not arbitrary builds
+or hardware modes.
+
+SessionSnapshot now records runtime metadata, resident `current` and `target`
+vectors, active recorder state, and active tracker leg state. Load paths
+compare metadata before claiming exact continuation. Executor queues,
+in-flight jobs, disposable caches, rosters, realized organism vectors, renderer
+state, and GPU resources remain outside persistence by design; exactness means
+save, load, then zero-travel settle under matching metadata, not replaying
+transient worker or presentation state.
 
 ### 4.4 Scheduling, portability, and verification gaps
 

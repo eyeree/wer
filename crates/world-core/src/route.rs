@@ -61,14 +61,27 @@ pub fn route_pull(usage: u32) -> f32 {
     ROUTE_PULL_CAP * (0.35 + 0.65 * (u / (u + ROUTE_PULL_HALF_USAGE)))
 }
 
-/// A route's difficulty, `0..=1`: the mean recorded transition cost of its
-/// nodes. Cost was banded from `1 − resonance` at record time, so difficulty
-/// falls out of the world model — a route through barren, low-resonance
-/// ground is hard; one through dense living ground is easy (section 13).
+/// A route's difficulty, `0..=1`: for v2 nodes, the distance-weighted recorded
+/// transition cost; for migrated v1 nodes with no distance metadata, the
+/// original arithmetic mean fallback. Cost was banded from `1 − resonance` at
+/// record time, so difficulty falls out of the world model.
 #[must_use]
 pub fn route_difficulty(nodes: &[RouteNode]) -> f32 {
     if nodes.is_empty() {
         return 0.0;
+    }
+    let (weighted_sum, total_distance) =
+        nodes
+            .iter()
+            .filter(|n| n.distance_q > 0)
+            .fold((0.0f32, 0u64), |(sum, dist), n| {
+                (
+                    sum + (f32::from(n.cost_q) / 255.0) * n.distance_q as f32,
+                    dist + u64::from(n.distance_q),
+                )
+            });
+    if total_distance > 0 {
+        return weighted_sum / total_distance as f32;
     }
     let sum: f32 = nodes.iter().map(|n| f32::from(n.cost_q) / 255.0).sum();
     sum / nodes.len() as f32
@@ -257,9 +270,11 @@ mod tests {
         RouteNode {
             pos_q: (x, 0),
             signature,
+            current_signature: None,
             cost_q: cost,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         }
     }
 
@@ -463,11 +478,17 @@ mod tests {
     }
 
     #[test]
-    fn route_difficulty_is_the_mean_cost_band() {
+    fn route_difficulty_uses_distance_weights_with_legacy_mean_fallback() {
         assert_eq!(route_difficulty(&[]), 0.0);
-        let nodes = [node_at(0, 2048, 0), node_at(10, 2048, 255)];
-        let d = route_difficulty(&nodes);
-        assert!((d - 0.5).abs() < 1e-3);
+        let legacy = [node_at(0, 2048, 0), node_at(10, 2048, 255)];
+        assert!((route_difficulty(&legacy) - 0.5).abs() < 1e-3);
+
+        let mut short_hard = node_at(10, 2048, 255);
+        short_hard.distance_q = 10;
+        let mut long_easy = node_at(20, 2048, 0);
+        long_easy.distance_q = 90;
+        let d = route_difficulty(&[short_hard, long_easy]);
+        assert!((d - 0.1).abs() < 1e-3);
     }
 
     #[test]
@@ -542,9 +563,11 @@ mod tests {
         let node = RouteNode {
             pos_q: (0, 0),
             signature,
+            current_signature: None,
             cost_q: 10,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         };
         let route = route_with(vec![node], 10);
         let anchors = attraction_anchors([&route], (0.0, 0.0), 8);

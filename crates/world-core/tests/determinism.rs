@@ -241,9 +241,11 @@ fn aggregate_route_attraction_golden() {
     let node = |x, cost| RouteNode {
         pos_q: (x, 0),
         signature,
+        current_signature: None,
         cost_q: cost,
         stability_q: 0,
         anchor_sig: 0,
+        distance_q: 0,
     };
     let mut first = RouteRecord::new(
         vec![node(0, 10), node(32, 11), node(64, 12), node(96, 13)],
@@ -614,9 +616,11 @@ fn record_content_id_golden() {
     let node = RouteNode {
         pos_q: (300, -10),
         signature: sig,
+        current_signature: None,
         cost_q: 40,
         stability_q: 255,
         anchor_sig: 0x1234_5678_9ABC_DEF0,
+        distance_q: 0,
     };
     let route = RouteRecord::new(vec![node, node], vec![disc.id], 3, String::from("trek"));
     assert_eq!(route.id, 0x5E9E_962B_E0DE_86D0);
@@ -644,7 +648,7 @@ fn record_wire_bytes_golden() {
     assert_eq!(
         bytes,
         [
-            0x01, 0x02, 0x02, 0xB4, 0xE1, 0xFB, 0xF0, 0xC1, 0xF7, 0xA9, 0x8A, 0x04, 0x00, 0xD2,
+            0x02, 0x02, 0x02, 0xB4, 0xE1, 0xFB, 0xF0, 0xC1, 0xF7, 0xA9, 0x8A, 0x04, 0x00, 0xD2,
             0xA5, 0xB7, 0xAE, 0x97, 0x8C, 0x98, 0xA0, 0x23, 0x95, 0x86, 0xA7, 0x97, 0xE3, 0xF0,
             0x84, 0x82, 0x42, 0x80, 0x10, 0x80, 0x10, 0x80, 0x10, 0x80, 0x10, 0x80, 0x10, 0xE6,
             0x1C, 0x80, 0x10, 0xE6, 0x1C, 0xA0, 0x00, 0xCC, 0x19, 0xDC, 0x0B, 0xD8, 0x04, 0x13,
@@ -653,8 +657,10 @@ fn record_wire_bytes_golden() {
     );
     // The v1 archive floor (phase-5-plan.md §12.1): these exact bytes must
     // decode forever, migrations included.
+    let mut old_bytes = bytes.clone();
+    old_bytes[0] = 0x01;
     let (envelope, decoded): (world_core::Envelope, DiscoveryRecord) =
-        decode_record(&bytes, RecordKind::Discovery).expect("v1 archive bytes decode");
+        decode_record(&old_bytes, RecordKind::Discovery).expect("v1 archive bytes decode");
     assert_eq!(envelope.format_version, 1);
     assert_eq!(decoded, disc);
 }

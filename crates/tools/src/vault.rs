@@ -22,9 +22,9 @@ use world_core::{
     RegionCoord, RouteNode, RouteRecord, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    apply_session_regions, Budget, FrameStats, InlineExecutor, MemoryStorage, RegionMap,
-    RouteTracker, Storage, StorageError, StreamConfig, Vault, CHANNEL_COUNT, CHANNEL_ELEVATION,
-    CHANNEL_HARDNESS,
+    apply_session_regions, session_runtime_record, Budget, FrameStats, InlineExecutor,
+    MemoryStorage, RegionMap, RouteTracker, SessionSnapshotInput, Storage, StorageError,
+    StreamConfig, Vault, CHANNEL_COUNT, CHANNEL_ELEVATION, CHANNEL_HARDNESS,
 };
 
 use crate::replay::state_hash;
@@ -210,15 +210,25 @@ fn scenario_durable() -> VaultReport {
         );
     }
     let mut vault = Vault::open(MemoryStorage::new()).expect("fresh store");
+    let anchors = script_anchors(SAVE);
     vault
-        .snapshot_session(
-            &before,
-            script_pos(SAVE),
-            script_pos(SAVE - 1),
-            &script_bias(SAVE, FRAMES),
-            false,
-            &script_anchors(SAVE),
-        )
+        .snapshot_session(SessionSnapshotInput {
+            map: &before,
+            player: script_pos(SAVE),
+            last_player: script_pos(SAVE - 1),
+            bias: &script_bias(SAVE, FRAMES),
+            transition_mode: false,
+            anchors: &anchors,
+            runtime: session_runtime_record(
+                before.config(),
+                &Budget::unlimited(),
+                None,
+                false,
+                false,
+            ),
+            recorder: None,
+            tracker: world_core::RouteTrackerSnapshot::default(),
+        })
         .expect("sequence available");
     vault.flush_all().expect("memory store flush");
     let reopened = Vault::open(vault.store().clone()).expect("reopen");
@@ -494,14 +504,17 @@ fn scenario_sparse() -> VaultReport {
         .record_preserve(vec![(RegionCoord::new(0, 0), sig)], "glade".into())
         .expect("sequence available");
     vault
-        .snapshot_session(
-            &map,
-            script_pos(FRAMES - 1),
-            script_pos(FRAMES - 2),
-            &[0.0; POSSIBILITY_DIMS],
-            false,
-            &[],
-        )
+        .snapshot_session(SessionSnapshotInput {
+            map: &map,
+            player: script_pos(FRAMES - 1),
+            last_player: script_pos(FRAMES - 2),
+            bias: &[0.0; POSSIBILITY_DIMS],
+            transition_mode: false,
+            anchors: &[],
+            runtime: session_runtime_record(map.config(), &Budget::unlimited(), None, false, false),
+            recorder: None,
+            tracker: world_core::RouteTrackerSnapshot::default(),
+        })
         .expect("sequence available");
     vault.flush_all().expect("memory store flush");
     let total = vault.store().bytes();
@@ -517,8 +530,8 @@ fn scenario_sparse() -> VaultReport {
         }
         let cap = if key_str.starts_with("session/") {
             // Session scales with the resident window (bounded by config),
-            // not with travel: ~50 bytes per resident region.
-            50 * map.len() + 512
+            // not with travel: current+target floats plus run-local metadata.
+            72 * map.len() + 512
         } else {
             512
         };
@@ -534,7 +547,7 @@ fn scenario_sparse() -> VaultReport {
     }
     // Affine bound in actions: the actions added a bounded number of bytes.
     let action_bytes = total.saturating_sub(travel_only);
-    if action_bytes > (ACTIONS + 1) * 512 {
+    if action_bytes > (ACTIONS + 1) * 768 {
         record(
             &mut violations,
             format!("{ACTIONS} actions grew the store by {action_bytes} bytes"),
@@ -796,9 +809,11 @@ fn scenario_routes() -> VaultReport {
         .map(|i| RouteNode {
             pos_q: (i * 300, 0),
             signature: sig,
+            current_signature: None,
             cost_q: 40,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         })
         .collect();
     let route = RouteRecord::new(nodes, vec![], 1, "trail".into());
@@ -845,9 +860,11 @@ fn scenario_routes() -> VaultReport {
         .map(|_| RouteNode {
             pos_q: (450, 0),
             signature: sig,
+            current_signature: None,
             cost_q: 40,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         })
         .collect();
     let mut dense_nodes_b = dense_nodes.clone();
@@ -926,9 +943,11 @@ fn scenario_precision() -> VaultReport {
         .map(|i| RouteNode {
             pos_q: (i * 250, 100),
             signature: sig,
+            current_signature: None,
             cost_q: 20,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         })
         .collect();
     vault

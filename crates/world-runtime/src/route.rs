@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use world_core::{
     anchor_set_signature, Anchor, PossibilitySignature, RegionCoord, RouteNode, RouteRecord,
-    ROUTE_CORRIDOR_RADIUS,
+    RouteRecorderSnapshot, RouteTrackerLegSnapshot, RouteTrackerSnapshot, ROUTE_CORRIDOR_RADIUS,
 };
 
 use crate::stream::RegionMap;
@@ -34,6 +34,7 @@ const TRAVERSAL_FRACTION: f32 = 0.6;
 #[derive(Debug, Default)]
 pub struct RouteRecorder {
     accumulated: f64,
+    last_observed: Option<(f64, f64)>,
     nodes: Vec<RouteNode>,
     discoveries: Vec<u64>,
 }
@@ -65,6 +66,28 @@ impl RouteRecorder {
         }
     }
 
+    /// Snapshot active recorder state into the session tier.
+    #[must_use]
+    pub fn snapshot(&self) -> RouteRecorderSnapshot {
+        RouteRecorderSnapshot {
+            accumulated: self.accumulated,
+            last_observed: self.last_observed,
+            nodes: self.nodes.clone(),
+            discoveries: self.discoveries.clone(),
+        }
+    }
+
+    /// Restore active recorder state from a session snapshot.
+    #[must_use]
+    pub fn from_snapshot(snapshot: RouteRecorderSnapshot) -> Self {
+        Self {
+            accumulated: snapshot.accumulated,
+            last_observed: snapshot.last_observed,
+            nodes: snapshot.nodes,
+            discoveries: snapshot.discoveries,
+        }
+    }
+
     /// Observe one frame: accumulate travel and emit a node every
     /// [`ROUTE_SAMPLE_SPACING`] units. The node captures the covering
     /// region's steered *target* (the possibility-space coordinate), the
@@ -81,34 +104,83 @@ impl RouteRecorder {
         &mut self,
         map: &RegionMap,
         player: (f64, f64),
-        travel: f64,
+        _travel: f64,
         effective_anchors: &[Anchor],
         resonance_strength: f32,
     ) {
         if self.nodes.len() >= MAX_ROUTE_NODES {
             return;
         }
-        self.accumulated += travel;
-        let due = if self.nodes.is_empty() {
-            true // the first node drops where recording starts
-        } else {
-            self.accumulated >= ROUTE_SAMPLE_SPACING
+
+        let Some(mut segment_start) = self.last_observed else {
+            if self.push_node(map, player, effective_anchors, resonance_strength, 0) {
+                self.last_observed = Some(player);
+            }
+            return;
         };
-        if !due {
+
+        let mut segment_len = f64::hypot(player.0 - segment_start.0, player.1 - segment_start.1);
+        if segment_len <= f64::EPSILON {
             return;
         }
-        let coord = RegionCoord::from_world(player.0, player.1);
+
+        while self.accumulated + segment_len + f64::EPSILON >= ROUTE_SAMPLE_SPACING
+            && self.nodes.len() < MAX_ROUTE_NODES
+        {
+            let distance_from_start = (ROUTE_SAMPLE_SPACING - self.accumulated).max(0.0);
+            let t = (distance_from_start / segment_len).clamp(0.0, 1.0);
+            let sample = (
+                segment_start.0 + (player.0 - segment_start.0) * t,
+                segment_start.1 + (player.1 - segment_start.1) * t,
+            );
+            if !self.push_node(
+                map,
+                sample,
+                effective_anchors,
+                resonance_strength,
+                ROUTE_SAMPLE_SPACING.round() as u32,
+            ) {
+                return;
+            }
+            segment_start = sample;
+            self.last_observed = Some(sample);
+            self.accumulated = 0.0;
+            segment_len = f64::hypot(player.0 - segment_start.0, player.1 - segment_start.1);
+            if segment_len <= f64::EPSILON {
+                self.last_observed = Some(player);
+                return;
+            }
+        }
+
+        self.accumulated += segment_len;
+        if (self.accumulated - ROUTE_SAMPLE_SPACING).abs() <= f64::EPSILON {
+            self.accumulated = ROUTE_SAMPLE_SPACING;
+        }
+        self.last_observed = Some(player);
+    }
+
+    fn push_node(
+        &mut self,
+        map: &RegionMap,
+        at: (f64, f64),
+        effective_anchors: &[Anchor],
+        resonance_strength: f32,
+        distance_q: u32,
+    ) -> bool {
+        let coord = RegionCoord::from_world(at.0, at.1);
         let Some(region) = map.get(coord) else {
-            return; // keep accumulating until the ground under us is resident
+            return false;
         };
-        self.accumulated = 0.0;
         self.nodes.push(RouteNode {
-            pos_q: (player.0.round() as i64, player.1.round() as i64),
+            pos_q: (at.0.round() as i64, at.1.round() as i64),
             signature: PossibilitySignature::of(region.target),
+            current_signature: Some(PossibilitySignature::of(region.current)),
             cost_q: (((1.0 - resonance_strength.clamp(0.0, 1.0)) * 255.0) as u8),
             stability_q: ((region.stability.clamp(0.0, 1.0) * 255.0) as u8),
             anchor_sig: anchor_set_signature(effective_anchors),
+            distance_q,
         });
+        true
     }
 
     /// Close the recording into `(nodes, discoveries)` for
@@ -136,6 +208,40 @@ impl RouteTracker {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot current leg state into sorted session records.
+    #[must_use]
+    pub fn snapshot(&self) -> RouteTrackerSnapshot {
+        RouteTrackerSnapshot {
+            legs: self
+                .visited
+                .iter()
+                .map(|(&route_id, visited)| RouteTrackerLegSnapshot {
+                    route_id,
+                    visited_nodes: visited.iter().map(|&node| node as u32).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Restore current leg state from a session snapshot.
+    #[must_use]
+    pub fn from_snapshot(snapshot: RouteTrackerSnapshot) -> Self {
+        let visited = snapshot
+            .legs
+            .into_iter()
+            .map(|leg| {
+                (
+                    leg.route_id,
+                    leg.visited_nodes
+                        .into_iter()
+                        .map(|node| node as usize)
+                        .collect(),
+                )
+            })
+            .collect();
+        Self { visited }
     }
 
     /// Observe one frame against the active route set. Returns the ids of
@@ -186,15 +292,34 @@ impl RouteTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use world_core::{PossibilityVector, REGION_SIZE};
+
+    fn map_with_regions(coords: impl IntoIterator<Item = RegionCoord>) -> RegionMap {
+        let mut map = RegionMap::new(crate::StreamConfig::default());
+        for coord in coords {
+            let mut target = PossibilityVector::neutral();
+            target.set(world_core::PossibilityDomain::Ecology, 0.75);
+            map.restore_region(&world_core::RegionSnapshotRecord {
+                coord,
+                current: PossibilityVector::neutral().dims,
+                target: target.dims,
+                stability: 1.0,
+                revision: 1,
+            });
+        }
+        map
+    }
 
     fn straight_route(nodes: usize, spacing: f64) -> RouteRecord {
         let nodes: Vec<RouteNode> = (0..nodes)
             .map(|i| RouteNode {
                 pos_q: ((i as f64 * spacing) as i64, 0),
                 signature: PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+                current_signature: None,
                 cost_q: 10,
                 stability_q: 0,
                 anchor_sig: 0,
+                distance_q: 0,
             })
             .collect();
         RouteRecord::new(nodes, vec![], 1, "straight".into())
@@ -232,5 +357,113 @@ mod tests {
             let at = (f64::from(step) * 400.0, ROUTE_CORRIDOR_RADIUS * 3.0);
             assert!(tracker.observe([&route], at).is_empty());
         }
+    }
+
+    #[test]
+    fn recorder_emits_every_crossed_interval_and_carries_remainder() {
+        let map = map_with_regions([
+            RegionCoord::new(0, 0),
+            RegionCoord::new(1, 0),
+            RegionCoord::new(2, 0),
+        ]);
+        let mut recorder = RouteRecorder::new();
+        recorder.observe(&map, (0.0, 0.0), 0.0, &[], 0.75);
+        recorder.observe(&map, (700.0, 0.0), 700.0, &[], 0.75);
+
+        let snap = recorder.snapshot();
+        assert_eq!(snap.nodes.len(), 4);
+        assert_eq!(snap.nodes[0].distance_q, 0);
+        assert_eq!(snap.nodes[1].pos_q, (192, 0));
+        assert_eq!(snap.nodes[2].pos_q, (384, 0));
+        assert_eq!(snap.nodes[3].pos_q, (576, 0));
+        assert_eq!(
+            snap.nodes[1].distance_q,
+            ROUTE_SAMPLE_SPACING.round() as u32
+        );
+        assert!((snap.accumulated - 124.0).abs() < 1e-9);
+        assert!(snap.nodes[1].current_signature.is_some());
+    }
+
+    #[test]
+    fn recorder_carries_overshoot_across_frames() {
+        let map = map_with_regions([RegionCoord::new(0, 0), RegionCoord::new(1, 0)]);
+        let mut recorder = RouteRecorder::new();
+        recorder.observe(&map, (0.0, 0.0), 0.0, &[], 1.0);
+        recorder.observe(&map, (100.0, 0.0), 100.0, &[], 1.0);
+        assert_eq!(recorder.snapshot().nodes.len(), 1);
+        recorder.observe(&map, (250.0, 0.0), 150.0, &[], 1.0);
+
+        let snap = recorder.snapshot();
+        assert_eq!(snap.nodes.len(), 2);
+        assert_eq!(snap.nodes[1].pos_q, (192, 0));
+        assert!((snap.accumulated - 58.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recorder_retries_missing_due_interval_without_moving_later_nodes_earlier() {
+        let mut recorder = RouteRecorder::new();
+        let only_start = map_with_regions([RegionCoord::new(0, 0)]);
+        recorder.observe(&only_start, (0.0, 0.0), 0.0, &[], 1.0);
+        recorder.observe(
+            &only_start,
+            (REGION_SIZE * 2.0, 0.0),
+            REGION_SIZE * 2.0,
+            &[],
+            1.0,
+        );
+        let stalled = recorder.snapshot();
+        assert_eq!(stalled.nodes.len(), 2);
+        assert_eq!(stalled.nodes[1].pos_q, (192, 0));
+        assert_eq!(stalled.last_observed, Some((192.0, 0.0)));
+        assert_eq!(stalled.accumulated, 0.0);
+
+        let with_next = map_with_regions([RegionCoord::new(0, 0), RegionCoord::new(1, 0)]);
+        recorder.observe(&with_next, (REGION_SIZE * 2.0, 0.0), 0.0, &[], 1.0);
+        let resumed = recorder.snapshot();
+        assert_eq!(resumed.nodes.len(), 3);
+        assert_eq!(resumed.nodes[2].pos_q, (384, 0));
+    }
+
+    #[test]
+    fn recorder_snapshot_restore_continues_like_uninterrupted() {
+        let map = map_with_regions([
+            RegionCoord::new(0, 0),
+            RegionCoord::new(1, 0),
+            RegionCoord::new(2, 0),
+        ]);
+        let mut uninterrupted = RouteRecorder::new();
+        uninterrupted.observe(&map, (0.0, 0.0), 0.0, &[], 0.5);
+        uninterrupted.observe(&map, (250.0, 0.0), 250.0, &[], 0.5);
+
+        let mut restored = RouteRecorder::new();
+        restored.observe(&map, (0.0, 0.0), 0.0, &[], 0.5);
+        restored.observe(&map, (100.0, 0.0), 100.0, &[], 0.5);
+        restored = RouteRecorder::from_snapshot(restored.snapshot());
+        restored.observe(&map, (250.0, 0.0), 150.0, &[], 0.5);
+
+        assert_eq!(restored.snapshot(), uninterrupted.snapshot());
+    }
+
+    #[test]
+    fn tracker_snapshot_restore_preserves_current_leg() {
+        let route = straight_route(5, 400.0);
+        let away = (1600.0, ROUTE_CORRIDOR_RADIUS * 3.0);
+        let mut uninterrupted = RouteTracker::new();
+        let mut restored = RouteTracker::new();
+        for step in 0..3 {
+            let at = (f64::from(step) * 400.0, 0.0);
+            assert!(uninterrupted.observe([&route], at).is_empty());
+            assert!(restored.observe([&route], at).is_empty());
+        }
+        restored = RouteTracker::from_snapshot(restored.snapshot());
+        for step in 3..5 {
+            let at = (f64::from(step) * 400.0, 0.0);
+            assert!(uninterrupted.observe([&route], at).is_empty());
+            assert!(restored.observe([&route], at).is_empty());
+        }
+        assert_eq!(
+            restored.observe([&route], away),
+            uninterrupted.observe([&route], away)
+        );
     }
 }

@@ -729,6 +729,7 @@ mod tests {
         let snapshot = |coord| RegionSnapshotRecord {
             coord,
             current: PossibilityVector::neutral().dims,
+            target: PossibilityVector::neutral().dims,
             stability: 0.5,
             revision: 7,
         };

@@ -29,15 +29,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use world_core::{
-    decode_record, encode_record, Anchor, AnchorSnapshot, AtlasBundle, DiscoveryRecord,
-    PossibilitySignature, PreserveRecord, RecordCanonicalError, RecordError, RecordKind,
-    RegionCoord, RegionSnapshotRecord, RouteNode, RouteRecord, SeenRecord, SessionSnapshot,
-    StoreMeta, POSSIBILITY_DIMS, WORLD_ALGORITHM_VERSION,
+    decode_record, encode_record, Anchor, AnchorSnapshot, AtlasBundle, BudgetRecord,
+    DiscoveryRecord, LegacyTargetPolicy, PossibilitySignature, PreserveRecord,
+    RecordCanonicalError, RecordError, RecordKind, RegionCoord, RegionSnapshotRecord, RouteNode,
+    RouteRecord, RouteRecorderSnapshot, RouteTrackerSnapshot, SeenRecord, SessionRuntimeRecord,
+    SessionSnapshot, SessionTierRecord, StoreMeta, StreamConfigRecord, POSSIBILITY_DIMS,
+    WORLD_ALGORITHM_VERSION,
 };
 
 use crate::budget::Budget;
 use crate::storage::{Storage, StorageError};
 use crate::stream::RegionMap;
+use crate::tier::ResourceTier;
 
 /// The store-header key.
 pub const KEY_META: &[u8] = b"meta/store";
@@ -46,6 +49,159 @@ pub const KEY_SESSION: &[u8] = b"session/current";
 
 /// Maximum number of nonfatal/active issue entries retained by a vault.
 pub const MAX_VAULT_ISSUES: usize = 64;
+
+/// Fully-typed input for a run-local session snapshot. Adding a persisted
+/// session field should extend this struct, not widen a positional API.
+#[derive(Debug)]
+pub struct SessionSnapshotInput<'a> {
+    pub map: &'a RegionMap,
+    pub player: (f64, f64),
+    pub last_player: (f64, f64),
+    pub bias: &'a [f32; POSSIBILITY_DIMS],
+    pub transition_mode: bool,
+    pub anchors: &'a [Anchor],
+    pub runtime: SessionRuntimeRecord,
+    pub recorder: Option<RouteRecorderSnapshot>,
+    pub tracker: RouteTrackerSnapshot,
+}
+
+/// Session metadata comparison result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCompatibility {
+    Exact,
+    CompatibleNotExact,
+    Incompatible,
+}
+
+/// Runtime metadata could not be represented on this platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionConfigError {
+    UsizeOverflow,
+}
+
+#[must_use]
+pub fn stream_config_record(cfg: &crate::stream::StreamConfig) -> StreamConfigRecord {
+    StreamConfigRecord {
+        near_radius: cfg.near_radius,
+        far_radius: cfg.far_radius,
+        load_radius: cfg.load_radius,
+        unload_radius: cfg.unload_radius,
+        converge_per_unit: cfg.converge_per_unit,
+        converge_rate_cap: cfg.converge_rate_cap,
+        field_resolution: cfg.field_resolution,
+        max_field_cache_bytes: cfg.max_field_cache_bytes as u64,
+        max_macro_cache_bytes: cfg.max_macro_cache_bytes as u64,
+        max_roster_cache_bytes: cfg.max_roster_cache_bytes as u64,
+        organisms_per_cell: cfg.organisms_per_cell,
+    }
+}
+
+pub fn stream_config_from_record(
+    record: &StreamConfigRecord,
+) -> Result<crate::stream::StreamConfig, SessionConfigError> {
+    Ok(crate::stream::StreamConfig {
+        near_radius: record.near_radius,
+        far_radius: record.far_radius,
+        load_radius: record.load_radius,
+        unload_radius: record.unload_radius,
+        converge_per_unit: record.converge_per_unit,
+        converge_rate_cap: record.converge_rate_cap,
+        field_resolution: record.field_resolution,
+        max_field_cache_bytes: usize::try_from(record.max_field_cache_bytes)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        max_macro_cache_bytes: usize::try_from(record.max_macro_cache_bytes)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        max_roster_cache_bytes: usize::try_from(record.max_roster_cache_bytes)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        organisms_per_cell: record.organisms_per_cell,
+    })
+}
+
+#[must_use]
+pub fn budget_record(budget: &Budget) -> BudgetRecord {
+    BudgetRecord {
+        max_loads: budget.max_loads as u64,
+        max_converge_regions: budget.max_converge_regions as u64,
+        max_regen_cost: budget.max_regen_cost,
+        max_realize_organisms: budget.max_realize_organisms as u64,
+        max_persist_ops: budget.max_persist_ops as u64,
+        max_route_attraction_nodes: budget.max_route_attraction_nodes as u64,
+        max_retarget_regions: budget.max_retarget_regions as u64,
+    }
+}
+
+pub fn budget_from_record(record: &BudgetRecord) -> Result<Budget, SessionConfigError> {
+    Ok(Budget {
+        max_loads: usize::try_from(record.max_loads)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        max_converge_regions: usize::try_from(record.max_converge_regions)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        max_regen_cost: record.max_regen_cost,
+        max_realize_organisms: usize::try_from(record.max_realize_organisms)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        max_persist_ops: usize::try_from(record.max_persist_ops)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        max_route_attraction_nodes: usize::try_from(record.max_route_attraction_nodes)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+        max_retarget_regions: usize::try_from(record.max_retarget_regions)
+            .map_err(|_| SessionConfigError::UsizeOverflow)?,
+    })
+}
+
+#[must_use]
+pub const fn tier_record(tier: Option<ResourceTier>) -> SessionTierRecord {
+    match tier {
+        Some(ResourceTier::Low) => SessionTierRecord::Low,
+        Some(ResourceTier::Mid) => SessionTierRecord::Mid,
+        Some(ResourceTier::High) => SessionTierRecord::High,
+        None => SessionTierRecord::Unknown,
+    }
+}
+
+#[must_use]
+pub fn session_runtime_record(
+    stream: &crate::stream::StreamConfig,
+    budget: &Budget,
+    tier: Option<ResourceTier>,
+    path_tracking: bool,
+    route_attraction: bool,
+) -> SessionRuntimeRecord {
+    SessionRuntimeRecord {
+        stream: stream_config_record(stream),
+        budget: budget_record(budget),
+        tier: tier_record(tier),
+        path_tracking,
+        route_attraction,
+        legacy_target_policy: LegacyTargetPolicy::ExactTargetStored,
+    }
+}
+
+#[must_use]
+pub fn compare_session_runtime(
+    snapshot: &SessionRuntimeRecord,
+    stream: &crate::stream::StreamConfig,
+    budget: &Budget,
+    tier: Option<ResourceTier>,
+    path_tracking: bool,
+    route_attraction: bool,
+) -> SessionCompatibility {
+    let current = session_runtime_record(stream, budget, tier, path_tracking, route_attraction);
+    if snapshot == &current {
+        return SessionCompatibility::Exact;
+    }
+    let mut pacing_only_budget = current.budget;
+    pacing_only_budget.max_persist_ops = snapshot.budget.max_persist_ops;
+    if snapshot.legacy_target_policy == LegacyTargetPolicy::TargetEqualsCurrent
+        || snapshot.stream != current.stream
+        || snapshot.budget != pacing_only_budget
+        || snapshot.tier != current.tier
+        || snapshot.path_tracking != current.path_tracking
+        || snapshot.route_attraction != current.route_attraction
+    {
+        return SessionCompatibility::Incompatible;
+    }
+    SessionCompatibility::CompatibleNotExact
+}
 
 /// The storage mutation which failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,7 +664,7 @@ impl<S: Storage> Vault<S> {
 
     /// Load one record namespace, skipping (and reporting) undecodable or
     /// invalid entries.
-    fn load_namespace<T: serde::de::DeserializeOwned>(
+    fn load_namespace<T: serde::de::DeserializeOwned + 'static>(
         &mut self,
         prefix: &[u8],
         kind: RecordKind,
@@ -795,32 +951,35 @@ impl<S: Storage> Vault<S> {
     /// state, capacity-parked entries included. Queued for flushing; overwrites
     /// the previous snapshot. Sequence exhaustion returns
     /// [`VaultSequenceError`] without replacing it.
-    #[allow(clippy::too_many_arguments)]
     pub fn snapshot_session(
         &mut self,
-        map: &RegionMap,
-        player: (f64, f64),
-        last_player: (f64, f64),
-        bias: &[f32; POSSIBILITY_DIMS],
-        transition_mode: bool,
-        anchors: &[Anchor],
+        input: SessionSnapshotInput<'_>,
     ) -> Result<(), VaultSequenceError> {
         let sequence = self.next_sequence()?;
         let snap = SessionSnapshot {
-            player,
-            last_player,
-            bias: *bias,
-            transition_mode,
-            anchors: anchors.iter().map(AnchorSnapshot::from_anchor).collect(),
-            regions: map
+            runtime: input.runtime,
+            player: input.player,
+            last_player: input.last_player,
+            bias: *input.bias,
+            transition_mode: input.transition_mode,
+            anchors: input
+                .anchors
+                .iter()
+                .map(AnchorSnapshot::from_anchor)
+                .collect(),
+            regions: input
+                .map
                 .iter_active()
                 .map(|r| RegionSnapshotRecord {
                     coord: r.coord,
                     current: r.current.dims,
+                    target: r.target.dims,
                     stability: r.stability,
                     revision: r.revision,
                 })
                 .collect(),
+            recorder: input.recorder,
+            tracker: input.tracker,
             sequence,
         };
         self.session = Some(snap);
@@ -1440,9 +1599,11 @@ mod tests {
         let node = RouteNode {
             pos_q: (0, 0),
             signature: PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+            current_signature: None,
             cost_q: 10,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         };
         let id = a.record_route(vec![node], vec![], "trail".into()).unwrap();
         a.bump_route_usage(id);
@@ -1773,9 +1934,11 @@ mod tests {
         let node = RouteNode {
             pos_q: (1, 2),
             signature: PossibilitySignature::of(world_core::PossibilityVector::neutral()),
+            current_signature: None,
             cost_q: 1,
             stability_q: 2,
             anchor_sig: 3,
+            distance_q: 0,
         };
         let canceled_route = vault
             .record_route(vec![node], vec![], "canceled route".into())
@@ -1879,14 +2042,23 @@ mod tests {
         assert_eq!(exhausted_target.dirty_records(), dirty_before);
         let map = RegionMap::new(crate::stream::StreamConfig::default());
         assert!(exhausted_target
-            .snapshot_session(
-                &map,
-                (0.0, 0.0),
-                (0.0, 0.0),
-                &[0.0; POSSIBILITY_DIMS],
-                false,
-                &[],
-            )
+            .snapshot_session(SessionSnapshotInput {
+                map: &map,
+                player: (0.0, 0.0),
+                last_player: (0.0, 0.0),
+                bias: &[0.0; POSSIBILITY_DIMS],
+                transition_mode: false,
+                anchors: &[],
+                runtime: session_runtime_record(
+                    map.config(),
+                    &Budget::unlimited(),
+                    None,
+                    false,
+                    false,
+                ),
+                recorder: None,
+                tracker: world_core::RouteTrackerSnapshot::default(),
+            })
             .is_err());
         assert!(exhausted_target.session().is_none());
         let mut max_replica = Vault::open(MemoryStorage::new()).unwrap();

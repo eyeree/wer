@@ -41,7 +41,7 @@ pub const EXPECTED_GENOME: u64 = 0x6023_7E3E_43E5_2590;
 pub const EXPECTED_FOOD_WEB: u64 = 0x6272_09D2_6720_001B;
 pub const EXPECTED_STEER: u64 = 0x9A4E_77F9_D151_9EC2;
 pub const EXPECTED_CANONICAL_ANCHOR_SIGNATURE: u64 = 0xBDAA_C72D_CA08_3AF7;
-pub const EXPECTED_RECORD_CODEC: u64 = 0xFA7F_9032_2BAF_D7FB;
+pub const EXPECTED_RECORD_CODEC: u64 = 0xF42F_DCB5_3552_F850;
 pub const EXPECTED_SHARED_STEER: u64 = 0xF0FB_820F_2030_1752;
 pub const EXPECTED_ROUTE_ATTRACTION: u64 = 0x3D54_75F6_34AF_1C41;
 
@@ -302,9 +302,11 @@ pub fn route_attraction_sample() -> u64 {
     let node = |x, cost| RouteNode {
         pos_q: (x, 0),
         signature,
+        current_signature: None,
         cost_q: cost,
         stability_q: 0,
         anchor_sig: 0,
+        distance_q: 0,
     };
     let mut first = RouteRecord::new(
         vec![node(0, 10), node(32, 11), node(64, 12), node(96, 13)],

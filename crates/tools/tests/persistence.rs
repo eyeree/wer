@@ -11,8 +11,8 @@ use world_core::{
     PossibilityField, POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    apply_session_regions, Budget, FrameStats, InlineExecutor, MemoryStorage, RegionMap,
-    StreamConfig, Vault,
+    apply_session_regions, session_runtime_record, Budget, FrameStats, InlineExecutor,
+    MemoryStorage, RegionMap, SessionSnapshotInput, StreamConfig, Vault,
 };
 
 const FRAMES: u32 = 90;
@@ -102,15 +102,25 @@ fn save_load_settle_matches_the_uninterrupted_run() {
         "save-point precondition: the scripted source map must have complete canonical near state"
     );
     let mut vault = Vault::open(MemoryStorage::new()).expect("fresh store opens");
+    let anchors = anchors_at(SAVE_FRAME);
     vault
-        .snapshot_session(
-            &before,
-            pos(SAVE_FRAME),
-            pos(SAVE_FRAME - 1),
-            &bias_at(SAVE_FRAME),
-            false,
-            &anchors_at(SAVE_FRAME),
-        )
+        .snapshot_session(SessionSnapshotInput {
+            map: &before,
+            player: pos(SAVE_FRAME),
+            last_player: pos(SAVE_FRAME - 1),
+            bias: &bias_at(SAVE_FRAME),
+            transition_mode: false,
+            anchors: &anchors,
+            runtime: session_runtime_record(
+                before.config(),
+                &Budget::unlimited(),
+                None,
+                false,
+                false,
+            ),
+            recorder: None,
+            tracker: world_core::RouteTrackerSnapshot::default(),
+        })
         .unwrap();
     let stats = vault.flush_all().unwrap();
     assert_eq!(stats.dirty, 0);
@@ -126,6 +136,13 @@ fn save_load_settle_matches_the_uninterrupted_run() {
 
     let mut restored = RegionMap::new(config());
     apply_session_regions(&mut restored, &snap);
+    for region in &snap.regions {
+        assert_eq!(
+            restored.get(region.coord).unwrap().target.dims,
+            region.target,
+            "session restore must preserve region target bit-exactly"
+        );
+    }
     let anchors: Vec<Anchor> = snap.anchors.iter().map(|a| a.to_anchor()).collect();
 
     // The settle phase (phase-5-plan.md §12.2; ADR 0024): travel = 0 at the

@@ -32,9 +32,11 @@ fn long_route(nodes: usize) -> RouteRecord {
         .map(|i| RouteNode {
             pos_q: ((i as i64) * 192, (i as i64) * 7),
             signature: sig,
+            current_signature: None,
             cost_q: (i % 200) as u8,
             stability_q: 0,
             anchor_sig: 0x1234_5678,
+            distance_q: 0,
         })
         .collect();
     RouteRecord::new(nodes, vec![], 1, String::from("trek"))

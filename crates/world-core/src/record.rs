@@ -28,6 +28,8 @@
 //! `tests/determinism.rs` — changing any of them is a format change and MUST
 //! bump [`RECORD_FORMAT_VERSION`] with a migration (phase-5-plan.md §9.4).
 
+use std::any::{Any, TypeId};
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -39,7 +41,7 @@ use crate::WORLD_ALGORITHM_VERSION;
 
 /// Version of the on-disk/wire record encoding. Bump on any schema change and
 /// add a migration in [`decode_record`] (phase-5-plan.md §9.4).
-pub const RECORD_FORMAT_VERSION: u16 = 1;
+pub const RECORD_FORMAT_VERSION: u16 = 2;
 
 /// Fixed basis separating possibility-signature seeds from every other hash
 /// domain.
@@ -47,6 +49,7 @@ const SIGNATURE_BASIS: u64 = 0x5165_A7C2_90D3_4E8B;
 /// Fixed bases separating each record kind's content-id fold (ADR 0014).
 const DISCOVERY_ID_BASIS: u64 = 0xD15C_08E2_4F17_A6C3;
 const ROUTE_ID_BASIS: u64 = 0x2073_E4D1_8B5F_60C9;
+const ROUTE_V2_NODE_TAG: u64 = 0xA12A_0002_7A67_3E11;
 const PRESERVE_ID_BASIS: u64 = 0x94E5_1D3B_C82A_7F04;
 /// Fixed basis for the mutable-field merge tiebreak fold (§7.6).
 const MUTABLE_RANK_BASIS: u64 = 0x3A9C_60B7_E512_D8F4;
@@ -313,7 +316,7 @@ pub fn peek_envelope(bytes: &[u8]) -> Result<Envelope, RecordError> {
 /// A body with trailing garbage is corrupt, not silently accepted. Older
 /// format versions migrate forward here (none exist yet at v1); newer ones are
 /// refused (§7.2).
-pub fn decode_record<T: DeserializeOwned>(
+pub fn decode_record<T: DeserializeOwned + 'static>(
     bytes: &[u8],
     expected: RecordKind,
 ) -> Result<(Envelope, T), RecordError> {
@@ -328,15 +331,56 @@ pub fn decode_record<T: DeserializeOwned>(
             found: envelope.kind,
         });
     }
-    // Migration hook: when RECORD_FORMAT_VERSION grows past 1, decode
-    // `envelope.format_version`'s body shape here and upgrade it forward with
-    // pure, kept-forever functions (phase-5-plan.md §9.4).
+    if envelope.format_version == 1 {
+        let body = decode_v1_body::<T>(rest, expected)?;
+        return Ok((envelope, body));
+    }
     let (body, trailing): (T, &[u8]) =
         postcard::take_from_bytes(rest).map_err(|_| RecordError::Corrupt)?;
     if !trailing.is_empty() {
         return Err(RecordError::Corrupt);
     }
     Ok((envelope, body))
+}
+
+fn decode_v1_body<T: DeserializeOwned + 'static>(
+    bytes: &[u8],
+    expected: RecordKind,
+) -> Result<T, RecordError> {
+    match expected {
+        RecordKind::Route if TypeId::of::<T>() == TypeId::of::<RouteRecord>() => {
+            let (body, trailing): (v1::RouteRecordV1, &[u8]) =
+                postcard::take_from_bytes(bytes).map_err(|_| RecordError::Corrupt)?;
+            if !trailing.is_empty() {
+                return Err(RecordError::Corrupt);
+            }
+            downcast_migration(body.migrate())
+        }
+        RecordKind::Session if TypeId::of::<T>() == TypeId::of::<SessionSnapshot>() => {
+            let (body, trailing): (v1::SessionSnapshotV1, &[u8]) =
+                postcard::take_from_bytes(bytes).map_err(|_| RecordError::Corrupt)?;
+            if !trailing.is_empty() {
+                return Err(RecordError::Corrupt);
+            }
+            downcast_migration(body.migrate())
+        }
+        _ => {
+            let (body, trailing): (T, &[u8]) =
+                postcard::take_from_bytes(bytes).map_err(|_| RecordError::Corrupt)?;
+            if !trailing.is_empty() {
+                return Err(RecordError::Corrupt);
+            }
+            Ok(body)
+        }
+    }
+}
+
+fn downcast_migration<T: 'static, U: Any>(value: U) -> Result<T, RecordError> {
+    let boxed: Box<dyn Any> = Box::new(value);
+    boxed
+        .downcast::<T>()
+        .map(|boxed| *boxed)
+        .map_err(|_| RecordError::Corrupt)
 }
 
 /// Quantize a `[0, 1]` scalar onto the shared record grid (the possibility
@@ -597,8 +641,13 @@ impl DiscoveryRecord {
 pub struct RouteNode {
     /// Physical position, integer world units.
     pub pos_q: (i64, i64),
-    /// The possibility-space position: the covering region's target, quantized.
+    /// The possibility-space target: the covering region's steered target,
+    /// quantized. Kept as `signature` for the v1 API surface; new code should
+    /// read it as the target signature, not the visible current state.
     pub signature: PossibilitySignature,
+    /// The covering region's visible realized current, quantized. `None`
+    /// identifies a migrated v1 node whose current-world truth was not stored.
+    pub current_signature: Option<PossibilitySignature>,
     /// Transition cost, banded to `[0, 255]` from `1 − resonance` at record
     /// time — route difficulty falls out of the world model, not a knob.
     pub cost_q: u8,
@@ -606,18 +655,45 @@ pub struct RouteNode {
     pub stability_q: u8,
     /// Order-independent signature of the anchor set active at record time.
     pub anchor_sig: u64,
+    /// Rounded world distance represented by this sample since the previous
+    /// node. The first node and migrated v1 nodes use zero.
+    pub distance_q: u32,
 }
 
 impl RouteNode {
-    /// Fold this node into a route content id.
+    /// Whether this node has exactly the v1 identity shape.
     #[must_use]
-    const fn fold(self, mut h: u64) -> u64 {
+    pub const fn is_legacy_identity(self) -> bool {
+        self.current_signature.is_none() && self.distance_q == 0
+    }
+
+    /// Fold this node into a v1 route content id.
+    #[must_use]
+    const fn fold_v1(self, mut h: u64) -> u64 {
         h = mix(h, self.pos_q.0 as u64);
         h = mix(h, self.pos_q.1 as u64);
         h = mix(h, self.signature.seed());
         h = mix(h, self.cost_q as u64);
         h = mix(h, self.stability_q as u64);
         h = mix(h, self.anchor_sig);
+        h
+    }
+
+    /// Fold this node into a v2 route content id.
+    #[must_use]
+    const fn fold_v2(self, mut h: u64) -> u64 {
+        h = mix(h, ROUTE_V2_NODE_TAG);
+        h = self.fold_v1(h);
+        match self.current_signature {
+            Some(sig) => {
+                h = mix(h, 1);
+                h = mix(h, sig.seed());
+            }
+            None => {
+                h = mix(h, 0);
+            }
+        }
+        h = mix(h, self.distance_q as u64);
         h
     }
 }
@@ -674,8 +750,13 @@ impl RouteRecord {
     pub fn content_id(&self) -> u64 {
         let mut h = ROUTE_ID_BASIS;
         h = mix(h, self.nodes.len() as u64);
+        let legacy_identity = self.nodes.iter().all(|node| node.is_legacy_identity());
         for node in &self.nodes {
-            h = node.fold(h);
+            h = if legacy_identity {
+                node.fold_v1(h)
+            } else {
+                node.fold_v2(h)
+            };
         }
         h = mix(h, self.discoveries.len() as u64);
         for &d in &self.discoveries {
@@ -1066,10 +1147,124 @@ pub struct RegionSnapshotRecord {
     pub coord: RegionCoord,
     /// Realized possibility state, bit-exact.
     pub current: [f32; POSSIBILITY_DIMS],
+    /// Steered target possibility state, bit-exact.
+    pub target: [f32; POSSIBILITY_DIMS],
     /// Distance-ramp stability at save time, bit-exact.
     pub stability: f32,
     /// The region's monotonic revision counter.
     pub revision: u32,
+}
+
+/// Effective streaming configuration at session-save time. Primitive widths
+/// are fixed for the record format; runtime converts to platform `usize`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StreamConfigRecord {
+    pub near_radius: f64,
+    pub far_radius: f64,
+    pub load_radius: f64,
+    pub unload_radius: f64,
+    pub converge_per_unit: f32,
+    pub converge_rate_cap: f32,
+    pub field_resolution: u16,
+    pub max_field_cache_bytes: u64,
+    pub max_macro_cache_bytes: u64,
+    pub max_roster_cache_bytes: u64,
+    pub organisms_per_cell: u16,
+}
+
+/// Effective frame budget at session-save time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetRecord {
+    pub max_loads: u64,
+    pub max_converge_regions: u64,
+    pub max_regen_cost: u32,
+    pub max_realize_organisms: u64,
+    pub max_persist_ops: u64,
+    pub max_route_attraction_nodes: u64,
+    pub max_retarget_regions: u64,
+}
+
+/// Resource tier label, if the saving platform knew one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionTierRecord {
+    Unknown,
+    Low,
+    Mid,
+    High,
+}
+
+/// Policy note for old sessions that did not encode region targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegacyTargetPolicy {
+    ExactTargetStored,
+    TargetEqualsCurrent,
+}
+
+/// Run-local metadata needed to decide whether exact continuation is being
+/// attempted under the same runtime contract.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SessionRuntimeRecord {
+    pub stream: StreamConfigRecord,
+    pub budget: BudgetRecord,
+    pub tier: SessionTierRecord,
+    pub path_tracking: bool,
+    pub route_attraction: bool,
+    pub legacy_target_policy: LegacyTargetPolicy,
+}
+
+impl Default for SessionRuntimeRecord {
+    fn default() -> Self {
+        Self {
+            stream: StreamConfigRecord {
+                near_radius: 0.0,
+                far_radius: 0.0,
+                load_radius: 0.0,
+                unload_radius: 0.0,
+                converge_per_unit: 0.0,
+                converge_rate_cap: 0.0,
+                field_resolution: 0,
+                max_field_cache_bytes: 0,
+                max_macro_cache_bytes: 0,
+                max_roster_cache_bytes: 0,
+                organisms_per_cell: 0,
+            },
+            budget: BudgetRecord {
+                max_loads: 0,
+                max_converge_regions: 0,
+                max_regen_cost: 0,
+                max_realize_organisms: 0,
+                max_persist_ops: 0,
+                max_route_attraction_nodes: 0,
+                max_retarget_regions: 0,
+            },
+            tier: SessionTierRecord::Unknown,
+            path_tracking: false,
+            route_attraction: false,
+            legacy_target_policy: LegacyTargetPolicy::TargetEqualsCurrent,
+        }
+    }
+}
+
+/// Active route-recorder state in the run-local session tier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteRecorderSnapshot {
+    pub accumulated: f64,
+    pub last_observed: Option<(f64, f64)>,
+    pub nodes: Vec<RouteNode>,
+    pub discoveries: Vec<u64>,
+}
+
+/// One active route-tracker leg.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteTrackerLegSnapshot {
+    pub route_id: u64,
+    pub visited_nodes: Vec<u32>,
+}
+
+/// Route-tracker state in the run-local session tier.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RouteTrackerSnapshot {
+    pub legs: Vec<RouteTrackerLegSnapshot>,
 }
 
 /// The run-local session tier (phase-5-plan.md §4.5, §6.3): everything needed
@@ -1077,6 +1272,8 @@ pub struct RegionSnapshotRecord {
 /// shared, never merged, excluded from [`AtlasBundle`]s.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    /// Runtime contract metadata for exactness checks.
+    pub runtime: SessionRuntimeRecord,
     /// Player position, bit-exact.
     pub player: (f64, f64),
     /// Previous-frame player position (travel derivation), bit-exact.
@@ -1090,6 +1287,10 @@ pub struct SessionSnapshot {
     /// Every resident region's authoritative state, in deterministic
     /// coordinate order.
     pub regions: Vec<RegionSnapshotRecord>,
+    /// Active route recorder, if one was running at save time.
+    pub recorder: Option<RouteRecorderSnapshot>,
+    /// Active route-tracker leg state.
+    pub tracker: RouteTrackerSnapshot,
     /// The store sequence at snapshot time.
     pub sequence: u64,
 }
@@ -1238,6 +1439,110 @@ fn round_world(v: f64) -> i64 {
     v.round() as i64
 }
 
+mod v1 {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub(super) struct RouteNodeV1 {
+        pub pos_q: (i64, i64),
+        pub signature: PossibilitySignature,
+        pub cost_q: u8,
+        pub stability_q: u8,
+        pub anchor_sig: u64,
+    }
+
+    impl RouteNodeV1 {
+        pub(super) fn migrate(self) -> RouteNode {
+            RouteNode {
+                pos_q: self.pos_q,
+                signature: self.signature,
+                current_signature: None,
+                cost_q: self.cost_q,
+                stability_q: self.stability_q,
+                anchor_sig: self.anchor_sig,
+                distance_q: 0,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(super) struct RouteRecordV1 {
+        pub id: u64,
+        pub nodes: Vec<RouteNodeV1>,
+        pub usage: u32,
+        pub discoveries: Vec<u64>,
+        pub sequence: u64,
+        pub name: String,
+        pub journal: String,
+    }
+
+    impl RouteRecordV1 {
+        pub(super) fn migrate(self) -> RouteRecord {
+            RouteRecord {
+                id: self.id,
+                nodes: self.nodes.into_iter().map(RouteNodeV1::migrate).collect(),
+                usage: self.usage,
+                discoveries: self.discoveries,
+                sequence: self.sequence,
+                name: self.name,
+                journal: self.journal,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    pub(super) struct RegionSnapshotRecordV1 {
+        pub coord: RegionCoord,
+        pub current: [f32; POSSIBILITY_DIMS],
+        pub stability: f32,
+        pub revision: u32,
+    }
+
+    impl RegionSnapshotRecordV1 {
+        pub(super) fn migrate(self) -> RegionSnapshotRecord {
+            RegionSnapshotRecord {
+                coord: self.coord,
+                current: self.current,
+                target: self.current,
+                stability: self.stability,
+                revision: self.revision,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(super) struct SessionSnapshotV1 {
+        pub player: (f64, f64),
+        pub last_player: (f64, f64),
+        pub bias: [f32; POSSIBILITY_DIMS],
+        pub transition_mode: bool,
+        pub anchors: Vec<AnchorSnapshot>,
+        pub regions: Vec<RegionSnapshotRecordV1>,
+        pub sequence: u64,
+    }
+
+    impl SessionSnapshotV1 {
+        pub(super) fn migrate(self) -> SessionSnapshot {
+            SessionSnapshot {
+                runtime: SessionRuntimeRecord::default(),
+                player: self.player,
+                last_player: self.last_player,
+                bias: self.bias,
+                transition_mode: self.transition_mode,
+                anchors: self.anchors,
+                regions: self
+                    .regions
+                    .into_iter()
+                    .map(RegionSnapshotRecordV1::migrate)
+                    .collect(),
+                recorder: None,
+                tracker: RouteTrackerSnapshot::default(),
+                sequence: self.sequence,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1286,9 +1591,11 @@ mod tests {
         let node = RouteNode {
             pos_q: (300, -11),
             signature: PossibilitySignature::of(PossibilityVector::neutral()),
+            current_signature: Some(PossibilitySignature::of(PossibilityVector::neutral())),
             cost_q: 40,
             stability_q: 255,
             anchor_sig: 0x1234,
+            distance_q: 192,
         };
         let route = RouteRecord::new(vec![node, node], vec![discovery.id], 3, "trek".into());
         let preserve = PreserveRecord::new(
@@ -1302,6 +1609,34 @@ mod tests {
         let mut seen = SeenRecord::empty(SeenRecord::chunk_of(RegionCoord::new(-3, 7)));
         seen.mark(RegionCoord::new(-3, 7));
         let session = SessionSnapshot {
+            runtime: SessionRuntimeRecord {
+                stream: StreamConfigRecord {
+                    near_radius: 10.0,
+                    far_radius: 20.0,
+                    load_radius: 30.0,
+                    unload_radius: 40.0,
+                    converge_per_unit: 0.01,
+                    converge_rate_cap: 0.2,
+                    field_resolution: 16,
+                    max_field_cache_bytes: 1024,
+                    max_macro_cache_bytes: 2048,
+                    max_roster_cache_bytes: 4096,
+                    organisms_per_cell: 1,
+                },
+                budget: BudgetRecord {
+                    max_loads: 1,
+                    max_converge_regions: 2,
+                    max_regen_cost: 3,
+                    max_realize_organisms: 4,
+                    max_persist_ops: 5,
+                    max_route_attraction_nodes: 6,
+                    max_retarget_regions: 7,
+                },
+                tier: SessionTierRecord::Low,
+                path_tracking: true,
+                route_attraction: true,
+                legacy_target_policy: LegacyTargetPolicy::ExactTargetStored,
+            },
             player: (300.4, -10.6),
             last_player: (299.0, -10.0),
             bias: [0.1; POSSIBILITY_DIMS],
@@ -1310,9 +1645,22 @@ mod tests {
             regions: vec![RegionSnapshotRecord {
                 coord: RegionCoord::new(1, -1),
                 current: [0.25; POSSIBILITY_DIMS],
+                target: [0.75; POSSIBILITY_DIMS],
                 stability: 1.0,
                 revision: 9,
             }],
+            recorder: Some(RouteRecorderSnapshot {
+                accumulated: 12.5,
+                last_observed: Some((299.0, -10.0)),
+                nodes: vec![node],
+                discoveries: vec![discovery.id],
+            }),
+            tracker: RouteTrackerSnapshot {
+                legs: vec![RouteTrackerLegSnapshot {
+                    route_id: route.id,
+                    visited_nodes: vec![0, 1],
+                }],
+            },
             sequence: 11,
         };
         let mut bundle = AtlasBundle {
@@ -1544,9 +1892,11 @@ mod tests {
         let node = RouteNode {
             pos_q: (0, 0),
             signature: PossibilitySignature::of(PossibilityVector::neutral()),
+            current_signature: None,
             cost_q: 10,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         };
         let base = RouteRecord::new(vec![node], vec![], 1, "r".into());
         let mut a = base.clone();
@@ -1563,6 +1913,106 @@ mod tests {
         let mut merged2 = b.clone();
         merged2.merge_from(&a).unwrap();
         assert_eq!(merged2.usage, 5);
+    }
+
+    #[test]
+    fn route_content_id_covers_current_signature_and_distance_for_v2_nodes() {
+        let mut node = RouteNode {
+            pos_q: (0, 0),
+            signature: PossibilitySignature::of(PossibilityVector::neutral()),
+            current_signature: Some(PossibilitySignature::of(PossibilityVector::neutral())),
+            cost_q: 10,
+            stability_q: 0,
+            anchor_sig: 0,
+            distance_q: 192,
+        };
+        let base = RouteRecord::new(vec![node], vec![], 1, "r".into());
+        node.current_signature = Some(PossibilitySignature {
+            buckets: [1; POSSIBILITY_DIMS],
+        });
+        assert_ne!(
+            RouteRecord::new(vec![node], vec![], 1, "r".into()).id,
+            base.id
+        );
+        node.current_signature = base.nodes[0].current_signature;
+        node.distance_q = 193;
+        assert_ne!(
+            RouteRecord::new(vec![node], vec![], 1, "r".into()).id,
+            base.id
+        );
+    }
+
+    #[test]
+    fn v1_route_decodes_with_legacy_id_preserved() {
+        let sig = PossibilitySignature::of(PossibilityVector::neutral());
+        let old_node = v1::RouteNodeV1 {
+            pos_q: (12, 34),
+            signature: sig,
+            cost_q: 9,
+            stability_q: 8,
+            anchor_sig: 7,
+        };
+        let migrated_node = old_node.migrate();
+        let legacy = RouteRecord::new(vec![migrated_node], vec![3, 1], 5, "old".into());
+        let old = v1::RouteRecordV1 {
+            id: legacy.id,
+            nodes: vec![old_node],
+            usage: 2,
+            discoveries: vec![1, 3],
+            sequence: 5,
+            name: "old".into(),
+            journal: "notes".into(),
+        };
+        let envelope = Envelope {
+            format_version: 1,
+            world_version: WORLD_ALGORITHM_VERSION,
+            kind: RecordKind::Route,
+        };
+        let mut bytes = postcard::to_allocvec(&envelope).unwrap();
+        bytes.extend_from_slice(&postcard::to_allocvec(&old).unwrap());
+
+        let (_, decoded): (Envelope, RouteRecord) =
+            decode_record(&bytes, RecordKind::Route).expect("v1 route migrates");
+        assert_eq!(decoded.id, legacy.id);
+        assert_eq!(decoded.content_id(), legacy.id);
+        assert_eq!(decoded.nodes[0].current_signature, None);
+        assert_eq!(decoded.nodes[0].distance_q, 0);
+    }
+
+    #[test]
+    fn v1_session_decodes_with_target_equals_current_policy() {
+        let current = [0.25; POSSIBILITY_DIMS];
+        let old = v1::SessionSnapshotV1 {
+            player: (1.0, 2.0),
+            last_player: (0.0, 2.0),
+            bias: [0.0; POSSIBILITY_DIMS],
+            transition_mode: false,
+            anchors: Vec::new(),
+            regions: vec![v1::RegionSnapshotRecordV1 {
+                coord: RegionCoord::new(0, 0),
+                current,
+                stability: 0.5,
+                revision: 4,
+            }],
+            sequence: 9,
+        };
+        let envelope = Envelope {
+            format_version: 1,
+            world_version: WORLD_ALGORITHM_VERSION,
+            kind: RecordKind::Session,
+        };
+        let mut bytes = postcard::to_allocvec(&envelope).unwrap();
+        bytes.extend_from_slice(&postcard::to_allocvec(&old).unwrap());
+
+        let (_, decoded): (Envelope, SessionSnapshot) =
+            decode_record(&bytes, RecordKind::Session).expect("v1 session migrates");
+        assert_eq!(
+            decoded.runtime.legacy_target_policy,
+            LegacyTargetPolicy::TargetEqualsCurrent
+        );
+        assert_eq!(decoded.regions[0].target, current);
+        assert!(decoded.recorder.is_none());
+        assert!(decoded.tracker.legs.is_empty());
     }
 
     #[test]
@@ -1636,9 +2086,11 @@ mod tests {
         let node = RouteNode {
             pos_q: (0, 0),
             signature: PossibilitySignature::of(PossibilityVector::neutral()),
+            current_signature: None,
             cost_q: 10,
             stability_q: 0,
             anchor_sig: 0,
+            distance_q: 0,
         };
         let route = RouteRecord::new(vec![node], vec![9, 3, 9, 1, 3], 0, String::new());
 

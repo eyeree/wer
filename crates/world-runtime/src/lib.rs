@@ -54,6 +54,9 @@ pub use task::{InlineExecutor, TaskExecutor, TaskPriority};
 pub use tier::{AdapterClass, ResourceTier, TierInputs};
 pub use timing::{Pass, PassTimings, PASS_COUNT};
 pub use vault::{
-    apply_session_regions, MergeStats, PersistenceOperation, Vault, VaultError, VaultFlushError,
-    VaultIssue, VaultPersistenceError, VaultSequenceError, VaultStats, MAX_VAULT_ISSUES,
+    apply_session_regions, budget_from_record, budget_record, compare_session_runtime,
+    session_runtime_record, stream_config_from_record, stream_config_record, tier_record,
+    MergeStats, PersistenceOperation, SessionCompatibility, SessionConfigError,
+    SessionSnapshotInput, Vault, VaultError, VaultFlushError, VaultIssue, VaultPersistenceError,
+    VaultSequenceError, VaultStats, MAX_VAULT_ISSUES,
 };

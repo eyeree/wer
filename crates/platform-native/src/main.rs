@@ -98,11 +98,12 @@ use world_core::{
     POSSIBILITY_DIMS, REGION_SIZE,
 };
 use world_runtime::{
-    apply_session_regions, AdapterClass, Budget, FrameStats, GenerationStatus, RegionMap,
-    ResourceTier, RouteRecorder, RouteTracker, Storage, StreamConfig, TierInputs, Vault,
-    VaultPersistenceError, VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY,
-    CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE,
-    CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    apply_session_regions, compare_session_runtime, session_runtime_record,
+    stream_config_from_record, AdapterClass, Budget, FrameStats, GenerationStatus, RegionMap,
+    ResourceTier, RouteRecorder, RouteTracker, SessionCompatibility, SessionSnapshotInput, Storage,
+    StreamConfig, TierInputs, Vault, VaultPersistenceError, VaultStats, CHANNEL_CANOPY,
+    CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER,
+    CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
 use executor::LaneExecutor;
@@ -245,6 +246,7 @@ struct World {
     /// the settled world identical either way — only pacing differs).
     executor: Box<dyn world_runtime::TaskExecutor>,
     budget: Budget,
+    tier: ResourceTier,
 }
 
 impl World {
@@ -304,6 +306,7 @@ impl World {
                 Box::new(LaneExecutor::auto())
             },
             budget: tier.budget(),
+            tier,
         };
         // A preserved region realizes its recorded buckets from the very
         // first frame, wherever the run begins (phase-5-plan.md §7.5).
@@ -619,14 +622,30 @@ impl World {
             log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
             return;
         };
-        if let Err(error) = vault.snapshot_session(
-            &self.map,
-            self.player,
-            self.last_player,
-            &self.bias,
-            self.transition_mode,
-            &self.anchors,
-        ) {
+        let runtime = session_runtime_record(
+            self.map.config(),
+            &self.budget,
+            Some(self.tier),
+            self.path_tracking,
+            self.route_attraction,
+        );
+        let recorder = self.recorder.as_ref().map(RouteRecorder::snapshot);
+        let tracker = if self.path_tracking {
+            self.tracker.snapshot()
+        } else {
+            world_core::RouteTrackerSnapshot::default()
+        };
+        if let Err(error) = vault.snapshot_session(SessionSnapshotInput {
+            map: &self.map,
+            player: self.player,
+            last_player: self.last_player,
+            bias: &self.bias,
+            transition_mode: self.transition_mode,
+            anchors: &self.anchors,
+            runtime,
+            recorder,
+            tracker,
+        }) {
             log::warn!("session save rejected before persistence: {error}");
             return;
         }
@@ -664,7 +683,39 @@ impl World {
             log::info!("no saved session in the vault");
             return;
         };
-        let mut map = RegionMap::new(*self.map.config());
+        let compatibility = compare_session_runtime(
+            &snap.runtime,
+            self.map.config(),
+            &self.budget,
+            Some(self.tier),
+            self.path_tracking,
+            self.route_attraction,
+        );
+        match compatibility {
+            SessionCompatibility::Exact => log::info!("session metadata exact-compatible"),
+            SessionCompatibility::CompatibleNotExact => {
+                log::warn!(
+                    "session metadata differs in pacing-only budget fields; restore is not exact"
+                )
+            }
+            SessionCompatibility::Incompatible => {
+                log::warn!("session metadata is incompatible with this run; restore is non-exact")
+            }
+        }
+        let stream = if compatibility == SessionCompatibility::Exact {
+            match stream_config_from_record(&snap.runtime.stream) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    log::warn!(
+                        "session stream config is not representable on this platform ({error:?}); using current config"
+                    );
+                    *self.map.config()
+                }
+            }
+        } else {
+            *self.map.config()
+        };
+        let mut map = RegionMap::new(stream);
         apply_session_regions(&mut map, &snap);
         self.map = map;
         self.apply_preserves();
@@ -673,6 +724,15 @@ impl World {
         self.bias = snap.bias;
         self.transition_mode = snap.transition_mode;
         self.anchors = snap.anchors.iter().map(|a| a.to_anchor()).collect();
+        if compatibility != SessionCompatibility::Incompatible {
+            self.path_tracking = snap.runtime.path_tracking;
+            self.route_attraction = snap.runtime.route_attraction;
+            self.recorder = snap.recorder.map(RouteRecorder::from_snapshot);
+            self.tracker = RouteTracker::from_snapshot(snap.tracker);
+        } else {
+            self.recorder = None;
+            self.tracker = RouteTracker::new();
+        }
         log::info!(
             "session loaded: {} regions, {} anchors at ({:.0}, {:.0}); canonical organisms settle while held still",
             snap.regions.len(),
@@ -2346,9 +2406,11 @@ mod preserve_lifecycle_tests {
                         signature: PossibilitySignature::of(
                             world_core::PossibilityVector::neutral(),
                         ),
+                        current_signature: None,
                         cost_q: marker,
                         stability_q: 0,
                         anchor_sig: u64::from(marker),
+                        distance_q: 0,
                     }],
                     vec![],
                     format!("route-{marker}"),
@@ -2394,9 +2456,11 @@ mod preserve_lifecycle_tests {
                     .map(|_| world_core::RouteNode {
                         pos_q: (0, 0),
                         signature: PossibilitySignature::of(possibility),
+                        current_signature: None,
                         cost_q: cost,
                         stability_q: 200,
                         anchor_sig: 0,
+                        distance_q: 0,
                     })
                     .collect()
             };
@@ -2453,6 +2517,7 @@ mod preserve_lifecycle_tests {
                 route_attraction: true,
                 executor: Box::new(world_runtime::InlineExecutor),
                 budget: tier.budget(),
+                tier,
             };
             // Publish canonical organisms and establish the unsteered current
             // before the same effective slice refreshes target and resonance.

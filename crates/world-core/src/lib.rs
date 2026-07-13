@@ -81,10 +81,12 @@ pub use possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS, PO
 pub use possibility_field::PossibilityField;
 pub use record::{
     decode_record, dequantize_unit, encode_record, peek_envelope, quantize_unit, AnchorSnapshot,
-    AtlasBundle, AtlasDigest, BundleCanonicalError, DiscoveryRecord, Envelope,
-    PossibilitySignature, PreserveRecord, PreserveRegionError, RecordCanonicalError, RecordError,
-    RecordKind, RecordMergeError, RegionSnapshotRecord, RouteNode, RouteRecord, SeenRecord,
-    SessionSnapshot, StoreMeta, RECORD_FORMAT_VERSION, SEEN_CHUNK_LEVEL,
+    AtlasBundle, AtlasDigest, BudgetRecord, BundleCanonicalError, DiscoveryRecord, Envelope,
+    LegacyTargetPolicy, PossibilitySignature, PreserveRecord, PreserveRegionError,
+    RecordCanonicalError, RecordError, RecordKind, RecordMergeError, RegionSnapshotRecord,
+    RouteNode, RouteRecord, RouteRecorderSnapshot, RouteTrackerLegSnapshot, RouteTrackerSnapshot,
+    SeenRecord, SessionRuntimeRecord, SessionSnapshot, SessionTierRecord, StoreMeta,
+    StreamConfigRecord, RECORD_FORMAT_VERSION, SEEN_CHUNK_LEVEL,
 };
 pub use route::{
     attraction_anchors, route_difficulty, route_pull, RouteGraph, RouteGraphHit,
