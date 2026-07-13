@@ -241,7 +241,7 @@ impl App {
             0.0,
             self.pov_toggles,
         );
-        let rgba = cap.snapshot(&params, CLEAR_COLOR);
+        let rgba = cap.snapshot_at_scale(&params, CLEAR_COLOR, self.pov_scale);
         write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
         Ok(format!(
             "screenshot.ppm ({width}x{height} POV, offscreen capture, {} chunks meshed)",
@@ -400,6 +400,7 @@ impl App {
             "toggles           : baked_light {}, detail_normals {}, water {}",
             self.pov_toggles.baked_light, self.pov_toggles.detail_normals, self.pov_toggles.water
         )?;
+        writeln!(s, "render_scale      : {}", self.pov_scale)?;
         if self.view_mode == ViewMode::Map {
             writeln!(
                 s,

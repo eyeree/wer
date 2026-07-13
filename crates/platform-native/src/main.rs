@@ -784,9 +784,14 @@ struct App {
     /// Live POV diagnostic toggles (`B` baked light, `N` detail normals,
     /// `V` water) — presentation-only switches for chasing llvmpipe CPU.
     pov_toggles: PovToggles,
-    /// The POV FPS chip, rebuilt only when the displayed value changes:
-    /// `(rgba, width, height, fps it shows)`.
-    pov_fps_chip: Option<(Vec<u8>, u32, u32, u32)>,
+    /// The POV HUD chip (fps + frame-budget split), rebuilt only when the
+    /// displayed text changes: `(rgba, width, height, text it shows)`.
+    pov_fps_chip: Option<(Vec<u8>, u32, u32, String)>,
+    /// POV render-scale (`WER_POV_SCALE`, clamped [0.25, 1.0]): fraction of
+    /// the surface resolution the 3D pass rasterizes at before the linear
+    /// upscale blit — the practical llvmpipe fps knob, since software
+    /// rasterization cost scales with pixel count.
+    pov_scale: f32,
     /// Content hashes of the last uploaded overlay/panel strips, so an
     /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
     overlay_hash: u64,
@@ -875,6 +880,10 @@ impl App {
             pov_counters_last: PovCounters::default(),
             pov_toggles: PovToggles::default(),
             pov_fps_chip: None,
+            pov_scale: std::env::var("WER_POV_SCALE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map_or(1.0, |s| s.clamp(0.25, 1.0)),
             overlay_hash: 0,
             panel_hash: 0,
             keys_down: HashSet::new(),
@@ -1695,18 +1704,32 @@ impl App {
                 time,
                 self.pov_toggles,
             );
-            // The corner FPS chip, rebuilt only when the value changes
-            // (the once-per-second telemetry roll updates `self.fps`).
-            let fps = self.fps;
-            if !matches!(&self.pov_fps_chip, Some((_, _, _, shown)) if *shown == fps) {
-                let (rgba, cw, ch) = panel::hud_chip(&format!("{fps:>4} fps"));
-                self.pov_fps_chip = Some((rgba, cw, ch, fps));
+            // The corner HUD chip: fps plus the frame-budget split — `upd`
+            // is the world update, `gpu` is the whole render+present call —
+            // so a present-bound frame (the llvmpipe/WSLg regime, where
+            // window pixels dominate and shading toggles barely move fps)
+            // is visible at a glance. Rebuilt only when the once-per-second
+            // telemetry roll changes the text.
+            let text = format!(
+                "{:>4} fps  upd {:>5.1}ms  gpu {:>5.1}ms",
+                self.fps, self.update_ms, self.render_ms
+            );
+            if !matches!(&self.pov_fps_chip, Some((_, _, _, shown)) if *shown == text) {
+                let (rgba, cw, ch) = panel::hud_chip(&text);
+                self.pov_fps_chip = Some((rgba, cw, ch, text));
             }
             let hud = self
                 .pov_fps_chip
                 .as_ref()
                 .map(|(rgba, cw, ch, _)| (rgba.as_slice(), *cw, *ch));
-            renderer.render_pov(&params, &uploads, &removes, CLEAR_COLOR, hud);
+            renderer.render_pov(
+                &params,
+                &uploads,
+                &removes,
+                CLEAR_COLOR,
+                hud,
+                self.pov_scale,
+            );
         }
         let render_seconds = render_start.elapsed().as_secs_f64();
 
@@ -1757,14 +1780,34 @@ impl ApplicationHandler for App {
             return; // already initialized (e.g. resume after suspend)
         }
 
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("Infinite World Exploration — Phase 1 continuity prototype");
+        // `WER_WINDOW=WxH`: fixed window size, for reproducible performance
+        // measurements (fragment and present cost scale with pixel count on
+        // a software rasterizer, so comparable numbers need a pinned size).
+        if let Ok(v) = std::env::var("WER_WINDOW") {
+            if let Some((w, h)) = v.split_once('x') {
+                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                    attributes = attributes.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                }
+            }
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
                 .expect("failed to create window"),
         );
 
+        // `WER_START=x,y`: spawn the player at a world position — jump
+        // straight to a scene of interest (a coast, a river) for debugging
+        // and measurements without flying there first.
+        if let Ok(v) = std::env::var("WER_START") {
+            if let Some((x, y)) = v.split_once(',') {
+                if let (Ok(x), Ok(y)) = (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
+                    self.world.player = (x, y);
+                }
+            }
+        }
         let size = window.inner_size();
         // The renderer gets a source of fresh surface targets (not a single
         // surface) so it can rebuild the swapchain if the platform loses it —
@@ -1790,6 +1833,13 @@ impl ApplicationHandler for App {
             let ground = pov::entry_ground(&self.world.map, self.world.player);
             self.pov_camera.enter_at(self.world.player, ground);
             log::info!("starting in POV (WER_POV set), radius {}", self.pov_radius);
+        }
+        if self.pov_scale < 1.0 {
+            log::info!(
+                "POV render scale {} (WER_POV_SCALE): 3D rasterizes at {:.0}% of the window pixels",
+                self.pov_scale,
+                f64::from(self.pov_scale * self.pov_scale) * 100.0
+            );
         }
         self.last_frame = Instant::now();
     }
@@ -2043,6 +2093,12 @@ fn run_pov_script(script: &str) -> Result<(), String> {
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
         .map_or(3, |r| r.clamp(1, 8));
+    // Honor the live render-scale knob so scaled frames are inspectable
+    // headlessly (the upscale-blit path, not just the shading).
+    let scale = std::env::var("WER_POV_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map_or(1.0, |s| s.clamp(0.25, 1.0));
     let mut size = (1024u32, 768u32);
     let mut capture: Option<renderer::pov::PovCapture> = None;
 
@@ -2147,7 +2203,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                     0.0,
                     pov::PovToggles::default(),
                 );
-                let rgba = cap.snapshot(&params, CLEAR_COLOR);
+                let rgba = cap.snapshot_at_scale(&params, CLEAR_COLOR, scale);
                 dump::write_ppm(std::path::Path::new(&path), &rgba, size.0, size.1)?;
                 log::info!(
                     "pov snapshot {path}: {}x{} at ({:.1}, {:.1}, {:.1}) yaw {:.1}° pitch {:.1}° | {} chunks resident",
