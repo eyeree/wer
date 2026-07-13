@@ -1,4 +1,5 @@
 import { commandById } from "./commands.js";
+import { runStartupBenchmark } from "./benchmark.js";
 import { exportSnapshot, openVault } from "./storage.js";
 
 const fields = new Map(
@@ -115,6 +116,12 @@ const initStorage = async () => {
   if (state.available) dispatchCommand("storage:enable");
 };
 
+const initBenchmark = () => {
+  const result = runStartupBenchmark();
+  appendDiagnostic(`benchmark:${result.ms.toFixed(3)}ms/${result.hardwareConcurrency} cores`);
+  dispatchCommand("tier:benchmark", result);
+};
+
 const renderMap = () => {
   const app = window.__werApp;
   if (!app) return;
@@ -124,7 +131,7 @@ const renderMap = () => {
 const updateSnapshot = (snapshot) => {
   lastSnapshot = snapshot;
   write("region", `${snapshot.region[0]}, ${snapshot.region[1]}`);
-  write("tier", snapshot.tier);
+  write("tier", `${snapshot.tier.name} / ${snapshot.tier.cache_ceiling_mb} MB`);
   write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
   write("storage", snapshot.storage.mode);
   write("webgpu-status", `${snapshot.renderer.mode} / refine ${snapshot.renderer.refinement}`);
@@ -196,3 +203,4 @@ probeWebGpu();
 initWorkerProbe();
 await initWasm();
 await initStorage();
+initBenchmark();

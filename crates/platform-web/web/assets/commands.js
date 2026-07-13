@@ -24,6 +24,12 @@ export const COMMANDS = [
     group: "Runtime",
   },
   {
+    id: "tier:benchmark",
+    key: "",
+    label: "Run startup benchmark",
+    group: "Runtime",
+  },
+  {
     id: "renderer:webgpu",
     key: "",
     label: "Use WebGPU atlas",

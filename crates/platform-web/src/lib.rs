@@ -29,6 +29,7 @@ use world_core::{
     terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, WORLD_ALGORITHM_VERSION,
 };
 use world_runtime::task::{InlineExecutor, TaskExecutor};
+use world_runtime::tier::ResourceTier;
 
 /// Shared native/wasm parity expectations. The wasm integration suite imports
 /// these exact constants, so the two execution gates cannot drift apart.
@@ -344,6 +345,9 @@ struct WebAppState {
     target: PossibilityVector,
     active_channel: u8,
     tier: &'static str,
+    cache_ceiling_mb: u32,
+    runtime_tier: ResourceTier,
+    benchmark_ms: f32,
     worker_mode: &'static str,
     worker_backlog: u32,
     workers: u32,
@@ -372,6 +376,9 @@ impl Default for WebAppState {
             target: PossibilityVector::neutral(),
             active_channel: 0,
             tier: "WebLow",
+            cache_ceiling_mb: 48,
+            runtime_tier: ResourceTier::Low,
+            benchmark_ms: 0.0,
             worker_mode: "inline",
             worker_backlog: 0,
             workers: 1,
@@ -398,9 +405,9 @@ impl WebAppState {
     fn new(config: &str) -> Self {
         let mut state = Self::default();
         if config.contains("\"tier\":\"mid\"") {
-            state.tier = "WebMid";
+            state.set_tier(ResourceTier::Mid);
         } else if config.contains("\"tier\":\"high\"") {
-            state.tier = "WebHigh";
+            state.set_tier(ResourceTier::High);
         }
         if config.contains("\"storage\":true") {
             state.storage = "indexeddb-pending";
@@ -489,12 +496,29 @@ impl WebAppState {
         } else if command.contains("storage:import") {
             self.record_count = self.record_count.saturating_add(1);
         } else if command.contains("\"tier\":\"mid\"") || command.contains("\"value\":\"mid\"") {
-            self.tier = "WebMid";
+            self.set_tier(ResourceTier::Mid);
         } else if command.contains("\"tier\":\"high\"") || command.contains("\"value\":\"high\"") {
-            self.tier = "WebHigh";
+            self.set_tier(ResourceTier::High);
         } else if command.contains("\"tier\":\"low\"") || command.contains("\"value\":\"low\"") {
-            self.tier = "WebLow";
+            self.set_tier(ResourceTier::Low);
+        } else if command.contains("tier:benchmark") {
+            self.benchmark_ms = 1.0 + self.workers as f32;
         }
+    }
+
+    fn set_tier(&mut self, tier: ResourceTier) {
+        self.runtime_tier = tier;
+        self.tier = match tier {
+            ResourceTier::Low => "WebLow",
+            ResourceTier::Mid => "WebMid",
+            ResourceTier::High => "WebHigh",
+        };
+        self.cache_ceiling_mb = match tier {
+            ResourceTier::Low => 48,
+            ResourceTier::Mid => 96,
+            ResourceTier::High => 160,
+        };
+        self.refinement_enabled = tier.refinement();
     }
 
     fn region(&self) -> RegionCoord {
@@ -527,7 +551,7 @@ impl WebAppState {
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
                 "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
-                "\"tier\":\"{}\",",
+                "\"tier\":{{\"name\":\"{}\",\"runtime\":\"{}\",\"cache_ceiling_mb\":{},\"benchmark_ms\":{:.3}}},",
                 "\"settle_hash\":\"{:#018x}\",",
                 "\"last_command\":\"{}\",",
                 "\"warnings\":[{}]",
@@ -556,6 +580,9 @@ impl WebAppState {
             self.refinement_enabled,
             self.device_losses,
             self.tier,
+            self.runtime_tier.name(),
+            self.cache_ceiling_mb,
+            self.benchmark_ms,
             self.settle_hash(),
             json_escape(&self.last_command),
             self.warnings
@@ -866,7 +893,7 @@ mod tests {
         app.update(16.666_667, "{\"move_x\":1}");
         app.apply_command("{\"id\":\"toggle:refinement\"}");
         let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"tier\":\"WebMid\""));
+        assert!(snapshot.contains("\"tier\":{\"name\":\"WebMid\""));
         assert!(snapshot.contains("\"region\":[0,0]"));
         assert!(snapshot.contains("\"executor\":{\"mode\":\"inline\""));
         assert!(snapshot.contains("\"renderer\":{\"mode\":\"cpu-fallback\""));
@@ -912,6 +939,19 @@ mod tests {
         assert!(snapshot.contains("\"mode\":\"shared-memory\""));
         assert!(snapshot.contains("\"cancellations\":8"));
         assert!(snapshot.contains("\"stale_results\":3"));
+    }
+
+    #[test]
+    fn tier_changes_preserve_settle_hash() {
+        let mut app = super::WebAppState::default();
+        let low = app.settle_hash();
+        app.apply_command("{\"value\":\"mid\"}");
+        assert_eq!(low, app.settle_hash());
+        app.apply_command("{\"value\":\"high\"}");
+        assert_eq!(low, app.settle_hash());
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"runtime\":\"high\""));
+        assert!(snapshot.contains("\"cache_ceiling_mb\":160"));
     }
 
     #[test]

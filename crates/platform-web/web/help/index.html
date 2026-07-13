@@ -31,6 +31,7 @@
           <tr data-help-command="toggle:compose"><td>Toggle GPU compose</td><td>,</td><td>Compose toggle</td></tr>
           <tr data-help-command="toggle:refinement"><td>Toggle refinement</td><td>.</td><td>Refine toggle</td></tr>
           <tr data-help-command="tier"><td>Resource tier override</td><td>none</td><td>Tier select</td></tr>
+          <tr data-help-command="tier:benchmark"><td>Run startup benchmark</td><td>none</td><td>Automatic startup benchmark</td></tr>
           <tr data-help-command="worker"><td>Worker mode override</td><td>none</td><td>Worker mode select</td></tr>
           <tr data-help-command="renderer:webgpu"><td>Use WebGPU atlas</td><td>none</td><td>Automatic WebGPU detection</td></tr>
           <tr data-help-command="renderer:cpu"><td>Use CPU map fallback</td><td>none</td><td>Reduced-mode fallback</td></tr>
@@ -52,7 +53,9 @@
       <p>
         WebLow favors small caches and inline execution, WebMid targets ordinary
         desktop browsers, and WebHigh enables larger visible windows and
-        refinement where supported. Tiers change budgets and presentation only.
+        refinement where supported. Startup benchmarking records generation and
+        frame-pacing signals for diagnostics. Tiers change budgets and
+        presentation only.
       </p>
       <h2>Storage</h2>
       <p>

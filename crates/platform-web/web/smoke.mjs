@@ -8,6 +8,7 @@ const required = [
   "docs/world-model.html",
   "assets/app.css",
   "assets/app.js",
+  "assets/benchmark.js",
   "assets/commands.js",
   "assets/storage.js",
   "assets/worker.js",
@@ -48,6 +49,9 @@ if (!app.includes("new Worker")) {
 }
 if (!app.includes("openVault")) {
   throw new Error("app.js does not initialize browser storage");
+}
+if (!app.includes("runStartupBenchmark")) {
+  throw new Error("app.js does not run startup benchmark");
 }
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
