@@ -31,6 +31,9 @@
           <tr data-help-command="toggle:compose"><td>Toggle GPU compose</td><td>,</td><td>Compose toggle</td></tr>
           <tr data-help-command="toggle:refinement"><td>Toggle refinement</td><td>.</td><td>Refine toggle</td></tr>
           <tr data-help-command="tier"><td>Resource tier override</td><td>none</td><td>Tier select</td></tr>
+          <tr data-help-command="renderer:webgpu"><td>Use WebGPU atlas</td><td>none</td><td>Automatic WebGPU detection</td></tr>
+          <tr data-help-command="renderer:cpu"><td>Use CPU map fallback</td><td>none</td><td>Reduced-mode fallback</td></tr>
+          <tr data-help-command="renderer:device-lost"><td>Handle WebGPU device loss</td><td>none</td><td>Automatic fallback</td></tr>
         </tbody>
       </table>
       <h2>Feature Tiers</h2>
@@ -47,9 +50,10 @@
       </p>
       <h2>Browser Requirements</h2>
       <p>
-        WebGPU is optional for the current static scaffold. Workers and shared
-        memory are detected later; the inline path remains the deterministic
-        fallback.
+        WebGPU is optional. When available, the browser selects the WebGPU atlas
+        presentation path; device loss or unsupported adapters fall back to the
+        CPU-composed map without changing world state. Workers and shared memory
+        are detected later; the inline path remains the deterministic fallback.
       </p>
       <h2>Unsupported</h2>
       <p>

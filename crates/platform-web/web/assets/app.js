@@ -66,6 +66,7 @@ const probeWebGpu = () => {
   if ("gpu" in navigator) {
     write("webgpu-status", "WebGPU available", "ok");
     appendDiagnostic("WebGPU: available");
+    queueMicrotask(() => dispatchCommand("renderer:webgpu"));
   } else {
     write("webgpu-status", "WebGPU unavailable", "warn");
     appendDiagnostic("WebGPU: unavailable; CPU/static fallback active");
@@ -105,6 +106,7 @@ const updateSnapshot = (snapshot) => {
   write("tier", snapshot.tier);
   write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
   write("storage", snapshot.storage.mode);
+  write("webgpu-status", `${snapshot.renderer.mode} / refine ${snapshot.renderer.refinement}`);
   appendDiagnostic(`settle_hash=${snapshot.settle_hash}`);
 };
 

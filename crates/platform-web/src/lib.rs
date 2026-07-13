@@ -346,6 +346,10 @@ struct WebAppState {
     tier: &'static str,
     worker_mode: &'static str,
     storage: &'static str,
+    renderer: &'static str,
+    compose_enabled: bool,
+    refinement_enabled: bool,
+    device_losses: u32,
     warnings: Vec<String>,
     executor_parallelism: usize,
     last_command: String,
@@ -362,6 +366,10 @@ impl Default for WebAppState {
             tier: "WebLow",
             worker_mode: "inline",
             storage: "memory",
+            renderer: "cpu-fallback",
+            compose_enabled: true,
+            refinement_enabled: false,
+            device_losses: 0,
             warnings: Vec::new(),
             executor_parallelism: InlineExecutor.parallelism(),
             last_command: String::new(),
@@ -383,6 +391,9 @@ impl WebAppState {
             state
                 .warnings
                 .push(String::from("IndexedDB storage lands in Phase 7-7"));
+        }
+        if config.contains("\"webgpu\":true") {
+            state.renderer = "webgpu-atlas";
         }
         state
     }
@@ -411,9 +422,20 @@ impl WebAppState {
         if command.contains("channel:composite") {
             self.active_channel = 0;
         } else if command.contains("toggle:refinement") {
+            self.refinement_enabled = !self.refinement_enabled;
             self.target.set(PossibilityDomain::Aesthetics, 0.625);
         } else if command.contains("toggle:compose") {
+            self.compose_enabled = !self.compose_enabled;
             self.target.set(PossibilityDomain::Planetary, 0.5625);
+        } else if command.contains("renderer:webgpu") {
+            self.renderer = "webgpu-atlas";
+        } else if command.contains("renderer:cpu") {
+            self.renderer = "cpu-fallback";
+        } else if command.contains("renderer:device-lost") {
+            self.renderer = "cpu-fallback";
+            self.device_losses = self.device_losses.saturating_add(1);
+            self.warnings
+                .push(String::from("WebGPU device lost; CPU map fallback active"));
         } else if command.contains("\"tier\":\"mid\"") || command.contains("\"value\":\"mid\"") {
             self.tier = "WebMid";
         } else if command.contains("\"tier\":\"high\"") || command.contains("\"value\":\"high\"") {
@@ -452,6 +474,7 @@ impl WebAppState {
                 "\"cache\":{{\"regions\":1,\"bytes\":0}},",
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"backlog\":0}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":0,\"failures\":0}},",
+                "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
                 "\"tier\":\"{}\",",
                 "\"settle_hash\":\"{:#018x}\",",
                 "\"last_command\":\"{}\",",
@@ -469,6 +492,10 @@ impl WebAppState {
             self.worker_mode,
             self.executor_parallelism,
             self.storage,
+            self.renderer,
+            self.compose_enabled,
+            self.refinement_enabled,
+            self.device_losses,
             self.tier,
             self.settle_hash(),
             json_escape(&self.last_command),
@@ -514,7 +541,8 @@ impl WebAppState {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"kind\":\"rgba8\",\"width\":{WIDTH},\"height\":{HEIGHT},\"pixels\":[{encoded}]}}"
+            "{{\"kind\":\"rgba8\",\"renderer\":\"{}\",\"width\":{WIDTH},\"height\":{HEIGHT},\"pixels\":[{encoded}]}}",
+            self.renderer
         )
     }
 }
@@ -782,6 +810,7 @@ mod tests {
         assert!(snapshot.contains("\"tier\":\"WebMid\""));
         assert!(snapshot.contains("\"region\":[0,0]"));
         assert!(snapshot.contains("\"executor\":{\"mode\":\"inline\""));
+        assert!(snapshot.contains("\"renderer\":{\"mode\":\"cpu-fallback\""));
         assert!(snapshot.contains("\"settle_hash\":\"0x"));
         assert!(snapshot.contains("\"last_command\":\"{\\\"id\\\":\\\"toggle:refinement\\\"}\""));
     }
@@ -798,5 +827,16 @@ mod tests {
             !map.contains("\"pixels\":[0,0,0,0"),
             "bootstrap map should not be blank"
         );
+    }
+
+    #[test]
+    fn renderer_device_loss_falls_back_to_cpu() {
+        let mut app = super::WebAppState::new("{\"webgpu\":true}");
+        assert!(app.snapshot_json().contains("\"mode\":\"webgpu-atlas\""));
+        app.apply_command("renderer:device-lost");
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"mode\":\"cpu-fallback\""));
+        assert!(snapshot.contains("\"device_losses\":1"));
+        assert!(snapshot.contains("WebGPU device lost"));
     }
 }

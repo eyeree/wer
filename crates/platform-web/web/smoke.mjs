@@ -38,6 +38,9 @@ if (!app.includes("new mod.WebApp")) {
 if (!app.includes("render_cpu_map")) {
   throw new Error("app.js does not render the CPU map buffer");
 }
+if (!app.includes("renderer:webgpu")) {
+  throw new Error("app.js does not expose WebGPU renderer selection");
+}
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
 for (const heading of ["World Model", "Possibility", "Terrain"]) {
