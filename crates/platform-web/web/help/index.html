@@ -47,11 +47,23 @@
           <tr data-help-command="storage:export"><td>Export atlas bundle</td><td>none</td><td>Export button</td></tr>
           <tr data-help-command="storage:import"><td>Import atlas bundle</td><td>none</td><td>Import button</td></tr>
           <tr data-help-command="storage:reset"><td>Reset local vault</td><td>none</td><td>Reset button</td></tr>
-          <tr data-help-command="mode:map"><td>Map mode</td><td>Tab</td><td>Map button</td></tr>
-          <tr data-help-command="mode:pov"><td>POV mode</td><td>Tab</td><td>POV button</td></tr>
+          <tr data-help-command="mode:map"><td>Map mode</td><td>Tab (from POV)</td><td>Map button</td></tr>
+          <tr data-help-command="mode:pov"><td>POV mode (needs WebGPU)</td><td>Tab</td><td>POV button</td></tr>
           <tr data-help-command="pov:pointer-lock"><td>Pointer lock</td><td>none</td><td>POV browser control</td></tr>
+          <tr data-help-command="pov:walk"><td>POV: toggle walk / fly</td><td>F (POV mode)</td><td>Walk button</td></tr>
+          <tr data-help-command="pov:toggle-baked"><td>POV: toggle baked lighting (shadows/AO)</td><td>B (POV mode)</td><td>Baked button</td></tr>
+          <tr data-help-command="pov:toggle-detail"><td>POV: toggle per-fragment detail normals</td><td>N (POV mode)</td><td>Detail button</td></tr>
+          <tr data-help-command="pov:toggle-water"><td>POV: toggle the water passes (sea + rivers)</td><td>none</td><td>Water button</td></tr>
+          <tr data-help-command="pov:scale"><td>POV render scale (fps knob: the 3D pass rasterizes at 1.0/0.5/0.25 of the canvas)</td><td>none</td><td>POV scale select</td></tr>
         </tbody>
       </table>
+      <p>
+        POV keys follow the same mode gate as the native shell: <code>F</code>,
+        <code>B</code>, and <code>N</code> act only while in POV mode, and
+        <code>Tab</code> toggles between map and POV. POV mode itself requires
+        WebGPU — there is no CPU 3D fallback; losing the device returns the
+        viewer to map mode with a warning.
+      </p>
       <h2>Feature Tiers</h2>
       <p>
         WebLow favors small caches and inline execution, WebMid targets ordinary
@@ -76,7 +88,10 @@
       </p>
       <h2>Unsupported</h2>
       <p>
-        Full POV rendering remains gated on the shared 3D renderer surface.
+        POV mode, its controls (walk/fly, the lighting and water toggles, the
+        render scale), and its WebGPU/device-loss gating are wired; hosting the
+        shared 3D terrain renderer in the browser canvas is the remaining
+        Phase 7-9 work, so the POV canvas does not draw terrain yet.
         Networking, accounts, hosted worlds, multiplayer, and authoritative GPU
         simulation are outside Phase 7.
       </p>

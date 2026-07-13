@@ -362,6 +362,21 @@ struct WebAppState {
     view_mode: &'static str,
     pov_supported: bool,
     pointer_lock: bool,
+    /// POV motion mode (`pov:walk` toggles walk ↔ fly), mirroring the native
+    /// shell's `F` key.
+    pov_walk: bool,
+    /// The native POV diagnostic toggles (`B`/`N`/`V`), mirrored so the
+    /// browser viewer drives the same presentation switches the shared 3D
+    /// renderer exposes: baked sun-visibility/AO, per-fragment detail
+    /// normals, and the water passes. Presentation-only — never part of the
+    /// settle hash.
+    pov_baked_light: bool,
+    pov_detail_normals: bool,
+    pov_water: bool,
+    /// POV render scale (the native `WER_POV_SCALE`): the fraction of the
+    /// canvas resolution the 3D pass rasterizes at before the upscale blit —
+    /// the practical fps knob wherever fragment cost is CPU-bound.
+    pov_render_scale: f32,
     compose_enabled: bool,
     refinement_enabled: bool,
     device_losses: u32,
@@ -396,6 +411,11 @@ impl Default for WebAppState {
             view_mode: "map",
             pov_supported: false,
             pointer_lock: false,
+            pov_walk: false,
+            pov_baked_light: true,
+            pov_detail_normals: true,
+            pov_water: true,
+            pov_render_scale: 1.0,
             compose_enabled: true,
             refinement_enabled: false,
             device_losses: 0,
@@ -422,7 +442,7 @@ impl WebAppState {
                 .push(String::from("IndexedDB storage lands in Phase 7-7"));
         }
         if config.contains("\"webgpu\":true") {
-            state.renderer = "webgpu-atlas";
+            state.set_renderer_webgpu();
         }
         if config.contains("\"worker_mode\":\"workers\"") {
             state.worker_mode = "workers";
@@ -461,14 +481,14 @@ impl WebAppState {
             self.compose_enabled = !self.compose_enabled;
             self.target.set(PossibilityDomain::Planetary, 0.5625);
         } else if command.contains("renderer:webgpu") {
-            self.renderer = "webgpu-atlas";
-        } else if command.contains("renderer:cpu") {
-            self.renderer = "cpu-fallback";
+            self.set_renderer_webgpu();
         } else if command.contains("renderer:device-lost") {
-            self.renderer = "cpu-fallback";
+            self.set_renderer_cpu();
             self.device_losses = self.device_losses.saturating_add(1);
             self.warnings
                 .push(String::from("WebGPU device lost; CPU map fallback active"));
+        } else if command.contains("renderer:cpu") {
+            self.set_renderer_cpu();
         } else if command.contains("worker:inline") {
             self.worker_mode = "inline";
             self.worker_backlog = 0;
@@ -523,6 +543,48 @@ impl WebAppState {
             self.pointer_lock = false;
         } else if command.contains("pov:pointer-lock") {
             self.pointer_lock = self.pov_supported;
+        } else if command.contains("pov:walk") {
+            self.pov_walk = !self.pov_walk;
+        } else if command.contains("pov:toggle-baked") {
+            self.pov_baked_light = !self.pov_baked_light;
+        } else if command.contains("pov:toggle-detail") {
+            self.pov_detail_normals = !self.pov_detail_normals;
+        } else if command.contains("pov:toggle-water") {
+            self.pov_water = !self.pov_water;
+        } else if command.contains("pov:scale") {
+            // The native WER_POV_SCALE ladder, as a select (the `tier`
+            // pattern): full/half/quarter canvas resolution for the 3D pass.
+            self.pov_render_scale = if command.contains("\"value\":\"quarter\"") {
+                0.25
+            } else if command.contains("\"value\":\"half\"") {
+                0.5
+            } else {
+                1.0
+            };
+        }
+    }
+
+    /// WebGPU presentation is up: the atlas path composes the map, and the
+    /// POV mode gate opens — the shared 3D renderer is GPU-only on every
+    /// platform (no CPU POV twin exists; phase-7-plan.md §9.9).
+    fn set_renderer_webgpu(&mut self) {
+        self.renderer = "webgpu-atlas";
+        self.pov_supported = true;
+    }
+
+    /// CPU fallback (chosen or device loss): the map keeps working, and POV
+    /// — GPU-only — closes cleanly, returning to map mode rather than
+    /// stranding the viewer in an unrenderable state (phase-7-plan.md §9.9:
+    /// "device-loss and unsupported-feature paths return to map mode
+    /// cleanly").
+    fn set_renderer_cpu(&mut self) {
+        self.renderer = "cpu-fallback";
+        self.pov_supported = false;
+        self.pointer_lock = false;
+        if self.view_mode == "pov" {
+            self.view_mode = "map";
+            self.warnings
+                .push(String::from("POV requires WebGPU; returned to map mode"));
         }
     }
 
@@ -571,7 +633,8 @@ impl WebAppState {
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
                 "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
-                "\"view\":{{\"mode\":\"{}\",\"pov_supported\":{},\"pointer_lock\":{}}},",
+                "\"view\":{{\"mode\":\"{}\",\"pov_supported\":{},\"pointer_lock\":{},",
+                "\"pov\":{{\"motion\":\"{}\",\"baked_light\":{},\"detail_normals\":{},\"water\":{},\"render_scale\":{:.2}}}}},",
                 "\"tier\":{{\"name\":\"{}\",\"runtime\":\"{}\",\"cache_ceiling_mb\":{},\"benchmark_ms\":{:.3}}},",
                 "\"settle_hash\":\"{:#018x}\",",
                 "\"last_command\":\"{}\",",
@@ -603,6 +666,11 @@ impl WebAppState {
             self.view_mode,
             self.pov_supported,
             self.pointer_lock,
+            if self.pov_walk { "walk" } else { "fly" },
+            self.pov_baked_light,
+            self.pov_detail_normals,
+            self.pov_water,
+            self.pov_render_scale,
             self.tier,
             self.runtime_tier.name(),
             self.cache_ceiling_mb,
@@ -1002,5 +1070,56 @@ mod tests {
         assert_eq!(before, app.settle_hash());
         assert!(snapshot.contains("\"view\":{\"mode\":\"map\""));
         assert!(snapshot.contains("POV renderer unavailable"));
+    }
+
+    #[test]
+    fn webgpu_opens_the_pov_gate_and_device_loss_returns_to_map() {
+        // phase-7-plan.md §9.9: the POV gate follows the GPU renderer (no
+        // CPU POV twin exists on any platform), and device-loss paths
+        // return to map mode cleanly instead of stranding the viewer.
+        let mut app = super::WebAppState::new("{\"webgpu\":true}");
+        let before = app.settle_hash();
+        app.apply_command("mode:pov");
+        app.apply_command("pov:pointer-lock");
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"view\":{\"mode\":\"pov\",\"pov_supported\":true"));
+        assert!(snapshot.contains("\"pointer_lock\":true"));
+        app.apply_command("renderer:device-lost");
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"view\":{\"mode\":\"map\",\"pov_supported\":false"));
+        assert!(snapshot.contains("\"pointer_lock\":false"));
+        assert!(snapshot.contains("POV requires WebGPU; returned to map mode"));
+        // Recovery re-opens the gate without touching world identity.
+        app.apply_command("renderer:webgpu");
+        app.apply_command("mode:pov");
+        assert!(app.snapshot_json().contains("\"view\":{\"mode\":\"pov\""));
+        assert_eq!(before, app.settle_hash());
+    }
+
+    #[test]
+    fn pov_config_commands_are_presentation_only() {
+        // The native POV surface mirrored in the browser (walk, the B/N/V
+        // diagnostic toggles, the render scale) is derived presentation:
+        // every command leaves the settle hash untouched.
+        let mut app = super::WebAppState::new("{\"webgpu\":true}");
+        app.apply_command("mode:pov");
+        let before = app.settle_hash();
+        app.apply_command("pov:walk");
+        app.apply_command("pov:toggle-baked");
+        app.apply_command("pov:toggle-detail");
+        app.apply_command("pov:toggle-water");
+        app.apply_command("{\"id\":\"pov:scale\",\"value\":\"half\"}");
+        let snapshot = app.snapshot_json();
+        assert_eq!(before, app.settle_hash());
+        assert!(snapshot.contains(
+            "\"pov\":{\"motion\":\"walk\",\"baked_light\":false,\"detail_normals\":false,\
+             \"water\":false,\"render_scale\":0.50}"
+        ));
+        app.apply_command("pov:walk");
+        app.apply_command("{\"id\":\"pov:scale\",\"value\":\"full\"}");
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"motion\":\"fly\""));
+        assert!(snapshot.contains("\"render_scale\":1.00"));
+        assert_eq!(before, app.settle_hash());
     }
 }

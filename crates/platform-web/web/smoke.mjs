@@ -56,6 +56,17 @@ if (!app.includes("runStartupBenchmark")) {
 if (!html.includes('data-command="mode:pov"')) {
   throw new Error("index.html does not expose POV mode control");
 }
+for (const control of ["pov:walk", "pov:toggle-baked", "pov:toggle-detail", "pov:toggle-water", "pov:scale"]) {
+  if (!html.includes(`data-command="${control}"`)) {
+    throw new Error(`index.html does not expose POV control ${control}`);
+  }
+}
+if (!app.includes('command.group === "POV"')) {
+  throw new Error("app.js does not gate POV keys to POV mode");
+}
+if (!app.includes('"mode:map" : command.id')) {
+  throw new Error("app.js does not toggle Tab between map and POV");
+}
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
 for (const heading of ["World Model", "Possibility", "Terrain"]) {
