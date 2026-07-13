@@ -421,19 +421,18 @@ pub fn run_invalidation_ledger() -> Vec<ScenarioReport> {
     let mut bias;
     let mut reports = Vec::new();
 
-    // Aesthetics/Morphology/Behavior: buckets flip; L8 is their only reader, so
-    // exactly ecology regenerates (its aggregate fields are Ecology-driven, but
-    // its dependency hash folds M/B/A because near-field realization expresses
-    // genomes under them — phase-3-plan.md §7.5).
+    // Aesthetics/Morphology/Behavior: buckets flip, but they are
+    // expression-only organism inputs after A.9. No generated layer declares
+    // them as direct readers.
     bias = [0.0f32; POSSIBILITY_DIMS];
     bias[PossibilityDomain::Aesthetics.index()] = 0.4;
     bias[PossibilityDomain::Morphology.index()] = 0.4;
     bias[PossibilityDomain::Behavior.index()] = -0.4;
     reports.push(drift_scenario(
-        "aesthetics/morphology/behavior bias -> ecology (L8) only",
+        "aesthetics/morphology/behavior bias -> expression only",
         bias,
         true,
-        Some(layer_bit(world_core::layer::LAYER_ECOLOGY)),
+        Some(0),
     ));
 
     // Ecology: vegetation and L8 (Ecology has driven vegetation density since

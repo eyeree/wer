@@ -8,14 +8,11 @@
 //! a stable [`FeatureKey`]-derived identity (the identity machine built in
 //! Phase 0, first used here).
 //!
-//! Placement, species choice, and per-instance jitter are seeded from
-//! `feature_hash(FeatureKey{ region, layer: LAYER_ECOLOGY, feature_index: cell,
-//! possibility_revision })`, so a pinned region realizes bit-identical organisms
-//! across frames and across a two-run replay. Distance-based regeneration and
-//! offscreen replacement fall out for free: organisms are recomputed when the
-//! region's source tiles change (its L8 dependency hash moves) and simply
-//! dropped when it leaves the near window — no morphing, no stored entity state
-//! (§7.6).
+//! Identity/placement and expression are deliberately keyed separately.
+//! Presence, species choice, and per-instance jitter are seeded from a stable
+//! [`OrganismIdentityKey`] plus `feature_index = cell + slot·resolution²`.
+//! Morphology/Behavior/Aesthetics only build [`OrganismExpressionKey`], so
+//! expression refreshes cannot perturb entity identity or placement.
 //!
 //! The runtime coordinator verifies that every signature tracked for a
 //! resident region is present in the roster cache before it reuses or
@@ -25,15 +22,88 @@
 
 use world_core::layer::LAYER_ECOLOGY;
 use world_core::{
-    feature_hash, species_biomass, Biome, Climate, Expressed, FeatureKey, GenomeBias,
-    HabitatSignature, LocalPos, RegionCoord, Rng, Soils, Trophic, REGION_SIZE,
-    WORLD_ALGORITHM_VERSION,
+    feature_hash, mix, species_biomass, Biome, Climate, Expressed, FeatureKey, GenomeBias,
+    HabitatSignature, LocalPos, PossibilityDomain, PossibilityVector, RegionCoord, Rng, Soils,
+    Trophic, REGION_SIZE, WORLD_ALGORITHM_VERSION,
 };
 
 use crate::generate::{
     RegionTiles, CHANNEL_FERTILITY, CHANNEL_MOISTURE, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
 };
 use crate::rostercache::RosterCache;
+
+const PRESENCE_LABEL: u64 = 0xA900_0001;
+const SPECIES_LABEL: u64 = 0xA900_0002;
+const PLACEMENT_LABEL: u64 = 0xA900_0003;
+
+/// Stable identity and placement provenance for a region's organism surface.
+/// This is intentionally independent of M/B/A expression buckets and the
+/// region's run-local revision counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OrganismIdentityKey {
+    /// Fresh aggregate Ecology provenance.
+    pub ecology_hash: u64,
+    /// Stable content hash of habitat/roster inputs used for realization.
+    pub habitat_hash: u64,
+    /// Explicit succession generation. Ordinary generated regions use zero;
+    /// callers may advance it for deliberate re-identification events.
+    pub succession_epoch: u64,
+    /// Field resolution defining cell and feature-index layout.
+    pub resolution: u16,
+}
+
+impl OrganismIdentityKey {
+    /// Fold the key into the `FeatureKey::possibility_revision` slot used by
+    /// the permanent identity hash. The full typed key remains visible to the
+    /// runtime; this compact revision is only the legacy hash API boundary.
+    #[must_use]
+    pub fn feature_revision(self) -> u32 {
+        let mut h = 0xA91D_EA7A_0000_0001;
+        h = mix(h, self.ecology_hash);
+        h = mix(h, self.habitat_hash);
+        h = mix(h, self.succession_epoch);
+        h = mix(h, u64::from(self.resolution));
+        (h ^ (h >> 32)) as u32
+    }
+}
+
+/// Quantized expression inputs for genome presentation. Bucket centers are
+/// used when building [`GenomeBias`] so raw sub-bucket drift cannot create a
+/// different realization after cache eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OrganismExpressionKey {
+    pub morphology_bucket: u16,
+    pub behavior_bucket: u16,
+    pub aesthetics_bucket: u16,
+}
+
+impl OrganismExpressionKey {
+    #[must_use]
+    pub fn from_vector(current: PossibilityVector) -> Self {
+        Self {
+            morphology_bucket: current.quantized(PossibilityDomain::Morphology),
+            behavior_bucket: current.quantized(PossibilityDomain::Behavior),
+            aesthetics_bucket: current.quantized(PossibilityDomain::Aesthetics),
+        }
+    }
+
+    #[must_use]
+    pub fn bias(self) -> GenomeBias {
+        GenomeBias {
+            morphology: PossibilityVector::dequantize(self.morphology_bucket),
+            behavior: PossibilityVector::dequantize(self.behavior_bucket),
+            aesthetics: PossibilityVector::dequantize(self.aesthetics_bucket),
+        }
+    }
+}
+
+/// Complete presentation currency for a region's realized vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OrganismPresentationKey {
+    pub identity: OrganismIdentityKey,
+    pub expression: OrganismExpressionKey,
+    pub slots: u16,
+}
 
 /// A realized near-field organism instance. Transient presentation state — a
 /// stable id, its species, where it sits, and its expressed appearance — never
@@ -83,12 +153,18 @@ pub fn realize_region(
     resolution: u16,
 ) -> Vec<Organism> {
     let mut out = Vec::new();
+    let identity = OrganismIdentityKey {
+        ecology_hash: 0,
+        habitat_hash: 0,
+        succession_epoch: u64::from(possibility_revision),
+        resolution,
+    };
     realize_region_into(
         coord,
         tiles,
         rosters,
-        bias,
-        possibility_revision,
+        identity,
+        expression_key_from_bias(bias),
         resolution,
         1,
         &mut out,
@@ -113,8 +189,8 @@ pub fn realize_region_into(
     coord: RegionCoord,
     tiles: &RegionTiles,
     rosters: &RosterCache,
-    bias: GenomeBias,
-    possibility_revision: u32,
+    identity: OrganismIdentityKey,
+    expression: OrganismExpressionKey,
     resolution: u16,
     organisms_per_cell: u16,
     out: &mut Vec<Organism>,
@@ -132,6 +208,8 @@ pub fn realize_region_into(
 
     let (ox, oy) = coord.origin();
     let cell_size = REGION_SIZE / f64::from(resolution);
+    let bias = expression.bias();
+    let possibility_revision = identity.feature_revision();
 
     for cy in 0..resolution {
         for cx in 0..resolution {
@@ -152,11 +230,11 @@ pub fn realize_region_into(
                     feature_index,
                     possibility_revision,
                 });
-                let mut rng = Rng::new(id);
+                let mut presence_rng = Rng::new(mix(id, PRESENCE_LABEL));
                 // Presence preserves the aggregate: each slot of a cell at
                 // density d hosts an organism with probability d (section 10),
                 // so expected population scales linearly with slots.
-                if rng.next_f32() >= density {
+                if presence_rng.next_f32() >= density {
                     continue;
                 }
                 // Classify the cell's habitat exactly as L8 does, then resolve
@@ -178,14 +256,16 @@ pub fn realize_region_into(
                 if entry.roster.species.is_empty() {
                     continue;
                 }
-                let index = sample_species(&entry.roster, &entry.web, &mut rng);
+                let mut species_rng = Rng::new(mix(id, SPECIES_LABEL));
+                let index = sample_species(&entry.roster, &entry.web, &mut species_rng);
                 let species = &entry.roster.species[index];
                 let mut expressed = species.genome.express(bias);
                 // Clamp expressed body size to what the habitat can feed.
                 expressed.size = expressed.size.min(entry.web.max_body_size);
 
-                let jx = f64::from(rng.next_f32());
-                let jy = f64::from(rng.next_f32());
+                let mut place_rng = Rng::new(mix(id, PLACEMENT_LABEL));
+                let jx = f64::from(place_rng.next_f32());
+                let jy = f64::from(place_rng.next_f32());
                 let world_pos = (
                     ox + (f64::from(cx) + jx) * cell_size,
                     oy + (f64::from(cy) + jy) * cell_size,
@@ -202,6 +282,14 @@ pub fn realize_region_into(
             }
         }
     }
+}
+
+fn expression_key_from_bias(bias: GenomeBias) -> OrganismExpressionKey {
+    let mut v = PossibilityVector::neutral();
+    v.set(PossibilityDomain::Morphology, bias.morphology);
+    v.set(PossibilityDomain::Behavior, bias.behavior);
+    v.set(PossibilityDomain::Aesthetics, bias.aesthetics);
+    OrganismExpressionKey::from_vector(v)
 }
 
 /// Sample a roster index weighted by per-species biomass (producers dominate;
@@ -236,6 +324,8 @@ mod tests {
     use crate::InlineExecutor;
     use world_core::{PossibilityField, POSSIBILITY_DIMS};
 
+    type StableOrganismFields = (u64, u64, Trophic, u16, LocalPos, (u64, u64));
+
     fn settled_map() -> (RegionMap, RegionCoord) {
         let cfg = StreamConfig {
             near_radius: 1.5 * REGION_SIZE,
@@ -261,6 +351,25 @@ mod tests {
             );
         }
         (map, RegionCoord::new(0, 0))
+    }
+
+    fn stable_fields(organisms: &[Organism]) -> Vec<StableOrganismFields> {
+        organisms
+            .iter()
+            .map(|organism| {
+                (
+                    organism.id,
+                    organism.species,
+                    organism.trophic,
+                    organism.slot,
+                    organism.cell,
+                    (
+                        organism.world_pos.0.to_bits(),
+                        organism.world_pos.1.to_bits(),
+                    ),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -319,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_changes_organism_ids() {
+    fn legacy_succession_argument_changes_organism_ids() {
         let (map, coord) = settled_map();
         let tiles = map.cache().get(coord).expect("tiles");
         let a = realize_region(
@@ -338,10 +447,87 @@ mod tests {
             1,
             16,
         );
-        // A different possibility revision re-rolls identities (succession).
+        // The compatibility helper maps this argument to an explicit
+        // succession epoch, not to `RegionState::revision`.
         if let (Some(x), Some(y)) = (a.first(), b.first()) {
             assert_ne!(x.id, y.id);
         }
+    }
+
+    #[test]
+    fn expression_key_changes_only_expressed_fields() {
+        let (map, coord) = settled_map();
+        let tiles = map.cache().get(coord).expect("tiles");
+        let identity = OrganismIdentityKey {
+            ecology_hash: 11,
+            habitat_hash: 22,
+            succession_epoch: 0,
+            resolution: 16,
+        };
+        let neutral = OrganismExpressionKey::from_vector(PossibilityVector::neutral());
+        let vivid = OrganismExpressionKey {
+            morphology_bucket: 4095,
+            behavior_bucket: neutral.behavior_bucket,
+            aesthetics_bucket: 0,
+        };
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        realize_region_into(
+            coord,
+            tiles,
+            map.roster_cache(),
+            identity,
+            neutral,
+            16,
+            1,
+            &mut a,
+        );
+        realize_region_into(
+            coord,
+            tiles,
+            map.roster_cache(),
+            identity,
+            vivid,
+            16,
+            1,
+            &mut b,
+        );
+        assert!(!a.is_empty());
+        assert_eq!(stable_fields(&a), stable_fields(&b));
+        assert!(
+            a.iter()
+                .zip(&b)
+                .any(|(left, right)| left.expressed != right.expressed),
+            "different expression buckets must refresh genome expression"
+        );
+    }
+
+    #[test]
+    fn succession_epoch_can_reidentify_and_replace_placement() {
+        let (map, coord) = settled_map();
+        let tiles = map.cache().get(coord).expect("tiles");
+        let expression = OrganismExpressionKey::from_vector(PossibilityVector::neutral());
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for (succession_epoch, out) in [(0, &mut first), (1, &mut second)] {
+            realize_region_into(
+                coord,
+                tiles,
+                map.roster_cache(),
+                OrganismIdentityKey {
+                    ecology_hash: 11,
+                    habitat_hash: 22,
+                    succession_epoch,
+                    resolution: 16,
+                },
+                expression,
+                16,
+                1,
+                out,
+            );
+        }
+        assert!(!first.is_empty());
+        assert_ne!(stable_fields(&first), stable_fields(&second));
     }
 
     #[test]
@@ -350,13 +536,20 @@ mod tests {
         let tiles = map.cache().get(coord).expect("tiles");
         let mut density_one = Vec::new();
         let mut density_four = Vec::new();
+        let identity = OrganismIdentityKey {
+            ecology_hash: 0,
+            habitat_hash: 0,
+            succession_epoch: 0,
+            resolution: 16,
+        };
+        let expression = OrganismExpressionKey::from_vector(PossibilityVector::neutral());
         for (density, out) in [(1, &mut density_one), (4, &mut density_four)] {
             realize_region_into(
                 coord,
                 tiles,
                 map.roster_cache(),
-                GenomeBias::neutral(),
-                0,
+                identity,
+                expression,
                 16,
                 density,
                 out,
@@ -387,7 +580,7 @@ mod tests {
                     region: coord,
                     layer: LAYER_ECOLOGY,
                     feature_index,
-                    possibility_revision: 0,
+                    possibility_revision: identity.feature_revision(),
                 })
             );
         }

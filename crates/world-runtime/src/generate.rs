@@ -780,11 +780,9 @@ pub fn generate_layer(
             else {
                 return missing_inputs(coord, layer, inputs.dep_hash);
             };
-            // Ecology is the sole direct reader of E/M/B/A. The aggregate fields
-            // are Ecology-driven; M/B/A fold into the dependency hash (via
-            // `decl.domains`) because near-field realization expresses genomes
-            // under them, so steering M/B/A regenerates L8 and re-realizes its
-            // organisms with new expression (phase-3-plan.md §7.5).
+            // Aggregate Ecology directly reads only E. M/B/A are
+            // expression-only inputs tracked by the near-field realization key,
+            // so they do not regenerate this tile (A.9).
             let p_ecology = p.get(PossibilityDomain::Ecology);
             let mut herbivore = new_tile();
             let mut predator = new_tile();

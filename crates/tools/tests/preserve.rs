@@ -301,8 +301,11 @@ fn overlap_order_winner_recovery_and_evicted_deletion_are_deterministic() {
     assert_eq!(forward.organisms_in(target), reverse.organisms_in(target));
 
     // Deleting the resident winner reveals the successor and advances the
-    // realized-state revision exactly once.
+    // realized-state revision exactly once. The successor differs only in
+    // Aesthetics, so A.9 keeps stable organism identity resident until the
+    // expression refresh publishes.
     let old_revision = forward.get(target).unwrap().revision;
+    let old_organisms = forward.organisms_in(target).unwrap().to_vec();
     assert!(forward.remove_preserve_contribution(low_id, target));
     assert_eq!(
         forward.effective_preserve(target),
@@ -312,7 +315,7 @@ fn overlap_order_winner_recovery_and_evicted_deletion_are_deterministic() {
         forward.get(target).unwrap().revision,
         old_revision.wrapping_add(1)
     );
-    assert!(forward.organisms_in(target).is_none());
+    assert_eq!(forward.organisms_in(target).unwrap(), old_organisms);
     for _ in 0..4 {
         settle(&mut forward, (128.0, 128.0), 0.0, &[]);
     }
@@ -333,6 +336,10 @@ fn overlap_order_winner_recovery_and_evicted_deletion_are_deterministic() {
     assert_eq!(
         region_tile_hashes(&forward, target),
         region_tile_hashes(&successor_oracle, target)
+    );
+    assert_eq!(
+        forward.organisms_in(target),
+        successor_oracle.organisms_in(target)
     );
 
     // Contributor ownership outlives the resident. Removing a winner while

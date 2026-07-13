@@ -512,7 +512,7 @@ The implemented directed acyclic graph is:
 | 5 | Soils | none directly | Terrain, Geology, Climate, Hydrology | depth, fertility | 2 |
 | 6 | Biome | none directly | Terrain, Climate, Hydrology, Soils | biome id `u8` | 1 |
 | 7 | Vegetation | Ecology | Climate, Soils, Biome | density, canopy height | 1 |
-| 8 | Ecology | Ecology, Morphology, Behavior, Aesthetics | Climate, Soils, Biome, Vegetation | herbivore pressure, predator pressure, diversity, dominant roster index | 2 |
+| 8 | Ecology | Ecology | Climate, Soils, Biome, Vegetation | herbivore pressure, predator pressure, diversity, dominant roster index | 2 |
 
 Layer ids are topological. Scanning dirty bits in ascending order therefore
 visits dependencies before dependents. Drainage is special: it does not read a
@@ -861,10 +861,12 @@ Possibility bucket flips use the declared domain-reader closure to mark dirty
 layers. Revisions still record any material float-state movement, including
 sub-bucket movement, but no longer determine tile staleness. Applying a newly
 effective preserve winner follows the same separation: any exact realized
-vector change advances revision once and retires old-revision organisms, while
-only quantized bucket flips dirty tiles or cancel their in-flight work. Thus a
-same-bucket snap to canonical centers changes the organism identity epoch but
-keeps tile dependency hashes and jobs intact.
+vector change advances revision once, while only quantized bucket flips dirty
+tiles or cancel their in-flight work. Organism identity is keyed separately
+from region revision: a same-bucket snap to canonical centers keeps tile
+dependency hashes, jobs, entity ids, species, slots, cells, and jittered
+positions intact, while an M/B/A expression-key change refreshes expressed
+genome values.
 
 ### 3.6 Resonance
 
@@ -1539,19 +1541,21 @@ with zero for zero or one surviving species. Diversity and dominant index are
 signature/web properties; they do not vary with the local Ecology scalar or
 vegetation density.
 
-Morphology, Behavior, and Aesthetics are folded into the Ecology dependency
-hash, but the four aggregate outputs do not use them. Their role is to force a
-new L8 key so near-field organism expression is rebuilt.
+Morphology, Behavior, and Aesthetics are not part of the aggregate Ecology
+dependency hash. The four L8 outputs do not use them; near-field realization
+tracks them with a separate expression key built from their quantized bucket
+centers.
 
 ### 3.20 Near-field organism realization
 
 [`realize.rs`](crates/world-runtime/src/realize.rs) uses a fresh, settled
-Ecology-layer key to create transient `Organism` structs only inside the near
-window. It reads the upstream vegetation, temperature, moisture, fertility,
-and biome fields plus the roster/web; it does not sample the L8 pressure,
-diversity, or dominant-index channels themselves. Each struct contains feature
-id, species id, trophic role, explicit density slot, local cell, world position,
-and expressed genome.
+Ecology-layer key, a stable habitat key, an explicit succession epoch, and a
+separate M/B/A expression key to create transient `Organism` structs only
+inside the near window. It reads the upstream vegetation, temperature,
+moisture, fertility, and biome fields plus the roster/web; it does not sample
+the L8 pressure, diversity, or dominant-index channels themselves. Each struct
+contains feature id, species id, trophic role, explicit density slot, local
+cell, world position, and expressed genome.
 
 For resolution $n$, cell index $c=c_yn+c_x$, and resource-density slot $s$,
 the feature index is
@@ -1561,16 +1565,23 @@ i=c+sn^2.
 $$
 
 Slot 0 is the Phase 5 identity and canonical gameplay sample; higher slots are
-additive presentation instances. The organism id
-folds world version, region, layer 8, this feature index, and the region's
-current revision. A SplitMix stream seeded by that id is consumed in a fixed
-order:
+additive presentation instances. The organism id folds world version, region,
+layer 8, this feature index, and a compact revision derived from the typed
+identity key. That key includes the fresh L8 provenance, field resolution,
+sorted habitat-signature/roster content, and the succession epoch; it excludes
+raw M/B/A floats and `RegionState::revision`. Separate SplitMix streams seeded
+from the id decide:
 
 1. create the organism if the first sample is below vegetation density;
 2. classify the cell signature;
 3. sample a surviving species proportionally to per-species biomass;
-4. express its genome under $(M,B,A)$ and cap size at $s_{max}$; and
-5. draw two fractions to jitter position uniformly inside the cell.
+4. draw two fractions to jitter position uniformly inside the cell.
+
+Expression is a pure post-selection transform: the selected species genome is
+expressed under the M/B/A bucket centers and body size is capped at $s_{max}$.
+Changing only Morphology, Behavior, or Aesthetics can update `expressed`, but
+not presence, id, species, trophic role, density slot, local cell, or
+world-space placement.
 
 One density slot therefore has expected occupancy $d_v$; $k$ slots have
 expected occupancy $kd_v$. A fixed pre-resonance pass publishes one nearest
@@ -1580,14 +1591,15 @@ the tier's one/two/four-slot visual density under
 `max_realize_organisms`. Visual backpressure cannot delay or accelerate the
 canonical publication schedule.
 
-One currency map records canonical L8-key availability and another records
-visual `(L8 key, slot count)` completion over the same vector; empty barren
-vectors retain both keys. Missing or changed L8 provenance, missing signatures
-or rosters, near exit, capacity parking, preserve revision changes, and session
-replacement retire the vector and both currencies before gameplay reads. A
-material preserve-winner snap therefore uses the new region revision even when
-center normalization stayed inside the same L8 buckets. There is no movement,
-animation state, hunger, reproduction, age, interaction, or behavior
+Runtime currency is split into canonical identity completion, canonical
+expression completion, and visual presentation completion
+`(identity, expression, slots)` over the same vector; empty barren vectors
+retain these keys. Missing or changed stable identity provenance, missing
+signatures or rosters, near exit, capacity parking, and session replacement
+retire the vector before gameplay reads. Expression-only changes leave the old
+canonical vector resident until the fixed pre-resonance publication pass can
+atomically refresh it under the same identity and placement. There is no
+movement, animation state, hunger, reproduction, age, interaction, or behavior
 simulation.
 
 ### 3.21 Record schema and codec
@@ -1807,7 +1819,8 @@ The streaming data structures are:
 * `MacroCache`: level-4 coordinate -> shared `DrainageTile`;
 * `RosterCache`: habitat signature -> shared `RosterEntry`;
 * organism map: coordinate -> transient organism vector, with separate
-  canonical-L8 and visual-`(L8, slots)` currency maps;
+  canonical identity, canonical expression, and visual
+  `(identity, expression, slots)` currency maps;
 * region-signature sets that identify roster dependencies; and
 * preserve contributors: coordinate -> ordered `(content id, signature)` map,
   whose first entry is the effective owner.
@@ -2070,10 +2083,15 @@ into one implementation unit.
    affected neighbor closure across authority lifecycle changes. Exact
    ordinary history-divergent border tests cover Terrain through Biome.
 
-9. **Separate stable organism identity, placement, succession, and expression**
-   (finding 12). Do not let M/B/A-only changes re-roll species or position; key
-   expression from explicitly quantized or exact inputs and use a distinct,
-   content-derived succession epoch when re-identification is intended.
+9. **Completed: Separate stable organism identity, placement, succession, and
+   expression**
+   ([Improvement A.9](plans/prototype/improvement_A_9_organism_identity_placement_succession_expression.md);
+   finding 12). L8 aggregate Ecology now reads Ecology only, while runtime
+   realization tracks typed identity, expression, and presentation keys. M/B/A
+   changes refresh bucket-center genome expression without changing presence,
+   id, species, trophic role, density slot, local cell, or jittered placement;
+   aggregate/habitat provenance and the explicit succession epoch are the
+   identity-grade inputs.
 
 10. **Harden content equality and canonical set encoding** (findings 24 and
     25). Compare immutable bodies when ids match, reject or deterministically
@@ -2427,25 +2445,24 @@ biomass weights whose sum remains constant across resource tiers. Tests should
 include the pure $E=0$ function case and the lowest quantized Ecology bucket,
 then compare entity totals with both pressure channels.
 
-#### 12. Appearance-only changes can re-roll identity and placement
+#### 12. Resolved: appearance-only changes can re-roll identity and placement
 
-Morphology, Behavior, and Aesthetics make the L8 dependency hash change even
-though aggregate L8 values do not use them. The rebuilt realization uses the
-incremented region revision in feature ids, so an Aesthetics-only bucket flip
-can re-roll presence, species choice, and positions rather than merely changing
-expression. This weakens the intended M/B/A expression-only behavior, causes
-unnecessary aggregate regeneration, and can reselect species and placement on
-the next realization.
+Previously, Morphology, Behavior, and Aesthetics made the L8 dependency hash
+change even though aggregate L8 values did not use them. Rebuilt realization
+also used the incremented region revision in feature ids, so an
+Aesthetics-only bucket flip could re-roll presence, species choice, and
+positions rather than merely changing expression. Raw M/B/A floats could also
+diverge from a bucket-keyed cache after near exit and re-entry.
 
-Separate the aggregate Ecology key, stable entity identity/placement key, and
-expression key. M/B/A changes should update expression while retaining entity
-id and species; true succession can use an explicit content-derived epoch.
-
-There is a related cache mismatch: realization reads raw M/B/A floats, but the
-L8 key contains only their buckets. Sub-bucket drift does not refresh current
-organisms, yet leaving and re-entering the near window can rebuild them from
-new raw floats and a new revision under the same L8 bucket key. Use bucket
-centers or include exact expression inputs in the realization key.
+Resolution: aggregate Ecology now declares only Ecology as its direct
+possibility-domain input. Runtime realization uses typed keys for stable
+identity, expression, and presentation completion. Stable identity folds fresh
+L8 provenance, field resolution, sorted habitat-signature/roster content, and
+an explicit succession epoch; it excludes M/B/A and `RegionState::revision`.
+Expression is rebuilt from M/B/A bucket centers, so same-bucket drift and
+near-window re-entry reproduce the same vector. M/B/A-only bucket changes can
+refresh expressed genome values but keep presence, id, species, trophic role,
+density slot, local cell, and jittered world position stable.
 
 #### 13. Several genes are unused or contradict assigned trophic roles
 
@@ -2671,10 +2688,11 @@ content-id-to-signature contributor map for every covered coordinate and uses
 the lowest content id as its effective owner. Winner deletion recomputes and
 applies the successor; non-winner deletion is inert, and final deletion keeps
 the no-snap release contract. Any material resident winner snap advances
-revision once and retires old-revision organisms, while only domain bucket
-flips dirty the ADR 0007 reader closure. Same-bucket center normalization
-therefore rebuilds organism identities without changing tile hashes or
-in-flight tile work. Runtime unit tests, including resident forward/reverse
+revision once, while only domain bucket flips dirty the ADR 0007 reader
+closure. A.9 later split organism identity from region revision, so
+same-bucket center normalization now preserves organism identities and
+placement while keeping tile hashes and in-flight tile work intact. Runtime
+unit tests, including resident forward/reverse
 atomic batches and session restore, the native effective-owner deletion seam,
 end-to-end overlap and evicted-deletion tests, and the `wer-vault` sign-off
 scenario exercise these contracts. Separate UI calls remain distinct material

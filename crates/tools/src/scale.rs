@@ -227,14 +227,14 @@ impl ScaleConfig {
 
 /// Whether every field-active region is fully generated, every near canonical
 /// realization is current, every parked region is intentionally quiescent, and
-/// no work is queued or in flight.
+/// no work is queued or in flight. Dirty bits plus queue/in-flight state are
+/// the backlog contract; `GenerationStatus` is advisory lifecycle telemetry and
+/// can lag clean state until the runtime refreshes a coordinate again.
 fn settled(map: &RegionMap, exec: &QueueExecutor, player: (f64, f64)) -> bool {
     exec.queue_len() == 0
         && map.jobs_in_flight() == 0
         && map.authoritative_realization_complete(player)
-        && map
-            .iter_active()
-            .all(|r| r.status != GenerationStatus::Generating)
+        && map.iter_active().all(|r| r.dirty_layers == 0)
 }
 
 /// The scripted bias storm for the long haul: a repeating ramp that pushes
@@ -377,6 +377,11 @@ pub fn long_haul(cfg: &ScaleConfig) -> ScenarioOutcome {
     // between `jobs cancelled` and `wasted kernel fraction` is exactly the
     // worker time cancellation reclaims (§6.2).
     let kernel_runs = acc.integrated + acc.dropped;
+    let generating_regions = map
+        .iter_active()
+        .filter(|r| r.status == GenerationStatus::Generating)
+        .count();
+    let dirty_regions = map.iter_active().filter(|r| r.dirty_layers != 0).count();
     let metrics = vec![
         ("peak resident regions".into(), acc.peak_regions as f64),
         (
@@ -398,6 +403,18 @@ pub fn long_haul(cfg: &ScaleConfig) -> ScenarioOutcome {
         (
             "drain frames".into(),
             drain_frames.map_or(f64::NAN, f64::from),
+        ),
+        ("final queue depth".into(), exec.queue_len() as f64),
+        ("final jobs in flight".into(), map.jobs_in_flight() as f64),
+        ("final generating regions".into(), generating_regions as f64),
+        ("final dirty regions".into(), dirty_regions as f64),
+        (
+            "final authoritative complete".into(),
+            if map.authoritative_realization_complete(stop) {
+                1.0
+            } else {
+                0.0
+            },
         ),
     ];
 
@@ -1558,6 +1575,20 @@ mod tests {
         let report = run_scale_harness(&ScaleConfig::quick());
         for scenario in &report.scenarios {
             for gate in &scenario.gates {
+                if !gate.passed {
+                    eprintln!("scenario metrics for {}:", scenario.name);
+                    for (label, value) in &scenario.metrics {
+                        eprintln!("  {label}: {value}");
+                    }
+                    for other in &scenario.gates {
+                        eprintln!(
+                            "  [{}] {} -- {}",
+                            if other.passed { "pass" } else { "fail" },
+                            other.name,
+                            other.detail
+                        );
+                    }
+                }
                 assert!(
                     gate.passed,
                     "{}: {} — {}",

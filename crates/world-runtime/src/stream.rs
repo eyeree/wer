@@ -42,8 +42,8 @@ use world_core::{
     anchor_influence_profile, anchor_set_signature, capture_target, domain_mask, drainage_dep_hash,
     layer_dep_hash, macro_coord_for, mix, organism_trait_deviation, project_plausible, steer,
     terrain_dep_hash, Anchor, AnchorKind, AnchorSource, Biome, Climate, DrainageTile, Genome,
-    GenomeBias, HabitatSignature, PossibilityDomain, PossibilityField, PossibilitySignature,
-    PossibilityVector, RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS, REGION_SIZE,
+    HabitatSignature, PossibilityDomain, PossibilityField, PossibilitySignature, PossibilityVector,
+    RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS, REGION_SIZE,
 };
 
 use crate::budget::Budget;
@@ -55,7 +55,10 @@ use crate::generate::{
 };
 use crate::macrocache::MacroCache;
 use crate::pool::TilePool;
-use crate::realize::{realize_region_into, Organism};
+use crate::realize::{
+    realize_region_into, Organism, OrganismExpressionKey, OrganismIdentityKey,
+    OrganismPresentationKey,
+};
 use crate::region::{GenerationStatus, RegionState};
 use crate::resonance::{
     combine_resonance, density_term, gated_rate, species_entropy, Resonance, ResonanceNode,
@@ -374,13 +377,14 @@ pub struct RegionMap {
     /// and un-cached, phase-3-plan.md §8.3). Rebuilt when a region's L8 tile
     /// changes, dropped when it leaves the near window.
     organisms: BTreeMap<RegionCoord, Vec<Organism>>,
-    /// The L8 dependency hash each region's canonical slot-0 organisms were
-    /// realized from. This is gameplay availability, independent of visual
-    /// density (ADR 0024).
-    authoritative_organism_keys: BTreeMap<RegionCoord, u64>,
-    /// The L8 dependency hash and slot count represented by the presentation
+    /// Stable identity key each region's canonical slot-0 organisms were
+    /// realized from. This excludes expression-only M/B/A inputs.
+    authoritative_organism_keys: BTreeMap<RegionCoord, OrganismIdentityKey>,
+    /// Expression key represented by a published canonical vector.
+    authoritative_expression_keys: BTreeMap<RegionCoord, OrganismExpressionKey>,
+    /// Complete identity/expression/slot count represented by the presentation
     /// vector. Empty realizations retain a key so barrenness is complete work.
-    presentation_organism_keys: BTreeMap<RegionCoord, (u64, u16)>,
+    presentation_organism_keys: BTreeMap<RegionCoord, OrganismPresentationKey>,
     /// Every preserve contribution covering a region, keyed by immutable
     /// content id (ADR 0020). The lowest id is the effective owner. The nested
     /// map is deliberately retained across region eviction so a later load
@@ -449,6 +453,7 @@ impl RegionMap {
             region_signatures: BTreeMap::new(),
             organisms: BTreeMap::new(),
             authoritative_organism_keys: BTreeMap::new(),
+            authoritative_expression_keys: BTreeMap::new(),
             presentation_organism_keys: BTreeMap::new(),
             preserve_contributors: BTreeMap::new(),
             revision_bumps: [0; LAYER_COUNT as usize],
@@ -690,12 +695,12 @@ impl RegionMap {
         self.near_realization_coords(player)
             .into_iter()
             .all(|coord| {
-                let Some(hash) = self.fresh_ecology_hash(coord) else {
+                let Some(key) = self.organism_presentation_key(coord, 1) else {
                     return false;
                 };
-                self.realization_rosters_complete(coord)
-                    && self.organisms.contains_key(&coord)
-                    && self.authoritative_organism_keys.get(&coord) == Some(&hash)
+                self.organisms.contains_key(&coord)
+                    && self.authoritative_organism_keys.get(&coord) == Some(&key.identity)
+                    && self.authoritative_expression_keys.get(&coord) == Some(&key.expression)
             })
     }
 
@@ -1131,8 +1136,10 @@ impl RegionMap {
     /// All contributors are retained and the numerically lowest content id is
     /// authoritative. Contributor-only churn is inert. A newly effective
     /// signature snaps a resident to its bucket centers; an exact vector
-    /// change advances the region revision and retires old-revision organisms,
-    /// while only quantized bucket changes dirty generated layers (ADR 0007).
+    /// change advances the region revision, while only quantized bucket
+    /// changes dirty generated layers (ADR 0007). Organism identity is keyed
+    /// separately from the revision, so same-bucket snaps can refresh
+    /// expression without re-identifying entities.
     /// Applying the same `(preserve_id, coord, signature)` is idempotent.
     pub fn apply_preserve_contribution(
         &mut self,
@@ -1242,8 +1249,9 @@ impl RegionMap {
 
     /// Snap a newly effective signature into an already resident region.
     /// Exact vector and bucket changes are separate contracts: the former
-    /// advances identity epoch and retires organisms, the latter invalidates
-    /// only declared layer readers.
+    /// advances the region's history revision, while organism identity follows
+    /// its explicit habitat/succession key and the latter invalidates only
+    /// declared layer readers.
     fn apply_effective_preserve_signature(
         &mut self,
         coord: RegionCoord,
@@ -1273,9 +1281,6 @@ impl RegionMap {
             if Self::field_active(region) && region.status == GenerationStatus::Ready {
                 region.status = GenerationStatus::Generating;
             }
-        }
-        if material {
-            self.retire_organisms(coord);
         }
         // Superseded in-flight work stops only for layers whose quantized
         // inputs changed. Same-bucket normalization leaves all jobs intact.
@@ -1854,6 +1859,7 @@ impl RegionMap {
             }
         }
         self.authoritative_organism_keys.remove(&coord);
+        self.authoritative_expression_keys.remove(&coord);
         self.presentation_organism_keys.remove(&coord);
     }
 
@@ -2611,12 +2617,59 @@ impl RegionMap {
             })
     }
 
+    fn organism_habitat_hash(&self, coord: RegionCoord, ecology_hash: u64) -> Option<u64> {
+        let signatures = self.region_signatures.get(&coord)?;
+        let mut h = 0xA948_AB17_0000_0001;
+        h = mix(h, u64::from(world_core::WORLD_ALGORITHM_VERSION));
+        h = mix(h, coord.x as u64);
+        h = mix(h, coord.y as u64);
+        h = mix(h, u64::from(LAYER_ECOLOGY));
+        h = mix(h, u64::from(self.cfg.field_resolution));
+        h = mix(h, ecology_hash);
+        h = mix(h, signatures.len() as u64);
+        for signature in signatures {
+            h = mix(h, signature.seed());
+        }
+        Some(h)
+    }
+
+    fn organism_identity_key(&self, coord: RegionCoord) -> Option<OrganismIdentityKey> {
+        let ecology_hash = self.fresh_ecology_hash(coord)?;
+        if !self.realization_rosters_complete(coord) {
+            return None;
+        }
+        Some(OrganismIdentityKey {
+            ecology_hash,
+            habitat_hash: self.organism_habitat_hash(coord, ecology_hash)?,
+            succession_epoch: 0,
+            resolution: self.cfg.field_resolution,
+        })
+    }
+
+    fn organism_expression_key(&self, coord: RegionCoord) -> Option<OrganismExpressionKey> {
+        let region = self.regions.get(&coord)?;
+        Some(OrganismExpressionKey::from_vector(region.current))
+    }
+
+    fn organism_presentation_key(
+        &self,
+        coord: RegionCoord,
+        slots: u16,
+    ) -> Option<OrganismPresentationKey> {
+        Some(OrganismPresentationKey {
+            identity: self.organism_identity_key(coord)?,
+            expression: self.organism_expression_key(coord)?,
+            slots,
+        })
+    }
+
     /// Retire offscreen or stale presentation vectors and both currency keys
     /// before any gameplay read. Empty vectors count as valid completed
     /// realizations when their two keys are current (ADR 0024).
     fn retire_invalid_realizations(&mut self, near: &BTreeSet<RegionCoord>) {
         let mut tracked: BTreeSet<RegionCoord> = self.organisms.keys().copied().collect();
         tracked.extend(self.authoritative_organism_keys.keys().copied());
+        tracked.extend(self.authoritative_expression_keys.keys().copied());
         tracked.extend(self.presentation_organism_keys.keys().copied());
         let stale: Vec<_> = tracked
             .into_iter()
@@ -2624,15 +2677,14 @@ impl RegionMap {
                 if !near.contains(&coord) || !self.organisms.contains_key(&coord) {
                     return true;
                 }
-                let Some(hash) = self.fresh_ecology_hash(coord) else {
+                let Some(identity) = self.organism_identity_key(coord) else {
                     return true;
                 };
-                !self.realization_rosters_complete(coord)
-                    || self.authoritative_organism_keys.get(&coord) != Some(&hash)
+                self.authoritative_organism_keys.get(&coord) != Some(&identity)
                     || self
                         .presentation_organism_keys
                         .get(&coord)
-                        .is_none_or(|&(presentation_hash, _)| presentation_hash != hash)
+                        .is_none_or(|key| key.identity != identity)
             })
             .collect();
         for coord in stale {
@@ -2652,23 +2704,16 @@ impl RegionMap {
         order
     }
 
-    fn realize_slots(&mut self, coord: RegionCoord, slots: u16) -> Vec<Organism> {
-        let region = &self.regions[&coord];
-        let bias = GenomeBias {
-            morphology: region.current.get(PossibilityDomain::Morphology),
-            behavior: region.current.get(PossibilityDomain::Behavior),
-            aesthetics: region.current.get(PossibilityDomain::Aesthetics),
-        };
-        let revision = region.revision;
+    fn realize_slots(&mut self, coord: RegionCoord, key: OrganismPresentationKey) -> Vec<Organism> {
         let mut organisms = self.organism_pool.pop().unwrap_or_default();
         realize_region_into(
             coord,
             self.cache.get(coord).expect("fresh ecology implies tiles"),
             &self.roster_cache,
-            bias,
-            revision,
+            key.identity,
+            key.expression,
             self.cfg.field_resolution,
-            slots,
+            key.slots,
             &mut organisms,
         );
         organisms
@@ -2690,20 +2735,21 @@ impl RegionMap {
         let near = self.near_realization_coords(player);
         self.retire_invalid_realizations(&near);
         for (_, coord) in Self::realization_order(&near, player) {
-            let Some(l8_hash) = self.fresh_ecology_hash(coord) else {
+            let Some(key) = self.organism_presentation_key(coord, 1) else {
                 continue;
             };
-            if self.authoritative_organism_keys.get(&coord) == Some(&l8_hash) {
+            if self.authoritative_organism_keys.get(&coord) == Some(&key.identity)
+                && self.authoritative_expression_keys.get(&coord) == Some(&key.expression)
+            {
                 continue;
             }
-            if !self.realization_rosters_complete(coord) {
-                continue;
-            }
-            let organisms = self.realize_slots(coord, 1);
+            let organisms = self.realize_slots(coord, key);
             stats.authoritative_organisms_realized += organisms.len();
             self.publish_organisms(coord, organisms);
-            self.authoritative_organism_keys.insert(coord, l8_hash);
-            self.presentation_organism_keys.insert(coord, (l8_hash, 1));
+            self.authoritative_organism_keys.insert(coord, key.identity);
+            self.authoritative_expression_keys
+                .insert(coord, key.expression);
+            self.presentation_organism_keys.insert(coord, key);
             break;
         }
         stats.organisms = self.organism_count();
@@ -2722,26 +2768,24 @@ impl RegionMap {
         self.retire_invalid_realizations(&near);
         let target_slots = self.cfg.organisms_per_cell.max(1);
         for (_, coord) in Self::realization_order(&near, player) {
-            let Some(l8_hash) = self.fresh_ecology_hash(coord) else {
+            let Some(key) = self.organism_presentation_key(coord, target_slots) else {
                 continue;
             };
-            if self.authoritative_organism_keys.get(&coord) != Some(&l8_hash) {
+            if self.authoritative_organism_keys.get(&coord) != Some(&key.identity)
+                || self.authoritative_expression_keys.get(&coord) != Some(&key.expression)
+            {
                 continue;
             }
-            if self.presentation_organism_keys.get(&coord) == Some(&(l8_hash, target_slots)) {
+            if self.presentation_organism_keys.get(&coord) == Some(&key) {
                 continue;
             }
             if stats.organisms_realized >= budget.max_realize_organisms {
                 break;
             }
-            if !self.realization_rosters_complete(coord) {
-                continue;
-            }
-            let organisms = self.realize_slots(coord, target_slots);
+            let organisms = self.realize_slots(coord, key);
             stats.organisms_realized += organisms.len();
             self.publish_organisms(coord, organisms);
-            self.presentation_organism_keys
-                .insert(coord, (l8_hash, target_slots));
+            self.presentation_organism_keys.insert(coord, key);
         }
         stats.organisms = self.organism_count();
     }
@@ -2867,6 +2911,9 @@ mod preserve_tests {
     use super::*;
     use crate::budget::Budget;
     use crate::InlineExecutor;
+    use world_core::{Expressed, LocalPos, Trophic};
+
+    type StableOrganismFields = (u64, u64, Trophic, u16, LocalPos, (u64, u64));
 
     const PLAYER: (f64, f64) = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
     const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
@@ -2921,6 +2968,32 @@ mod preserve_tests {
             "four slots keep the identity assertions non-vacuous"
         );
         map
+    }
+
+    fn stable_organism_fields(organisms: &[Organism]) -> Vec<StableOrganismFields> {
+        organisms
+            .iter()
+            .map(|organism| {
+                (
+                    organism.id,
+                    organism.species,
+                    organism.trophic,
+                    organism.slot,
+                    organism.cell,
+                    (
+                        organism.world_pos.0.to_bits(),
+                        organism.world_pos.1.to_bits(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn expressions(organisms: &[Organism]) -> Vec<Expressed> {
+        organisms
+            .iter()
+            .map(|organism| organism.expressed)
+            .collect()
     }
 
     fn changed_signature(
@@ -2981,6 +3054,7 @@ mod preserve_tests {
         let low_signature = changed_signature(base, PossibilityDomain::Aesthetics);
         let high_signature = changed_signature(base, PossibilityDomain::Climate);
         let old_revision = forward.get(coord()).unwrap().revision;
+        let old_stable = stable_organism_fields(forward.organisms_in(coord()).unwrap());
         assert_eq!(reverse.get(coord()).unwrap().revision, old_revision);
 
         forward.apply_preserve_contributions([
@@ -3003,7 +3077,10 @@ mod preserve_tests {
                 old_revision.wrapping_add(1),
                 "one synchronization batch is one material revision event"
             );
-            assert!(map.organisms_in(coord()).is_none());
+            assert_eq!(
+                stable_organism_fields(map.organisms_in(coord()).unwrap()),
+                old_stable
+            );
         }
 
         settle(&mut forward);
@@ -3022,7 +3099,7 @@ mod preserve_tests {
     }
 
     #[test]
-    fn same_bucket_snap_bumps_revision_and_rebuilds_only_organisms() {
+    fn same_bucket_snap_preserves_organism_identity_and_placement() {
         let mut map = settled_map();
         let signature = PossibilitySignature::of(map.get(coord()).unwrap().current);
         let snapped = signature.dequantize();
@@ -3035,6 +3112,8 @@ mod preserve_tests {
         let old_tiles = tile_keys(&map);
         let old_organisms = map.organisms_in(coord()).unwrap().to_vec();
         let old_key = map.authoritative_organism_keys[&coord()];
+        let old_expression_key = map.authoritative_expression_keys[&coord()];
+        let old_l8_hash = map.fresh_ecology_hash(coord()).unwrap();
 
         // A same-bucket normalization must not retire unrelated work.
         let cancel = Arc::new(AtomicBool::new(false));
@@ -3042,7 +3121,7 @@ mod preserve_tests {
             (coord(), LAYER_ECOLOGY),
             InFlightJob {
                 id: u64::MAX,
-                expected_hash: old_key,
+                expected_hash: old_l8_hash,
                 cancel: Arc::clone(&cancel),
             },
         );
@@ -3057,25 +3136,51 @@ mod preserve_tests {
         assert_eq!(tile_keys(&map), old_tiles);
         assert!(map.in_flight.contains_key(&(coord(), LAYER_ECOLOGY)));
         assert!(!cancel.load(Ordering::Relaxed));
-        assert!(map.organisms_in(coord()).is_none());
-        assert!(!map.authoritative_organism_keys.contains_key(&coord()));
-        assert!(!map.presentation_organism_keys.contains_key(&coord()));
+        assert_eq!(map.organisms_in(coord()).unwrap(), old_organisms);
+        assert_eq!(map.authoritative_organism_keys[&coord()], old_key);
+        assert_eq!(
+            map.authoritative_expression_keys[&coord()],
+            old_expression_key
+        );
 
         // Remove the synthetic job; normal realization can now rebuild from
-        // the unchanged fresh L8 key using the incremented revision.
+        // the unchanged stable identity key and bucket-center expression key.
         map.in_flight.remove(&(coord(), LAYER_ECOLOGY));
         settle(&mut map);
         assert_eq!(tile_keys(&map), old_tiles);
         assert_eq!(map.authoritative_organism_keys[&coord()], old_key);
+        assert_eq!(
+            map.authoritative_expression_keys[&coord()],
+            old_expression_key
+        );
         let new_organisms = map.organisms_in(coord()).unwrap();
         assert!(!new_organisms.is_empty());
-        assert_ne!(new_organisms, old_organisms);
-        assert!(
-            new_organisms
-                .iter()
-                .all(|new| old_organisms.iter().all(|old| new.id != old.id)),
-            "the new possibility revision must define a new feature-id epoch"
+        assert_eq!(new_organisms, old_organisms);
+    }
+
+    #[test]
+    fn near_exit_and_reentry_rebuilds_same_expression_and_identity() {
+        let mut map = settled_map();
+        let before = map.organisms_in(coord()).unwrap().to_vec();
+        let outside_near = (REGION_SIZE, REGION_SIZE * 0.5);
+        map.update(
+            outside_near,
+            0.0,
+            &PossibilityField::default(),
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
         );
+        assert!(
+            map.get(coord()).is_some(),
+            "fixture should leave authority resident while exiting near realization"
+        );
+        assert!(map.organisms_in(coord()).is_none());
+
+        settle(&mut map);
+        assert_eq!(map.organisms_in(coord()).unwrap(), before);
     }
 
     #[test]
@@ -3182,25 +3287,40 @@ mod preserve_tests {
         assert_eq!(map.authoritative_organism_keys[&coord()], before_key);
         assert_eq!(map.organisms_in(coord()).unwrap(), before_organisms);
 
-        // Re-add then reveal the successor. Its changed Aesthetics bucket
-        // dirties exactly the declared closure and advances the epoch once.
+        // Re-add then reveal the successor. Its changed Aesthetics bucket is
+        // expression-only: it advances region history but does not dirty L8
+        // aggregate work or retire stable organism identity.
         map.apply_preserve_contribution(20, coord(), high_signature);
         let revision_before_winner_delete = map.get(coord()).unwrap().revision;
+        let before_stable = stable_organism_fields(map.organisms_in(coord()).unwrap());
+        let before_expression = expressions(map.organisms_in(coord()).unwrap());
+        let before_identity_key = map.authoritative_organism_keys[&coord()];
         assert!(map.remove_preserve_contribution(10, coord()));
         assert_eq!(map.effective_preserve(coord()), Some((20, high_signature)));
-        let expected_dirty = domain_dirty_mask(1 << PossibilityDomain::Aesthetics.index());
         let changed = map.get(coord()).unwrap();
         assert_eq!(changed.current, high_signature.dequantize());
         assert_eq!(
             changed.revision,
             revision_before_winner_delete.wrapping_add(1)
         );
-        assert_eq!(changed.dirty_layers, expected_dirty);
-        assert_eq!(changed.status, GenerationStatus::Generating);
-        assert!(map.organisms_in(coord()).is_none());
-        assert!(!map.authoritative_organism_keys.contains_key(&coord()));
-        assert!(!map.presentation_organism_keys.contains_key(&coord()));
+        assert_eq!(changed.dirty_layers, 0);
+        assert_eq!(changed.status, GenerationStatus::Ready);
+        assert_eq!(
+            stable_organism_fields(map.organisms_in(coord()).unwrap()),
+            before_stable
+        );
+        assert_eq!(
+            map.authoritative_organism_keys[&coord()],
+            before_identity_key
+        );
         settle(&mut map);
+        let after_successor = map.organisms_in(coord()).unwrap();
+        assert_eq!(stable_organism_fields(after_successor), before_stable);
+        assert_ne!(
+            expressions(after_successor),
+            before_expression,
+            "Aesthetics bucket change must refresh expression"
+        );
 
         // Final deletion is a no-snap release: all resident derived state is
         // byte-for-byte untouched until a future travel-fueled convergence.
@@ -4444,12 +4564,12 @@ mod recovery_tests {
             &InlineExecutor,
             &mut generation_stats,
         );
-        let new_key = map
+        let new_l8_hash = map
             .cache
             .get(coord())
             .and_then(|tiles| tiles.layer_hash(LAYER_ECOLOGY))
             .expect("new ecology output");
-        assert_ne!(new_key, old_key);
+        assert_ne!(new_l8_hash, old_key.ecology_hash);
         let new_required = map
             .region_signatures
             .get(&coord())
@@ -4462,15 +4582,20 @@ mod recovery_tests {
         assert!(map.resonance_at(PLAYER, &[]).nodes.is_empty());
 
         assert_eq!(map.maintain_roster_working_set(), new_required);
+        let new_key = map
+            .organism_identity_key(coord())
+            .expect("new complete identity key");
         let mut repaired_stats = FrameStats::default();
         map.realize_authoritative_near_window(PLAYER, &mut repaired_stats);
         assert_eq!(map.authoritative_organism_keys[&coord()], new_key);
-        assert_eq!(
-            map.authoritative_organisms_in(coord())
-                .copied()
-                .collect::<Vec<_>>(),
-            old_canonical,
-            "algorithm revision changes provenance, not realization math"
+        let repaired_canonical = map
+            .authoritative_organisms_in(coord())
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(!repaired_canonical.is_empty());
+        assert_ne!(
+            repaired_canonical, old_canonical,
+            "aggregate provenance changes are identity events under the A.9 key split"
         );
     }
 

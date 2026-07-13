@@ -38,7 +38,10 @@ pub use generate::{
 };
 pub use macrocache::MacroCache;
 pub use pool::TilePool;
-pub use realize::{realize_region, realize_region_into, Organism};
+pub use realize::{
+    realize_region, realize_region_into, Organism, OrganismExpressionKey, OrganismIdentityKey,
+    OrganismPresentationKey,
+};
 pub use region::{GenerationStatus, RegionState};
 pub use resonance::{Resonance, ResonanceNode, MAX_RESONANCE_NODES};
 pub use rostercache::{RosterCache, RosterEntry, RosterEviction, RosterSnapshot};

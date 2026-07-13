@@ -21,10 +21,13 @@
 
 use world_core::foodweb::{CARNIVORE_EFFICIENCY, HERBIVORE_EFFICIENCY};
 use world_core::layer::LAYER_ECOLOGY;
-use world_core::{GenomeBias, PossibilityField, Trophic, POSSIBILITY_DIMS, REGION_SIZE};
+use world_core::{
+    PossibilityDomain, PossibilityField, PossibilitySignature, Trophic, POSSIBILITY_DIMS,
+    REGION_SIZE,
+};
 use world_runtime::{
-    realize_region, Budget, InlineExecutor, RegionMap, StreamConfig, CHANNEL_HERBIVORE,
-    CHANNEL_PREDATOR, CHANNEL_VEGETATION,
+    Budget, InlineExecutor, Organism, RegionMap, StreamConfig, CHANNEL_HERBIVORE, CHANNEL_PREDATOR,
+    CHANNEL_VEGETATION,
 };
 
 /// Outcome of one ecology-harness scenario.
@@ -268,11 +271,11 @@ fn diversity_scenario() -> EcologyReport {
     }
 }
 
-/// Expression response: steering Aesthetics/Morphology/Behavior shifts organism
-/// *expression* without moving species identity (phase-3-plan.md §12.3). Checked
-/// at the realization layer, where expression happens.
+/// Expression response: changing Aesthetics/Morphology/Behavior buckets shifts
+/// organism *expression* without moving species identity. Checked through
+/// `RegionMap`, where expression currency is published.
 fn expression_response_scenario() -> EcologyReport {
-    let map = settled_map(&Budget::unlimited());
+    let mut map = settled_map(&Budget::unlimited());
     let mut violations = Vec::new();
 
     // A near region with organisms.
@@ -287,51 +290,65 @@ fn expression_response_scenario() -> EcologyReport {
             summary: String::new(),
         };
     };
-    let tiles = map.cache().get(coord).expect("tiles");
-    let res = harness_config().field_resolution;
+    let neutral = map.organisms_in(coord).expect("organisms").to_vec();
+    let base = PossibilitySignature::of(map.get(coord).expect("region").current);
 
-    let neutral = realize_region(
-        coord,
-        tiles,
-        map.roster_cache(),
-        GenomeBias::neutral(),
-        0,
-        res,
-    );
-    let aesthetic = realize_region(
-        coord,
-        tiles,
-        map.roster_cache(),
-        GenomeBias {
-            aesthetics: 1.0,
-            ..GenomeBias::neutral()
-        },
-        0,
-        res,
-    );
-    let morphic = realize_region(
-        coord,
-        tiles,
-        map.roster_cache(),
-        GenomeBias {
-            morphology: 1.0,
-            ..GenomeBias::neutral()
-        },
-        0,
-        res,
-    );
+    let mut expression_variant = |domain: PossibilityDomain| {
+        let mut changed = base;
+        let bucket = &mut changed.buckets[domain.index()];
+        *bucket = if *bucket < 2048 { 4095 } else { 0 };
+        map.apply_preserve_contribution(domain.index() as u64 + 1, coord, changed);
+        for _ in 0..4 {
+            map.update(
+                PLAYER,
+                0.0,
+                &PossibilityField::default(),
+                &[],
+                &[0.0; POSSIBILITY_DIMS],
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+        }
+        map.organisms_in(coord)
+            .expect("refreshed organisms")
+            .to_vec()
+    };
+
+    let aesthetic = expression_variant(PossibilityDomain::Aesthetics);
+    let morphic = expression_variant(PossibilityDomain::Morphology);
+
+    let stable = |organisms: &[Organism]| {
+        organisms
+            .iter()
+            .map(|organism| {
+                (
+                    organism.id,
+                    organism.species,
+                    organism.trophic,
+                    organism.slot,
+                    organism.cell,
+                    (
+                        organism.world_pos.0.to_bits(),
+                        organism.world_pos.1.to_bits(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
 
     // Same identities and placement (rosters/webs unchanged) — expression is a
     // modulation, never a re-identification.
-    let same_identities = neutral.len() == aesthetic.len()
-        && neutral
-            .iter()
-            .zip(&aesthetic)
-            .all(|(a, b)| a.id == b.id && a.species == b.species);
-    if !same_identities {
+    if stable(&neutral) != stable(&aesthetic) {
         record(
             &mut violations,
             "aesthetics steering changed organism identity (must only change expression)".into(),
+        );
+    }
+    if stable(&neutral) != stable(&morphic) {
+        record(
+            &mut violations,
+            "morphology steering changed organism identity (must only change expression)".into(),
         );
     }
     // Colour actually shifts under Aesthetics.
