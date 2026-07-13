@@ -35,6 +35,9 @@ if (!app.includes("origin_feature_hash")) {
 if (!app.includes("new mod.WebApp")) {
   throw new Error("app.js does not construct the WebApp facade");
 }
+if (!app.includes("render_cpu_map")) {
+  throw new Error("app.js does not render the CPU map buffer");
+}
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
 for (const heading of ["World Model", "Possibility", "Terrain"]) {

@@ -47,6 +47,21 @@ const drawBootCanvas = () => {
   ctx.fillText("Browser runtime boot", 18, 30);
 };
 
+const drawCpuMap = (map) => {
+  const canvas = document.getElementById("world-canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx || map.kind !== "rgba8") return;
+  const source = new ImageData(new Uint8ClampedArray(map.pixels), map.width, map.height);
+  const scratch = document.createElement("canvas");
+  scratch.width = map.width;
+  scratch.height = map.height;
+  const scratchCtx = scratch.getContext("2d");
+  scratchCtx.putImageData(source, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(scratch, 0, 0, canvas.width, canvas.height);
+};
+
 const probeWebGpu = () => {
   if ("gpu" in navigator) {
     write("webgpu-status", "WebGPU available", "ok");
@@ -70,12 +85,19 @@ const initWasm = async () => {
     appendDiagnostic(`origin_feature_hash=${hex}`);
     document.body.dataset.originFeatureHash = hex;
     updateSnapshot(JSON.parse(app.info_snapshot()));
+    renderMap();
   } catch (error) {
     write("wasm-status", "wasm failed", "err");
     write("origin-hash", "origin hash unavailable", "err");
     appendDiagnostic(`wasm initialization failed: ${String(error)}`);
     throw error;
   }
+};
+
+const renderMap = () => {
+  const app = window.__werApp;
+  if (!app) return;
+  drawCpuMap(JSON.parse(app.render_cpu_map()));
 };
 
 const updateSnapshot = (snapshot) => {
@@ -91,6 +113,7 @@ const dispatchCommand = (id, value) => {
   if (!app) return;
   const snapshot = JSON.parse(app.apply_command(JSON.stringify({ id, value })));
   updateSnapshot(snapshot);
+  renderMap();
 };
 
 for (const control of document.querySelectorAll("[data-command]")) {
@@ -122,6 +145,14 @@ window.addEventListener("keydown", (event) => {
       break;
     }
   }
+});
+
+document.getElementById("world-canvas").addEventListener("pointermove", (event) => {
+  const canvas = event.currentTarget;
+  const rect = canvas.getBoundingClientRect();
+  const nx = (event.clientX - rect.left) / rect.width - 0.5;
+  const ny = (event.clientY - rect.top) / rect.height - 0.5;
+  write("cursor", `${Math.round(nx * 768)}, ${Math.round(ny * 512)}`);
 });
 
 drawBootCanvas();

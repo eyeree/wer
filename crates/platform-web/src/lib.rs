@@ -479,6 +479,44 @@ impl WebAppState {
                 .join(",")
         )
     }
+
+    fn cpu_map_json(&self) -> String {
+        const WIDTH: usize = 96;
+        const HEIGHT: usize = 64;
+        let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 4);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let wx = self.world_pos.0 + (x as f64 - WIDTH as f64 * 0.5) * 8.0;
+                let wy = self.world_pos.1 + (y as f64 - HEIGHT as f64 * 0.5) * 8.0;
+                let coord = RegionCoord::from_world(wx, wy);
+                let (ox, oy) = coord.origin();
+                let local_x = (wx - ox).rem_euclid(world_core::REGION_SIZE) as u64;
+                let local_y = (wy - oy).rem_euclid(world_core::REGION_SIZE) as u64;
+                let feature = feature_hash(&FeatureKey {
+                    world_version: WORLD_ALGORITHM_VERSION,
+                    region: coord,
+                    layer: u16::from(self.active_channel),
+                    feature_index: (local_y * 256 + local_x) as u32,
+                    possibility_revision: 0,
+                });
+                let elevation = ((feature >> 8) & 0xff) as u8;
+                let moisture = ((feature >> 24) & 0xff) as u8;
+                let vegetation = ((feature >> 40) & 0xff) as u8;
+                pixels.push(elevation.saturating_div(2).saturating_add(38));
+                pixels.push(moisture.saturating_div(2).saturating_add(56));
+                pixels.push(vegetation.saturating_div(2).saturating_add(48));
+                pixels.push(255);
+            }
+        }
+        let encoded = pixels
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"kind\":\"rgba8\",\"width\":{WIDTH},\"height\":{HEIGHT},\"pixels\":[{encoded}]}}"
+        )
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -644,15 +682,14 @@ mod wasm {
             Ok(JsValue::from_str(&self.state.snapshot_json()))
         }
 
-        /// Bootstrap CPU-map placeholder; the pixel-producing map renderer
-        /// lands in Phase 7-4.
+        /// Return a deterministic CPU-composed RGBA map tile for browser canvas
+        /// upload. This is the Phase 7-4 bootstrap renderer; WebGPU atlas
+        /// composition remains a later presentation path.
         pub fn render_cpu_map(&mut self) -> Result<JsValue, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
-            Ok(JsValue::from_str(
-                "{\"kind\":\"bootstrap\",\"width\":0,\"height\":0}",
-            ))
+            Ok(JsValue::from_str(&self.state.cpu_map_json()))
         }
 
         /// Apply one normalized command from the shared browser command
@@ -747,5 +784,19 @@ mod tests {
         assert!(snapshot.contains("\"executor\":{\"mode\":\"inline\""));
         assert!(snapshot.contains("\"settle_hash\":\"0x"));
         assert!(snapshot.contains("\"last_command\":\"{\\\"id\\\":\\\"toggle:refinement\\\"}\""));
+    }
+
+    #[test]
+    fn cpu_map_json_is_nonblank_rgba() {
+        let app = super::WebAppState::default();
+        let map = app.cpu_map_json();
+        assert!(map.contains("\"kind\":\"rgba8\""));
+        assert!(map.contains("\"width\":96"));
+        assert!(map.contains("\"height\":64"));
+        assert!(map.contains("\"pixels\":["));
+        assert!(
+            !map.contains("\"pixels\":[0,0,0,0"),
+            "bootstrap map should not be blank"
+        );
     }
 }
