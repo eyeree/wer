@@ -544,8 +544,8 @@ pub fn teleport_storm(cfg: &ScaleConfig) -> ScenarioOutcome {
 }
 
 /// Scale a budget's counting knobs by `factor` (¼× / 1× / 4× in the
-/// ADR 0018 gates). Saturating; every knob stays ≥ 1 so progress is always
-/// possible.
+/// ADR 0018 gates). Saturating; count knobs stay ≥ 1 and regeneration stays at
+/// least the largest atomic declared layer cost, so progress is always possible.
 #[must_use]
 pub fn scale_budget(budget: &Budget, factor: f64) -> Budget {
     let scale_usize = |v: usize| -> usize {
@@ -561,7 +561,7 @@ pub fn scale_budget(budget: &Budget, factor: f64) -> Budget {
         max_regen_cost: if budget.max_regen_cost == u32::MAX {
             u32::MAX
         } else {
-            ((f64::from(budget.max_regen_cost) * factor) as u32).max(1)
+            ((f64::from(budget.max_regen_cost) * factor) as u32).max(world_core::max_layer_cost())
         },
         max_realize_organisms: scale_usize(budget.max_realize_organisms),
         max_persist_ops: scale_usize(budget.max_persist_ops),
@@ -1565,5 +1565,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scaled_budget_always_admits_the_largest_atomic_layer() {
+        let budget = Budget {
+            max_regen_cost: 96,
+            ..Budget::unlimited()
+        };
+        assert_eq!(
+            scale_budget(&budget, 0.25).max_regen_cost,
+            world_core::max_layer_cost()
+        );
     }
 }

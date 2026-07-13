@@ -2,13 +2,15 @@
 //! and the chunk lifecycle manager.
 //!
 //! **Derived presentation only (ADR 0017).** Every height the mesher emits is
-//! `world_core::terrain::elevation` through its bit-identical SIMD row twin
-//! (ADR 0016); every color is the 2D Composite per-cell logic
-//! ([`crate::viz::composite_cell_color`]) over the settled field tiles; the
+//! the authoritative Terrain P/G halo through the same SIMD relief row and
+//! scalar scaling tail as field generation (ADRs 0016 and 0027); every color is
+//! the 2D Composite per-cell logic
+//! ([`crate::viz::composite_cell_color`]) over the settled field tiles. The
 //! baked per-vertex light (sun visibility from a heightfield horizon march,
 //! ambient occlusion from multi-scale concavity) is float presentation math
-//! over the same elevation kernel and the fixed [`SUN_DIR`]. Nothing here
-//! feeds back into world state, hashing, or persistence.
+//! over the same halo evaluator, edge-extended for distant probes, and the
+//! fixed [`SUN_DIR`]. Nothing here feeds back into world state, hashing, or
+//! persistence.
 //!
 //! The mesher is a pure function of value snapshots (plan §6.1): no
 //! filesystem, no threads, no GPU, no `RegionMap` — so it is unit-testable,
@@ -23,9 +25,10 @@ use renderer::pov::{
     skirt_core_index, CORE_VERTS, DETAIL_OCTAVES, POV_GRID, POV_MESH_RES, VERTS_PER_CHUNK,
 };
 use renderer::{PovFrameParams, PovVertex, TerrainChunkUpload};
-use world_core::layer::{layer_decl, LAYER_TERRAIN};
 use world_core::{mix, simd, Biome, FieldTile, PossibilityVector, RegionCoord, REGION_SIZE};
-use world_runtime::{RegionMap, TaskExecutor, TaskPriority, CHANNEL_RIVER, CHANNEL_WETNESS};
+use world_runtime::{
+    RegionMap, TaskExecutor, TaskPriority, TerrainPossibilityHalo, CHANNEL_RIVER, CHANNEL_WETNESS,
+};
 
 use crate::gpumap::AtlasManager;
 use crate::viz::composite_cell_color;
@@ -305,15 +308,17 @@ fn detail_base(coord: RegionCoord) -> [[u32; 4]; DETAIL_OCTAVES] {
 }
 
 /// The terrain height under a world position for POV-entry camera placement:
-/// the authoritative `elevation` under the covering region's realized vector
-/// (neutral if the region is not resident yet). Presentation-only camera
-/// placement — never an identity.
+/// authoritative halo-sampled `elevation` when the covering region is
+/// resident (neutral otherwise). Presentation-only camera placement — never
+/// an identity.
 #[must_use]
 pub fn entry_ground(map: &RegionMap, world: (f64, f64)) -> f64 {
     let coord = RegionCoord::from_world(world.0, world.1);
     let p = map
-        .get(coord)
-        .map_or_else(PossibilityVector::neutral, terrain_vector);
+        .terrain_possibility_halo(coord)
+        .map_or_else(PossibilityVector::neutral, |halo| {
+            halo.sample_world(world.0, world.1)
+        });
     f64::from(world_core::elevation(world.0, world.1, &p)).max(f64::from(world_core::SEA_LEVEL))
 }
 
@@ -322,14 +327,13 @@ pub fn entry_ground(map: &RegionMap, world: (f64, f64)) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Value snapshot a mesh job carries (plan §6.1). The tiles arrive as `Arc`
-/// clones held by the job; `p` is the region's terrain-quantized possibility
-/// vector (§6.2) — the exact reconstruction `generate.rs` performs for the
-/// terrain generator, so mesh heights are bit-equal to what produced the
-/// `ELEVATION` tile.
+/// clones held by the job; `terrain_halo` is the exact owned snapshot the
+/// Terrain generator hashes and samples, so mesh heights agree at field cell
+/// centers and remain continuous at ordinary borders (ADR 0027).
 #[derive(Debug)]
 pub struct ChunkMeshInputs<'a> {
     pub coord: RegionCoord,
-    pub p: PossibilityVector,
+    pub terrain_halo: TerrainPossibilityHalo,
     /// `CHANNEL_RIVER`, sampled bilinearly per vertex.
     pub river: &'a FieldTile<f32>,
     /// `CHANNEL_WETNESS`, sampled bilinearly per vertex.
@@ -365,6 +369,27 @@ pub fn mesh_region_chunk(inputs: &ChunkMeshInputs<'_>) -> ChunkMesh {
     mesh_region_chunk_cancellable(inputs, &AtomicBool::new(false)).expect("never cancelled")
 }
 
+/// Evaluate a presentation height row from an owned Terrain halo. Relief is
+/// always sampled at the requested world position. Only the P/G lookup is
+/// clamped to the outer region-center rectangle when a shadow or AO probe
+/// reaches beyond Terrain's authoritative 3×3 simulation halo; this
+/// constant edge extension keeps distant presentation work bounded by the
+/// same provenance key without changing core or ghost samples (ADR 0027).
+fn halo_elevation_row(xs: &[f64], y: f64, halo: &TerrainPossibilityHalo, out: &mut [f32]) {
+    assert_eq!(xs.len(), out.len());
+    simd::fbm_row(xs, y, out);
+    let (ox, oy) = halo.center().origin();
+    let min_x = ox - REGION_SIZE * 0.5;
+    let max_x = ox + REGION_SIZE * 1.5;
+    let min_y = oy - REGION_SIZE * 0.5;
+    let max_y = oy + REGION_SIZE * 1.5;
+    let sample_y = y.clamp(min_y, max_y);
+    for (x, value) in xs.iter().zip(out) {
+        let p = halo.sample_world(x.clamp(min_x, max_x), sample_y);
+        *value = world_core::terrain::elevation_from_relief(*value, &p);
+    }
+}
+
 /// [`mesh_region_chunk`] with the job-side cancellation token, checked
 /// between row batches (plan §7.2): a cancelled mesh returns `None` and the
 /// job no-ops, the exact pattern generation jobs use.
@@ -385,17 +410,15 @@ pub fn mesh_region_chunk_cancellable(
             return None;
         }
         let y = oy + (g as f64 - margin) * SPACING;
-        // One batched kernel call per row — the same kernel generation uses,
-        // bit-identical to scalar `elevation` (ADR 0016), so vertex heights
-        // are *exactly* `elevation(x, y, p)` (asserted by unit test).
-        simd::elevation_row(&xs, y, &inputs.p, &mut h[g * S..(g + 1) * S]);
+        let row = &mut h[g * S..(g + 1) * S];
+        halo_elevation_row(&xs, y, &inputs.terrain_halo, row);
     }
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
 
     // Baked sun visibility (the shadow half of the vertex `light` bytes).
-    let sunvis = bake_sun_visibility(&h, (ox, oy), &inputs.p, cancel)?;
+    let sunvis = bake_sun_visibility(&h, (ox, oy), &inputs.terrain_halo, cancel)?;
 
     // Coarse height lattice for valley-scale AO (the other half): 25×25 at
     // 32-unit spacing spanning [origin − 256, origin + 512].
@@ -405,10 +428,10 @@ pub fn mesh_region_chunk_cancellable(
     let mut hc = vec![0f32; COARSE_GRID * COARSE_GRID];
     for g in 0..COARSE_GRID {
         let y = oy + (g as f64 - COARSE_MARGIN as f64) * COARSE_SPACING;
-        simd::elevation_row(
+        halo_elevation_row(
             &xsc,
             y,
-            &inputs.p,
+            &inputs.terrain_halo,
             &mut hc[g * COARSE_GRID..(g + 1) * COARSE_GRID],
         );
     }
@@ -476,19 +499,17 @@ pub fn mesh_region_chunk_cancellable(
 /// Baked sun visibility per core vertex — the terrain self-shadow term of
 /// the vertex `light` bytes. From each vertex, march the heightfield along
 /// the horizontal toward-sun direction at the [`SHADOW_STEPS`] exponential
-/// distances (one batched row-kernel call per vertex row per step — the same
-/// bit-identical kernel the height lattice uses), track the highest horizon
-/// tangent seen, and soft-threshold it against the sun's elevation tangent.
+/// distances (one batched halo-elevation row call per vertex row per step),
+/// track the highest horizon tangent seen, and soft-threshold it against the
+/// sun's elevation tangent.
 ///
 /// Derived presentation only (ADR 0017): deterministic float math over the
-/// region's terrain-quantized `p`, never an identity. Samples past the
-/// region border evaluate under *this* region's `p`, exactly like the
-/// heights themselves — the resulting border step is the one the skirt
-/// already hides (plan §6.4).
+/// owned Terrain halo, never an identity. Probes beyond the halo's outer
+/// center rectangle use [`halo_elevation_row`]'s constant P/G edge extension.
 fn bake_sun_visibility(
     h: &[f32],
     origin: (f64, f64),
-    p: &PossibilityVector,
+    halo: &TerrainPossibilityHalo,
     cancel: &AtomicBool,
 ) -> Option<Vec<f32>> {
     // Horizontal unit vector pointing toward the sun, and the tangent of the
@@ -528,7 +549,7 @@ fn bake_sun_visibility(
         let y = origin.1 + j as f64 * SPACING;
         horizon.fill(f32::NEG_INFINITY);
         for (k, &dist) in dists.iter().enumerate() {
-            simd::elevation_row(&step_xs[k], y + toward.1 * dist, p, &mut row);
+            halo_elevation_row(&step_xs[k], y + toward.1 * dist, halo, &mut row);
             let inv_d = (1.0 / dist) as f32;
             for i in 0..POV_GRID {
                 let e = h[(j + GRID_MARGIN) * SAMPLE_GRID + i + GRID_MARGIN];
@@ -661,45 +682,35 @@ fn nearest_cell(res: u16, l: f64) -> u16 {
 // Chunk lifecycle (plan §7)
 // ---------------------------------------------------------------------------
 
-/// The chunk key (plan §7.1): the atlas dependency-hash key of the region's
-/// tiles folded with the terrain-domain quantized buckets, so a drift step
-/// that flips a terrain bucket forces a remesh in the same breath that it
-/// dirties the tiles. Steady state: same tiles, same buckets ⇒ same key ⇒
-/// zero remesh traffic — exact by the same argument that makes atlas
-/// upload-skipping exact (ADR 0008).
+/// The coherently captured presentation provenance for one chunk. The key
+/// folds both the atlas dependency-hash key of the region's current tiles and
+/// every bucket of the owned Terrain halo used to generate mesh heights. A
+/// neighbor-source change therefore supersedes old mesh work immediately,
+/// even before corrected Terrain and its consumers integrate (ADR 0027).
+#[derive(Debug)]
+struct ChunkProvenance {
+    key: u64,
+    terrain_halo: TerrainPossibilityHalo,
+}
+
+/// Capture one chunk's key and Terrain halo together (plan §7.1). Steady
+/// state: same tiles and same halo ⇒ same key ⇒ zero remesh traffic — exact by
+/// the same argument that makes atlas upload-skipping exact (ADR 0008).
 ///
 /// `None` until the tiles the mesher needs are present; holes at the loading
 /// frontier are acceptable in 3D-1 and hide in fog (plan §7.1).
-fn chunk_key(map: &RegionMap, coord: RegionCoord) -> Option<u64> {
+fn chunk_provenance(map: &RegionMap, coord: RegionCoord) -> Option<ChunkProvenance> {
     let tiles = map.cache().get(coord)?;
     tiles.channels[CHANNEL_RIVER].as_ref()?;
     tiles.channels[CHANNEL_WETNESS].as_ref()?;
     tiles.biome.as_ref()?;
     tiles.dominant.as_ref()?;
-    let region_key = AtlasManager::region_key(map, coord)?;
-    let state = map.get(coord)?;
-    let buckets = state
-        .current
-        .quantized_domains(layer_decl(LAYER_TERRAIN).domains);
-    Some(chunk_key_from(region_key, &buckets))
-}
-
-/// The pure fold of [`chunk_key`], separated for unit tests.
-fn chunk_key_from(region_key: u64, buckets: &[u16]) -> u64 {
-    let mut h = mix(0x3D01_C4A5_B00C_0001, region_key);
-    for &bucket in buckets {
-        h = mix(h, u64::from(bucket));
+    let terrain_halo = map.terrain_possibility_halo(coord)?;
+    let mut key = mix(AtlasManager::region_key(map, coord)?, 0x504F_565F_4841_4C4F);
+    for bucket in terrain_halo.dependency_buckets() {
+        key = mix(key, u64::from(bucket));
     }
-    h
-}
-
-/// The terrain-quantized possibility vector for a region's mesh (plan §6.2):
-/// exactly the reconstruction `generate.rs` performs for the terrain
-/// generator, so mesh heights agree bit-exactly with the `ELEVATION` tile.
-fn terrain_vector(state: &world_runtime::RegionState) -> PossibilityVector {
-    let decl = layer_decl(LAYER_TERRAIN);
-    let buckets = state.current.quantized_domains(decl.domains);
-    PossibilityVector::from_quantized(decl.domains, &buckets)
+    Some(ChunkProvenance { key, terrain_halo })
 }
 
 /// Lifecycle counters (plan §7.5): telemetry only — never gating (ADR 0018
@@ -835,9 +846,10 @@ impl PovChunkManager {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 let coord = RegionCoord::new(center.x + dx, center.y + dy);
-                let Some(key) = chunk_key(map, coord) else {
+                let Some(provenance) = chunk_provenance(map, coord) else {
                     continue; // not settled yet: hole at the frontier, hidden in fog
                 };
+                let key = provenance.key;
                 if self.chunks.get(&coord).is_some_and(|c| c.key == key) {
                     continue; // steady state
                 }
@@ -850,7 +862,7 @@ impl PovChunkManager {
                     }
                     None => {}
                 }
-                self.schedule(map, coord, key, executor);
+                self.schedule(map, coord, provenance, executor);
             }
         }
 
@@ -960,7 +972,7 @@ impl PovChunkManager {
         &mut self,
         map: &RegionMap,
         coord: RegionCoord,
-        key: u64,
+        provenance: ChunkProvenance,
         executor: &dyn TaskExecutor,
     ) {
         let Some(tiles) = map.cache().get(coord) else {
@@ -974,10 +986,7 @@ impl PovChunkManager {
         ) else {
             return;
         };
-        let Some(state) = map.get(coord) else {
-            return;
-        };
-        let p = terrain_vector(state);
+        let ChunkProvenance { key, terrain_halo } = provenance;
         // Resolve the dominant-species tint ids here, where the map is in
         // reach; 0 = no tint (ecology inputs not settled for that cell).
         let res = dominant.resolution();
@@ -1007,7 +1016,7 @@ impl PovChunkManager {
                 let start = std::time::Instant::now();
                 let inputs = ChunkMeshInputs {
                     coord,
-                    p,
+                    terrain_halo,
                     river: &river,
                     wetness: &wetness,
                     biome: &biome,
@@ -1173,7 +1182,10 @@ mod tests {
     use super::*;
     use renderer::pov::chunk_indices;
     use world_core::terrain::elevation;
-    use world_core::{PossibilityField, POSSIBILITY_DIMS};
+    use world_core::{
+        PossibilityDomain, PossibilityField, PossibilitySignature, POSSIBILITY_DIMS,
+        POSSIBILITY_QUANT,
+    };
     use world_runtime::{Budget, InlineExecutor, StreamConfig, CHANNEL_ELEVATION};
 
     /// A small fully-settled window (the `gpumap.rs` test fixture).
@@ -1208,7 +1220,7 @@ mod tests {
     /// `PovChunkManager::schedule` builds them.
     struct Snapshot {
         coord: RegionCoord,
-        p: PossibilityVector,
+        terrain_halo: TerrainPossibilityHalo,
         river: Arc<FieldTile<f32>>,
         wetness: Arc<FieldTile<f32>>,
         biome: Arc<FieldTile<u8>>,
@@ -1227,7 +1239,9 @@ mod tests {
             }
             Self {
                 coord,
-                p: terrain_vector(map.get(coord).expect("resident")),
+                terrain_halo: map
+                    .terrain_possibility_halo(coord)
+                    .expect("resident Terrain halo"),
                 river: tiles.channels[CHANNEL_RIVER].clone().expect("river tile"),
                 wetness: tiles.channels[CHANNEL_WETNESS].clone().expect("wetness"),
                 biome: tiles.biome.clone().expect("biome tile"),
@@ -1238,7 +1252,7 @@ mod tests {
         fn inputs(&self) -> ChunkMeshInputs<'_> {
             ChunkMeshInputs {
                 coord: self.coord,
-                p: self.p,
+                terrain_halo: self.terrain_halo.clone(),
                 river: &self.river,
                 wetness: &self.wetness,
                 biome: &self.biome,
@@ -1312,13 +1326,16 @@ mod tests {
         let (ox, oy) = coord.origin();
         for j in 0..POV_GRID {
             for i in 0..POV_GRID {
-                let expected = elevation(ox + i as f64 * SPACING, oy + j as f64 * SPACING, &snap.p);
+                let x = ox + i as f64 * SPACING;
+                let y = oy + j as f64 * SPACING;
+                let p = snap.terrain_halo.sample_world(x, y);
+                let expected = elevation(x, y, &p);
                 let got = mesh.vertices[j * POV_GRID + i].position[2];
                 assert_eq!(got.to_bits(), expected.to_bits(), "vertex ({i}, {j})");
                 assert_eq!(mesh.heights[j * POV_GRID + i].to_bits(), expected.to_bits());
             }
         }
-        // Cell centers: same function, same quantized vector as generation.
+        // Cell centers: same halo sampler and relief/scaling operations as generation.
         let res = map.config().field_resolution;
         let tiles = map.cache().get(coord).expect("settled");
         let elev = tiles.channels[CHANNEL_ELEVATION].as_ref().expect("tile");
@@ -1334,6 +1351,38 @@ mod tests {
                     "cell ({cx}, {cy}) center"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn halo_height_rows_edge_extend_only_the_possibility_lookup() {
+        let center = RegionCoord::new(-4, 3);
+        let mut buckets = [[[0u16; 2]; 3]; 3];
+        for (y, row) in buckets.iter_mut().enumerate() {
+            for (x, pair) in row.iter_mut().enumerate() {
+                let index = (y * 3 + x) as u16;
+                *pair = [173 + index * 211, 3_700 - index * 257];
+            }
+        }
+        let halo = TerrainPossibilityHalo::new(center, buckets);
+        let (ox, oy) = center.origin();
+        let xs = [
+            ox - REGION_SIZE * 3.0,
+            ox - REGION_SIZE * 0.5,
+            ox + REGION_SIZE * 0.375,
+            ox + REGION_SIZE * 3.0,
+        ];
+        let y = oy + REGION_SIZE * 2.5;
+        let mut row = [0.0; 4];
+        halo_elevation_row(&xs, y, &halo, &mut row);
+
+        let min_x = ox - REGION_SIZE * 0.5;
+        let max_x = ox + REGION_SIZE * 1.5;
+        let sample_y = oy + REGION_SIZE * 1.5;
+        for (x, got) in xs.into_iter().zip(row) {
+            let p = halo.sample_world(x.clamp(min_x, max_x), sample_y);
+            let expected = elevation(x, y, &p);
+            assert_eq!(got.to_bits(), expected.to_bits(), "world x {x}");
         }
     }
 
@@ -1524,22 +1573,97 @@ mod tests {
     }
 
     #[test]
-    fn chunk_key_folds_the_terrain_buckets() {
-        // Plan §10 check 7 (keying): same tiles + same buckets ⇒ same key;
-        // a bucket flip ⇒ a new key.
+    fn chunk_key_folds_atlas_and_owned_halo_provenance() {
+        let map = settled_map();
+        let coord = RegionCoord::new(0, 0);
+        let provenance = chunk_provenance(&map, coord).expect("complete inputs");
+        let mut expected = mix(
+            AtlasManager::region_key(&map, coord).expect("atlas provenance"),
+            0x504F_565F_4841_4C4F,
+        );
+        for bucket in provenance.terrain_halo.dependency_buckets() {
+            expected = mix(expected, u64::from(bucket));
+        }
+        assert_eq!(provenance.key, expected);
+    }
+
+    #[test]
+    fn neighbor_source_flip_supersedes_mesh_before_terrain_integration() {
+        // A completed old mesh must not publish after a neighbor's P/G
+        // authority changes, even though this region's stored Terrain and
+        // downstream tiles still carry their old hashes. The replacement job
+        // owns the same new halo snapshot folded into its key.
+        use std::cell::RefCell;
+        struct QueueExecutor {
+            jobs: RefCell<Vec<Box<dyn FnOnce() + Send>>>,
+        }
+        impl TaskExecutor for QueueExecutor {
+            fn submit(&self, _priority: TaskPriority, job: Box<dyn FnOnce() + Send>) {
+                self.jobs.borrow_mut().push(job);
+            }
+            fn parallelism(&self) -> usize {
+                1
+            }
+        }
+
+        let mut map = settled_map();
+        let coord = RegionCoord::new(0, 0);
+        let source = RegionCoord::new(1, 0);
+        let executor = QueueExecutor {
+            jobs: RefCell::new(Vec::new()),
+        };
+        let mut manager = PovChunkManager::new();
+        let old_atlas_key = AtlasManager::region_key(&map, coord).expect("settled atlas");
+        let old_key = chunk_provenance(&map, coord).expect("settled chunk").key;
+
+        let (uploads, _) = manager.sync(&map, (0.0, 0.0), 0, &executor);
+        assert!(uploads.is_empty());
+        assert_eq!(executor.jobs.borrow().len(), 1);
+        executor.jobs.borrow_mut().pop().expect("old job")();
+
+        let mut changed = PossibilitySignature::of(map.get(source).expect("source").current);
+        for domain in [PossibilityDomain::Planetary, PossibilityDomain::Geology] {
+            let bucket = &mut changed.buckets[domain.index()];
+            *bucket = if *bucket == 0 {
+                POSSIBILITY_QUANT - 1
+            } else {
+                0
+            };
+        }
+        map.apply_preserve_contribution(7, source, changed);
+
         assert_eq!(
-            chunk_key_from(42, &[100, 2000]),
-            chunk_key_from(42, &[100, 2000])
+            AtlasManager::region_key(&map, coord),
+            Some(old_atlas_key),
+            "source flip precedes corrected Terrain integration"
         );
-        assert_ne!(
-            chunk_key_from(42, &[100, 2000]),
-            chunk_key_from(42, &[101, 2000]),
-            "a flipped terrain bucket must force a remesh"
+        let new = chunk_provenance(&map, coord).expect("new halo provenance");
+        assert_ne!(new.key, old_key);
+        let expected_halo = new.terrain_halo.clone();
+
+        let (uploads, _) = manager.sync(&map, (0.0, 0.0), 0, &executor);
+        assert!(uploads.is_empty(), "completed old-key mesh must be dropped");
+        assert_eq!(manager.counters().cancelled, 1);
+        assert_eq!(manager.counters().dropped_stale, 1);
+        assert_eq!(executor.jobs.borrow().len(), 1, "replacement scheduled");
+        assert_eq!(
+            manager.in_flight.get(&coord).expect("replacement").key,
+            new.key
         );
-        assert_ne!(
-            chunk_key_from(42, &[100, 2000]),
-            chunk_key_from(43, &[100, 2000]),
-            "a changed tile dep-hash must force a remesh"
+
+        executor.jobs.borrow_mut().pop().expect("replacement job")();
+        let (uploads, _) = manager.sync(&map, (0.0, 0.0), 0, &executor);
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(manager.chunks.get(&coord).expect("published").key, new.key);
+        let origin = coord.origin();
+        let expected = elevation(
+            origin.0,
+            origin.1,
+            &expected_halo.sample_world(origin.0, origin.1),
+        );
+        assert_eq!(
+            uploads[0].vertices[0].position[2].to_bits(),
+            expected.to_bits()
         );
     }
 

@@ -11,7 +11,7 @@
 
 use crate::coord::RegionCoord;
 use crate::hash::{mix, Rng};
-use crate::possibility::{PossibilityVector, POSSIBILITY_DIMS};
+use crate::possibility::{PossibilityDomain, PossibilityVector, POSSIBILITY_DIMS};
 use crate::WORLD_ALGORITHM_VERSION;
 
 /// Fixed basis separating possibility-field seeding from other hash domains.
@@ -99,6 +99,46 @@ impl PossibilityField {
         }
         out
     }
+
+    /// Integer-only possibility bucket used by identity-grade drainage routing.
+    ///
+    /// This follows the control-point SplitMix stream and bilinearly combines
+    /// its 24-bit components as an exact rational before flooring to the
+    /// ordinary 4096-bucket grid. It intentionally does not pass through the
+    /// floating-point field or plausibility APIs (ADR 0027).
+    pub(crate) fn routing_bucket(&self, region: RegionCoord, domain: PossibilityDomain) -> u16 {
+        let cell = u64::from(self.cell_regions.max(1));
+        let rx = i64::from(region.x);
+        let ry = i64::from(region.y);
+        let cell_i64 = i64::try_from(cell).expect("u32 field spacing fits i64");
+        let cx0 = rx.div_euclid(cell_i64);
+        let cy0 = ry.div_euclid(cell_i64);
+        let fx = rx.rem_euclid(cell_i64) as u64;
+        let fy = ry.rem_euclid(cell_i64) as u64;
+
+        let component = |cx: i64, cy: i64| -> u64 {
+            let mut rng = Rng::new(self.control_point_seed(cx as i32, cy as i32));
+            let mut value = 0;
+            for current in PossibilityDomain::ALL {
+                value = rng.next_u64() >> 40;
+                if current == domain {
+                    break;
+                }
+            }
+            value
+        };
+
+        let wx0 = cell - fx;
+        let wy0 = cell - fy;
+        let weighted = u128::from(component(cx0, cy0)) * u128::from(wx0) * u128::from(wy0)
+            + u128::from(component(cx0 + 1, cy0)) * u128::from(fx) * u128::from(wy0)
+            + u128::from(component(cx0, cy0 + 1)) * u128::from(wx0) * u128::from(fy)
+            + u128::from(component(cx0 + 1, cy0 + 1)) * u128::from(fx) * u128::from(fy);
+        // 24-bit components divided by 2^24 and multiplied by 4096:
+        // denominator = cell^2 * 2^(24-12).
+        let denominator = u128::from(cell) * u128::from(cell) * 4096;
+        u16::try_from((weighted / denominator).min(4095)).expect("bucket is at most 4095")
+    }
 }
 
 impl Default for PossibilityField {
@@ -144,6 +184,25 @@ mod tests {
                 let v = f.sample(RegionCoord::new(x * 3, y * 3));
                 for d in v.dims {
                     assert!((0.0..=1.0).contains(&d));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routing_buckets_are_integer_and_coordinate_stable() {
+        for spacing in [1, PossibilityField::DEFAULT_CELL_REGIONS, 7, 31] {
+            let field = PossibilityField::new(spacing);
+            for coord in [
+                RegionCoord::new(0, 0),
+                RegionCoord::new(14, -15),
+                RegionCoord::new(-15, 14),
+                RegionCoord::new(i32::MAX - 1, i32::MIN + 1),
+            ] {
+                for domain in [PossibilityDomain::Planetary, PossibilityDomain::Geology] {
+                    let bucket = field.routing_bucket(coord, domain);
+                    assert!(bucket < 4096);
+                    assert_eq!(bucket, field.routing_bucket(coord, domain));
                 }
             }
         }

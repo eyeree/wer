@@ -35,10 +35,10 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-  # Browser portability: the platform-neutral crates must keep compiling for wasm
-  # continuously (implementation-plan.md section 19).
+  # Browser portability plus executed parity: neutral crates compile for wasm,
+  # then every deterministic probe runs in Node (ADR 0027).
   wasm:
-    name: wasm32 check
+    name: wasm32 check + parity test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,9 +47,13 @@ jobs:
           rustup show active-toolchain || rustup toolchain install stable
           rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - name: Install pinned wasm-pack
+        run: cargo install wasm-pack --version 0.13.1 --locked
       - name: check world-core (wasm32)
         run: cargo check -p world-core --target wasm32-unknown-unknown
       - name: check world-runtime (wasm32)
         run: cargo check -p world-runtime --target wasm32-unknown-unknown
       - name: check platform-web (wasm32)
         run: cargo check -p platform-web --target wasm32-unknown-unknown
+      - name: execute parity probes in Node
+        run: wasm-pack test --node crates/platform-web

@@ -174,7 +174,7 @@ pub fn elevation(world_x: f64, world_y: f64, p: &PossibilityVector) -> f32 {
 /// expression (ADR 0016).
 #[inline]
 #[must_use]
-pub(crate) fn elevation_from_relief(relief: f32, p: &PossibilityVector) -> f32 {
+pub fn elevation_from_relief(relief: f32, p: &PossibilityVector) -> f32 {
     // Geology 0..1 → amplitude scale 0.5..1.5 (quiet plains ↔ young mountains).
     let tectonic = 0.5 + p.get(PossibilityDomain::Geology);
     // Planetary 0..1 → sea shift −60..+60 (more ocean ↔ more land).

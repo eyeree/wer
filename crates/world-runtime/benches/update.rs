@@ -4,8 +4,14 @@
 //! world-scale Climate flip rippling through the expression layers.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use world_core::{PossibilityDomain, PossibilityField, POSSIBILITY_DIMS};
-use world_runtime::{Budget, InlineExecutor, RegionMap, StreamConfig};
+use world_core::{
+    layer::LAYER_TERRAIN, PossibilityDomain, PossibilityField, PossibilityVector, RegionCoord,
+    POSSIBILITY_DIMS,
+};
+use world_runtime::{
+    generate_layer, Budget, InlineExecutor, LayerInputs, RegionMap, StreamConfig,
+    TerrainPossibilityHalo, TileBuffers,
+};
 
 fn settled_map(cfg: StreamConfig, field: &PossibilityField) -> RegionMap {
     let mut map = RegionMap::new(cfg);
@@ -103,6 +109,52 @@ fn bench_update(c: &mut Criterion) {
             },
             criterion::BatchSize::LargeInput,
         )
+    });
+
+    let terrain_inputs = |varying: bool| {
+        let center = RegionCoord::new(-2, 3);
+        let mut buckets = [[[2048u16; 2]; 3]; 3];
+        if varying {
+            for (y, row) in buckets.iter_mut().enumerate() {
+                for (x, pair) in row.iter_mut().enumerate() {
+                    *pair = [
+                        400 + (y * 3 + x) as u16 * 350,
+                        3600 - (y * 3 + x) as u16 * 320,
+                    ];
+                }
+            }
+        }
+        LayerInputs {
+            quantized: PossibilityVector::neutral()
+                .quantized_domains(world_core::layer_decl(LAYER_TERRAIN).domains),
+            terrain_halo: Some(TerrainPossibilityHalo::new(center, buckets)),
+            tiles: Vec::new(),
+            biome: None,
+            drainage: None,
+            rosters: None,
+            dep_hash: 1,
+            buffers: TileBuffers::default(),
+        }
+    };
+    c.bench_function("terrain_tile_uniform_halo", |b| {
+        b.iter(|| {
+            generate_layer(
+                RegionCoord::new(-2, 3),
+                LAYER_TERRAIN,
+                &mut terrain_inputs(false),
+                32,
+            )
+        })
+    });
+    c.bench_function("terrain_tile_varying_halo_slope", |b| {
+        b.iter(|| {
+            generate_layer(
+                RegionCoord::new(-2, 3),
+                LAYER_TERRAIN,
+                &mut terrain_inputs(true),
+                32,
+            )
+        })
     });
 }
 

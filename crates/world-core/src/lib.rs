@@ -39,6 +39,7 @@ pub mod possibility;
 pub mod possibility_field;
 pub mod record;
 pub mod route;
+pub mod routing;
 pub mod simd;
 pub mod soils;
 pub mod species;
@@ -55,8 +56,10 @@ pub use capture::{
 };
 pub use climate::{climate, Climate};
 pub use coord::{LocalPos, RegionCoord, REGION_SIZE};
-pub use dephash::{drainage_dep_hash, drainage_dep_hash_default, layer_dep_hash};
-pub use drainage::{drainage, macro_coord_for, DrainageTile, MACRO_GRID, MACRO_LEVEL};
+pub use dephash::{drainage_dep_hash, drainage_dep_hash_default, layer_dep_hash, terrain_dep_hash};
+pub use drainage::{
+    drainage, drainage_topology_sample, macro_coord_for, DrainageTile, MACRO_GRID, MACRO_LEVEL,
+};
 pub use field::{FieldTile, FIELD_RES};
 pub use foodweb::{food_web, max_body_size, species_biomass, FoodWeb};
 pub use genome::{
@@ -68,7 +71,7 @@ pub use hash::{feature_hash, mix, splitmix64, FeatureKey, Rng};
 pub use hydrology::{hydrology, Hydrology};
 pub use layer::{
     all_layers_mask, dependents_closure, domain_dirty_mask, domain_readers, layer_bit, layer_decl,
-    LayerDecl, LAYERS, LAYER_COUNT,
+    max_layer_cost, LayerDecl, LAYERS, LAYER_COUNT,
 };
 pub use population::{
     diversity_of, population, population_from_table, population_table, signature_productivity,
@@ -86,6 +89,7 @@ pub use route::{
     attraction_anchors, route_difficulty, route_pull, RouteGraph, RouteGraphHit,
     ROUTE_ATTRACTION_MASK, ROUTE_CORRIDOR_RADIUS, ROUTE_PULL_CAP,
 };
+pub use routing::routing_elevation_cm;
 pub use soils::{soils, Soils};
 pub use species::{
     species_roster, species_seed, Species, SpeciesRoster, Trophic, ROSTER_MAX, TROPHIC_TIERS,

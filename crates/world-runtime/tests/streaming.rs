@@ -416,10 +416,10 @@ fn cost_budgets_are_enforced_per_frame() {
     let budget = Budget {
         max_loads: 5,
         max_converge_regions: 3,
-        // One drainage job costs 17 after the M4 recalibration
-        // (phase-6-plan.md §7.2); 20 admits it plus a cheap layer while
+        // One fixed-point drainage job costs 31 after the A.8 recalibration;
+        // 35 admits it plus one Terrain-cost unit while
         // still deferring most of a fresh window.
-        max_regen_cost: 20,
+        max_regen_cost: 35,
         max_realize_organisms: usize::MAX,
         max_persist_ops: usize::MAX,
         max_route_attraction_nodes: usize::MAX,
@@ -438,7 +438,7 @@ fn cost_budgets_are_enforced_per_frame() {
         false,
     );
     assert!(stats.loaded <= 5);
-    assert!(stats.regen_cost_spent <= 20);
+    assert!(stats.regen_cost_spent <= 35);
     assert!(stats.deferred_loads > 0, "small budget must defer loads");
     assert!(stats.deferred_regens > 0, "small budget must defer regens");
     let stats = map.update(
@@ -453,7 +453,7 @@ fn cost_budgets_are_enforced_per_frame() {
     );
     assert!(stats.loaded <= 5);
     assert!(stats.converged <= 3);
-    assert!(stats.regen_cost_spent <= 20);
+    assert!(stats.regen_cost_spent <= 35);
 
     // The budget throttles but never starves: the window must fully settle.
     for _ in 0..600 {
@@ -467,7 +467,7 @@ fn cost_budgets_are_enforced_per_frame() {
             &InlineExecutor,
             false,
         );
-        assert!(stats.regen_cost_spent <= 20);
+        assert!(stats.regen_cost_spent <= 35);
         if stats.regen_cost_spent == 0 && stats.loaded == 0 && map.jobs_in_flight() == 0 {
             break;
         }
@@ -679,13 +679,13 @@ fn zero_macro_target_recovers_hydrology_chain_to_roomy_fixed_point() {
     assert!(!diagnostics[LAYER_DRAINAGE as usize].dirty);
     assert!(diagnostics[LAYER_HYDROLOGY as usize].dirty);
 
-    // Seventeen units admit exactly the missing macro job in the first
+    // Thirty-one units admit exactly the missing macro job in the first
     // recovery frame. Hold it in a manual queue so its result reaches the
     // integrator at the start of the next update, immediately before the
     // zero-target capacity pass. Hydrology is still dirty at that pass, so
     // the just-integrated macro must survive long enough to be snapshotted.
     let finite_budget = Budget {
-        max_regen_cost: 17,
+        max_regen_cost: 31,
         ..Budget::unlimited()
     };
     let executor = ManualExecutor::default();
@@ -699,7 +699,7 @@ fn zero_macro_target_recovers_hydrology_chain_to_roomy_fixed_point() {
         &executor,
         false,
     );
-    assert_eq!(queued_stats.regen_cost_spent, 17);
+    assert_eq!(queued_stats.regen_cost_spent, 31);
     assert_eq!(executor.queue_len(), 1);
     assert_eq!(tight.jobs_in_flight(), 1);
     assert!(tight.macro_cache().get(macro_coord).is_none());
@@ -765,7 +765,7 @@ fn dispatch_is_topological_under_tiny_budgets() {
     let budget = Budget {
         max_loads: usize::MAX,
         max_converge_regions: usize::MAX,
-        max_regen_cost: 17, // exactly one drainage job (M4 costs), or a few cheap layers
+        max_regen_cost: 31, // exactly one A.8 drainage job, or a few cheap layers
         max_realize_organisms: usize::MAX,
         max_persist_ops: usize::MAX,
         max_route_attraction_nodes: usize::MAX,

@@ -507,7 +507,7 @@ fn scenario_sparse() -> VaultReport {
     let total = vault.store().bytes();
 
     // Namespace check + per-value size bound (a tile at 8×8 f32 alone would
-    // be 256 bytes of samples per channel across ~13 channels; a whole-region
+    // be 256 bytes of samples per channel across 14 channels; a whole-region
     // leak would show as multi-KB values).
     let allowed = ["meta/", "session/", "disc/", "route/", "pres/", "seen/"];
     for (key, value) in vault.store().iter() {

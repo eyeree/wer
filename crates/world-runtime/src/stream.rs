@@ -36,22 +36,22 @@ use std::sync::Arc;
 
 use world_core::layer::{
     all_layers_mask, dependents_closure, domain_dirty_mask, layer_bit, layer_decl, LAYER_COUNT,
-    LAYER_DRAINAGE, LAYER_ECOLOGY,
+    LAYER_DRAINAGE, LAYER_ECOLOGY, LAYER_TERRAIN,
 };
 use world_core::{
     anchor_influence_profile, anchor_set_signature, capture_target, domain_mask, drainage_dep_hash,
     layer_dep_hash, macro_coord_for, mix, organism_trait_deviation, project_plausible, steer,
-    Anchor, AnchorKind, AnchorSource, Biome, Climate, DrainageTile, Genome, GenomeBias,
-    HabitatSignature, PossibilityDomain, PossibilityField, PossibilitySignature, PossibilityVector,
-    RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS, REGION_SIZE,
+    terrain_dep_hash, Anchor, AnchorKind, AnchorSource, Biome, Climate, DrainageTile, Genome,
+    GenomeBias, HabitatSignature, PossibilityDomain, PossibilityField, PossibilitySignature,
+    PossibilityVector, RegionCoord, Soils, TraitDeviation, POSSIBILITY_DIMS, REGION_SIZE,
 };
 
 use crate::budget::Budget;
 use crate::generate::{
     full_region_payload_bytes, generate_layer, layer_channels, GeneratedTile, LayerInputs,
-    RegionCache, RegionTiles, TileBuffers, CHANNEL_DIVERSITY, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
-    CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_TEMPERATURE,
-    CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    RegionCache, RegionTiles, TerrainPossibilityHalo, TileBuffers, CHANNEL_DIVERSITY,
+    CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR,
+    CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 use crate::macrocache::MacroCache;
 use crate::pool::TilePool;
@@ -359,6 +359,9 @@ enum JobResult {
 #[derive(Debug)]
 pub struct RegionMap {
     cfg: StreamConfig,
+    /// Active field recipe used by fallback Terrain halos and macro topology.
+    /// Synchronized before any result integrates in an update (ADR 0027).
+    field_recipe: PossibilityField,
     regions: BTreeMap<RegionCoord, RegionState>,
     cache: RegionCache,
     macro_cache: MacroCache,
@@ -438,6 +441,7 @@ impl RegionMap {
         let (results_tx, results_rx) = channel();
         Self {
             cfg,
+            field_recipe: PossibilityField::default(),
             regions: BTreeMap::new(),
             cache: RegionCache::default(),
             macro_cache: MacroCache::default(),
@@ -465,6 +469,52 @@ impl RegionMap {
     #[inline]
     const fn field_active(region: &RegionState) -> bool {
         !matches!(region.status, GenerationStatus::Unloaded)
+    }
+
+    fn fallback_terrain_pair(&self, coord: RegionCoord) -> [u16; 2] {
+        let base = project_plausible(self.field_recipe.sample(coord)).requantized();
+        [
+            base.quantized(PossibilityDomain::Planetary),
+            base.quantized(PossibilityDomain::Geology),
+        ]
+    }
+
+    fn effective_terrain_pair(&self, coord: RegionCoord) -> [u16; 2] {
+        self.regions.get(&coord).map_or_else(
+            || self.fallback_terrain_pair(coord),
+            |region| {
+                [
+                    region.current.quantized(PossibilityDomain::Planetary),
+                    region.current.quantized(PossibilityDomain::Geology),
+                ]
+            },
+        )
+    }
+
+    fn terrain_halo(&self, center: RegionCoord) -> TerrainPossibilityHalo {
+        debug_assert_eq!(center.level, 0);
+        let mut buckets = [[[0; 2]; 3]; 3];
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let coord = RegionCoord::new(center.x + dx, center.y + dy);
+                buckets[(dy + 1) as usize][(dx + 1) as usize] = self.effective_terrain_pair(coord);
+            }
+        }
+        TerrainPossibilityHalo::new(center, buckets)
+    }
+
+    /// Invalidate every admitted Terrain consumer whose 3×3 halo includes the
+    /// changed absolute source. Parked authority remains a source but has no
+    /// disposable closure to dirty (ADR 0027).
+    fn invalidate_terrain_consumers(&mut self, source: RegionCoord, stats: &mut FrameStats) {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let consumer = RegionCoord::new(source.x + dx, source.y + dy);
+                if self.regions.get(&consumer).is_some_and(Self::field_active) {
+                    self.mark_dirty_closure(consumer, LAYER_TERRAIN, stats);
+                }
+            }
+        }
     }
 
     /// Full-payload reservations currently charged to the disposable field
@@ -991,6 +1041,16 @@ impl RegionMap {
         self.regions.get(&coord)
     }
 
+    /// Owned Terrain P/G halo for a resident level-0 region. Presentation
+    /// workers use this same authoritative snapshot rather than reconstructing
+    /// a region-constant vector (ADR 0027).
+    #[must_use]
+    pub fn terrain_possibility_halo(&self, coord: RegionCoord) -> Option<TerrainPossibilityHalo> {
+        self.regions
+            .contains_key(&coord)
+            .then(|| self.terrain_halo(coord))
+    }
+
     /// Number of authoritative residents, parked entries included.
     #[inline]
     #[must_use]
@@ -1220,6 +1280,11 @@ impl RegionMap {
         // Superseded in-flight work stops only for layers whose quantized
         // inputs changed. Same-bucket normalization leaves all jobs intact.
         self.cancel_in_flight(coord, dirtied);
+        let slow_mask =
+            (1 << PossibilityDomain::Planetary.index()) | (1 << PossibilityDomain::Geology.index());
+        if flipped & slow_mask != 0 {
+            self.invalidate_terrain_consumers(coord, &mut FrameStats::default());
+        }
     }
 
     /// Restore one region from a session snapshot (phase-5-plan.md §12.2):
@@ -1230,6 +1295,7 @@ impl RegionMap {
     /// possibility state (ADRs 0008 and 0023). Loading is not an event: nothing
     /// converges and no target moves beyond what the live run would compute.
     pub fn restore_region(&mut self, snap: &world_core::RegionSnapshotRecord) {
+        let old_pair = self.effective_terrain_pair(snap.coord);
         if self.regions.contains_key(&snap.coord) {
             self.park_region_fields(snap.coord, &mut FrameStats::default());
         } else {
@@ -1243,6 +1309,9 @@ impl RegionMap {
         region.dirty_layers = 0;
         region.status = GenerationStatus::Unloaded;
         self.regions.insert(snap.coord, region);
+        if self.effective_terrain_pair(snap.coord) != old_pair {
+            self.invalidate_terrain_consumers(snap.coord, &mut FrameStats::default());
+        }
     }
 
     /// Apply a run-local bump to one layer's algorithm revision, invalidating
@@ -1313,6 +1382,7 @@ impl RegionMap {
         transition_mode: bool,
     ) -> FrameStats {
         let mut stats = FrameStats::default();
+        self.synchronize_field_recipe(*field, anchors, bias, &mut stats);
         // Per-pass wall-clock (phase-6-plan.md §5.2): telemetry only, all
         // zeros without the `pass-timing` feature. Timing changes no behavior.
         let mut timings = PassTimings::default();
@@ -1380,6 +1450,49 @@ impl RegionMap {
         stats
     }
 
+    /// Make a field-recipe transition atomic with provenance validation. Macro
+    /// jobs, fallback-sensitive Terrain closures, and every ordinary target are
+    /// refreshed before an old result can integrate (ADR 0027).
+    fn synchronize_field_recipe(
+        &mut self,
+        field: PossibilityField,
+        anchors: &[Anchor],
+        bias: &[f32; POSSIBILITY_DIMS],
+        stats: &mut FrameStats,
+    ) {
+        if self.field_recipe == field {
+            return;
+        }
+        self.field_recipe = field;
+
+        let macro_jobs: Vec<_> = self
+            .in_flight
+            .keys()
+            .filter(|(_, layer)| *layer == LAYER_DRAINAGE)
+            .copied()
+            .collect();
+        for key in macro_jobs {
+            stats.jobs_cancelled += self.retire_in_flight(key);
+        }
+
+        let coords: Vec<_> = self.regions.keys().copied().collect();
+        for &coord in &coords {
+            if self.regions.get(&coord).is_some_and(Self::field_active) {
+                self.mark_dirty_closure(coord, LAYER_TERRAIN, stats);
+            }
+        }
+        // The field recipe is a target input as well as a fallback/topology
+        // input. Refresh all authority immediately, bypassing amortized target
+        // budgets so no region can converge toward the old recipe.
+        for coord in coords {
+            if self.preserve_contributors.contains_key(&coord) {
+                continue;
+            }
+            let target = self.target_for(coord, &field, anchors, bias);
+            self.regions.get_mut(&coord).expect("resident").target = target;
+        }
+    }
+
     /// The steered, projected target vector for a region.
     fn target_for(
         &self,
@@ -1403,6 +1516,7 @@ impl RegionMap {
             macro_coord,
             self.effective_revision(LAYER_DRAINAGE),
             self.effective_revision(world_core::layer::LAYER_TERRAIN),
+            self.field_recipe.cell_regions,
         )
     }
 
@@ -1437,6 +1551,17 @@ impl RegionMap {
             return hash;
         }
         let decl = layer_decl(layer);
+        if layer == LAYER_TERRAIN {
+            let buckets = self.terrain_halo(coord).dependency_buckets();
+            let hash = terrain_dep_hash(
+                coord,
+                self.effective_revision(layer),
+                &buckets,
+                self.cfg.field_resolution,
+            );
+            memo[layer as usize] = Some(hash);
+            return hash;
+        }
         let mut input_hashes = Vec::with_capacity(decl.deps.len());
         for &dep in decl.deps {
             let hash = if dep == LAYER_DRAINAGE {
@@ -1710,8 +1835,12 @@ impl RegionMap {
 
     /// Forget one resident completely after it crosses `unload_radius`.
     fn drop_region(&mut self, coord: RegionCoord, stats: &mut FrameStats) {
+        let old_pair = self.effective_terrain_pair(coord);
         self.park_region_fields(coord, stats);
         self.regions.remove(&coord);
+        if self.effective_terrain_pair(coord) != old_pair {
+            self.invalidate_terrain_consumers(coord, stats);
+        }
     }
 
     /// Retire one region's near-field realization and recycle its allocation.
@@ -1883,6 +2012,7 @@ impl RegionMap {
         candidates.sort_unstable_by(|a, b| a.cmp(b).then_with(|| a.1.cmp(&b.1)));
         let created = candidates.len().min(budget.max_loads);
         for &(_, coord) in candidates.iter().take(created) {
+            let old_pair = self.fallback_terrain_pair(coord);
             let mut region = RegionState::new(coord);
             if let Some((_, sig)) = self.effective_preserve(coord) {
                 // Preserved region: reload from its persisted buckets, pinned
@@ -1898,6 +2028,9 @@ impl RegionMap {
             // Authority is created parked. Admission below is the sole path
             // that allocates a field working set and marks its layers dirty.
             self.regions.insert(coord, region);
+            if self.effective_terrain_pair(coord) != old_pair {
+                self.invalidate_terrain_consumers(coord, stats);
+            }
             stats.loaded += 1;
         }
         stats.deferred_loads = candidates.len().saturating_sub(created);
@@ -2081,6 +2214,7 @@ impl RegionMap {
             .collect();
         // Farthest first: descending distance, coord tiebreak for determinism.
         eligible.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut terrain_sources = Vec::new();
         for &(_, coord) in eligible.iter().take(budget.max_converge_regions) {
             let region = self.regions.get_mut(&coord).expect("resident");
             let mut dirtied = 0u32;
@@ -2092,11 +2226,21 @@ impl RegionMap {
                     if Self::field_active(region) && region.status == GenerationStatus::Ready {
                         region.status = GenerationStatus::Generating;
                     }
+                    let slow_mask = (1 << PossibilityDomain::Planetary.index())
+                        | (1 << PossibilityDomain::Geology.index());
+                    if flipped & slow_mask != 0 {
+                        terrain_sources.push(coord);
+                    }
                 }
             }
             // Bucket flips supersede any in-flight job of the dirtied layers:
             // its expected hash moved on while it flew (§6.2).
             stats.jobs_cancelled += self.cancel_in_flight(coord, dirtied);
+        }
+        terrain_sources.sort_unstable();
+        terrain_sources.dedup();
+        for source in terrain_sources {
+            self.invalidate_terrain_consumers(source, stats);
         }
         stats.deferred_converges = eligible.len().saturating_sub(budget.max_converge_regions);
     }
@@ -2334,7 +2478,8 @@ impl RegionMap {
             },
         );
         let tx = self.results_tx.clone();
-        let field = *field;
+        debug_assert_eq!(*field, self.field_recipe);
+        let field = self.field_recipe;
         executor.submit(
             priority,
             Box::new(move || {
@@ -2623,6 +2768,16 @@ impl RegionMap {
         } else {
             None
         };
+        let terrain_halo = (layer == LAYER_TERRAIN).then(|| self.terrain_halo(coord));
+        let dispatch_hash = terrain_halo.as_ref().map_or(expected, |halo| {
+            terrain_dep_hash(
+                coord,
+                self.effective_revision(LAYER_TERRAIN),
+                &halo.dependency_buckets(),
+                self.cfg.field_resolution,
+            )
+        });
+        debug_assert_eq!(dispatch_hash, expected, "owned Terrain halo/key skew");
 
         let decl = layer_decl(layer);
         let tiles = self.cache.get(coord);
@@ -2663,11 +2818,12 @@ impl RegionMap {
         let region = self.regions.get_mut(&coord).expect("resident");
         let inputs = LayerInputs {
             quantized: region.current.quantized_domains(decl.domains),
+            terrain_halo,
             tiles: input_tiles,
             biome,
             drainage,
             rosters,
-            dep_hash: expected,
+            dep_hash: dispatch_hash,
             buffers,
         };
         region.dirty_layers &= !layer_bit(layer);
@@ -2680,7 +2836,7 @@ impl RegionMap {
             (coord, layer),
             InFlightJob {
                 id: job_id,
-                expected_hash: expected,
+                expected_hash: dispatch_hash,
                 cancel: Arc::clone(&cancel),
             },
         );
@@ -3521,7 +3677,9 @@ mod compatibility_tests {
 mod recovery_tests {
     use super::*;
     use crate::budget::Budget;
-    use crate::generate::{RegionTiles, CHANNEL_COUNT};
+    use crate::generate::{
+        RegionTiles, CHANNEL_COUNT, CHANNEL_ELEVATION, CHANNEL_SLOPE, CHANNEL_SOIL_DEPTH,
+    };
     use crate::InlineExecutor;
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -4699,5 +4857,672 @@ mod recovery_tests {
         for coord in parked {
             assert_eq!(map.regions[&coord].status, GenerationStatus::Unloaded);
         }
+    }
+
+    #[test]
+    fn field_recipe_change_refreshes_all_targets_before_amortized_work() {
+        let player = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
+        let cfg = StreamConfig {
+            near_radius: 0.1 * REGION_SIZE,
+            far_radius: 1.5 * REGION_SIZE,
+            load_radius: 1.1 * REGION_SIZE,
+            unload_radius: 2.5 * REGION_SIZE,
+            field_resolution: 2,
+            max_field_cache_bytes: 0,
+            ..StreamConfig::default()
+        };
+        let mut map = RegionMap::new(cfg);
+        map.update(
+            player,
+            0.0,
+            &PossibilityField::default(),
+            &[],
+            &NO_BIAS,
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        assert!(map
+            .regions
+            .values()
+            .any(|region| region.status == GenerationStatus::Unloaded));
+        let old_macro = map.expected_macro_hash(macro_coord_for(coord()));
+        let changed_field = PossibilityField::new(7);
+        let expected: BTreeMap<_, _> = map
+            .regions
+            .keys()
+            .map(|&coord| (coord, map.target_for(coord, &changed_field, &[], &NO_BIAS)))
+            .collect();
+        let budget = Budget {
+            max_loads: 0,
+            max_retarget_regions: 0,
+            max_regen_cost: 0,
+            ..Budget::unlimited()
+        };
+        map.update(
+            player,
+            0.0,
+            &changed_field,
+            &[],
+            &NO_BIAS,
+            &budget,
+            &InlineExecutor,
+            false,
+        );
+
+        assert_eq!(map.field_recipe, changed_field);
+        assert_ne!(map.expected_macro_hash(macro_coord_for(coord())), old_macro);
+        for (coord, target) in expected {
+            assert_eq!(map.regions[&coord].target, target);
+        }
+    }
+
+    fn ordinary_divergent_map(reverse_insertion: bool) -> RegionMap {
+        let mut map = RegionMap::new(StreamConfig {
+            near_radius: REGION_SIZE * 0.25,
+            far_radius: REGION_SIZE * 2.0,
+            load_radius: REGION_SIZE * 2.0,
+            unload_radius: REGION_SIZE * 3.0,
+            field_resolution: 8,
+            ..StreamConfig::default()
+        });
+        let left = RegionCoord::new(0, 0);
+        let right = RegionCoord::new(1, 0);
+        let make = |coord: RegionCoord, planetary: f32, geology: f32| {
+            let mut region = RegionState::new(coord);
+            region.current = project_plausible(field().sample(coord)).requantized();
+            region.current.set(PossibilityDomain::Planetary, planetary);
+            region.current.set(PossibilityDomain::Geology, geology);
+            region.target = region.current;
+            region.stability = 0.5;
+            region.dirty_layers = all_layers_mask();
+            region.status = GenerationStatus::Generating;
+            region
+        };
+        let left_region = make(left, 0.08, 0.92);
+        let right_region = make(right, 0.91, 0.12);
+        if reverse_insertion {
+            map.regions.insert(right, right_region);
+            map.regions.insert(left, left_region);
+        } else {
+            map.regions.insert(left, left_region);
+            map.regions.insert(right, right_region);
+        }
+
+        for _ in 0..12 {
+            let mut stats = FrameStats::default();
+            map.dispatch_regen(
+                PLAYER,
+                &field(),
+                &Budget::unlimited(),
+                &InlineExecutor,
+                &mut stats,
+            );
+            map.integrate_finished(&mut stats);
+            if [left, right].iter().all(|coord| {
+                map.regions[coord].dirty_layers == 0
+                    && map.regions[coord].status == GenerationStatus::Ready
+            }) && map.in_flight.is_empty()
+            {
+                return map;
+            }
+        }
+        panic!(
+            "ordinary divergent fixture did not settle: left={:?}, right={:?}",
+            map.layer_diagnostics(left),
+            map.layer_diagnostics(right)
+        );
+    }
+
+    fn tile_image_at(map: &RegionMap, coord: RegionCoord) -> Vec<(u64, u64, Vec<u32>)> {
+        map.cache
+            .get(coord)
+            .expect("settled ordinary tiles")
+            .channels
+            .iter()
+            .map(|tile| {
+                let tile = tile.as_ref().expect("every channel settled");
+                (
+                    tile.dep_hash,
+                    tile.content_hash(),
+                    tile.samples().iter().map(|value| value.to_bits()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn canonical_cell_world(coord: i32, resolution: u16, cell: i32) -> f64 {
+        let global = i64::from(coord) * i64::from(resolution) + i64::from(cell);
+        (global as f64 + 0.5) * (REGION_SIZE / f64::from(resolution))
+    }
+
+    fn halo_elevation(
+        coord: RegionCoord,
+        halo: &TerrainPossibilityHalo,
+        resolution: u16,
+        cx: i32,
+        cy: i32,
+    ) -> f32 {
+        world_core::elevation(
+            canonical_cell_world(coord.x, resolution, cx),
+            canonical_cell_world(coord.y, resolution, cy),
+            &halo.sample_cell(resolution, cx, cy),
+        )
+    }
+
+    #[test]
+    fn ordinary_divergent_history_seam_is_exact_through_biome_and_parking() {
+        let left = RegionCoord::new(0, 0);
+        let right = RegionCoord::new(1, 0);
+        let mut forward = ordinary_divergent_map(false);
+        let reverse = ordinary_divergent_map(true);
+        assert!(!forward.is_overridden(left) && !forward.is_overridden(right));
+
+        for coord in [left, right] {
+            assert_eq!(
+                tile_image_at(&forward, coord),
+                tile_image_at(&reverse, coord)
+            );
+            assert_eq!(
+                forward
+                    .cache
+                    .get(coord)
+                    .unwrap()
+                    .biome
+                    .as_ref()
+                    .unwrap()
+                    .samples(),
+                reverse
+                    .cache
+                    .get(coord)
+                    .unwrap()
+                    .biome
+                    .as_ref()
+                    .unwrap()
+                    .samples(),
+            );
+        }
+
+        let left_halo = forward.terrain_halo(left);
+        let right_halo = forward.terrain_halo(right);
+        let left_pair = forward.effective_terrain_pair(left);
+        let right_pair = forward.effective_terrain_pair(right);
+        assert_ne!(left_pair, right_pair, "fixture histories must be divergent");
+        assert_eq!(left_halo.buckets_at(right), Some(right_pair));
+        assert_eq!(right_halo.buckets_at(left), Some(left_pair));
+
+        let resolution = 8;
+        let cy = 4;
+        let shared_left = left_halo.sample_cell(resolution, i32::from(resolution), cy);
+        let shared_right = right_halo.sample_cell(resolution, 0, cy);
+        assert_eq!(
+            shared_left.dims.map(f32::to_bits),
+            shared_right.dims.map(f32::to_bits)
+        );
+        let shared_elevation =
+            halo_elevation(left, &left_halo, resolution, i32::from(resolution), cy);
+        let right_elevation = forward.cache.channel(right, CHANNEL_ELEVATION).unwrap();
+        assert_eq!(
+            shared_elevation.to_bits(),
+            right_elevation.get(0, cy as u16).to_bits()
+        );
+
+        let cx = i32::from(resolution) - 1;
+        let step = (REGION_SIZE / f64::from(resolution)) as f32;
+        let dx = (halo_elevation(left, &left_halo, resolution, cx + 1, cy)
+            - halo_elevation(left, &left_halo, resolution, cx - 1, cy))
+            / (2.0 * step);
+        let dy = (halo_elevation(left, &left_halo, resolution, cx, cy + 1)
+            - halo_elevation(left, &left_halo, resolution, cx, cy - 1))
+            / (2.0 * step);
+        let expected_slope = (dx * dx + dy * dy).sqrt();
+        let tiles = forward.cache.get(left).unwrap();
+        let elevation = tiles.channels[CHANNEL_ELEVATION].as_ref().unwrap();
+        let slope = tiles.channels[CHANNEL_SLOPE].as_ref().unwrap();
+        assert_eq!(
+            slope.get(cx as u16, cy as u16).to_bits(),
+            expected_slope.to_bits()
+        );
+        let old_dx =
+            (elevation.get(cx as u16, cy as u16) - elevation.get(cx as u16 - 1, cy as u16)) / step;
+        assert_ne!(
+            expected_slope.to_bits(),
+            (old_dx * old_dx + dy * dy).sqrt().to_bits(),
+            "fixture must detect the old one-sided edge derivative"
+        );
+
+        let x = canonical_cell_world(left.x, resolution, cx);
+        let y = canonical_cell_world(left.y, resolution, cy);
+        let current = forward.regions[&left].current;
+        let climate = Climate {
+            temperature: tiles.channels[CHANNEL_TEMPERATURE]
+                .as_ref()
+                .unwrap()
+                .get(cx as u16, cy as u16),
+            moisture: tiles.channels[CHANNEL_MOISTURE]
+                .as_ref()
+                .unwrap()
+                .get(cx as u16, cy as u16),
+        };
+        let drainage = forward
+            .macro_cache
+            .get(macro_coord_for(left))
+            .expect("drainage settled");
+        let hydrology_p = PossibilityVector::from_quantized(
+            layer_decl(world_core::layer::LAYER_HYDROLOGY).domains,
+            &current.quantized_domains(layer_decl(world_core::layer::LAYER_HYDROLOGY).domains),
+        );
+        let expected_hydrology = world_core::hydrology(
+            elevation.get(cx as u16, cy as u16),
+            expected_slope,
+            drainage.accum_bilinear(x, y),
+            &climate,
+            hydrology_p.get(PossibilityDomain::Hydrology),
+            hydrology_p.get(PossibilityDomain::Planetary),
+        );
+        assert_eq!(
+            tiles.channels[CHANNEL_RIVER]
+                .as_ref()
+                .unwrap()
+                .get(cx as u16, cy as u16)
+                .to_bits(),
+            expected_hydrology.river.to_bits()
+        );
+        assert_eq!(
+            tiles.channels[CHANNEL_WETNESS]
+                .as_ref()
+                .unwrap()
+                .get(cx as u16, cy as u16)
+                .to_bits(),
+            expected_hydrology.wetness.to_bits()
+        );
+        let geology_p = PossibilityVector::from_quantized(
+            layer_decl(world_core::layer::LAYER_GEOLOGY).domains,
+            &current.quantized_domains(layer_decl(world_core::layer::LAYER_GEOLOGY).domains),
+        );
+        let geology = world_core::geology(x, y, geology_p.get(PossibilityDomain::Geology));
+        assert_eq!(
+            geology.hardness.to_bits(),
+            tiles.channels[CHANNEL_HARDNESS]
+                .as_ref()
+                .unwrap()
+                .get(cx as u16, cy as u16)
+                .to_bits()
+        );
+        let expected_soils = world_core::soils(
+            elevation.get(cx as u16, cy as u16),
+            expected_slope,
+            &geology,
+            &climate,
+            &expected_hydrology,
+        );
+        assert_eq!(
+            tiles.channels[CHANNEL_SOIL_DEPTH]
+                .as_ref()
+                .unwrap()
+                .get(cx as u16, cy as u16)
+                .to_bits(),
+            expected_soils.depth.to_bits()
+        );
+        assert_eq!(
+            tiles.channels[CHANNEL_FERTILITY]
+                .as_ref()
+                .unwrap()
+                .get(cx as u16, cy as u16)
+                .to_bits(),
+            expected_soils.fertility.to_bits()
+        );
+        let expected_biome = world_core::classify(
+            elevation.get(cx as u16, cy as u16),
+            &climate,
+            &expected_hydrology,
+            &expected_soils,
+        );
+        assert_eq!(
+            tiles.biome.as_ref().unwrap().get(cx as u16, cy as u16),
+            expected_biome.id()
+        );
+
+        let left_before_parking = tile_image_at(&forward, left);
+        let left_key_before = forward.expected_layer_hash(left, LAYER_TERRAIN);
+        forward.park_region_fields(right, &mut FrameStats::default());
+        assert_eq!(forward.regions[&right].status, GenerationStatus::Unloaded);
+        assert_eq!(forward.effective_terrain_pair(right), right_pair);
+        assert_eq!(
+            forward.expected_layer_hash(left, LAYER_TERRAIN),
+            left_key_before
+        );
+        assert_eq!(tile_image_at(&forward, left), left_before_parking);
+    }
+
+    #[test]
+    fn queued_old_neighbor_halo_never_publishes_with_or_without_cancellation() {
+        for cancellation in [false, true] {
+            let left = RegionCoord::new(0, 0);
+            let right = RegionCoord::new(1, 0);
+            let mut map = RegionMap::new(StreamConfig {
+                field_resolution: 8,
+                ..tiny_config()
+            });
+            map.cancellation = cancellation;
+            for coord in [left, right] {
+                let mut region = RegionState::new(coord);
+                region.current = project_plausible(field().sample(coord)).requantized();
+                region.target = region.current;
+                region.status = GenerationStatus::Generating;
+                region.dirty_layers = layer_bit(LAYER_TERRAIN);
+                map.regions.insert(coord, region);
+            }
+            let executor = ManualExecutor::default();
+            let old_hash = map.expected_layer_hash(left, LAYER_TERRAIN).unwrap();
+            map.submit_layer(
+                left,
+                LAYER_TERRAIN,
+                old_hash,
+                TaskPriority::Critical,
+                &executor,
+            );
+            assert_eq!(executor.len(), 1);
+
+            map.regions
+                .get_mut(&right)
+                .unwrap()
+                .current
+                .set(PossibilityDomain::Geology, 0.99);
+            let mut stats = FrameStats::default();
+            map.invalidate_terrain_consumers(right, &mut stats);
+            let corrected_hash = map.expected_layer_hash(left, LAYER_TERRAIN).unwrap();
+            assert_ne!(corrected_hash, old_hash);
+            assert!(!map.in_flight.contains_key(&(left, LAYER_TERRAIN)));
+
+            executor.run_next();
+            map.integrate_finished(&mut stats);
+            assert!(map.cache.get(left).is_none());
+            assert_eq!(stats.results_dropped, usize::from(!cancellation));
+
+            map.submit_layer(
+                left,
+                LAYER_TERRAIN,
+                corrected_hash,
+                TaskPriority::Critical,
+                &executor,
+            );
+            executor.run_next();
+            map.integrate_finished(&mut stats);
+            assert_eq!(
+                map.cache
+                    .get(left)
+                    .and_then(|tiles| tiles.layer_hash(LAYER_TERRAIN)),
+                Some(corrected_hash)
+            );
+        }
+    }
+
+    fn clean_active_region(coord: RegionCoord, current: PossibilityVector) -> RegionState {
+        let mut region = RegionState::new(coord);
+        region.current = current;
+        region.target = current;
+        region.status = GenerationStatus::Ready;
+        region.dirty_layers = 0;
+        region
+    }
+
+    #[test]
+    fn neighbor_halo_lifecycle_paths_notify_only_material_pg_changes() {
+        let field = field();
+        let neighbor = RegionCoord::new(0, 0);
+        let source = RegionCoord::new(1, 0);
+
+        // Actual authority insertion replaces fallback when steering makes the
+        // loaded current P/G differ; radius-drop restoration returns to the
+        // exact fallback and fans out through the same production helper.
+        let mut map = RegionMap::new(StreamConfig {
+            near_radius: REGION_SIZE * 0.05,
+            far_radius: REGION_SIZE * 0.1,
+            load_radius: REGION_SIZE * 0.1,
+            unload_radius: REGION_SIZE * 4.0,
+            field_resolution: 8,
+            ..StreamConfig::default()
+        });
+        map.regions.insert(
+            neighbor,
+            clean_active_region(
+                neighbor,
+                project_plausible(field.sample(neighbor)).requantized(),
+            ),
+        );
+        let fallback_key = map.expected_layer_hash(neighbor, LAYER_TERRAIN).unwrap();
+        let mut bias = NO_BIAS;
+        bias[PossibilityDomain::Planetary.index()] = 0.4;
+        bias[PossibilityDomain::Geology.index()] = -0.4;
+        let mut stats = FrameStats::default();
+        map.load(
+            (
+                (f64::from(source.x) + 0.5) * REGION_SIZE,
+                (f64::from(source.y) + 0.5) * REGION_SIZE,
+            ),
+            &field,
+            &[],
+            &bias,
+            &Budget {
+                max_loads: 1,
+                ..Budget::unlimited()
+            },
+            &mut stats,
+        );
+        assert!(map.regions.contains_key(&source));
+        let authority_key = map.expected_layer_hash(neighbor, LAYER_TERRAIN).unwrap();
+        assert_ne!(authority_key, fallback_key);
+        assert_ne!(
+            map.regions[&neighbor].dirty_layers & layer_bit(LAYER_TERRAIN),
+            0
+        );
+        map.regions.get_mut(&neighbor).unwrap().dirty_layers = 0;
+        map.regions.get_mut(&neighbor).unwrap().status = GenerationStatus::Ready;
+        map.drop_region(source, &mut stats);
+        assert_eq!(
+            map.expected_layer_hash(neighbor, LAYER_TERRAIN),
+            Some(fallback_key)
+        );
+        assert_ne!(
+            map.regions[&neighbor].dirty_layers & layer_bit(LAYER_TERRAIN),
+            0
+        );
+
+        // Preserve winner P/G snaps fan out. A later winner which changes only
+        // Climate while retaining the same P/G buckets leaves the neighbor's
+        // Terrain key and work untouched.
+        let mut map = RegionMap::new(tiny_config());
+        let base = project_plausible(field.sample(source)).requantized();
+        map.regions
+            .insert(neighbor, clean_active_region(neighbor, base));
+        map.regions
+            .insert(source, clean_active_region(source, base));
+        let mut changed = PossibilitySignature::of(base);
+        changed.buckets[PossibilityDomain::Planetary.index()] = 300;
+        changed.buckets[PossibilityDomain::Geology.index()] = 3_700;
+        map.apply_preserve_contribution(20, source, changed);
+        assert_ne!(
+            map.regions[&neighbor].dirty_layers & layer_bit(LAYER_TERRAIN),
+            0
+        );
+        let preserve_key = map.expected_layer_hash(neighbor, LAYER_TERRAIN).unwrap();
+        map.regions.get_mut(&neighbor).unwrap().dirty_layers = 0;
+        map.regions.get_mut(&neighbor).unwrap().status = GenerationStatus::Ready;
+        let mut climate_only = changed;
+        climate_only.buckets[PossibilityDomain::Climate.index()] = 123;
+        map.apply_preserve_contribution(10, source, climate_only);
+        assert_eq!(
+            map.expected_layer_hash(neighbor, LAYER_TERRAIN),
+            Some(preserve_key)
+        );
+        assert_eq!(map.regions[&neighbor].dirty_layers, 0);
+
+        // Session restoration replaces source authority with parked authority,
+        // but a material P/G pair still invalidates its active neighbor.
+        let restored = world_core::RegionSnapshotRecord {
+            coord: source,
+            current: PossibilitySignature {
+                buckets: [1_900; POSSIBILITY_DIMS],
+            }
+            .dequantize()
+            .dims,
+            stability: 0.25,
+            revision: 9,
+        };
+        map.restore_region(&restored);
+        assert_eq!(map.regions[&source].status, GenerationStatus::Unloaded);
+        assert_ne!(
+            map.regions[&neighbor].dirty_layers & layer_bit(LAYER_TERRAIN),
+            0
+        );
+
+        // Actual convergence of slow buckets fans out, while a Climate-only
+        // crossing dirties only the source's declared readers.
+        let mut map = RegionMap::new(StreamConfig {
+            converge_per_unit: 1.0,
+            converge_rate_cap: 1.0,
+            ..tiny_config()
+        });
+        let mut slow = base;
+        slow.set(PossibilityDomain::Planetary, 0.1);
+        slow.set(PossibilityDomain::Geology, 0.1);
+        let mut slow_target = slow;
+        slow_target.set(PossibilityDomain::Planetary, 0.9);
+        slow_target.set(PossibilityDomain::Geology, 0.9);
+        let mut source_region = clean_active_region(source, slow);
+        source_region.target = slow_target;
+        source_region.stability = 0.0;
+        map.regions.insert(source, source_region);
+        map.regions
+            .insert(neighbor, clean_active_region(neighbor, base));
+        let mut stats = FrameStats::default();
+        map.converge(PLAYER, 1.0, 1.0, 1.0, &Budget::unlimited(), &mut stats);
+        assert_ne!(
+            map.regions[&neighbor].dirty_layers & layer_bit(LAYER_TERRAIN),
+            0
+        );
+        map.regions.get_mut(&neighbor).unwrap().dirty_layers = 0;
+        map.regions.get_mut(&neighbor).unwrap().status = GenerationStatus::Ready;
+        let terrain_key = map.expected_layer_hash(neighbor, LAYER_TERRAIN).unwrap();
+        let source_region = map.regions.get_mut(&source).unwrap();
+        source_region.current = source_region.target;
+        let climate_target = if source_region.current.get(PossibilityDomain::Climate) < 0.5 {
+            0.99
+        } else {
+            0.01
+        };
+        source_region
+            .target
+            .set(PossibilityDomain::Climate, climate_target);
+        source_region.stability = 0.0;
+        source_region.dirty_layers = 0;
+        source_region.status = GenerationStatus::Ready;
+        map.converge(PLAYER, 1.0, 1.0, 1.0, &Budget::unlimited(), &mut stats);
+        assert_eq!(
+            map.expected_layer_hash(neighbor, LAYER_TERRAIN),
+            Some(terrain_key)
+        );
+        assert_eq!(map.regions[&neighbor].dirty_layers, 0);
+
+        // A recipe change through `update` invalidates a fallback-sensitive
+        // Terrain job and refreshes the key before old work can integrate.
+        let mut map = RegionMap::new(tiny_config());
+        map.regions
+            .insert(neighbor, clean_active_region(neighbor, base));
+        map.regions.get_mut(&neighbor).unwrap().dirty_layers = layer_bit(LAYER_TERRAIN);
+        let executor = ManualExecutor::default();
+        let old_key = map.expected_layer_hash(neighbor, LAYER_TERRAIN).unwrap();
+        map.submit_layer(
+            neighbor,
+            LAYER_TERRAIN,
+            old_key,
+            TaskPriority::Critical,
+            &executor,
+        );
+        let changed_field = PossibilityField::new(7);
+        let stats = map.update(
+            PLAYER,
+            0.0,
+            &changed_field,
+            &[],
+            &NO_BIAS,
+            &Budget {
+                max_loads: 0,
+                max_regen_cost: 0,
+                ..Budget::unlimited()
+            },
+            &executor,
+            false,
+        );
+        assert_eq!(stats.jobs_cancelled, 1);
+        assert!(!map.in_flight.contains_key(&(neighbor, LAYER_TERRAIN)));
+        assert_ne!(
+            map.expected_layer_hash(neighbor, LAYER_TERRAIN),
+            Some(old_key)
+        );
+        assert_ne!(
+            map.regions[&neighbor].dirty_layers & layer_bit(LAYER_TERRAIN),
+            0
+        );
+    }
+
+    #[test]
+    fn ordinary_history_halos_use_parked_authority_and_fan_out_nine_consumers() {
+        let mut map = RegionMap::new(StreamConfig {
+            field_resolution: 8,
+            ..tiny_config()
+        });
+        let source = RegionCoord::new(0, 0);
+        let mut source_region = RegionState::new(source);
+        source_region.current.set(PossibilityDomain::Planetary, 0.1);
+        source_region.current.set(PossibilityDomain::Geology, 0.9);
+        source_region.target = source_region.current;
+        source_region.status = GenerationStatus::Unloaded;
+        source_region.dirty_layers = 0;
+        let expected_pair = [
+            source_region
+                .current
+                .quantized(PossibilityDomain::Planetary),
+            source_region.current.quantized(PossibilityDomain::Geology),
+        ];
+        map.regions.insert(source, source_region);
+
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let coord = RegionCoord::new(dx, dy);
+                let mut region = RegionState::new(coord);
+                region.status = GenerationStatus::Ready;
+                region.dirty_layers = 0;
+                map.regions.insert(coord, region);
+            }
+        }
+        let outside = RegionCoord::new(2, 0);
+        let mut outside_region = RegionState::new(outside);
+        outside_region.status = GenerationStatus::Ready;
+        outside_region.dirty_layers = 0;
+        map.regions.insert(outside, outside_region);
+
+        let neighbor_halo = map.terrain_halo(RegionCoord::new(1, 0));
+        assert_eq!(neighbor_halo.buckets_at(source), Some(expected_pair));
+        let mut stats = FrameStats::default();
+        map.invalidate_terrain_consumers(source, &mut stats);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let coord = RegionCoord::new(dx, dy);
+                if coord == source {
+                    assert_eq!(map.regions[&coord].status, GenerationStatus::Unloaded);
+                } else {
+                    assert_ne!(
+                        map.regions[&coord].dirty_layers & dependents_closure(LAYER_TERRAIN),
+                        0
+                    );
+                }
+            }
+        }
+        assert_eq!(map.regions[&outside].dirty_layers, 0);
     }
 }

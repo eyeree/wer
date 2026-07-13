@@ -64,6 +64,26 @@ pub fn layer_dep_hash(
     h
 }
 
+/// Terrain dependency hash over the complete ordered 3×3 Planetary/Geology
+/// possibility halo. Values are row-major (`dy`, then `dx`), Planetary before
+/// Geology at every absolute region center (ADR 0027).
+#[must_use]
+pub fn terrain_dep_hash(
+    region: RegionCoord,
+    terrain_revision: u16,
+    halo_buckets: &[u16; 18],
+    resolution: u16,
+) -> u64 {
+    layer_dep_hash(
+        region,
+        LAYER_TERRAIN,
+        terrain_revision,
+        halo_buckets,
+        &[],
+        resolution,
+    )
+}
+
 /// Dependency hash of a macro drainage tile (ADR 0009).
 ///
 /// Drainage routes over the terrain *algorithm* (sampled directly at macro
@@ -77,15 +97,21 @@ pub fn drainage_dep_hash(
     macro_coord: RegionCoord,
     drainage_revision: u16,
     terrain_revision: u16,
+    field_cell_regions: u32,
 ) -> u64 {
-    layer_dep_hash(
-        macro_coord,
-        LAYER_DRAINAGE,
-        drainage_revision,
-        &[],
-        &[terrain_revision as u64],
-        MACRO_GRID as u16,
-    )
+    let mut h = DEPHASH_BASIS;
+    h = mix(h, WORLD_ALGORITHM_VERSION as u64);
+    h = mix(h, LAYER_DRAINAGE as u64);
+    h = mix(h, drainage_revision as u64);
+    h = mix(h, terrain_revision as u64);
+    // Fold the stored recipe exactly. Although the public constructor clamps
+    // zero, a struct literal can still carry it; its control-point seed differs
+    // from spacing 1 and therefore its topology key must differ too.
+    h = mix(h, field_cell_regions as u64);
+    h = mix(h, macro_coord.x as u32 as u64);
+    h = mix(h, macro_coord.y as u32 as u64);
+    h = mix(h, macro_coord.level as u64);
+    mix(h, MACRO_GRID as u64)
 }
 
 /// [`drainage_dep_hash`] at the declared table revisions (no run-local bumps).
@@ -95,6 +121,7 @@ pub fn drainage_dep_hash_default(macro_coord: RegionCoord) -> u64 {
         macro_coord,
         layer_decl(LAYER_DRAINAGE).algorithm_revision,
         layer_decl(LAYER_TERRAIN).algorithm_revision,
+        crate::PossibilityField::DEFAULT_CELL_REGIONS,
     )
 }
 
@@ -143,9 +170,40 @@ mod tests {
     #[test]
     fn drainage_hash_tracks_both_revisions() {
         let mc = RegionCoord::at_level(1, -2, crate::drainage::MACRO_LEVEL);
-        let base = drainage_dep_hash(mc, 0, 0);
-        assert_ne!(drainage_dep_hash(mc, 1, 0), base);
-        assert_ne!(drainage_dep_hash(mc, 0, 1), base);
+        let base = drainage_dep_hash(mc, 1, 1, 8);
+        assert_ne!(drainage_dep_hash(mc, 2, 1, 8), base);
+        assert_ne!(drainage_dep_hash(mc, 1, 2, 8), base);
+        assert_ne!(drainage_dep_hash(mc, 1, 1, 7), base);
+        assert_ne!(
+            drainage_dep_hash(mc, 0, 0, 0),
+            drainage_dep_hash(mc, 0, 0, 1)
+        );
+        let raw_zero = crate::PossibilityField { cell_regions: 0 };
+        let spacing_one = crate::PossibilityField::new(1);
+        let zero_key = drainage_dep_hash(mc, 0, 0, raw_zero.cell_regions);
+        let one_key = drainage_dep_hash(mc, 0, 0, spacing_one.cell_regions);
+        assert_ne!(
+            crate::drainage(mc, &raw_zero, zero_key).content_hash(),
+            crate::drainage(mc, &spacing_one, one_key).content_hash()
+        );
         assert_eq!(drainage_dep_hash_default(mc), base);
+    }
+
+    #[test]
+    fn terrain_hash_tracks_every_halo_slot() {
+        let region = RegionCoord::new(-4, 6);
+        let buckets = core::array::from_fn(|index| index as u16 + 100);
+        let base = terrain_dep_hash(region, 1, &buckets, 32);
+        for index in 0..buckets.len() {
+            let mut changed = buckets;
+            changed[index] += 1;
+            assert_ne!(terrain_dep_hash(region, 1, &changed, 32), base);
+        }
+        assert_ne!(terrain_dep_hash(region, 2, &buckets, 32), base);
+        assert_ne!(terrain_dep_hash(region, 1, &buckets, 31), base);
+        assert_ne!(
+            terrain_dep_hash(RegionCoord::new(-3, 6), 1, &buckets, 32),
+            base
+        );
     }
 }

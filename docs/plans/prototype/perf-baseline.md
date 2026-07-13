@@ -171,3 +171,27 @@ found with the same harness (skirts were one-sided under back-face culling,
 and the possibility-field gradient steps borders by far more than the
 planned 4-unit drop) and fixed: double-sided skirt quads, 128-unit drop;
 a top-down radius-8 sweep now shows zero gap pixels.
+
+## Improvement A.8 — fixed routing and halo Terrain
+
+Measured on the same local execution machine with the release Criterion
+profiles. The pre-A.8 drainage measurement was taken from `main` immediately
+before the worktree measurement; no full-Terrain job benchmark existed before
+A.8, so the two new Terrain cases establish its ongoing baseline.
+
+| benchmark | pre-A.8 | post-A.8 |
+|---|---:|---:|
+| one fixed routing elevation | n/a (float presentation path) | **249 ns** |
+| `drainage_macro_tile` | **421 µs** | **764 µs** |
+| Terrain 32², uniform P/G halo, Elevation + Slope | no dedicated case | **78.8 µs** |
+| Terrain 32², adversarial varying halo, Elevation + Slope | no dedicated case | **78.4 µs** |
+
+The macro tradeoff is deliberate: topology no longer uses the float/SIMD fBm
+row and is now fixed Q30/i128 identity math. At the existing approximate
+25-µs scheduling unit, conservative ceiling division recalibrates Terrain
+`cost` 2 → **4** and Drainage `cost` 17 → **31**. A complete 32² field payload
+is now **60,416 bytes** (14 `f32` channels plus biome `u8` and dominant `u16`);
+the three rolling Terrain ghost rows are bounded job scratch and are not
+misreported as cache payload. Finite temporal-budget scaling now floors
+`max_regen_cost` at the largest declared atomic cost (31), preserving liveness
+for the ADR 0018 quarter-budget schedule.

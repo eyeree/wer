@@ -19,7 +19,7 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0006](0006-travel-fueled-convergence.md) | Convergence is fueled by player travel, not wall-clock time | Accepted |
 | [0007](0007-declared-layer-dependencies.md) | Declared layer dependencies supersede the static drift mask | Accepted |
 | [0008](0008-tiles-are-functions-of-their-dependency-hash.md) | Tiles are functions of their dependency hash | Accepted |
-| [0009](0009-drainage-topology-from-quantized-elevation.md) | Drainage topology from quantized elevation at macro level | Accepted |
+| [0009](0009-drainage-topology-from-quantized-elevation.md) | Drainage topology from quantized elevation at macro level | Superseded in part by 0027 |
 | [0010](0010-species-identity-presentation-grade-until-atlas.md) | Species identity is presentation-grade until the atlas needs otherwise | Accepted |
 | [0011](0011-anchors-capture-trait-targets-combine-order-independently.md) | Anchors capture trait targets and combine order-independently | Accepted |
 | [0012](0012-resonance-gates-transition.md) | Resonance gates transition; it multiplies the travel-fueled rate | Accepted |
@@ -37,3 +37,4 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0024](0024-gameplay-uses-one-canonical-organism-slot.md) | Gameplay uses one canonical organism slot; resource-tier density is visual | Accepted |
 | [0025](0025-anchor-steering-uses-canonical-multisets.md) | Anchor steering uses canonical multisets | Accepted |
 | [0026](0026-route-attraction-is-globally-bounded.md) | Route attraction is globally bounded and resonance scores final desire | Accepted |
+| [0027](0027-fixed-point-drainage-and-halo-sampled-terrain.md) | Fixed-point drainage and halo-sampled Terrain boundaries | Accepted |

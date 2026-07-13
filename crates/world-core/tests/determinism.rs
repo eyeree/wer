@@ -338,7 +338,7 @@ fn drainage_routing_golden() {
     let accum_row: Vec<u32> = (a..a + 8).map(|gx| tile.accum_at(gx, a + 4)).collect();
     assert_eq!(accum_row, [1, 2, 5, 1, 5, 11, 1, 13]);
 
-    assert_eq!(tile.content_hash(), 0x3D3C_D818_31BC_900B);
+    assert_eq!(tile.content_hash(), 0x594B_ABBC_7B6F_F4BE);
 
     // Quantized routing elevations are integer identities too (§9.3).
     assert_eq!(
@@ -348,6 +348,14 @@ fn drainage_routing_golden() {
     assert_eq!(
         world_core::drainage::routing_elevation_cm(&field, -37, 74),
         2208
+    );
+}
+
+#[test]
+fn drainage_topology_matrix_golden() {
+    assert_eq!(
+        world_core::drainage_topology_sample(),
+        0xB9FA_AD5C_9521_6B3F
     );
 }
 
@@ -454,7 +462,7 @@ fn layer_dep_hash_golden() {
     );
     assert_eq!(
         drainage_dep_hash_default(RegionCoord::at_level(0, 0, MACRO_LEVEL)),
-        0x1902_F38A_1E6A_30A6
+        0xBE47_F27D_EA2E_EF2A
     );
 }
 

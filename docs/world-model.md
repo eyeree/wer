@@ -486,6 +486,13 @@ computable without a resident macro tile. Input hashes therefore include
 upstream provenance, so an upstream change changes downstream keys, absent a
 64-bit collision.
 
+Terrain and Drainage have typed keys beyond that generic shape. Terrain folds
+the 18 Planetary/Geology buckets in its absolute 3 by 3 possibility halo.
+Drainage folds the stored possibility-field spacing plus the Terrain and
+Drainage algorithm revisions before its macro coordinate. A field-recipe
+change refreshes every authoritative target before integration, invalidates
+fallback-sensitive Terrain closures, and retires old macro work.
+
 The implementation checks both stored tiles and completed results against that
 current expected key. A completed result must also match the key captured at
 dispatch, while its current job id is the separate dispatch-identity gate. A
@@ -497,9 +504,9 @@ The implemented directed acyclic graph is:
 
 | Id | Layer | Direct domains | Declared layer inputs | Cached result | Cost |
 |---:|---|---|---|---|---:|
-| 0 | Terrain | Geology, Planetary | none | elevation `f32` | 2 |
+| 0 | Terrain | 3 by 3 Geology/Planetary halo | none | elevation and slope `f32` | 4 |
 | 1 | Geology | Geology | none | hardness `f32` | 2 |
-| 2 | Drainage | none | Terrain revision | macro flow direction + accumulation | 17 |
+| 2 | Drainage | none | Terrain revision | macro flow direction + accumulation | 31 |
 | 3 | Climate | Climate, Hydrology, Planetary | Terrain | temperature, moisture | 1 |
 | 4 | Hydrology | Hydrology, Planetary | Terrain, Drainage, Climate | river, wetness | 1 |
 | 5 | Soils | none directly | Terrain, Geology, Climate, Hydrology | depth, fertility | 2 |
@@ -509,9 +516,10 @@ The implemented directed acyclic graph is:
 
 Layer ids are topological. Scanning dirty bits in ascending order therefore
 visits dependencies before dependents. Drainage is special: it does not read a
-terrain tile or the live possibility state. Its declared Terrain edge carries
-the Terrain algorithm revision, while its actual routing elevation comes from
-the anchor-free base possibility field.
+terrain tile or live realized possibility state. Its declared Terrain edge
+carries the Terrain algorithm revision, while its integer routing elevation
+comes from the anchor-free base possibility field identified by the field
+spacing in the macro key.
 
 That special edge is intentionally coarser than the data dependency. A live
 Geology or Planetary bucket change dirties Terrain and therefore propagates a
@@ -957,31 +965,35 @@ signature seed determines build order but is not a metric index.
 A [`FieldTile<T>`](crates/world-core/src/field.rs) owns a square row-major
 `Vec<T>`, its resolution, and the dependency hash from which it was generated.
 Tiles are immutable after integration and shared with workers through `Arc`.
-`RegionTiles` is a structure-of-arrays container with 13 optional `f32` tiles,
+`RegionTiles` is a structure-of-arrays container with 14 optional `f32` tiles,
 one `u8` biome tile, and one `u16` dominant-species tile:
 
 ```text
 elevation, hardness, temperature, moisture,
 river, wetness, soil depth, fertility,
 vegetation density, canopy height,
-herbivore pressure, predator pressure, diversity,
+herbivore pressure, predator pressure, diversity, slope,
 biome id, dominant roster index
 ```
 
-At 32 by 32, a complete region has 56,320 bytes of sample payload, before map,
+At 32 by 32, a complete region has 60,416 bytes of sample payload, before map,
 `Arc`, and allocation overhead. A content hash folds tile provenance and every
 sample's exact bit pattern; it is a replay oracle, not a portable identity for
 float tiles.
 
-Terrain slope used by Hydrology and Soils is a finite-difference magnitude:
+Terrain emits the slope used by Hydrology and Soils atomically with Elevation.
+It is a centered finite-difference magnitude:
 
 $$
 s=\sqrt{\left(\frac{z(x_1,y)-z(x_0,y)}{(x_1-x_0)\Delta}\right)^2+
         \left(\frac{z(x,y_1)-z(x,y_0)}{(y_1-y_0)\Delta}\right)^2},
 $$
 
-where $\Delta=R/n=8$. Interior cells use centered neighbors; tile-edge cells
-use a one-sided difference from inside the same tile.
+where $\Delta=R/n=8$. A rolling one-cell elevation ghost ring supplies both
+neighbors at every core cell, including all four tile edges and corners. The
+ghost and a neighboring tile's core construct the same absolute cell-center
+coordinate, possibility sample, and noise operations, so their shared-position
+elevation bits agree exactly.
 
 ### 3.9 Terrain
 
@@ -1014,8 +1026,8 @@ n_o\left(\frac{x}{4096/2^o}+\Delta x_o,
 {\sum_{o=0}^{4}2^{-o}}.
 $$
 
-The denominator is $1.9375$. Elevation for a region's dequantized Geology and
-Planetary buckets is
+The denominator is $1.9375$. Elevation for a per-cell dequantized Geology and
+Planetary sample is
 
 $$
 z(x,y)=600\,N(x,y)(0.5+G)-120(P-0.5).
@@ -1024,8 +1036,20 @@ $$
 Sea level is zero. $G$ therefore scales relief from 0.5 to 1.5 times the base,
 while increasing $P$ lowers the land; the end-to-end Planetary swing is 120
 units. Gradient selection is integer identity; interpolation and possibility
-scaling are float presentation math. The possibility vector is constant across
-an entire region's tile, not sampled per cell.
+scaling are float presentation math.
+
+Terrain snapshots the absolute 3 by 3 region-center neighborhood. Resident
+authority contributes realized `current` P/G buckets even when its fields are
+parked; a missing coordinate contributes the projected/requantized anchor-free
+field sample for that absolute coordinate. Every core and one-cell ghost
+position bilinearly samples those centers in a fixed x-then-y order. Exact-
+center axes fetch only the used center.
+
+The Terrain dependency key folds all 18 ordered halo buckets. A P/G authority
+change fans out the Terrain dependent closure to every field-active consumer
+whose 3 by 3 halo contains the source. Loading, radius removal, preserve snaps,
+session restoration, convergence, and field-recipe transitions share that
+invalidation path; parking fields alone does not change authority.
 
 ### 3.10 Geology
 
@@ -1066,19 +1090,24 @@ river *topology* from changing river *expression*. A level-4 macro tile has a
 routing grid. Generation temporarily samples a 50 by 50 elevation grid so each
 routing cell has a complete 3 by 3 neighborhood.
 
-Routing deliberately ignores each region's live realized state. At the center
-of every level-0 region, it samples
+Routing deliberately ignores each region's live realized state. Its isolated
+evaluator contains no floating-point operation from control-point seeds through
+the final centimeters. It extracts the field stream's 24-bit P/G components,
+bilinearly combines them as exact integer rationals, floors them to 4096
+buckets, and reconstructs exact Q30 bucket centers. Hashed gradients, octave
+offsets, fade, interpolation, the 16:8:4:2:1 fBm spectrum, and Terrain's
+conceptual P/G scaling all run in signed Q30 with `i128` products and sums.
+Every division rounds to nearest with ties away from zero. The final conversion
+is
 
 $$
-p_b=\operatorname{requantize}(\Pi(F(r)))
+z_{cm}=\operatorname{round}_{\text{ties away}}(100z_{Q30}/2^{30}).
 $$
 
-and evaluates Terrain under that anchor-free baseline. Elevation is then
-rounded to integer centimeters:
-
-$$
-z_{cm}=\operatorname{round}(100z).
-$$
+This fixed evaluator is terrain-shaped but is not claimed bit-equal to the
+float presentation surface. The macro dependency key includes the stored field
+spacing and both Terrain and Drainage algorithm revisions. Terrain and Drainage
+are revision 1; the world algorithm version remains 2.
 
 For each of eight neighbors with strictly lower integer elevation, the descent
 score is
@@ -1695,6 +1724,13 @@ nothing. Parking retires level-0 dispatch identities, so late cancellation-off
 results are reclaimed without recreating fields. Dirty bits and cancellation
 are never substitutes for the identity and provenance checks.
 
+Terrain adds one cross-region notification: when an authority's realized P/G
+bucket pair can replace or be replaced by fallback, the runtime dirties the
+Terrain dependent closure of every field-active consumer in its 3 by 3
+neighborhood. The submitted owned halo is the same snapshot whose 18 buckets
+formed the dispatch key; a late result from an older neighbor halo therefore
+fails current-key integration. Parked sources remain authoritative halo input.
+
 Drainage jobs are keyed by level-4 macro coordinate. Their priority is inherited
 from the nearest dependent region that requests the tile. Ecology jobs first
 snapshot all required roster entries in the same way Hydrology snapshots its
@@ -1729,9 +1765,12 @@ time. The low-tier 16.6 ms nominal budget is:
 | target refreshes | unlimited |
 
 Declared generation cost approximates about 25 microseconds per unit on the
-reference machine. A macro Drainage job costs 17; other layers cost one or two.
-Budget exhaustion is represented by deferred-work counters and is considered
-normal backpressure.
+reference machine. The measured halo Terrain job costs 4 and fixed-point macro
+Drainage costs 31; other layers cost one or two. Budget exhaustion is
+represented by deferred-work counters and is considered normal backpressure.
+Finite budget scaling floors regeneration at the largest declared atomic layer
+cost (currently Drainage at 31), so a quarter-budget schedule can defer work
+without making a required job permanently inadmissible.
 
 ### 3.25 Resource tiers, caches, and pools
 
@@ -1806,7 +1845,7 @@ content.
 ### 3.26 Same-math performance paths
 
 [`simd.rs`](crates/world-core/src/simd.rs) provides row kernels with permanent
-scalar twins. Terrain interpolation uses four-wide `f32` vectors while
+scalar twins. Float Terrain presentation uses the four-wide fBm row kernel while
 retaining scalar `f64` lattice coordinates; Climate, Hydrology, Soils, and
 Vegetation use eight-wide lanes. Tail elements run the scalar functions.
 
@@ -1821,6 +1860,11 @@ shares, and diversity depend only on `(roster, food web)`, so `RosterEntry`
 computes them once instead of scanning the roster for every cell. The per-cell
 loop becomes table lookup plus pressure scaling, preserving operation order and
 output bits.
+
+Identity-grade routing is deliberately separate: its Q30 evaluator is scalar
+integer math and no longer calls the float SIMD row path. Terrain scales the
+`n+2` relief row by per-cell halo samples and rolls three rows to emit Elevation
+and centered Slope without a full ghost-patch allocation.
 
 Target refresh is amortized on Mid and High. A steering-input hash folds bias
 plus ADR 0025's canonical, cardinality-preserving anchor signature. Reordering
@@ -1850,9 +1894,18 @@ rgba32float: diversity, presence mask, unused, unused
 rg16uint:    biome id, dominant roster index
 ```
 
+The CPU-only Slope channel is explicitly skipped during atlas key/payload
+packing. Elevation and Slope share the Terrain dependency hash, so Elevation's
+existing upload provenance still observes every Terrain change without adding
+a fifth plane or shader selector.
+
 An `AtlasManager` assigns and recycles slots and uploads a region only when its
 presence/dependency key changes. A storage buffer maps visible window positions
 to slots. Sparse routes, rings, markers, and other overlays remain CPU-drawn.
+The POV chunk manager extends that tile key with the 18 buckets of the exact
+owned Terrain halo snapshot passed to its mesh job. A neighbor P/G authority
+flip therefore supersedes completed or in-flight old-halo meshes immediately,
+before corrected Terrain and downstream tiles integrate.
 
 The WGSL composition pass selects false-colour channels and can add up to three
 hashed-gradient refinement octaves above the 32-by-32 authoritative sampling
@@ -1861,15 +1914,17 @@ no GPU result can become a generation input, identity, steering value,
 resonance value, or persistent record.
 
 The current web crate compiles the neutral code for `wasm32` and exposes parity
-probe functions. It does not run `RegionMap`, a worker executor, browser
-storage, or the renderer.
+probe functions. CI also executes every probe in Node through pinned
+`wasm-bindgen-test` 0.3.76 and `wasm-pack` 0.13.1. It does not run `RegionMap`,
+a worker executor, browser storage, or the renderer.
 
 ### 3.28 Verification surfaces
 
 The repository uses several complementary checks:
 
 * fixed golden hashes and record bytes in `world-core`, including additive
-  canonical-anchor-signature and aggregate-route-attraction fixtures;
+  canonical-anchor-signature, aggregate-route-attraction, and signed multi-
+  macro drainage-topology fixtures;
 * same-platform SIMD-versus-scalar differential tests;
 * the continuity replay for pinned stability and bounded seams;
 * `wer-ledger` for declared invalidation precision;
@@ -1912,12 +1967,12 @@ amortized while duplicate/radius/masked-target edits refresh fully. A native
 requiring exact normalized strengths, target, compatibility, resonance cost,
 signature, route id, and encoded bytes. The web parity surface adds fixed
 duplicate-containing canonical-signature and quantized dense-route
-normalization probes and compiles the identical core implementation.
+normalization probes and executes those plus fixed routing elevations and three
+complete macro topology folds in Node.
 
-CI formats, lints, checks, and tests the native workspace and compile-checks
-the three neutral/web crates for `wasm32-unknown-unknown`. The parity exports
-are golden-tested in a native build and compiled for wasm, but CI does not
-currently execute those exports in a wasm engine or browser.
+CI formats, lints, checks, and tests the native workspace, compile-checks the
+three neutral/web crates for `wasm32-unknown-unknown`, and then runs the shared
+parity suite in Node as actual wasm.
 
 ## 4. Questionable aspects and opportunities for improvement
 
@@ -2002,15 +2057,18 @@ into one implementation unit.
    compatibility weights authoritative current-versus-final-target differences
    with the same canonical center-evaluated influence profile. Dense
    multi-route, Suppress-final, exact permutation, native recording, tier, and
-   an additive native-golden/wasm-compiled parity sample cover the corrected
+   an additive native/wasm-executed parity sample covers the corrected
    contracts.
 
-8. **Make stable topology and ordinary region boundaries satisfy their stated
-   guarantees** (findings 9 and 19). Move routing elevation to fixed-point math
-   or narrow the portability contract, execute parity probes in wasm, and give
-   Terrain and slope either smoothly sampled possibility inputs or cross-region
-   halos. Any output-changing fix must follow the versioning and golden-fixture
-   process.
+8. **Completed: Make stable topology and ordinary region boundaries satisfy
+   their stated guarantees**
+   ([Improvement A.8](plans/prototype/improvement_A_8_topology_boundaries.md);
+   findings 9 and 19). Drainage routing elevation is now an entirely integer
+   Q30/i128 function with field-aware keys and executed native/wasm topology
+   probes. Terrain samples an exact 3 by 3 realized-current/fallback P/G halo,
+   emits centered ghost-derived Slope atomically, and invalidates every
+   affected neighbor closure across authority lifecycle changes. Exact
+   ordinary history-divergent border tests cover Terrain through Biome.
 
 9. **Separate stable organism identity, placement, succession, and expression**
    (finding 12). Do not let M/B/A-only changes re-roll species or position; key
@@ -2308,7 +2366,7 @@ cases, every returned node center and corridor probes, singleton bits, usage
 saturation, output order, and route-iterator permutations. The vault harness
 reports the dense peak, the native recording test covers normalized effective
 inputs, and an additive quantized route sample is golden-tested natively and
-compiled for wasm.
+executed as wasm in Node.
 
 #### 8. Transition mode currently reverses the high-level movement fantasy
 
@@ -2322,22 +2380,18 @@ Either make free travel nearly neutral and transition mode enable convergence
 while reducing physical speed, or revise the product description and controls
 to match the implemented mechanic.
 
-#### 9. "Integer drainage topology" still depends on float thresholds
+#### 9. Resolved: integer drainage topology depended on float thresholds
 
-Drainage decisions are integer *after* elevation is rounded to centimeters,
-but that integer is produced by float possibility interpolation and
-quantization, Perlin interpolation, fBm summation, relief scaling, and
-`f32::round`. (The plausibility projection is currently inert here because it
-does not change Terrain's Planetary or Geology inputs.) A small target/compiler
-difference near a half-centimeter boundary can change a descent edge and then
-an entire accumulation tree. The present pipeline therefore does not
-structurally satisfy the stronger claim that floating point never decides
-permanent topology.
+**Status:** Resolved by
+[Improvement A.8](plans/prototype/improvement_A_8_topology_boundaries.md) and
+[ADR 0027](adr/0027-fixed-point-drainage-and-halo-sampled-terrain.md).
 
-A fixed-point routing-elevation evaluator would make the guarantee real. A less
-disruptive near-term step is to describe the guarantee more narrowly and run
-the parity exports inside an actual wasm engine in CI over many cells. Current
-CI only compiles the wasm exports and executes their goldens natively.
+Routing elevation now uses one integer-only Q30/i128 evaluator from the
+control-point stream through P/G bucket sampling, hashed-gradient fBm, signed
+ties-away rounding, and final centimeters. Scalar and macro paths share it;
+the macro key includes the raw stored field spacing and both layer revisions.
+Known answers cover signed/custom/extreme coordinates and CI executes a broad
+multi-macro topology fold as real wasm in Node.
 
 #### 10. Integration does not revalidate the dependency hash
 
@@ -2486,19 +2540,20 @@ Add a capture radius and an explicit result describing which feature supplied
 each trait. Weather, cloud, ocean, or atmospheric fields are needed before a
 Planetary capture can be distinctive.
 
-#### 19. Terrain and downstream fields are not border-identical
+#### 19. Resolved: Terrain and downstream fields were not border-identical
 
-The base possibility field varies smoothly *between region samples*, but every
-tile uses one constant region possibility vector. Neighboring terrain tiles can
-therefore apply different relief scale and sea shift to the same continuous
-noise near a border. A loose base-field bound permits a substantial elevation
-step, and steering/convergence history can make it larger.
+**Status:** Resolved by
+[Improvement A.8](plans/prototype/improvement_A_8_topology_boundaries.md) and
+[ADR 0027](adr/0027-fixed-point-drainage-and-halo-sampled-terrain.md).
 
-Slope then uses only the local tile and one-sided edge differences, adding
-derivative seams to Hydrology and Soils. Sample slow possibility per cell or
-blend it across borders, and give slope a cross-region halo or analytical
-terrain derivative. These changes alter generated output and require the
-normal versioning process.
+Terrain now snapshots nine absolute realized-current/fallback P/G center
+samples, bilinearly evaluates them at every core and ghost position, and folds
+all 18 buckets into its key. It emits Elevation and centered ghost-derived
+Slope under one provenance key; Hydrology and Soils consume the stored Slope.
+Central lifecycle invalidation reaches every affected neighbor, while parked
+authority remains halo input. Ordinary divergent-history, reverse-order,
+parking, downstream-oracle, and queued-stale-result regressions pin the
+boundary contract.
 
 #### 20. Drainage accumulation and physical rules are acknowledged approximations
 
@@ -2746,9 +2801,10 @@ into a simultaneous all-cache test or make its hash cover external queues and
 every derived presentation detail.
 
 Add the remaining frame-slicing, all-cache-ceiling, cross-tier persistence, and
-full settled-state scenarios. Run wasm parity exports—not just compilation—in
-CI. Add ordinary region-border tests for elevation, slope, soil, and biome, plus
-multi-node route softness. The SIMD differential generator should also sample
+full settled-state scenarios. A.8 now runs wasm parity exports in Node and adds
+ordinary divergent-history border tests through Terrain, Slope, Hydrology,
+Soils, and Biome; the remaining verification gaps include multi-node route
+softness. The SIMD differential generator should also sample
 all 12 biome ids; it currently calls `next_below(11)`, so Ice (id 11) is never
 exercised there.
 

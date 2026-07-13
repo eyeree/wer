@@ -1,5 +1,5 @@
 //! Macro drainage: stable river-network topology from quantized elevation
-//! (phase-2-plan.md §7.3, milestone M4, ADR 0009).
+//! (phase-2-plan.md §7.3, milestone M4, ADRs 0009 and 0027).
 //!
 //! River networks are *topology* and must be integer-derived (section 6.2),
 //! yet flow is inherently non-local. Drainage is therefore computed per
@@ -10,13 +10,15 @@
 //!
 //! Routing consumes **no runtime possibility state**: each cell's elevation is
 //! sampled at the quantized anchor-free possibility-field base of its region.
-//! That makes a macro tile a pure function of its coordinate (plus the world
-//! algorithm version), so networks are permanent — rivers do not walk under
-//! any drift, fast or slow, and a macro tile spanning the pinned zone can
-//! never rewrite the ground under the player. Possibility expresses through
+//! That makes a macro tile a pure function of its coordinate, stored field
+//! spacing, world version, and Terrain/Drainage algorithm revisions. Networks
+//! are permanent for that complete recipe — rivers do not walk under any live
+//! drift, fast or slow, and a macro tile spanning the pinned zone can never
+//! rewrite the ground under the player. Possibility expresses through
 //! the hydrology layer instead (river width, wetness — phase-2-plan.md §7.4).
 //! The realized-terrain-vs-routing-elevation skew in strongly steered worlds
-//! is a declared plausibility approximation (ADR 0009).
+//! is a declared plausibility approximation (ADR 0009 as partially superseded
+//! by ADR 0027).
 //!
 //! Flow directions are **window-independent**: a cell's direction depends only
 //! on its own 3×3 quantized neighborhood, so adjacent macro tiles can never
@@ -26,12 +28,12 @@
 //! river" rather than a seam, and the continuity replay bounds the residual
 //! width step across macro boundaries (phase-2-plan.md §12.2).
 
-use crate::anchor::project_plausible;
 use crate::coord::{RegionCoord, REGION_SIZE};
 use crate::hash::mix;
 use crate::possibility_field::PossibilityField;
-use crate::terrain::elevation;
 use crate::WORLD_ALGORITHM_VERSION;
+
+pub use crate::routing::routing_elevation_cm;
 
 /// Hierarchy level of macro drainage tiles: level 4 ⇒ 16×16 level-0 regions
 /// (4096 world units — one terrain [`crate::terrain::BASE_WAVELENGTH`]).
@@ -80,24 +82,6 @@ pub const fn tiebreak_hash(region_x: i64, region_y: i64) -> u64 {
     h = mix(h, region_x as u64);
     h = mix(h, region_y as u64);
     h
-}
-
-/// Quantize an elevation to integer centimeters — the only form routing sees.
-#[inline]
-#[must_use]
-pub fn quantize_elevation_cm(elevation: f32) -> i32 {
-    (elevation * 100.0).round() as i32
-}
-
-/// Routing elevation of one drainage cell (the level-0 region at
-/// `(region_x, region_y)`): the terrain heightfield at the region center,
-/// under the region's quantized anchor-free field base, in centimeters.
-#[must_use]
-pub fn routing_elevation_cm(field: &PossibilityField, region_x: i32, region_y: i32) -> i32 {
-    let p = project_plausible(field.sample(RegionCoord::new(region_x, region_y))).requantized();
-    let cx = (f64::from(region_x) + 0.5) * REGION_SIZE;
-    let cy = (f64::from(region_y) + 0.5) * REGION_SIZE;
-    quantize_elevation_cm(elevation(cx, cy, &p))
 }
 
 /// Flow direction of one cell from its own 3×3 quantized neighborhood —
@@ -276,24 +260,11 @@ pub fn drainage(macro_coord: RegionCoord, field: &PossibilityField, dep_hash: u6
     // full 3×3 neighborhood.
     const EDGE: usize = MACRO_GRID + 2;
     let mut elev = vec![0i32; EDGE * EDGE];
-    // Row-kernel fill (phase-6-plan.md §6.1): the relief (fBm) row runs
-    // through the differential-tested SIMD path; the per-region possibility
-    // scaling then applies the identical `elevation_from_relief` expression
-    // the scalar `routing_elevation_cm` applies — same bits, proven by the
-    // drainage routing golden.
-    let xs: Vec<f64> = (0..EDGE)
-        .map(|gx| (f64::from(ox + gx as i32 - 1) + 0.5) * REGION_SIZE)
-        .collect();
-    let mut relief = vec![0f32; EDGE];
     for gy in 0..EDGE {
         let ry = oy + gy as i32 - 1;
-        let cy = (f64::from(ry) + 0.5) * REGION_SIZE;
-        crate::simd::fbm_row(&xs, cy, &mut relief);
         for gx in 0..EDGE {
             let rx = ox + gx as i32 - 1;
-            let p = project_plausible(field.sample(RegionCoord::new(rx, ry))).requantized();
-            elev[gy * EDGE + gx] =
-                quantize_elevation_cm(crate::terrain::elevation_from_relief(relief[gx], &p));
+            elev[gy * EDGE + gx] = routing_elevation_cm(field, rx, ry);
         }
     }
 
@@ -346,6 +317,43 @@ pub fn drainage(macro_coord: RegionCoord, field: &PossibilityField, dep_hash: u6
         flow_dir,
         accum,
     }
+}
+
+/// Broad native/wasm topology parity fold spanning signed coordinates,
+/// control-cell boundaries, non-power-of-two fields, and three complete macro
+/// tiles. Every direction and accumulation cell contributes through each
+/// tile's content hash (ADR 0027).
+#[must_use]
+pub fn drainage_topology_sample() -> u64 {
+    let cases = [
+        (8, 0, 0),
+        (8, -1, -1),
+        (8, 7, 8),
+        (8, -8, -9),
+        (7, 14, -15),
+        (3, -31, 29),
+    ];
+    let mut h = mix(0xD2A1_0027_70F0_1001, cases.len() as u64);
+    for (spacing, x, y) in cases {
+        let field = PossibilityField::new(spacing);
+        h = mix(h, u64::from(spacing));
+        h = mix(h, x as u32 as u64);
+        h = mix(h, y as u32 as u64);
+        h = mix(h, routing_elevation_cm(&field, x, y) as u32 as u64);
+    }
+
+    let macros = [(-1, 0), (0, 0), (0, -1)];
+    h = mix(h, macros.len() as u64);
+    let field = PossibilityField::default();
+    for (x, y) in macros {
+        let coord = RegionCoord::at_level(x, y, MACRO_LEVEL);
+        let dep_hash = crate::drainage_dep_hash_default(coord);
+        let tile = drainage(coord, &field, dep_hash);
+        h = mix(h, x as u32 as u64);
+        h = mix(h, y as u32 as u64);
+        h = mix(h, tile.content_hash());
+    }
+    h
 }
 
 #[cfg(test)]

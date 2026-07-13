@@ -29,6 +29,22 @@ use world_core::{
     terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, WORLD_ALGORITHM_VERSION,
 };
 
+/// Shared native/wasm parity expectations. The wasm integration suite imports
+/// these exact constants, so the two execution gates cannot drift apart.
+pub const EXPECTED_ORIGIN_FEATURE_HASH: u64 = 0x4C6C_A5DE_38F9_0B17;
+pub const EXPECTED_TERRAIN_GRADIENT_SEED: u64 = 0x557D_9B95_E708_EDFF;
+pub const EXPECTED_CONTROL_POINT_SEED: u64 = 0xAAF0_551F_3E6F_1A1C;
+pub const EXPECTED_LITHOLOGY_SEED: u64 = 0x61DD_60E4_EEF6_FD16;
+pub const EXPECTED_DRAINAGE_ROUTING: u64 = 0x0000_0001_0000_000D;
+pub const EXPECTED_DRAINAGE_TOPOLOGY: u64 = 0xB9FA_AD5C_9521_6B3F;
+pub const EXPECTED_GENOME: u64 = 0x6023_7E3E_43E5_2590;
+pub const EXPECTED_FOOD_WEB: u64 = 0x6272_09D2_6720_001B;
+pub const EXPECTED_STEER: u64 = 0x9A4E_77F9_D151_9EC2;
+pub const EXPECTED_CANONICAL_ANCHOR_SIGNATURE: u64 = 0xBDAA_C72D_CA08_3AF7;
+pub const EXPECTED_RECORD_CODEC: u64 = 0xFA7F_9032_2BAF_D7FB;
+pub const EXPECTED_SHARED_STEER: u64 = 0xF0FB_820F_2030_1752;
+pub const EXPECTED_ROUTE_ATTRACTION: u64 = 0x3D54_75F6_34AF_1C41;
+
 /// The fixed habitat used by the Phase 3 parity exports. Only the (portable)
 /// integer signature → seed → genome / roster / web chain is asserted
 /// cross-platform; how a cell arrives at this signature is presentation-grade
@@ -93,6 +109,13 @@ pub fn drainage_routing_sample() -> u64 {
     let apron = MACRO_APRON as usize;
     let (gx, gy) = (apron + 7, apron + 4);
     (u64::from(tile.flow_dir_at(gx, gy)) << 32) | u64::from(tile.accum_at(gx, gy))
+}
+
+/// Broad fixed-topology parity fold spanning signs, field lattice boundaries,
+/// a non-power-of-two field recipe, and three complete macro tiles (ADR 0027).
+#[must_use]
+pub fn drainage_topology_sample() -> u64 {
+    world_core::drainage_topology_sample()
 }
 
 /// Parity sample for the procedural-genetics identity layer (phase-3-plan.md
@@ -359,6 +382,13 @@ mod wasm {
         super::drainage_routing_sample()
     }
 
+    /// Broad fixed-topology fold — complete macro content and signed samples.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn drainage_topology_sample() -> u64 {
+        super::drainage_topology_sample()
+    }
+
     /// Procedural-genome identity sample (phase-3-plan.md §12.5).
     #[wasm_bindgen]
     #[must_use]
@@ -419,21 +449,43 @@ mod tests {
 
     #[test]
     fn parity_samples_match_goldens() {
-        assert_eq!(super::origin_feature_hash(), 0x4C6C_A5DE_38F9_0B17);
-        assert_eq!(super::terrain_gradient_seed_sample(), 0x557D_9B95_E708_EDFF);
-        assert_eq!(super::control_point_seed_sample(), 0xAAF0_551F_3E6F_1A1C);
-        assert_eq!(super::lithology_seed_sample(), 0x61DD_60E4_EEF6_FD16);
-        assert_eq!(super::drainage_routing_sample(), 0x0000_0001_0000_000D);
-        assert_eq!(super::genome_sample(), 0x6023_7E3E_43E5_2590);
-        assert_eq!(super::food_web_sample(), 0x6272_09D2_6720_001B);
-        assert_eq!(super::steer_sample(), 0x9A4E_77F9_D151_9EC2);
+        assert_eq!(
+            super::origin_feature_hash(),
+            super::EXPECTED_ORIGIN_FEATURE_HASH
+        );
+        assert_eq!(
+            super::terrain_gradient_seed_sample(),
+            super::EXPECTED_TERRAIN_GRADIENT_SEED
+        );
+        assert_eq!(
+            super::control_point_seed_sample(),
+            super::EXPECTED_CONTROL_POINT_SEED
+        );
+        assert_eq!(
+            super::lithology_seed_sample(),
+            super::EXPECTED_LITHOLOGY_SEED
+        );
+        assert_eq!(
+            super::drainage_routing_sample(),
+            super::EXPECTED_DRAINAGE_ROUTING
+        );
+        assert_eq!(
+            super::drainage_topology_sample(),
+            super::EXPECTED_DRAINAGE_TOPOLOGY
+        );
+        assert_eq!(super::genome_sample(), super::EXPECTED_GENOME);
+        assert_eq!(super::food_web_sample(), super::EXPECTED_FOOD_WEB);
+        assert_eq!(super::steer_sample(), super::EXPECTED_STEER);
         assert_eq!(
             super::canonical_anchor_signature_sample(),
-            0xBDAA_C72D_CA08_3AF7
+            super::EXPECTED_CANONICAL_ANCHOR_SIGNATURE
         );
-        assert_eq!(super::record_codec_sample(), 0xFA7F_9032_2BAF_D7FB);
-        assert_eq!(super::shared_steer_sample(), 0xF0FB_820F_2030_1752);
-        assert_eq!(super::route_attraction_sample(), 0x3D54_75F6_34AF_1C41);
+        assert_eq!(super::record_codec_sample(), super::EXPECTED_RECORD_CODEC);
+        assert_eq!(super::shared_steer_sample(), super::EXPECTED_SHARED_STEER);
+        assert_eq!(
+            super::route_attraction_sample(),
+            super::EXPECTED_ROUTE_ATTRACTION
+        );
     }
 
     #[test]

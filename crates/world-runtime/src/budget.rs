@@ -56,7 +56,7 @@ impl Budget {
         Self {
             max_loads: ((48.0 * scale) as usize).max(1),
             max_converge_regions: ((512.0 * scale) as usize).max(1),
-            max_regen_cost: ((96.0 * scale) as u32).max(1),
+            max_regen_cost: ((96.0 * scale) as u32).max(world_core::max_layer_cost()),
             // A few hundred organisms/frame keeps entering a dense biome smooth
             // while still filling the near window in a handful of frames.
             max_realize_organisms: ((400.0 * scale) as usize).max(1),
@@ -105,5 +105,9 @@ mod tests {
         assert!(fast.max_regen_cost < base.max_regen_cost);
         assert!(slow.max_regen_cost > base.max_regen_cost);
         assert!(fast.max_loads >= 1);
+        assert!(
+            Budget::per_frame(0.0).max_regen_cost >= world_core::max_layer_cost(),
+            "even the minimum temporal budget must admit one atomic layer"
+        );
     }
 }

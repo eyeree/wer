@@ -19,11 +19,11 @@ use world_core::layer::{
     LAYER_BIOME, LAYER_CLIMATE, LAYER_DRAINAGE, LAYER_ECOLOGY, LAYER_GEOLOGY, LAYER_HYDROLOGY,
     LAYER_SOILS, LAYER_TERRAIN, LAYER_VEGETATION,
 };
-use world_core::simd::{climate_row, elevation_row, hydrology_row, soils_row, vegetation_row};
+use world_core::simd::{climate_row, fbm_row, hydrology_row, soils_row, vegetation_row};
 use world_core::{
     classify, geology, population_from_table, Biome, Climate, DrainageTile, FieldTile,
     HabitatSignature, Hydrology, PossibilityDomain, PossibilityVector, RegionCoord, Soils,
-    REGION_SIZE,
+    POSSIBILITY_QUANT, REGION_SIZE,
 };
 
 use crate::rostercache::RosterSnapshot;
@@ -55,10 +55,13 @@ pub const CHANNEL_HERBIVORE: usize = 10;
 pub const CHANNEL_PREDATOR: usize = 11;
 /// Species-diversity channel (`[0, 1]`), produced by the ecology layer.
 pub const CHANNEL_DIVERSITY: usize = 12;
+/// Terrain slope magnitude (rise/run), produced atomically with Elevation and
+/// consumed by Hydrology and Soils. It remains CPU-only presentation state.
+pub const CHANNEL_SLOPE: usize = 13;
 /// Number of cached `f32` channels per region. Biome ids (`u8`) and the
 /// dominant-species index (`u16`) live in honest integer tiles beside the
 /// channels, not smuggled through f32 (phase-2-plan.md §6.1, phase-3-plan.md §6.1).
-pub const CHANNEL_COUNT: usize = 13;
+pub const CHANNEL_COUNT: usize = 14;
 
 /// Logical bytes in one fully materialized region field at `resolution`.
 ///
@@ -80,7 +83,7 @@ pub const fn full_region_payload_bytes(resolution: u16) -> usize {
 #[must_use]
 pub const fn layer_channels(layer: u16) -> &'static [usize] {
     match layer {
-        LAYER_TERRAIN => &[CHANNEL_ELEVATION],
+        LAYER_TERRAIN => &[CHANNEL_ELEVATION, CHANNEL_SLOPE],
         LAYER_GEOLOGY => &[CHANNEL_HARDNESS],
         LAYER_CLIMATE => &[CHANNEL_TEMPERATURE, CHANNEL_MOISTURE],
         LAYER_HYDROLOGY => &[CHANNEL_RIVER, CHANNEL_WETNESS],
@@ -254,6 +257,141 @@ pub struct TileBuffers {
     pub u16_buf: Option<Vec<u16>>,
 }
 
+/// Ordered Planetary/Geology buckets at the 3×3 absolute region-center halo
+/// around one level-0 Terrain tile (ADR 0027).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerrainPossibilityHalo {
+    center: RegionCoord,
+    // Row-major dy=-1..=1, dx=-1..=1, [Planetary, Geology].
+    buckets: [[[u16; 2]; 3]; 3],
+}
+
+impl TerrainPossibilityHalo {
+    /// Construct a complete level-0 halo from row-major bucket pairs.
+    #[must_use]
+    pub fn new(center: RegionCoord, buckets: [[[u16; 2]; 3]; 3]) -> Self {
+        assert_eq!(center.level, 0, "Terrain halo center must be level 0");
+        debug_assert!(buckets
+            .iter()
+            .flatten()
+            .flatten()
+            .all(|bucket| *bucket < POSSIBILITY_QUANT));
+        Self { center, buckets }
+    }
+
+    /// Center coordinate this snapshot belongs to.
+    #[must_use]
+    pub const fn center(&self) -> RegionCoord {
+        self.center
+    }
+
+    /// Planetary/Geology pair for an absolute coordinate inside the halo.
+    #[must_use]
+    pub fn buckets_at(&self, coord: RegionCoord) -> Option<[u16; 2]> {
+        if coord.level != 0 {
+            return None;
+        }
+        let dx = coord.x.checked_sub(self.center.x)?;
+        let dy = coord.y.checked_sub(self.center.y)?;
+        if !(-1..=1).contains(&dx) || !(-1..=1).contains(&dy) {
+            return None;
+        }
+        Some(self.buckets[(dy + 1) as usize][(dx + 1) as usize])
+    }
+
+    /// Exact typed fold sequence: row-major pair order, Planetary then Geology.
+    #[must_use]
+    pub fn dependency_buckets(&self) -> [u16; 18] {
+        let mut out = [0; 18];
+        let mut next = 0;
+        for row in self.buckets {
+            for pair in row {
+                out[next] = pair[0];
+                out[next + 1] = pair[1];
+                next += 2;
+            }
+        }
+        out
+    }
+
+    fn axis_sample(base: i32, numerator: i64, denominator: i64) -> (i32, i32, f32) {
+        let lower = numerator.div_euclid(denominator);
+        let remainder = numerator.rem_euclid(denominator);
+        let x0 = i32::try_from(lower).expect("level-0 sample coordinate fits i32");
+        let x1 = if remainder == 0 { x0 } else { x0 + 1 };
+        debug_assert!((base - 1..=base + 1).contains(&x0));
+        debug_assert!((base - 1..=base + 1).contains(&x1));
+        (x0, x1, remainder as f32 / denominator as f32)
+    }
+
+    fn sample_axes(
+        &self,
+        x0: i32,
+        x1: i32,
+        fx: f32,
+        y0: i32,
+        y1: i32,
+        fy: f32,
+    ) -> PossibilityVector {
+        let pair = |x, y| {
+            self.buckets_at(RegionCoord::new(x, y))
+                .expect("core/ghost Terrain sample stays within its halo")
+        };
+        let p00 = pair(x0, y0);
+        let p10 = pair(x1, y0);
+        let p01 = pair(x0, y1);
+        let p11 = pair(x1, y1);
+        let sample = |index: usize| {
+            let a = PossibilityVector::dequantize(p00[index]);
+            let b = PossibilityVector::dequantize(p10[index]);
+            let c = PossibilityVector::dequantize(p01[index]);
+            let d = PossibilityVector::dequantize(p11[index]);
+            let top = a + (b - a) * fx;
+            let bottom = c + (d - c) * fx;
+            top + (bottom - top) * fy
+        };
+        let mut out = PossibilityVector::neutral();
+        out.set(PossibilityDomain::Planetary, sample(0));
+        out.set(PossibilityDomain::Geology, sample(1));
+        out
+    }
+
+    /// Sample a world position through the same absolute center lattice used
+    /// by core/ghost generation. Exact center axes do not fetch an unused
+    /// endpoint. This is the presentation-mesher surface (ADR 0027).
+    #[must_use]
+    pub fn sample_world(&self, world_x: f64, world_y: f64) -> PossibilityVector {
+        let axis = |base: i32, world: f64| {
+            let lattice = world / REGION_SIZE - 0.5;
+            let lower = lattice.floor();
+            let fraction = (lattice - lower) as f32;
+            let x0 = lower as i32;
+            let x1 = if fraction == 0.0 { x0 } else { x0 + 1 };
+            debug_assert!((base - 1..=base + 1).contains(&x0));
+            debug_assert!((base - 1..=base + 1).contains(&x1));
+            (x0, x1, fraction)
+        };
+        let (x0, x1, fx) = axis(self.center.x, world_x);
+        let (y0, y1, fy) = axis(self.center.y, world_y);
+        self.sample_axes(x0, x1, fx, y0, y1, fy)
+    }
+
+    /// Sample P/G at a core or one-cell ghost position using an exact rational
+    /// global cell coordinate. This avoids side-dependent reconstruction of a
+    /// shared negative or positive world position.
+    #[must_use]
+    pub fn sample_cell(&self, resolution: u16, cx: i32, cy: i32) -> PossibilityVector {
+        assert!(resolution > 0, "Terrain resolution must be nonzero");
+        let n = i64::from(resolution);
+        let denominator = 2 * n;
+        let x_numerator = (2 * i64::from(self.center.x) - 1) * n + 2 * i64::from(cx) + 1;
+        let y_numerator = (2 * i64::from(self.center.y) - 1) * n + 2 * i64::from(cy) + 1;
+        let (x0, x1, fx) = Self::axis_sample(self.center.x, x_numerator, denominator);
+        let (y0, y1, fy) = Self::axis_sample(self.center.y, y_numerator, denominator);
+        self.sample_axes(x0, x1, fx, y0, y1, fy)
+    }
+}
+
 /// Everything a layer generation job consumes, snapshotted at dispatch
 /// (phase-2-plan.md §5.2). The job never touches shared mutable state.
 #[derive(Debug)]
@@ -261,6 +399,8 @@ pub struct LayerInputs {
     /// Quantized buckets of the layer's directly-read domains, in stable
     /// domain order (matching `LayerDecl::domains`).
     pub quantized: Vec<u16>,
+    /// Absolute realized-current/fallback P/G snapshot used only by Terrain.
+    pub terrain_halo: Option<TerrainPossibilityHalo>,
     /// Input `f32` channel tiles, by `CHANNEL_*` index.
     pub tiles: Vec<(usize, Arc<FieldTile<f32>>)>,
     /// The biome input tile, where declared.
@@ -324,20 +464,12 @@ fn cell_center(coord: RegionCoord, resolution: u16, cx: u16, cy: u16) -> (f64, f
     )
 }
 
-/// Local terrain gradient magnitude (rise/run) at a cell, by central
-/// differences over the elevation tile (one-sided at tile edges).
-fn slope_at(elevation: &FieldTile<f32>, cx: u16, cy: u16, resolution: u16) -> f32 {
-    let step = (REGION_SIZE / f64::from(resolution)) as f32;
-    let max = resolution - 1;
-    let x0 = cx.saturating_sub(1);
-    let x1 = (cx + 1).min(max);
-    let y0 = cy.saturating_sub(1);
-    let y1 = (cy + 1).min(max);
-    let dzdx =
-        (elevation.get(x1, cy) - elevation.get(x0, cy)) / (f32::from(x1 - x0).max(1.0) * step);
-    let dzdy =
-        (elevation.get(cx, y1) - elevation.get(cx, y0)) / (f32::from(y1 - y0).max(1.0) * step);
-    (dzdx * dzdx + dzdy * dzdy).sqrt()
+/// Canonical world coordinate for a core or ghost cell center. The global
+/// integer cell index makes overlapping tiles construct identical `f64` bits,
+/// including across negative coordinates.
+fn cell_center_extended(coord: i32, resolution: u16, cell: i32) -> f64 {
+    let global = i64::from(coord) * i64::from(resolution) + i64::from(cell);
+    (global as f64 + 0.5) * (REGION_SIZE / f64::from(resolution))
 }
 
 /// Reconstruct the `Climate` a cell was generated with, from the climate
@@ -390,17 +522,49 @@ pub fn generate_layer(
 
     match layer {
         LAYER_TERRAIN => {
-            // Row-kernel path (phase-6-plan.md §6.1, ADR 0016): bit-identical
-            // to the per-cell `elevation` loop, differential-tested.
-            let mut tile = new_tile();
-            let xs: Vec<f64> = (0..resolution)
-                .map(|cx| cell_center(coord, resolution, cx, 0).0)
+            let Some(halo) = inputs.terrain_halo.as_ref() else {
+                return missing_inputs(coord, layer, inputs.dep_hash);
+            };
+            debug_assert_eq!(halo.center(), coord);
+            let n = i32::from(resolution);
+            let xs: Vec<f64> = (-1..=n)
+                .map(|cx| cell_center_extended(coord.x, resolution, cx))
                 .collect();
-            for cy in 0..resolution {
-                let y = cell_center(coord, resolution, 0, cy).1;
-                elevation_row(&xs, y, &p, tile.row_mut(cy));
+            let mut elevation = new_tile();
+            let mut slope = new_tile();
+            let mut rows = [
+                vec![0.0; n as usize + 2],
+                vec![0.0; n as usize + 2],
+                vec![0.0; n as usize + 2],
+            ];
+            let fill_row = |cy: i32, row: &mut [f32]| {
+                let y = cell_center_extended(coord.y, resolution, cy);
+                fbm_row(&xs, y, row);
+                for (index, value) in row.iter_mut().enumerate() {
+                    let p = halo.sample_cell(resolution, index as i32 - 1, cy);
+                    *value = world_core::terrain::elevation_from_relief(*value, &p);
+                }
+            };
+            fill_row(-1, &mut rows[0]);
+            fill_row(0, &mut rows[1]);
+            fill_row(1, &mut rows[2]);
+            let two_step = 2.0 * (REGION_SIZE / f64::from(resolution)) as f32;
+            for cy in 0..n {
+                for cx in 0..n {
+                    let index = cx as usize + 1;
+                    let value = rows[1][index];
+                    let dx = (rows[1][index + 1] - rows[1][index - 1]) / two_step;
+                    let dy = (rows[2][index] - rows[0][index]) / two_step;
+                    elevation.set(cx as u16, cy as u16, value);
+                    slope.set(cx as u16, cy as u16, (dx * dx + dy * dy).sqrt());
+                }
+                if cy + 1 < n {
+                    rows.rotate_left(1);
+                    fill_row(cy + 2, &mut rows[2]);
+                }
             }
-            channels.push((CHANNEL_ELEVATION, tile));
+            channels.push((CHANNEL_ELEVATION, elevation));
+            channels.push((CHANNEL_SLOPE, slope));
         }
         LAYER_GEOLOGY => {
             let p_geology = p.get(PossibilityDomain::Geology);
@@ -431,29 +595,35 @@ pub fn generate_layer(
             channels.push((CHANNEL_MOISTURE, moisture));
         }
         LAYER_HYDROLOGY => {
-            let (Some(elevation_tile), Some(temperature), Some(moisture), Some(drainage)) = (
+            let (
+                Some(elevation_tile),
+                Some(slope),
+                Some(temperature),
+                Some(moisture),
+                Some(drainage),
+            ) = (
                 inputs.channel(CHANNEL_ELEVATION),
+                inputs.channel(CHANNEL_SLOPE),
                 inputs.channel(CHANNEL_TEMPERATURE),
                 inputs.channel(CHANNEL_MOISTURE),
                 inputs.drainage.as_deref(),
-            ) else {
+            )
+            else {
                 return missing_inputs(coord, layer, inputs.dep_hash);
             };
             let p_hydrology = p.get(PossibilityDomain::Hydrology);
             let p_planetary = p.get(PossibilityDomain::Planetary);
             let mut river = new_tile();
             let mut wetness = new_tile();
-            let mut slope_row = vec![0f32; resolution as usize];
             let mut accum_row = vec![0f32; resolution as usize];
             for cy in 0..resolution {
                 for cx in 0..resolution {
                     let (x, y) = cell_center(coord, resolution, cx, cy);
-                    slope_row[cx as usize] = slope_at(elevation_tile, cx, cy, resolution);
                     accum_row[cx as usize] = drainage.accum_bilinear(x, y);
                 }
                 hydrology_row(
                     elevation_tile.row(cy),
-                    &slope_row,
+                    slope.row(cy),
                     &accum_row,
                     temperature.row(cy),
                     moisture.row(cy),
@@ -469,6 +639,7 @@ pub fn generate_layer(
         LAYER_SOILS => {
             let (
                 Some(elevation_tile),
+                Some(slope),
                 Some(hardness),
                 Some(temperature),
                 Some(moisture),
@@ -476,6 +647,7 @@ pub fn generate_layer(
                 Some(wetness),
             ) = (
                 inputs.channel(CHANNEL_ELEVATION),
+                inputs.channel(CHANNEL_SLOPE),
                 inputs.channel(CHANNEL_HARDNESS),
                 inputs.channel(CHANNEL_TEMPERATURE),
                 inputs.channel(CHANNEL_MOISTURE),
@@ -487,7 +659,6 @@ pub fn generate_layer(
             };
             let mut depth = new_tile();
             let mut fertility = new_tile();
-            let mut slope_row = vec![0f32; resolution as usize];
             // Lithology ids are possibility-independent, so soils reads them
             // through the pure function rather than a cached channel
             // (phase-2-plan.md §6.1); hardness — the cached possibility-
@@ -496,12 +667,11 @@ pub fn generate_layer(
             for cy in 0..resolution {
                 for cx in 0..resolution {
                     let (x, y) = cell_center(coord, resolution, cx, cy);
-                    slope_row[cx as usize] = slope_at(elevation_tile, cx, cy, resolution);
                     lith_row[cx as usize] = world_core::lithology_id(x, y);
                 }
                 soils_row(
                     elevation_tile.row(cy),
-                    &slope_row,
+                    slope.row(cy),
                     hardness.row(cy),
                     &lith_row,
                     temperature.row(cy),
@@ -703,10 +873,43 @@ mod tests {
     use world_core::climate;
     use world_core::layer::LAYER_COUNT;
 
-    fn terrain_inputs(p: &PossibilityVector) -> LayerInputs {
+    fn patterned_halo(center: RegionCoord) -> TerrainPossibilityHalo {
+        let mut buckets = [[[0; 2]; 3]; 3];
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let x = center.x + dx;
+                let y = center.y + dy;
+                buckets[(dy + 1) as usize][(dx + 1) as usize] = [
+                    (900 + (x + 8) * 113 + (y + 8) * 31) as u16,
+                    (2800 - (x + 8) * 97 + (y + 8) * 43) as u16,
+                ];
+            }
+        }
+        TerrainPossibilityHalo::new(center, buckets)
+    }
+
+    fn direct_elevation(
+        coord: RegionCoord,
+        halo: &TerrainPossibilityHalo,
+        resolution: u16,
+        cx: i32,
+        cy: i32,
+    ) -> f32 {
+        let x = cell_center_extended(coord.x, resolution, cx);
+        let y = cell_center_extended(coord.y, resolution, cy);
+        let p = halo.sample_cell(resolution, cx, cy);
+        world_core::elevation(x, y, &p)
+    }
+
+    fn terrain_inputs(coord: RegionCoord, p: &PossibilityVector) -> LayerInputs {
         let decl = world_core::layer_decl(LAYER_TERRAIN);
+        let pair = [
+            p.quantized(PossibilityDomain::Planetary),
+            p.quantized(PossibilityDomain::Geology),
+        ];
         LayerInputs {
             quantized: p.quantized_domains(decl.domains),
+            terrain_halo: Some(TerrainPossibilityHalo::new(coord, [[pair; 3]; 3])),
             tiles: Vec::new(),
             biome: None,
             drainage: None,
@@ -726,15 +929,16 @@ mod tests {
             }
         }
         assert_eq!(producers, [1; CHANNEL_COUNT]);
+        assert_eq!(full_region_payload_bytes(32), 60_416);
     }
 
     #[test]
     fn generation_is_pure_and_reproducible() {
         let coord = RegionCoord::new(3, -2);
         let p = PossibilityVector::neutral();
-        let a = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
-        let b = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
-        assert_eq!(a.channels.len(), 1);
+        let a = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(coord, &p), 8);
+        let b = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(coord, &p), 8);
+        assert_eq!(a.channels.len(), 2);
         for ((ca, ta), (cb, tb)) in a.channels.iter().zip(&b.channels) {
             assert_eq!(ca, cb);
             assert_eq!(ta.content_hash(), tb.content_hash());
@@ -742,14 +946,75 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_halos_sample_shared_positions_bit_exactly() {
+        let left_coord = RegionCoord::new(-2, -3);
+        let right_coord = RegionCoord::new(-1, -3);
+        let left = patterned_halo(left_coord);
+        let right = patterned_halo(right_coord);
+        for resolution in [1, 7, 8, 32] {
+            for cy in [-1, 0, i32::from(resolution)] {
+                let a = left.sample_cell(resolution, i32::from(resolution), cy);
+                let b = right.sample_cell(resolution, 0, cy);
+                for domain in [PossibilityDomain::Planetary, PossibilityDomain::Geology] {
+                    assert_eq!(a.get(domain).to_bits(), b.get(domain).to_bits());
+                }
+                assert_eq!(
+                    direct_elevation(left_coord, &left, resolution, i32::from(resolution), cy,)
+                        .to_bits(),
+                    direct_elevation(right_coord, &right, resolution, 0, cy).to_bits(),
+                );
+            }
+        }
+
+        let diagonal_coord = RegionCoord::new(-1, -2);
+        let diagonal = patterned_halo(diagonal_coord);
+        let a = left.sample_cell(8, 8, 8);
+        let b = diagonal.sample_cell(8, 0, 0);
+        assert_eq!(a.dims.map(f32::to_bits), b.dims.map(f32::to_bits));
+    }
+
+    #[test]
+    fn terrain_stores_centered_ghost_slope_at_edges() {
+        let coord = RegionCoord::new(-2, 1);
+        let resolution = 8;
+        let halo = patterned_halo(coord);
+        let mut inputs = terrain_inputs(coord, &PossibilityVector::neutral());
+        inputs.terrain_halo = Some(halo.clone());
+        let out = generate_layer(coord, LAYER_TERRAIN, &mut inputs, resolution);
+        let elevation = &out.channels[0].1;
+        let slope = &out.channels[1].1;
+        let cx = i32::from(resolution) - 1;
+        let cy = 3;
+        let step = (REGION_SIZE / f64::from(resolution)) as f32;
+        let left = direct_elevation(coord, &halo, resolution, cx - 1, cy);
+        let right_ghost = direct_elevation(coord, &halo, resolution, cx + 1, cy);
+        let down = direct_elevation(coord, &halo, resolution, cx, cy - 1);
+        let up = direct_elevation(coord, &halo, resolution, cx, cy + 1);
+        let dx = (right_ghost - left) / (2.0 * step);
+        let dy = (up - down) / (2.0 * step);
+        let expected = (dx * dx + dy * dy).sqrt();
+        assert_eq!(
+            slope.get(cx as u16, cy as u16).to_bits(),
+            expected.to_bits()
+        );
+
+        let old_dx =
+            (elevation.get(cx as u16, cy as u16) - elevation.get(cx as u16 - 1, cy as u16)) / step;
+        let old_dy = (up - down) / (2.0 * step);
+        let old_one_sided = (old_dx * old_dx + old_dy * old_dy).sqrt();
+        assert_ne!(expected.to_bits(), old_one_sided.to_bits());
+    }
+
+    #[test]
     fn climate_consumes_the_terrain_input_tile() {
         let coord = RegionCoord::new(1, 1);
         let p = PossibilityVector::neutral();
-        let terrain = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
+        let terrain = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(coord, &p), 8);
         let (_, elevation_tile) = terrain.channels.into_iter().next().unwrap();
         let decl = world_core::layer_decl(LAYER_CLIMATE);
         let mut inputs = LayerInputs {
             quantized: p.quantized_domains(decl.domains),
+            terrain_halo: None,
             tiles: vec![(CHANNEL_ELEVATION, Arc::new(elevation_tile.clone()))],
             biome: None,
             drainage: None,
@@ -776,8 +1041,8 @@ mod tests {
         // same fill code, same content hash as a fresh allocation.
         let coord = RegionCoord::new(-4, 9);
         let p = PossibilityVector::neutral();
-        let fresh = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(&p), 8);
-        let mut pooled_inputs = terrain_inputs(&p);
+        let fresh = generate_layer(coord, LAYER_TERRAIN, &mut terrain_inputs(coord, &p), 8);
+        let mut pooled_inputs = terrain_inputs(coord, &p);
         pooled_inputs.buffers.f32_bufs.push(vec![f32::NAN; 3]); // dirty, wrong-sized
         let pooled = generate_layer(coord, LAYER_TERRAIN, &mut pooled_inputs, 8);
         assert_eq!(
@@ -793,7 +1058,7 @@ mod tests {
         let out = generate_layer(
             coord,
             LAYER_TERRAIN,
-            &mut terrain_inputs(&PossibilityVector::neutral()),
+            &mut terrain_inputs(coord, &PossibilityVector::neutral()),
             8,
         );
         for (channel, tile) in out.channels {
@@ -801,7 +1066,7 @@ mod tests {
         }
         assert!(cache.channel(coord, CHANNEL_ELEVATION).is_some());
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.bytes(), 8 * 8 * 4);
+        assert_eq!(cache.bytes(), 8 * 8 * 4 * 2);
         assert_eq!(
             cache.get(coord).unwrap().layer_hash(LAYER_TERRAIN),
             Some(42)

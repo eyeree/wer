@@ -83,6 +83,12 @@ fn bench_generation(c: &mut Criterion) {
         b.iter(|| field.sample(black_box(RegionCoord::new(-37, 74))))
     });
 
+    c.bench_function("routing_elevation_fixed", |b| {
+        b.iter(|| {
+            world_core::routing_elevation_cm(black_box(&field), black_box(-37), black_box(74))
+        })
+    });
+
     // The expensive macro job (calibrates LayerDecl::cost for drainage).
     c.bench_function("drainage_macro_tile", |b| {
         b.iter(|| {

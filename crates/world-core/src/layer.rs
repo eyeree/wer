@@ -112,8 +112,8 @@ pub const LAYERS: [LayerDecl; LAYER_COUNT as usize] = [
         name: "terrain",
         deps: &[],
         domains: G | P,
-        algorithm_revision: 0,
-        cost: 2,
+        algorithm_revision: 1,
+        cost: 4,
     },
     LayerDecl {
         id: LAYER_GEOLOGY,
@@ -134,8 +134,8 @@ pub const LAYERS: [LayerDecl; LAYER_COUNT as usize] = [
         // no runtime possibility state (ADR 0009). Slow-dim character arrives
         // via the quantized anchor-free field base inside the generator.
         domains: 0,
-        algorithm_revision: 0,
-        cost: 17,
+        algorithm_revision: 1,
+        cost: 31,
     },
     LayerDecl {
         id: LAYER_CLIMATE,
@@ -195,6 +195,21 @@ pub const LAYERS: [LayerDecl; LAYER_COUNT as usize] = [
         cost: 2,
     },
 ];
+
+/// Largest indivisible declared generation cost. Any finite regeneration
+/// budget must admit at least this much work or a required layer can starve.
+#[must_use]
+pub const fn max_layer_cost() -> u32 {
+    let mut maximum = 0;
+    let mut index = 0;
+    while index < LAYERS.len() {
+        if LAYERS[index].cost > maximum {
+            maximum = LAYERS[index].cost;
+        }
+        index += 1;
+    }
+    maximum
+}
 
 /// The layer itself plus every transitive dependent, as a layer bitmask —
 /// what must be re-checked when the layer's output (or an input it reads)

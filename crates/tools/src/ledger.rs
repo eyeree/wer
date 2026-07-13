@@ -7,8 +7,9 @@
 //! regenerated iff its stored hash changed — regeneration only happens on
 //! hash mismatch and always lands a new hash — so the diff *is* the exact
 //! regeneration set. The expected set is predicted independently from each
-//! region's observed quantized-bucket flips through the declared graph
-//! ([`world_core::layer::domain_dirty_mask`]): the scenario passes iff
+//! region's observed quantized-bucket flips through the declared graph, plus
+//! Terrain's dependent closure when any source in that region's 3×3 P/G halo
+//! flipped ([`world_core::layer::domain_dirty_mask`]): the scenario passes iff
 //! `actual == predicted` for every region.
 //!
 //! Drainage is excluded from per-region predictions: macro routing consumes
@@ -18,7 +19,8 @@
 use std::collections::BTreeMap;
 
 use world_core::layer::{
-    domain_dirty_mask, layer_bit, layer_decl, LAYER_COUNT, LAYER_DRAINAGE, LAYER_SOILS,
+    dependents_closure, domain_dirty_mask, layer_bit, layer_decl, LAYER_COUNT, LAYER_DRAINAGE,
+    LAYER_SOILS,
 };
 use world_core::{PossibilityDomain, PossibilityField, RegionCoord, POSSIBILITY_DIMS, REGION_SIZE};
 use world_runtime::{Budget, InlineExecutor, RegionMap, StreamConfig};
@@ -180,16 +182,25 @@ fn drift_scenario(
     let mut regenerated = 0usize;
     let mut regions_flipped = 0usize;
     let mut regions_moved_sub_bucket = 0usize;
-    for (&coord, before) in &buckets_before {
-        let after = buckets_after
-            .get(&coord)
-            .expect("resident set fixed during scenario");
-        let mut flipped = 0u8;
-        for i in 0..POSSIBILITY_DIMS {
-            if before[i] != after[i] {
-                flipped |= 1 << i;
+    let observed_flips: BTreeMap<RegionCoord, u8> = buckets_before
+        .iter()
+        .map(|(&coord, before)| {
+            let after = buckets_after
+                .get(&coord)
+                .expect("resident set fixed during scenario");
+            let mut flipped = 0u8;
+            for i in 0..POSSIBILITY_DIMS {
+                if before[i] != after[i] {
+                    flipped |= 1 << i;
+                }
             }
-        }
+            (coord, flipped)
+        })
+        .collect();
+    let slow_mask =
+        (1 << PossibilityDomain::Planetary.index()) | (1 << PossibilityDomain::Geology.index());
+    for &coord in buckets_before.keys() {
+        let flipped = observed_flips[&coord];
         if flipped != 0 {
             regions_flipped += 1;
         } else if map
@@ -204,7 +215,19 @@ fn drift_scenario(
                 format!("pinned region ({}, {}) flipped buckets", coord.x, coord.y),
             );
         }
-        let predicted = domain_dirty_mask(flipped) & !layer_bit(LAYER_DRAINAGE);
+        let halo_changed = (-1..=1).any(|dy| {
+            (-1..=1).any(|dx| {
+                observed_flips
+                    .get(&RegionCoord::new(coord.x + dx, coord.y + dy))
+                    .is_some_and(|mask| mask & slow_mask != 0)
+            })
+        });
+        let halo_prediction = if halo_changed {
+            dependents_closure(world_core::layer::LAYER_TERRAIN)
+        } else {
+            0
+        };
+        let predicted = (domain_dirty_mask(flipped) | halo_prediction) & !layer_bit(LAYER_DRAINAGE);
         for layer in 0..LAYER_COUNT {
             if layer == LAYER_DRAINAGE {
                 continue;

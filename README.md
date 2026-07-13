@@ -22,7 +22,10 @@ caches, SIMD kernels bit-identical to their scalar twins, a GPU-composed
 debug map with refinement octaves (derived presentation only), and Low/Mid/
 High resource tiers that scale world density without changing a single
 generated output (`wer-scale` machine-checks all of it; the measured ledger
-lives in [`docs/perf-baseline.md`](docs/perf-baseline.md)).
+lives in [`docs/perf-baseline.md`](docs/perf-baseline.md)). The post-Phase-6
+A.8 correction makes macro routing elevation entirely fixed-point and gives
+ordinary Terrain a realized-current 3×3 P/G halo plus a centered Slope output
+(ADR 0027; Terrain and Drainage layer revisions are 1, world version remains 2).
 
 ## Workspace layout
 
@@ -96,6 +99,9 @@ cargo bench -p world-runtime --bench update
 
 # Continuously verify the core still compiles for the browser target.
 cargo check -p world-core -p world-runtime -p platform-web --target wasm32-unknown-unknown
+
+# Execute every deterministic parity probe as real wasm in Node.
+wasm-pack test --node crates/platform-web
 
 # Lints & formatting (as run in CI).
 cargo fmt --all -- --check
@@ -173,11 +179,15 @@ Open <http://localhost:8080> and check the console for
 native `wer-inspect 0 0` output — the determinism guarantee the browser port
 depends on.
 
+CI also pins `wasm-pack` 0.13.1 and executes the complete parity suite in Node,
+including signed fixed routing elevations and three complete macro tiles.
+
 ## Determinism
 
 Permanent world identities are derived from integer hashing over stable inputs
 (world version, region coordinate, layer, feature index, possibility revision);
-drainage routing is all-integer topology, parity-tested against wasm. Any
+drainage routing elevation and topology are fixed-point/integer from seed to
+centimeters and execute under wasm in Node. Any
 change that alters generated output must bump `WORLD_ALGORITHM_VERSION` — or,
 for a single layer's tuning, that layer's `algorithm_revision` in the
 declaration table — and update the golden fixtures in

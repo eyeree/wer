@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use renderer::{MapTileUpload, RefineOctaveParams};
 use world_core::{mix, RegionCoord, REGION_SIZE};
-use world_runtime::{RegionMap, CHANNEL_COUNT};
+use world_runtime::{RegionMap, CHANNEL_SLOPE};
 
 use crate::viz::Channel;
 
@@ -57,13 +57,17 @@ impl AtlasManager {
     /// present and which inputs they were generated from. Regenerating a tile
     /// changes its dep hash; settling back to identical inputs reproduces the
     /// same key — and, by ADR 0008, the same bytes, so skipping the upload is
-    /// exact, not approximate. `pub(crate)`: the POV chunk key folds this
-    /// with the terrain buckets (3d-phase-1-plan.md §7.1).
+    /// exact, not approximate. `pub(crate)`: the POV chunk key folds this tile
+    /// provenance together with its coherently captured current Terrain halo
+    /// (3d-phase-1-plan.md §7.1).
     pub(crate) fn region_key(map: &RegionMap, coord: RegionCoord) -> Option<u64> {
         let tiles = map.cache().get(coord)?;
         let mut h: u64 = 0xA71A_50FF_EE00_0006;
         let mut presence = 0u64;
         for (i, tile) in tiles.channels.iter().enumerate() {
+            if i == CHANNEL_SLOPE {
+                continue;
+            }
             if let Some(tile) = tile {
                 presence |= 1 << i;
                 h = mix(h, tile.dep_hash);
@@ -166,6 +170,9 @@ fn pack_region(
 
     let mut presence = 0u32;
     for (i, tile) in tiles.channels.iter().enumerate() {
+        if i == CHANNEL_SLOPE {
+            continue;
+        }
         if tile.is_some() {
             presence |= 1 << i;
         }
@@ -178,7 +185,7 @@ fn pack_region(
     }
 
     // (plane, component) per CHANNEL_* index — the shader's layout.
-    const SLOT_OF: [(usize, usize); CHANNEL_COUNT] = [
+    const SLOT_OF: [(usize, usize); 13] = [
         (0, 0), // elevation
         (0, 1), // hardness
         (0, 2), // temperature
@@ -194,6 +201,9 @@ fn pack_region(
         (3, 0), // diversity
     ];
     for (channel, tile) in tiles.channels.iter().enumerate() {
+        if channel == CHANNEL_SLOPE {
+            continue;
+        }
         let Some(tile) = tile else { continue };
         let (plane, component) = SLOT_OF[channel];
         for (t, &v) in tile.samples().iter().enumerate() {
@@ -328,7 +338,8 @@ mod tests {
         let coord = RegionCoord::new(0, 0);
         let upload = pack_region(&map, coord, 0, 8).expect("settled region packs");
         let presence = upload.planes[3][1] as u32;
-        // A settled region has all 13 channels + biome + dominant.
+        // A settled region has 13 presented channels plus CPU-only Slope,
+        // biome, and dominant.
         assert_eq!(presence & 0x1FFF, 0x1FFF, "all f32 channels present");
         assert_ne!(presence & (1 << 13), 0, "biome present");
         assert_ne!(presence & (1 << 14), 0, "dominant present");
@@ -336,5 +347,11 @@ mod tests {
         let tiles = map.cache().get(coord).unwrap();
         let elev = tiles.channels[0].as_ref().unwrap();
         assert_eq!(upload.planes[0][(3 * 8 + 5) * 4], elev.get(5, 3));
+        let slope = tiles.channels[CHANNEL_SLOPE].as_ref().unwrap();
+        assert!(slope.samples().iter().any(|value| *value > 0.0));
+        for texel in 0..64 {
+            assert_eq!(upload.planes[3][texel * 4 + 2], 0.0);
+            assert_eq!(upload.planes[3][texel * 4 + 3], 0.0);
+        }
     }
 }

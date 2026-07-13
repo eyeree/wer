@@ -67,6 +67,15 @@ scale harness (`wer-scale`). The possibility vector is still one scalar per
 domain, and there is no networking and no browser storage backend (Phase 7)
 — those grow in later phases; do not mistake them for finished subsystems.
 
+Post-Phase-6 Improvement A.8 deliberately changes Terrain and Drainage output
+under their layer-local version boundary: `WORLD_ALGORITHM_VERSION` remains 2,
+Terrain and Drainage `algorithm_revision` are 1, and all other revisions remain
+0. Macro routing elevation is integer-only Q30/i128 from field seed to
+centimeters. Terrain samples a 3×3 realized-current/fallback P/G halo and emits
+Elevation plus a centered ghost-derived Slope channel atomically; Hydrology and
+Soils consume Slope. CI runs every parity probe as actual wasm in Node with
+pinned `wasm-bindgen-test` 0.3.76 / `wasm-pack` 0.13.1 (ADR 0027).
+
 ## Toolchain
 
 - Rust **stable**, pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
@@ -108,6 +117,7 @@ cargo test --workspace
 
 # Keep the platform-neutral crates + web shell compiling for the browser.
 cargo check -p world-core -p world-runtime -p platform-web --target wasm32-unknown-unknown
+wasm-pack test --node crates/platform-web
 
 # Format & lint exactly as CI does.
 cargo fmt --all -- --check
@@ -117,7 +127,8 @@ cargo clippy --workspace --all-targets
 **Before you consider a change done, it must pass what CI runs** (see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `fmt --check`, `clippy`,
 `check`, and `test` on the whole workspace natively, plus a `wasm32` `cargo
-check` of `world-core`, `world-runtime`, and `platform-web`. **CI sets
+check` of `world-core`, `world-runtime`, and `platform-web`, followed by the
+Node wasm parity suite. **CI sets
 `RUSTFLAGS: -D warnings`, so any warning fails the build** — treat clippy
 warnings and unused-code warnings as errors. Run clippy locally the same way if
 in doubt: `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`.

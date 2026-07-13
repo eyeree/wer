@@ -39,17 +39,15 @@ new is generated; the 3D mode is a second *reader*.
   resolution, at any position, without a readback and without touching the
   cached field tiles. The SIMD twin `simd::elevation_row` (ADR 0016,
   bit-identical to the scalar path) is the batch sampler the mesher uses.
-- **Per-region possibility.** The generation pipeline evaluates each region's
-  tiles under that region's quantized possibility vector
-  (`PossibilityVector::from_quantized(decl.domains, &inputs.quantized)`,
-  `world-runtime/src/generate.rs`). The 3D mesher must do the same — one mesh
-  chunk per region, sampled under that region's vector — so the 3D ground
-  agrees exactly with the 2D map and the field tiles. Possibility drift
-  between adjacent regions can therefore step vertex heights slightly at
-  region borders; §3.4 handles this with skirts, not by blending (blending
-  would invent an elevation no authoritative path ever computes).
+- **Halo-sampled terrain possibility.** Terrain evaluates each core/ghost
+  position from the region's authoritative 3×3 P/G halo
+  (`TerrainPossibilityHalo`, `world-runtime/src/generate.rs`). A 3D mesher that
+  regenerates height must snapshot and sample that same halo; reading the
+  settled Elevation tile remains the simpler exact source. Skirts in §3.4
+  remain defensive presentation geometry, not the ordinary seam model.
 - **Per-cell fields for materials.** `RegionMap::cache().channel(coord, c)`
-  returns the settled `FieldTile<f32>` for the 13 channels
+  returns the settled `FieldTile<f32>` for 14 CPU channels (13 GPU-presented
+  channels plus CPU-only Slope)
   (`generate.rs`: ELEVATION, TEMPERATURE, MOISTURE, RIVER, WETNESS,
   FERTILITY, VEGETATION, CANOPY, …) at `FIELD_RES = 32` cells per region
   (cell = 8.0 world units), plus `biome(coord)` / `dominant(coord)`. This is
@@ -174,8 +172,9 @@ One chunk per region, a uniform grid of `POV_MESH_RES = 64` quads per edge
 that is 49 chunks ≈ 400 k triangles — acceptable on llvmpipe, trivial on
 hardware. Per vertex:
 
-- **Height:** `elevation(x, y, p_region)` via `simd::elevation_row` over each
-  vertex row — the same math, batched. Sampling at 2× field resolution is
+- **Height:** `fbm(x, y)` via `simd::fbm_row`, followed by the same scalar
+  per-position `TerrainPossibilityHalo` scaling tail as field generation.
+  Sampling at 2× field resolution is
   free detail the 2D map doesn't show; it is still the authoritative CPU
   spectrum (the GPU refinement octaves of `compose_map.wgsl` are *not*
   ported in this phase — if they ever displace 3D vertices they must come
@@ -195,23 +194,24 @@ Vertex format: `position: [f32; 3]`, `normal: [f32; 3]`, `color: [u8; 4]`
 ### 3.3 Chunk lifecycle
 
 `PovChunkManager` (platform-native) mirrors `AtlasManager`: it walks resident
-regions within `WER_POV_RADIUS`, compares each region's dep-hash key against
-the mesh it holds, schedules stale/missing chunks on the background lane
+regions within `WER_POV_RADIUS`, compares each region's tile dep-hash key plus
+the 18 buckets of the coherently captured current Terrain halo against the mesh
+it holds, schedules stale/missing chunks on the background lane
 (cancellation-checked), and hands finished `TerrainChunkUpload`s to the
-renderer under the per-frame amortization cap. Eviction is
+renderer under the per-frame amortization cap. A neighbor P/G source flip
+therefore supersedes old mesh work before corrected Terrain integration.
+Eviction is
 farthest-first, same as the caches. A region whose tiles are not yet settled
 simply has no chunk yet — holes at the loading frontier are acceptable in
 3D-1 (fog hides most of it), and shrink as generation catches up.
 
 ### 3.4 Region-border seams
 
-Adjacent regions can carry different quantized possibility vectors, so shared
-border positions can disagree in height by a small amount (drift is smooth
-and quantized; steps are sub-unit in practice). The fix is the standard one:
-each chunk extends a **vertical skirt** one grid step down around its
-perimeter. No cross-region blending, no averaging — the mesh shows exactly
-what the authoritative sampler computes, and the skirt hides the hairline.
-This also covers the (rarer) step at a preserve boundary.
+Adjacent regions now snapshot overlapping absolute possibility halos, so the
+same shared border position uses identical P/G and relief operations. Each
+chunk still extends a **vertical skirt** around its perimeter as defensive
+presentation geometry for incomplete/stale frontier combinations and raster
+precision. No separate cross-region averaging is introduced.
 
 ### 3.5 Exit criteria
 
