@@ -20,6 +20,8 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -38,6 +40,7 @@ struct Lanes {
 struct Shared {
     lanes: Mutex<Lanes>,
     ready: Condvar,
+    worker_panics: AtomicUsize,
 }
 
 /// Executes jobs on `N` std worker threads, draining the highest-priority
@@ -55,6 +58,7 @@ impl fmt::Debug for LaneExecutor {
         f.debug_struct("LaneExecutor")
             .field("workers", &self.workers.len())
             .field("queued", &self.queued())
+            .field("worker_panics", &self.worker_panics())
             .finish()
     }
 }
@@ -66,6 +70,7 @@ impl LaneExecutor {
         let shared = Arc::new(Shared {
             lanes: Mutex::new(Lanes::default()),
             ready: Condvar::new(),
+            worker_panics: AtomicUsize::new(0),
         });
         let workers = (1..=workers.max(1))
             .map(|i| {
@@ -104,11 +109,39 @@ impl LaneExecutor {
     pub fn queued(&self) -> usize {
         self.queued_per_lane().iter().sum()
     }
+
+    /// Worker job panics caught by the native executor. Telemetry only.
+    #[must_use]
+    pub fn worker_panics(&self) -> usize {
+        self.shared.worker_panics.load(Ordering::Relaxed)
+    }
+
+    fn begin_shutdown(&self) {
+        {
+            let mut lanes = self.shared.lanes.lock().expect("executor lock");
+            lanes.shutdown = true;
+            for queue in &mut lanes.queues {
+                queue.clear();
+            }
+        }
+        self.shared.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    fn begin_shutdown_for_test(&self) {
+        self.begin_shutdown();
+    }
 }
 
 fn worker_loop(shared: &Shared) {
     let mut lanes = shared.lanes.lock().expect("executor lock");
     loop {
+        while !lanes.shutdown && lanes.queues.iter().all(VecDeque::is_empty) {
+            lanes = shared.ready.wait(lanes).expect("executor lock");
+        }
+        if lanes.shutdown {
+            return;
+        }
         // Drain Critical > Normal > Background, FIFO within a lane.
         let job = lanes
             .queues
@@ -117,20 +150,21 @@ fn worker_loop(shared: &Shared) {
             .find_map(std::collections::VecDeque::pop_front);
         if let Some(job) = job {
             drop(lanes);
-            job();
+            if catch_unwind(AssertUnwindSafe(job)).is_err() {
+                shared.worker_panics.fetch_add(1, Ordering::Relaxed);
+            }
             lanes = shared.lanes.lock().expect("executor lock");
             continue;
         }
-        if lanes.shutdown {
-            return;
-        }
-        lanes = shared.ready.wait(lanes).expect("executor lock");
     }
 }
 
 impl TaskExecutor for LaneExecutor {
     fn submit(&self, priority: TaskPriority, job: Box<dyn FnOnce() + Send>) {
         let mut lanes = self.shared.lanes.lock().expect("executor lock");
+        if lanes.shutdown {
+            return;
+        }
         lanes.queues[priority as usize].push_back(job);
         drop(lanes);
         self.shared.ready.notify_one();
@@ -143,14 +177,8 @@ impl TaskExecutor for LaneExecutor {
 
 impl Drop for LaneExecutor {
     fn drop(&mut self) {
-        {
-            let mut lanes = self.shared.lanes.lock().expect("executor lock");
-            lanes.shutdown = true;
-        }
-        self.shared.ready.notify_all();
+        self.begin_shutdown();
         for handle in self.workers.drain(..) {
-            // A worker that panicked already poisoned nothing we still read;
-            // shutdown proceeds regardless.
             let _ = handle.join();
         }
     }
@@ -241,5 +269,88 @@ mod tests {
         let exec = LaneExecutor::new(3);
         assert_eq!(exec.parallelism(), 3);
         assert!(LaneExecutor::auto().parallelism() >= 1);
+    }
+
+    #[test]
+    fn shutdown_clears_queued_jobs_and_submit_drops_after_shutdown() {
+        let exec = LaneExecutor::new(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let started = Arc::new((Mutex::new(false), Condvar::new()));
+        {
+            let release = Arc::clone(&release);
+            let started = Arc::clone(&started);
+            exec.submit(
+                TaskPriority::Critical,
+                Box::new(move || {
+                    let (lock, cv) = &*started;
+                    *lock.lock().unwrap() = true;
+                    cv.notify_all();
+
+                    let (lock, cv) = &*release;
+                    let mut open = lock.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                }),
+            );
+        }
+        {
+            let (lock, cv) = &*started;
+            let mut running = lock.lock().unwrap();
+            while !*running {
+                running = cv.wait(running).unwrap();
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        for _ in 0..32 {
+            let counter = Arc::clone(&counter);
+            exec.submit(
+                TaskPriority::Normal,
+                Box::new(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
+        }
+        assert_eq!(exec.queued(), 32);
+
+        exec.begin_shutdown_for_test();
+        assert_eq!(exec.queued_per_lane(), [0, 0, 0]);
+        let after_shutdown = Arc::clone(&counter);
+        exec.submit(
+            TaskPriority::Critical,
+            Box::new(move || {
+                after_shutdown.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        assert_eq!(exec.queued(), 0);
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        drop(exec);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn worker_panic_does_not_reduce_parallelism_or_stop_future_jobs() {
+        let exec = LaneExecutor::new(1);
+        exec.submit(
+            TaskPriority::Critical,
+            Box::new(|| {
+                panic!("intentional executor test panic");
+            }),
+        );
+        let (tx, rx) = channel();
+        exec.submit(
+            TaskPriority::Critical,
+            Box::new(move || {
+                let _ = tx.send(());
+            }),
+        );
+        rx.recv().expect("worker survived panic");
+        assert_eq!(exec.worker_panics(), 1);
+        assert_eq!(exec.parallelism(), 1);
     }
 }

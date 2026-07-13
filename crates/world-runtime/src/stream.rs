@@ -30,6 +30,7 @@
 //! change ripples outward over several frames instead of hitching.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -228,6 +229,10 @@ pub struct FrameStats {
     /// zero; the pair (`jobs_cancelled`, `results_dropped`) is the §11.4
     /// "cancellation reduces jobs-run" counter gate.
     pub results_dropped: usize,
+    /// Current generation dispatches that failed inside the worker closure
+    /// and were retired so normal dirty scheduling can retry them. Telemetry
+    /// only; failures never enter hashes or persisted state.
+    pub jobs_failed: usize,
     /// Tile-pool buffers served from the pool at dispatch (phase-6-plan.md
     /// §4.2).
     pub pool_hits: usize,
@@ -351,6 +356,14 @@ enum JobResult {
         job_id: u64,
         tile: DrainageTile,
     },
+    /// A region-layer worker panicked before producing output.
+    TileFailed {
+        coord: RegionCoord,
+        layer: u16,
+        job_id: u64,
+    },
+    /// A macro drainage worker panicked before producing output.
+    MacroFailed { coord: RegionCoord, job_id: u64 },
 }
 
 /// The authoritative streaming window plus its disposable field/macro caches.
@@ -1652,6 +1665,9 @@ impl RegionMap {
                         }
                     }
                 }
+                JobResult::MacroFailed { coord, job_id } => {
+                    self.reject_failed_macro_job(coord, job_id, stats);
+                }
                 JobResult::Tile(result) => {
                     let key = (result.coord, result.layer);
                     let Some((current_id, dispatch_hash)) = self
@@ -1718,8 +1734,56 @@ impl RegionMap {
                     }
                     self.refresh_status(coord);
                 }
+                JobResult::TileFailed {
+                    coord,
+                    layer,
+                    job_id,
+                } => {
+                    self.reject_failed_tile_job(coord, layer, job_id, stats);
+                }
             }
         }
+    }
+
+    fn reject_failed_macro_job(
+        &mut self,
+        macro_coord: RegionCoord,
+        job_id: u64,
+        stats: &mut FrameStats,
+    ) {
+        let key = (macro_coord, LAYER_DRAINAGE);
+        let Some(current_id) = self.in_flight.get(&key).map(|job| job.id) else {
+            stats.results_dropped += 1;
+            return;
+        };
+        if current_id != job_id {
+            stats.results_dropped += 1;
+            return;
+        }
+        self.in_flight.remove(&key);
+        stats.jobs_failed += 1;
+        self.mark_macro_dependents_dirty(macro_coord, stats);
+    }
+
+    fn reject_failed_tile_job(
+        &mut self,
+        coord: RegionCoord,
+        layer: u16,
+        job_id: u64,
+        stats: &mut FrameStats,
+    ) {
+        let key = (coord, layer);
+        let Some(current_id) = self.in_flight.get(&key).map(|job| job.id) else {
+            stats.results_dropped += 1;
+            return;
+        };
+        if current_id != job_id {
+            stats.results_dropped += 1;
+            return;
+        }
+        self.in_flight.remove(&key);
+        stats.jobs_failed += 1;
+        self.mark_dirty_closure(coord, layer, stats);
     }
 
     /// Reject one current macro dispatch whose content provenance failed,
@@ -2495,14 +2559,19 @@ impl RegionMap {
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let tile = world_core::drainage(mc, &field, expected);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    world_core::drainage(mc, &field, expected)
+                }));
                 // The receiver may be gone if the map was dropped; the job's
                 // work is simply discarded then.
-                let _ = tx.send(JobResult::Macro {
-                    coord: mc,
-                    job_id,
-                    tile,
-                });
+                let _ = match result {
+                    Ok(tile) => tx.send(JobResult::Macro {
+                        coord: mc,
+                        job_id,
+                        tile,
+                    }),
+                    Err(_) => tx.send(JobResult::MacroFailed { coord: mc, job_id }),
+                };
             }),
         );
         stats.regen_cost_spent += cost;
@@ -2895,12 +2964,22 @@ impl RegionMap {
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut inputs = inputs;
-                let mut out = generate_layer(coord, layer, &mut inputs, resolution);
-                out.job_id = job_id;
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let mut inputs = inputs;
+                    let mut out = generate_layer(coord, layer, &mut inputs, resolution);
+                    out.job_id = job_id;
+                    out
+                }));
                 // The receiver may be gone if the map was dropped; the job's
                 // work is simply discarded then.
-                let _ = tx.send(JobResult::Tile(out));
+                let _ = match result {
+                    Ok(out) => tx.send(JobResult::Tile(out)),
+                    Err(_) => tx.send(JobResult::TileFailed {
+                        coord,
+                        layer,
+                        job_id,
+                    }),
+                };
             }),
         );
     }
@@ -3803,7 +3882,7 @@ mod recovery_tests {
     use crate::InlineExecutor;
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use world_core::layer::{LAYER_BIOME, LAYER_TERRAIN};
+    use world_core::layer::{LAYER_BIOME, LAYER_DRAINAGE, LAYER_TERRAIN};
 
     const PLAYER: (f64, f64) = (REGION_SIZE * 0.5, REGION_SIZE * 0.5);
     const NO_BIAS: [f32; POSSIBILITY_DIMS] = [0.0; POSSIBILITY_DIMS];
@@ -4072,6 +4151,40 @@ mod recovery_tests {
         );
     }
 
+    fn dispatch_layer_for_failure(
+        map: &mut RegionMap,
+        layer: u16,
+        executor: &ManualExecutor,
+    ) -> ((RegionCoord, u16), u64) {
+        map.revision_bumps[layer as usize] = map.revision_bumps[layer as usize].wrapping_add(1);
+        let region = map.regions.get_mut(&coord()).expect("resident");
+        region.dirty_layers = layer_bit(layer);
+        region.status = GenerationStatus::Generating;
+        let mut dispatch_stats = FrameStats::default();
+        dispatch_dirty_region(map, executor, &mut dispatch_stats);
+        assert_eq!(dispatch_stats.layers_dispatched, 1);
+        assert_eq!(executor.len(), 1);
+        let key = dispatch_key(layer);
+        let job_id = map.in_flight.get(&key).expect("current dispatch").id;
+        (key, job_id)
+    }
+
+    fn send_failed_result(map: &RegionMap, layer: u16, job_id: u64) {
+        let result = if layer == LAYER_DRAINAGE {
+            JobResult::MacroFailed {
+                coord: macro_coord_for(coord()),
+                job_id,
+            }
+        } else {
+            JobResult::TileFailed {
+                coord: coord(),
+                layer,
+                job_id,
+            }
+        };
+        map.results_tx.send(result).expect("result receiver live");
+    }
+
     fn remove_layer_output(map: &mut RegionMap, layer: u16) {
         let mut tiles = map.cache.remove_region(coord()).expect("region tiles");
         for &channel in layer_channels(layer) {
@@ -4113,6 +4226,106 @@ mod recovery_tests {
             None,
             "only the producer's atomic output set should be absent"
         );
+    }
+
+    #[test]
+    fn failed_tile_job_retires_in_flight_and_redirties_layer() {
+        let mut map = settled_map();
+        let old_image = region_image(&map);
+        let executor = ManualExecutor::default();
+        let (key, job_id) = dispatch_layer_for_failure(&mut map, LAYER_TERRAIN, &executor);
+
+        send_failed_result(&map, LAYER_TERRAIN, job_id);
+        let mut stats = FrameStats::default();
+        map.integrate_finished(&mut stats);
+
+        assert_eq!(stats.jobs_failed, 1);
+        assert_eq!(stats.results_dropped, 0);
+        assert_eq!(map.jobs_in_flight(), 0);
+        assert!(!map.in_flight.contains_key(&key));
+        assert_eq!(
+            map.regions[&coord()].dirty_layers,
+            dependents_closure(LAYER_TERRAIN)
+        );
+        assert_eq!(map.regions[&coord()].status, GenerationStatus::Generating);
+        assert_eq!(region_image(&map), old_image);
+    }
+
+    #[test]
+    fn failed_macro_job_retires_macro_and_redirties_dependents() {
+        let mut map = settled_map();
+        let old_macro = map
+            .macro_cache
+            .get(macro_coord_for(coord()))
+            .expect("settled macro")
+            .as_ref()
+            .clone();
+        let executor = ManualExecutor::default();
+        let (key, job_id) = dispatch_layer_for_failure(&mut map, LAYER_DRAINAGE, &executor);
+
+        send_failed_result(&map, LAYER_DRAINAGE, job_id);
+        let mut stats = FrameStats::default();
+        map.integrate_finished(&mut stats);
+
+        assert_eq!(stats.jobs_failed, 1);
+        assert_eq!(stats.results_dropped, 0);
+        assert_eq!(map.jobs_in_flight(), 0);
+        assert!(!map.in_flight.contains_key(&key));
+        assert_eq!(
+            map.macro_cache
+                .get(macro_coord_for(coord()))
+                .expect("old macro retained")
+                .as_ref(),
+            &old_macro
+        );
+        assert_eq!(
+            map.regions[&coord()].dirty_layers,
+            dependents_closure(LAYER_DRAINAGE)
+        );
+        assert_eq!(map.regions[&coord()].status, GenerationStatus::Generating);
+    }
+
+    #[test]
+    fn obsolete_failed_job_does_not_retire_newer_dispatch() {
+        let mut map = settled_map();
+        let executor = ManualExecutor::default();
+        let (key, old_job_id) = dispatch_layer_for_failure(&mut map, LAYER_TERRAIN, &executor);
+        let old_expected = map.in_flight[&key].expected_hash;
+        map.in_flight.get_mut(&key).expect("current dispatch").id = old_job_id + 1;
+
+        send_failed_result(&map, LAYER_TERRAIN, old_job_id);
+        let mut stats = FrameStats::default();
+        map.integrate_finished(&mut stats);
+
+        assert_eq!(stats.jobs_failed, 0);
+        assert_eq!(stats.results_dropped, 1);
+        let current = map.in_flight.get(&key).expect("newer dispatch retained");
+        assert_eq!(current.id, old_job_id + 1);
+        assert_eq!(current.expected_hash, old_expected);
+        assert_eq!(map.jobs_in_flight(), 1);
+    }
+
+    #[test]
+    fn failed_dispatch_retries_to_settle_to_the_same_oracle() {
+        let mut failed = settled_map();
+        let mut oracle = settled_map();
+        oracle.revision_bumps[LAYER_TERRAIN as usize] =
+            oracle.revision_bumps[LAYER_TERRAIN as usize].wrapping_add(1);
+        let region = oracle.regions.get_mut(&coord()).expect("resident");
+        region.dirty_layers = layer_bit(LAYER_TERRAIN);
+        region.status = GenerationStatus::Generating;
+        settle_inline(&mut oracle);
+
+        let executor = ManualExecutor::default();
+        let (_key, job_id) = dispatch_layer_for_failure(&mut failed, LAYER_TERRAIN, &executor);
+        send_failed_result(&failed, LAYER_TERRAIN, job_id);
+        let mut stats = FrameStats::default();
+        failed.integrate_finished(&mut stats);
+        assert_eq!(stats.jobs_failed, 1);
+
+        settle_inline(&mut failed);
+        assert_fully_settled(&failed);
+        assert_eq!(region_image(&failed), region_image(&oracle));
     }
 
     fn materialized_declared_edges() -> Vec<(u16, u16)> {

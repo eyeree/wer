@@ -1761,6 +1761,17 @@ thread and creates `available_parallelism - 1` workers, with a minimum of one.
 Cancellation is implemented inside job closures, not by the executor; a worker
 checks its token once after dequeue and before running the kernel.
 
+Shutdown is bounded by work that has already started. Dropping the executor
+sets the shutdown flag and clears all queued lanes under the mutex, wakes every
+worker, and then joins only the running closures. Workers check shutdown before
+taking more queued work, and submissions racing after shutdown are dropped
+without running. Native worker panics are caught and counted so the worker loop
+continues and `parallelism()` remains the configured worker count. Runtime
+generation closures also catch panics and send structured failed dispatch
+results; the main-thread integrator retires only matching current job ids,
+marks the failed layer/dependent closure dirty, and retries through normal
+budgeted scheduling.
+
 Per-frame work is bounded by counts and declared cost units, never elapsed
 time. The low-tier 16.6 ms nominal budget is:
 
@@ -2104,10 +2115,15 @@ into one implementation unit.
     Tombstones and per-replica route-usage counters remain separate future
     work before deletion and usage can be called fully CRDT-compatible.
 
-11. **Make executor failure and shutdown bounded** (finding 30). Stop or clear
-    queued work during shutdown, convert worker panics into structured failed
-    jobs, repair in-flight bookkeeping, and ensure lost workers are replaced or
-    their work is deterministically requeued.
+11. **Completed: Make executor failure and shutdown bounded**
+    ([Improvement A.11](plans/prototype/improvement_A_11_executor_failure_shutdown.md);
+    finding 30). LaneExecutor shutdown now clears queued work before waking
+    workers, workers exit before taking more work once shutdown starts, and
+    submit-after-shutdown drops closures. Worker panics are caught as telemetry
+    while runtime generation panics become structured failed dispatch results
+    that retire matching in-flight entries, dirty the affected closure, and
+    retry deterministically. Fairness, bounded queues, and proactive removal of
+    cancelled queued closures remain future backpressure work.
 
 12. **State and encode the truth of snapshots and route samples** (findings 22
     and 29). Persist the configuration required for exact session restoration,
@@ -2783,19 +2799,24 @@ contract.
 
 #### 30. Native executor shutdown drains work it says it discards
 
-`LaneExecutor::Drop` sets `shutdown`, but workers check for queued jobs before
-checking that flag. They therefore drain the entire backlog and can stall
-shutdown doing work whose result receiver is gone. Check shutdown first or
-clear queues explicitly.
+Correctness resolved by
+[Improvement A.11](plans/prototype/improvement_A_11_executor_failure_shutdown.md):
+`LaneExecutor::Drop` now sets `shutdown` and clears all queued lanes under the
+mutex before waking workers, worker loops check shutdown before selecting new
+work, and submit-after-shutdown drops the closure. Shutdown can still wait for
+already-running Rust closures, but it no longer drains the queued backlog.
+
+Worker/job panics are also bounded. The native worker loop catches and counts
+panics so the configured worker count remains live, and runtime generation
+closures catch panics separately so `RegionMap` receives structured failed
+macro/tile dispatch results. Matching current failures retire their in-flight
+entry, dirty the failed layer and dependents, and retry through ordinary
+budgeted dispatch; obsolete failed results are dropped like stale successes.
 
 Strict Critical-over-Normal-over-Background priority also has no fairness or
 aging, so continuous nearby work can starve the far field indefinitely. The
 queue is unbounded, and cancelled no-op closures remain queued. Bounded queues,
 weighted aging, and cancellation-aware removal would improve backpressure.
-
-A worker panic is not converted into a failed job, does not clear in-flight
-bookkeeping, and does not replace the worker. Generation errors should return
-structured results or trigger deterministic requeue/recovery.
 
 #### 31. The executor abstraction is not directly portable to Web Workers
 
