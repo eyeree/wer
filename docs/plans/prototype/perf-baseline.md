@@ -172,6 +172,10 @@ and the possibility-field gradient steps borders by far more than the
 planned 4-unit drop) and fixed: double-sided skirt quads, 128-unit drop;
 a top-down radius-8 sweep now shows zero gap pixels.
 
+3D-2 (walk mode) adds one O(1) `ground_height` query per frame — a hash
+lookup, four `f32` reads, and a handful of multiplies — with no measurable
+frame-time change (verified on the llvmpipe reference environment).
+
 ## Improvement A.8 — fixed routing and halo Terrain
 
 Measured on the same local execution machine with the release Criterion

@@ -84,11 +84,12 @@ cargo run --bin wer-atlas -- check my.bundle
 # Headless map screenshot (no window/GPU): settle the world and dump a PPM.
 cargo run --release --bin wer -- --screenshot map.ppm composite 0 0
 
-# Headless POV screenshots (offscreen GPU, ADR 0021): drive the fly camera
-# through a scripted sequence — pos:x,y[,z] | mouse:dx,dy | move:f[,r[,u]]
-# | settle[:n] | size:WxH | snap:file.ppm — the POV debugging harness.
+# Headless POV screenshots (offscreen GPU, ADR 0021): drive the fly/walk
+# camera through a scripted sequence — pos:x,y[,z] | mouse:dx,dy |
+# move:f[,r[,u]] | walk | fly | settle[:n] | size:WxH | snap:file.ppm —
+# the POV debugging harness.
 cargo run --release --bin wer -- --pov-script \
-  "pos:300,-10; snap:a.ppm; mouse:200,-50; move:150; snap:b.ppm"
+  "pos:300,-10; walk; move:200; snap:walk-a.ppm; mouse:400,0; move:200; snap:walk-b.ppm"
 
 # Test everything, including determinism goldens and the continuity replay.
 cargo test --workspace
@@ -142,7 +143,7 @@ world drifts toward it only as you move (sprinting drifts it faster).
 | `V` | Cycle the visualized channel (composite, layers, ecology, influence, stability, …) |
 | `G` / `N` / `X` / `M` / `F` | Toggle region grid / stability rings / changed-while-pinned flash / organism markers / discovered-region dimming |
 | Mouse wheel | Zoom the map view in/out (x1–x16); zoomed in past x4, hovering an organism marker shows that organism's details in the panel instead of the region info |
-| `Tab` | Toggle the 3D POV mode: a fly camera over lit, fogged terrain meshed from the same authoritative fields the map shows. In POV: **hold the left mouse button and drag to look**, `WASD` along view/strafe, `Space`/`LShift` up/down, wheel adjusts fly speed. All map bindings above are map-mode-only. `WER_POV=1` starts in POV; `WER_POV_RADIUS` (1–8, default 3) sets the chunk draw radius |
+| `Tab` | Toggle the 3D POV mode: a fly camera over lit, fogged terrain meshed from the same authoritative fields the map shows. In POV: **hold the left mouse button and drag to look**, `WASD` along view/strafe, `Space`/`LShift` up/down, wheel adjusts the active mode's speed, `F` toggles walk ↔ fly (walk holds the eye 1.7 units above the rendered terrain, cliffs climb as fast ramps, the sea floor is walkable). All map bindings above are map-mode-only. `WER_POV=1` starts in POV; `WER_POV_RADIUS` (1–8, default 3) sets the chunk draw radius |
 | `F12` | Write a debug dump to `./dump/<UTC datetime>/`: a screenshot of the active view (map or POV) plus `state.txt` with the player/camera state (position, forward vector), steering, telemetry, the region's dependency-hash chain, and vault counters. Works in both modes |
 | `Esc` | Quit |
 

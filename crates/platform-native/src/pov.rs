@@ -1,5 +1,8 @@
 //! POV mode (3d-phase-1-plan.md): the fly camera, the pure region mesher,
-//! and the chunk lifecycle manager.
+//! and the chunk lifecycle manager — plus the 3D-2 walk camera
+//! (3d-phase-2-plan.md): [`PovChunkManager::ground_height`] rides the same
+//! CPU-side height lattices the drawn chunks carry, with
+//! [`analytic_ground`] as the loading-frontier fallback.
 //!
 //! **Derived presentation only (ADR 0017).** Every height the mesher emits is
 //! the authoritative Terrain P/G halo through the same SIMD relief row and
@@ -122,6 +125,25 @@ pub const POV_FLY_SPEED: f64 = 40.0;
 /// Scroll-wheel speed multiplier bounds (plan §8.3).
 const POV_SPEED_RANGE: (f64, f64) = (2.0, 2000.0);
 
+/// Eye height above the ground surface in walk mode (3d-phase-2-plan.md
+/// §5.2; design §1.1 scale reference: person-scale in a world where
+/// 1 unit ≈ 1 m).
+pub const EYE_HEIGHT: f64 = 1.7;
+
+/// Base walk speed, world units per second — a brisk run at person scale.
+/// [`POV_FLY_SPEED`] (40) is survey speed, wrong for eye-level ground travel.
+pub const POV_WALK_SPEED: f64 = 6.0;
+
+/// Scroll-wheel walk-speed bounds (fly keeps [`POV_SPEED_RANGE`]).
+const POV_WALK_SPEED_RANGE: (f64, f64) = (1.0, 60.0);
+
+/// Vertical-rate clamp as a multiple of the current walk speed: the eye
+/// approaches `ground + EYE_HEIGHT` at ≤ this × walk_speed, both up and
+/// down, so a cliff face is climbed as a ≤ ~71° effective ramp and a ledge
+/// is descended as a quick drop — never a teleport (design §4.2). Scaling
+/// with walk speed keeps the feel constant under the scroll multiplier.
+const POV_CLIMB_FACTOR: f64 = 3.0;
+
 /// Mouse-look sensitivity, radians per raw device pixel.
 const LOOK_SENSITIVITY: f32 = 0.0025;
 
@@ -150,6 +172,13 @@ pub struct PovCamera {
     pub pitch: f32,
     /// Current fly speed, world units per second (scroll-adjusted).
     pub speed: f64,
+    /// Walk mode: terrain following at eye height (3d-phase-2-plan.md).
+    /// Fly mode when false. Deliberately a `bool`, not an enum — the design
+    /// has exactly two modes and reserves nothing that needs a third.
+    pub walk: bool,
+    /// Walk speed, world units per second (scroll-adjusted, like `speed`;
+    /// each mode keeps its own scroll-tuned speed).
+    pub walk_speed: f64,
 }
 
 impl PovCamera {
@@ -160,6 +189,8 @@ impl PovCamera {
             yaw: core::f32::consts::FRAC_PI_2, // facing north, like the map
             pitch: 0.0,
             speed: POV_FLY_SPEED,
+            walk: false,
+            walk_speed: POV_WALK_SPEED,
         }
     }
 
@@ -175,10 +206,48 @@ impl PovCamera {
         self.pitch = (self.pitch - dy as f32 * LOOK_SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
-    /// One scroll notch: multiply/divide the fly speed by 1.5, clamped.
+    /// One scroll notch: multiply/divide the active mode's speed by 1.5,
+    /// clamped to that mode's range (3d-phase-2-plan.md §5.1 — each mode
+    /// keeps its own scroll-tuned speed).
     pub fn scroll_speed(&mut self, up: bool) {
         let factor = if up { 1.5 } else { 1.0 / 1.5 };
-        self.speed = (self.speed * factor).clamp(POV_SPEED_RANGE.0, POV_SPEED_RANGE.1);
+        if self.walk {
+            self.walk_speed =
+                (self.walk_speed * factor).clamp(POV_WALK_SPEED_RANGE.0, POV_WALK_SPEED_RANGE.1);
+        } else {
+            self.speed = (self.speed * factor).clamp(POV_SPEED_RANGE.0, POV_SPEED_RANGE.1);
+        }
+    }
+
+    /// Enter or leave walk mode — the shared toggle path behind the live `F`
+    /// key and the scripted `walk`/`fly` instructions (3d-phase-2-plan.md
+    /// §5.3, §6.4). Entering snaps the eye straight to `ground + EYE_HEIGHT`
+    /// (instant grounding from any fly altitude — a clamped descent from a
+    /// 600-unit survey height would be a 30-second elevator); leaving keeps
+    /// position and orientation unchanged. `ground` is read only when
+    /// entering walk.
+    pub fn set_walk(&mut self, walk: bool, ground: f64) {
+        self.walk = walk;
+        if walk {
+            self.snap_to_ground(ground);
+        }
+    }
+
+    /// Set the eye directly to `ground + EYE_HEIGHT`, no clamp — the §5.3
+    /// snap cases (`F` into walk, the scripted `pos:`/walk-mode `move:`).
+    pub fn snap_to_ground(&mut self, ground: f64) {
+        self.pos.z = ground + EYE_HEIGHT;
+    }
+
+    /// The walk-mode follow step (3d-phase-2-plan.md §5.3): approach
+    /// `target` (= ground + EYE_HEIGHT) at ≤ [`POV_CLIMB_FACTOR`] × the walk
+    /// speed, both up and down. On flat and ordinary terrain the clamp never
+    /// engages and following is exact; it engages only on cliff faces,
+    /// frontier-fallback corrections, remesh swaps, and drift steps —
+    /// precisely the cases the design wants softened into ramps.
+    pub fn follow_ground(&mut self, target: f64, dt: f64) {
+        let max_step = POV_CLIMB_FACTOR * self.walk_speed * dt;
+        self.pos.z += (target - self.pos.z).clamp(-max_step, max_step);
     }
 
     /// The full 3D view direction (pitch included — it is a fly camera).
@@ -194,6 +263,17 @@ impl PovCamera {
     pub fn right(&self) -> glam::DVec3 {
         let (sy, cy) = (f64::from(self.yaw.sin()), f64::from(self.yaw.cos()));
         glam::DVec3::new(sy, -cy, 0.0)
+    }
+
+    /// Walk-mode forward: the horizontal yaw direction, *not* [`forward`],
+    /// which pitches — looking at your feet must not stop you
+    /// (3d-phase-2-plan.md §5.3, design "move along ground plane").
+    ///
+    /// [`forward`]: Self::forward
+    #[must_use]
+    pub fn walk_forward(&self) -> glam::DVec3 {
+        let (sy, cy) = (f64::from(self.yaw.sin()), f64::from(self.yaw.cos()));
+        glam::DVec3::new(cy, sy, 0.0)
     }
 
     /// The camera-relative view-projection (plan §4): `look_to` from the
@@ -307,19 +387,44 @@ fn detail_base(coord: RegionCoord) -> [[u32; 4]; DETAIL_OCTAVES] {
     out
 }
 
-/// The terrain height under a world position for POV-entry camera placement:
-/// authoritative halo-sampled `elevation` when the covering region is
-/// resident (neutral otherwise). Presentation-only camera placement — never
-/// an identity.
+/// The authoritative halo-sampled terrain height under a world position —
+/// the mesh-free fallback for walk mode at the loading frontier
+/// (3d-phase-2-plan.md §4.4), and the shared core of [`entry_ground`]:
+/// halo-sampled `PossibilityVector` when the covering region is resident
+/// (neutral otherwise), through `world_core::elevation`. Deliberately
+/// unclamped — walking the sea floor is allowed (design §4.2).
+/// Presentation-only; never an identity.
 #[must_use]
-pub fn entry_ground(map: &RegionMap, world: (f64, f64)) -> f64 {
+pub fn analytic_ground(map: &RegionMap, world: (f64, f64)) -> f64 {
     let coord = RegionCoord::from_world(world.0, world.1);
     let p = map
         .terrain_possibility_halo(coord)
         .map_or_else(PossibilityVector::neutral, |halo| {
             halo.sample_world(world.0, world.1)
         });
-    f64::from(world_core::elevation(world.0, world.1, &p)).max(f64::from(world_core::SEA_LEVEL))
+    f64::from(world_core::elevation(world.0, world.1, &p))
+}
+
+/// The terrain height under a world position for POV-entry camera placement:
+/// [`analytic_ground`] floored at sea level (entry hovers over water, it
+/// does not dive). Presentation-only camera placement — never an identity.
+#[must_use]
+pub fn entry_ground(map: &RegionMap, world: (f64, f64)) -> f64 {
+    analytic_ground(map, world).max(f64::from(world_core::SEA_LEVEL))
+}
+
+/// The ground walk mode stands on (3d-phase-2-plan.md §4.4): the rendered
+/// mesh where the covering region's chunk is resident
+/// ([`PovChunkManager::ground_height`]), else the analytic fallback at the
+/// loading frontier — correct to within one mesh cell, and transient.
+/// Returns the height and whether it came from the mesh (the telemetry/dump
+/// observable for the frontier-fallback exit criterion).
+#[must_use]
+pub fn walk_ground(chunks: &PovChunkManager, map: &RegionMap, world: (f64, f64)) -> (f64, bool) {
+    match chunks.ground_height(world.0, world.1) {
+        Some(h) => (f64::from(h), true),
+        None => (analytic_ground(map, world), false),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -740,12 +845,11 @@ struct MeshResult {
 }
 
 /// A resident chunk: its key, its renderer handle, and the CPU-side core
-/// heights (kept for 3D-2's `ground_height`, plan §1.2).
+/// heights ([`PovChunkManager::ground_height`]'s lattice, plan §1.2).
 #[derive(Debug)]
 struct ChunkEntry {
     key: u64,
     handle: u64,
-    #[allow(dead_code)] // consumed by 3D-2's ground_height
     heights: Vec<f32>,
 }
 
@@ -819,6 +923,47 @@ impl PovChunkManager {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty() && self.in_flight.is_empty()
+    }
+
+    /// Height of the rendered terrain surface under a world position, from
+    /// the resident chunk's CPU-side height lattice (the drawn mesh's twin —
+    /// [`ChunkEntry::heights`] is swapped in atomically with the GPU upload,
+    /// so this is at every moment exactly the vertices on screen, including
+    /// mid-drift staleness; 3d-phase-2-plan.md §4.1). `None` when the
+    /// covering region has no chunk yet (loading frontier).
+    ///
+    /// Barycentric interpolation over the 65×65 core lattice, splitting each
+    /// cell along the v00→v11 diagonal exactly as
+    /// `renderer::pov::chunk_indices` does (§4.2) — mid-cell heights agree
+    /// with the drawn triangles, and the interpolant is continuous across
+    /// the diagonal, cell edges, and (in steady state, ADR 0027) region
+    /// borders. O(1), no allocation, pure over `&self`.
+    #[must_use]
+    pub fn ground_height(&self, wx: f64, wy: f64) -> Option<f32> {
+        // Floor semantics put a border position in exactly one region, whose
+        // chunk owns that border column.
+        let coord = RegionCoord::from_world(wx, wy);
+        let entry = self.chunks.get(&coord)?;
+        let (ox, oy) = coord.origin();
+        let max_cell = (POV_MESH_RES - 1) as f64;
+        let gx = (wx - ox) / SPACING;
+        let gy = (wy - oy) / SPACING;
+        let cx = gx.floor().clamp(0.0, max_cell);
+        let cy = gy.floor().clamp(0.0, max_cell);
+        let (i, j) = (cx as usize, cy as usize);
+        let (fx, fy) = ((gx - cx) as f32, (gy - cy) as f32);
+        let h = &entry.heights;
+        let h00 = h[j * POV_GRID + i];
+        let h10 = h[j * POV_GRID + i + 1];
+        let h01 = h[(j + 1) * POV_GRID + i];
+        let h11 = h[(j + 1) * POV_GRID + i + 1];
+        Some(if fx >= fy {
+            // South-east triangle [v00, v10, v11].
+            h00 + fx * (h10 - h00) + fy * (h11 - h10)
+        } else {
+            // North-west triangle [v00, v11, v01].
+            h00 + fy * (h01 - h00) + fx * (h11 - h01)
+        })
     }
 
     /// Per-frame sync (plan §7.2–§7.4): drain finished meshes, schedule
@@ -1082,8 +1227,17 @@ pub enum PovInstr {
     /// [`PovCamera::look`].
     Mouse(f64, f64),
     /// `move:f[,r[,u]]` — fly `f` world units along the view direction, `r`
-    /// strafing right, `u` straight up (the held-key movement basis).
+    /// strafing right, `u` straight up (the held-key movement basis). In
+    /// walk mode the displacement is in the walk basis instead (`f` along
+    /// horizontal yaw, `r` strafe, `u` ignored) and the eye then snaps to
+    /// `ground + EYE_HEIGHT` — scripted captures want the settled pose, not
+    /// a clamped animation (3d-phase-2-plan.md §6.4).
     Move { forward: f64, right: f64, up: f64 },
+    /// `walk` — enter walk mode through the same toggle path the live `F`
+    /// key uses, including the snap to ground (3d-phase-2-plan.md §6.4).
+    Walk,
+    /// `fly` — return to fly mode, keeping position and orientation.
+    Fly,
     /// `settle[:n]` — run `n` (default 8) zero-travel world updates at the
     /// camera position, so tiles generate/regenerate.
     Settle(u32),
@@ -1152,6 +1306,16 @@ pub fn parse_pov_script(script: &str) -> Result<Vec<PovInstr>, String> {
                 },
                 _ => return Err(format!("move wants f[,r[,u]], got {args:?}")),
             },
+            "walk" | "fly" => {
+                if !args.is_empty() {
+                    return Err(format!("{op} takes no arguments, got {args:?}"));
+                }
+                if op == "walk" {
+                    PovInstr::Walk
+                } else {
+                    PovInstr::Fly
+                }
+            }
             "settle" => {
                 if args.is_empty() {
                     PovInstr::Settle(8)
@@ -1175,6 +1339,44 @@ pub fn parse_pov_script(script: &str) -> Result<Vec<PovInstr>, String> {
         return Err(String::from("empty script"));
     }
     Ok(out)
+}
+
+/// Apply one camera-movement script instruction (3d-phase-2-plan.md §6.4) —
+/// the shared core of the headless runner and the walk-kinematics tests.
+/// `mouse` goes through [`PovCamera::look`]; `move` uses the active mode's
+/// movement basis (walk: horizontal yaw + strafe, `u` ignored, then a snap
+/// to `ground + EYE_HEIGHT`); `walk`/`fly` go through [`PovCamera::set_walk`],
+/// the same toggle path as the live `F` key. `ground(x, y)` supplies the
+/// composed walk ground under a world position (the runner settles the world
+/// before sampling; tests pass a settled manager or a stub). Returns whether
+/// the instruction was camera-affecting; `size`/`pos`/`settle`/`snap` are
+/// the runner's concern and return false.
+pub fn apply_camera_instr(
+    camera: &mut PovCamera,
+    instr: &PovInstr,
+    ground: &mut dyn FnMut(f64, f64) -> f64,
+) -> bool {
+    match *instr {
+        PovInstr::Mouse(dx, dy) => camera.look(dx, dy),
+        PovInstr::Move { forward, right, up } => {
+            if camera.walk {
+                camera.pos += camera.walk_forward() * forward + camera.right() * right;
+                let g = ground(camera.pos.x, camera.pos.y);
+                camera.snap_to_ground(g);
+            } else {
+                camera.pos += camera.forward() * forward
+                    + camera.right() * right
+                    + glam::DVec3::new(0.0, 0.0, up);
+            }
+        }
+        PovInstr::Walk => {
+            let g = ground(camera.pos.x, camera.pos.y);
+            camera.set_walk(true, g);
+        }
+        PovInstr::Fly => camera.set_walk(false, 0.0),
+        _ => return false,
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1795,5 +1997,358 @@ mod tests {
         let (uploads, _) = manager.sync(&map, (5000.0, 5000.0), 0, &executor);
         assert!(uploads.is_empty(), "cancelled jobs must produce nothing");
         assert_eq!(manager.counters().dropped_stale, 0);
+    }
+
+    // -- 3D-2: the ground query and walk kinematics (3d-phase-2-plan.md §8) --
+
+    /// A chunk manager settled over `map` within `radius` of `camera`
+    /// (inline executor; enough syncs to pass the upload amortization cap).
+    fn settled_chunks(map: &RegionMap, camera: (f64, f64), radius: i32) -> PovChunkManager {
+        let mut manager = PovChunkManager::new();
+        for _ in 0..16 {
+            let _ = manager.sync(map, camera, radius, &InlineExecutor);
+        }
+        assert!(manager.is_idle(), "chunk ring must settle");
+        manager
+    }
+
+    /// z of the plane through `a`, `b`, `c` at `(px, py)`, via barycentric
+    /// weights — deliberately not the interpolation formula under test.
+    fn plane_z(a: [f64; 3], b: [f64; 3], c: [f64; 3], px: f64, py: f64) -> f64 {
+        let det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+        let wb = ((px - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (py - a[1])) / det;
+        let wc = ((b[0] - a[0]) * (py - a[1]) - (px - a[0]) * (b[1] - a[1])) / det;
+        (1.0 - wb - wc) * a[2] + wb * b[2] + wc * c[2]
+    }
+
+    /// Whether `(px, py)` lies in the 2D projection of triangle `a, b, c`.
+    fn triangle_contains(a: [f64; 3], b: [f64; 3], c: [f64; 3], px: f64, py: f64) -> bool {
+        let det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+        let wb = ((px - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (py - a[1])) / det;
+        let wc = ((b[0] - a[0]) * (py - a[1]) - (px - a[0]) * (b[1] - a[1])) / det;
+        wb >= -1e-9 && wc >= -1e-9 && wb + wc <= 1.0 + 1e-9
+    }
+
+    #[test]
+    fn ground_height_is_vertex_exact() {
+        // Plan §8 test 1: at every core lattice position the query returns
+        // exactly the stored height (which 3D-1's tests pin to halo-sampled
+        // elevation()). Radius 1 so the far border columns — owned by the
+        // eastern/northern neighbors under floor semantics — resolve too;
+        // their bit-exact agreement with this chunk's own column is the
+        // ADR 0027 steady-state border-continuity claim, asserted exactly.
+        let map = settled_map();
+        let manager = settled_chunks(&map, (0.0, 0.0), 1);
+        let coord = RegionCoord::new(0, 0);
+        let heights = manager
+            .chunks
+            .get(&coord)
+            .expect("resident")
+            .heights
+            .clone();
+        let (ox, oy) = coord.origin();
+        for j in 0..POV_GRID {
+            for i in 0..POV_GRID {
+                let got = manager
+                    .ground_height(ox + i as f64 * SPACING, oy + j as f64 * SPACING)
+                    .expect("covering chunk resident");
+                assert_eq!(
+                    got.to_bits(),
+                    heights[j * POV_GRID + i].to_bits(),
+                    "vertex ({i}, {j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ground_height_mid_cell_is_bounded_and_planar() {
+        // Plan §8 test 2: interior points stay within the cell's corner
+        // range and equal the containing triangle's plane to f32 round-off.
+        let map = settled_map();
+        let manager = settled_chunks(&map, (0.0, 0.0), 0);
+        let coord = RegionCoord::new(0, 0);
+        let heights = &manager.chunks.get(&coord).expect("resident").heights;
+        let (ox, oy) = coord.origin();
+        for &(i, j) in &[(0usize, 0usize), (10, 20), (31, 7), (63, 63)] {
+            let h00 = heights[j * POV_GRID + i];
+            let h10 = heights[j * POV_GRID + i + 1];
+            let h01 = heights[(j + 1) * POV_GRID + i];
+            let h11 = heights[(j + 1) * POV_GRID + i + 1];
+            let lo = h00.min(h10).min(h01).min(h11);
+            let hi = h00.max(h10).max(h01).max(h11);
+            for &(fx, fy) in &[
+                (0.25, 0.125),
+                (0.7, 0.3),
+                (0.3, 0.7),
+                (0.5, 0.5),
+                (0.9, 0.95),
+            ] {
+                let x = ox + (i as f64 + fx) * SPACING;
+                let y = oy + (j as f64 + fy) * SPACING;
+                let got = manager.ground_height(x, y).expect("resident");
+                assert!(
+                    got >= lo - 1e-3 && got <= hi + 1e-3,
+                    "cell ({i}, {j}) at ({fx}, {fy}): {got} outside [{lo}, {hi}]"
+                );
+                let (a, b, c) = if fx >= fy {
+                    // South-east triangle v00, v10, v11 (unit cell coords).
+                    (
+                        [0.0, 0.0, f64::from(h00)],
+                        [1.0, 0.0, f64::from(h10)],
+                        [1.0, 1.0, f64::from(h11)],
+                    )
+                } else {
+                    // North-west triangle v00, v11, v01.
+                    (
+                        [0.0, 0.0, f64::from(h00)],
+                        [1.0, 1.0, f64::from(h11)],
+                        [0.0, 1.0, f64::from(h01)],
+                    )
+                };
+                let expected = plane_z(a, b, c, fx, fy);
+                assert!(
+                    (f64::from(got) - expected).abs() < 1e-3,
+                    "cell ({i}, {j}) at ({fx}, {fy}): {got} vs plane {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ground_height_agrees_with_the_rendered_topology() {
+        // Plan §8 test 3, the diagonal-drift guard: derive the expected
+        // surface from chunk_indices() itself — find the core triangle whose
+        // 2D projection contains each probe and evaluate its plane. If
+        // either side flips its cell split, this fails loudly instead of
+        // silently de-synchronizing collision from visuals.
+        let map = settled_map();
+        let manager = settled_chunks(&map, (0.0, 0.0), 0);
+        let coord = RegionCoord::new(0, 0);
+        let snap = Snapshot::of(&map, coord);
+        let mesh = mesh_region_chunk(&snap.inputs());
+        let indices = chunk_indices();
+        let core = POV_MESH_RES * POV_MESH_RES * 6;
+        let (ox, oy) = coord.origin();
+        let vertex = |v: u32| {
+            let p = mesh.vertices[v as usize].position;
+            [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]
+        };
+        for a in 0..20 {
+            for b in 0..20 {
+                let (lx, ly) = (a as f64 * 12.7 + 0.45, b as f64 * 12.7 + 0.85);
+                let got = f64::from(
+                    manager
+                        .ground_height(ox + lx, oy + ly)
+                        .expect("chunk resident"),
+                );
+                let expected = indices[..core]
+                    .chunks_exact(3)
+                    .find_map(|tri| {
+                        let (ta, tb, tc) = (vertex(tri[0]), vertex(tri[1]), vertex(tri[2]));
+                        triangle_contains(ta, tb, tc, lx, ly).then(|| plane_z(ta, tb, tc, lx, ly))
+                    })
+                    .expect("probe inside a core triangle");
+                assert!(
+                    (got - expected).abs() < 1e-3,
+                    "probe ({lx}, {ly}): {got} vs rendered {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ground_height_is_continuous_across_edges_diagonal_and_border() {
+        // Plan §8 test 4: along a transect crossing cell edges, the cell
+        // diagonals, and the region border at x = 256 (chunks (0,0) and
+        // (1,0), both settled), consecutive samples differ by O(ε · slope) —
+        // no jumps. (Bit-exact border-column agreement is asserted by the
+        // vertex-exactness test; this asserts the interpolant numerically.)
+        let map = settled_map();
+        let manager = settled_chunks(&map, (0.0, 0.0), 1);
+        let (ox, oy) = RegionCoord::new(0, 0).origin();
+        let eps = 0.01;
+        let mut prev: Option<f64> = None;
+        let mut t = 0.0;
+        while t <= 32.0 {
+            let x = ox + 240.0 + t;
+            let y = oy + 100.5 + 0.37 * t;
+            let h = f64::from(manager.ground_height(x, y).expect("both chunks resident"));
+            if let Some(prev) = prev {
+                assert!((h - prev).abs() < 0.1, "jump at t = {t}: {prev} -> {h}");
+            }
+            prev = Some(h);
+            t += eps;
+        }
+    }
+
+    #[test]
+    fn frontier_fallback_is_analytic_and_entry_ground_keeps_its_clamp() {
+        // Plan §8 test 5: no chunk ⇒ None; walk_ground composes the mesh
+        // first, the analytic fallback at the frontier; analytic_ground is
+        // unclamped halo-sampled elevation() (neutral off-map); and the
+        // entry_ground refactor is pinned as analytic.max(SEA_LEVEL).
+        let map = settled_map();
+        let manager = settled_chunks(&map, (0.0, 0.0), 0);
+        let frontier = (3.5 * REGION_SIZE, 8.0);
+        assert!(manager.ground_height(frontier.0, frontier.1).is_none());
+        let (g, mesh) = walk_ground(&manager, &map, frontier);
+        assert!(!mesh, "frontier ground is analytic");
+        assert_eq!(g, analytic_ground(&map, frontier));
+        let (g, mesh) = walk_ground(&manager, &map, (10.0, 20.0));
+        assert!(mesh, "resident chunk answers from the mesh");
+        assert_eq!(
+            g,
+            f64::from(manager.ground_height(10.0, 20.0).expect("resident"))
+        );
+
+        let far = (1.0e6, -1.0e6);
+        assert!(
+            map.terrain_possibility_halo(RegionCoord::from_world(far.0, far.1))
+                .is_none(),
+            "far position is really off-map"
+        );
+        for world in [(10.0, 20.0), frontier, far] {
+            let coord = RegionCoord::from_world(world.0, world.1);
+            let p = map
+                .terrain_possibility_halo(coord)
+                .map_or_else(PossibilityVector::neutral, |halo| {
+                    halo.sample_world(world.0, world.1)
+                });
+            let expected = f64::from(elevation(world.0, world.1, &p));
+            assert_eq!(analytic_ground(&map, world), expected);
+            assert_eq!(
+                entry_ground(&map, world),
+                expected.max(f64::from(world_core::SEA_LEVEL))
+            );
+        }
+    }
+
+    #[test]
+    fn walk_kinematics_follow_snap_and_round_trip() {
+        // Plan §8 test 6: pure camera math against stub grounds.
+        let mut cam = PovCamera::new();
+        cam.pos = glam::DVec3::new(10.0, 20.0, 100.0);
+        cam.yaw = 0.7;
+        cam.pitch = -1.2;
+        // Pitch must not affect the walk basis: horizontal, unit length.
+        let fwd = cam.walk_forward();
+        assert_eq!(fwd.z, 0.0);
+        assert!((fwd.length() - 1.0).abs() < 1e-6); // f32 sin/cos, like look()
+        assert!((fwd.x - f64::from(cam.yaw.cos())).abs() < 1e-9);
+        cam.pitch = 0.9;
+        assert_eq!(cam.walk_forward(), fwd, "walk basis ignores pitch");
+
+        // Follow step: exact within the clamp, rate-limited beyond it.
+        cam.walk = true;
+        let dt = 0.1;
+        let max_step = POV_CLIMB_FACTOR * cam.walk_speed * dt;
+        cam.pos.z = 100.0;
+        cam.follow_ground(100.5, dt);
+        assert_eq!(cam.pos.z, 100.5, "within the clamp: exact following");
+        cam.pos.z = 0.0;
+        cam.follow_ground(1000.0, dt);
+        assert_eq!(cam.pos.z, max_step, "rate-limited climbing");
+        cam.pos.z = 0.0;
+        cam.follow_ground(-1000.0, dt);
+        assert_eq!(cam.pos.z, -max_step, "rate-limited descending");
+
+        // `F` snap grounds immediately; fly→walk→fly keeps the pose.
+        let mut cam = PovCamera::new();
+        cam.pos = glam::DVec3::new(-4.0, 9.0, 600.0);
+        cam.yaw = 1.3;
+        cam.pitch = -0.4;
+        let (x, y, yaw, pitch) = (cam.pos.x, cam.pos.y, cam.yaw, cam.pitch);
+        cam.set_walk(true, 42.0);
+        assert!(cam.walk);
+        assert_eq!(cam.pos.z, 42.0 + EYE_HEIGHT, "instant grounding");
+        cam.set_walk(false, -999.0);
+        assert!(!cam.walk);
+        assert_eq!(
+            (cam.pos.x, cam.pos.y, cam.yaw, cam.pitch),
+            (x, y, yaw, pitch)
+        );
+        assert_eq!(cam.pos.z, 42.0 + EYE_HEIGHT, "leaving walk keeps position");
+    }
+
+    #[test]
+    fn wheel_adjusts_only_the_active_modes_speed() {
+        // Plan §8 test 6 (wheel): each mode keeps its own scroll-tuned
+        // speed, clamped to its own range.
+        let mut cam = PovCamera::new();
+        assert!(!cam.walk);
+        cam.scroll_speed(true);
+        assert!(cam.speed > POV_FLY_SPEED);
+        assert_eq!(cam.walk_speed, POV_WALK_SPEED, "fly scroll leaves walk");
+        cam.walk = true;
+        let fly_speed = cam.speed;
+        for _ in 0..100 {
+            cam.scroll_speed(true);
+        }
+        assert_eq!(cam.speed, fly_speed, "walk scroll leaves fly");
+        assert_eq!(cam.walk_speed, POV_WALK_SPEED_RANGE.1, "clamped above");
+        for _ in 0..200 {
+            cam.scroll_speed(false);
+        }
+        assert_eq!(cam.walk_speed, POV_WALK_SPEED_RANGE.0, "clamped below");
+    }
+
+    #[test]
+    fn pov_script_walk_fly_and_walk_move_snap() {
+        // Plan §8 test 7: parsing, and the walk-mode `move` snap semantics
+        // driven through the parsed instructions against a settled map.
+        let parsed = parse_pov_script("pos:10,20; walk; move:10,5,7; fly; move:10; snap:x.ppm")
+            .expect("valid");
+        assert_eq!(parsed[1], PovInstr::Walk);
+        assert_eq!(parsed[3], PovInstr::Fly);
+        assert!(parse_pov_script("walk:1").is_err(), "walk takes no args");
+        assert!(parse_pov_script("fly:now").is_err(), "fly takes no args");
+
+        let map = settled_map();
+        let manager = settled_chunks(&map, (0.0, 0.0), 1);
+        let mut ground = |x: f64, y: f64| walk_ground(&manager, &map, (x, y)).0;
+        let mut camera = PovCamera::new();
+        camera.pos = glam::DVec3::new(10.0, 20.0, 500.0);
+        camera.look(-80.0, 260.0); // yaw off-axis, pitch well below level
+        assert!(camera.pitch < -0.5);
+
+        // walk: the F-key toggle path, snapping to the mesh ground.
+        assert!(apply_camera_instr(&mut camera, &parsed[1], &mut ground));
+        assert!(camera.walk);
+        let (g0, mesh) = walk_ground(&manager, &map, (10.0, 20.0));
+        assert!(mesh);
+        assert_eq!(camera.pos.z, g0 + EYE_HEIGHT);
+
+        // move:10,5,7 in walk mode: the walk basis (pitch-independent),
+        // `u` ignored, then the snap at the destination.
+        let expected_xy = camera.pos + (camera.walk_forward() * 10.0 + camera.right() * 5.0);
+        assert!(apply_camera_instr(&mut camera, &parsed[2], &mut ground));
+        assert_eq!(camera.pos.x, expected_xy.x);
+        assert_eq!(camera.pos.y, expected_xy.y);
+        let g1 = ground(camera.pos.x, camera.pos.y);
+        assert_eq!(camera.pos.z, g1 + EYE_HEIGHT);
+
+        // fly: pose kept exactly, both ways.
+        let before = camera.pos;
+        let (yaw, pitch) = (camera.yaw, camera.pitch);
+        assert!(apply_camera_instr(&mut camera, &parsed[3], &mut ground));
+        assert!(!camera.walk);
+        assert_eq!(camera.pos, before);
+        assert_eq!((camera.yaw, camera.pitch), (yaw, pitch));
+
+        // move:10 back in fly mode pitches with the view again.
+        let v = camera.forward() * 10.0 + camera.right() * 0.0 + glam::DVec3::new(0.0, 0.0, 0.0);
+        let expected = camera.pos + v;
+        assert!(apply_camera_instr(&mut camera, &parsed[4], &mut ground));
+        assert_eq!(camera.pos, expected);
+
+        // Non-camera instructions are the runner's concern.
+        assert!(!apply_camera_instr(&mut camera, &parsed[0], &mut ground));
+        assert!(!apply_camera_instr(&mut camera, &parsed[5], &mut ground));
+        assert!(!apply_camera_instr(
+            &mut camera,
+            &PovInstr::Settle(1),
+            &mut ground
+        ));
     }
 }

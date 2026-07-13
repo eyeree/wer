@@ -35,9 +35,12 @@
 //! - `Tab` — toggle the 3D POV mode (3d-phase-1-plan.md): a fly camera over
 //!   the meshed near-field terrain. In POV: hold the **left mouse button**
 //!   and drag to look, `WASD` along view/strafe, `Space`/`LShift` up/down,
-//!   wheel adjusts fly speed. Every map binding above is map-mode-only.
-//!   `WER_POV=1` starts in POV; `WER_POV_RADIUS` sets the chunk draw radius
-//!   in regions (default 3).
+//!   wheel adjusts the active mode's speed. `F` toggles walk ↔ fly
+//!   (3d-phase-2-plan.md): walk rides the rendered terrain at eye height
+//!   (`Space`/`LShift` reserved, cliffs climb as fast ramps, the sea floor
+//!   is walkable); toggling back to fly keeps the pose. Every map binding
+//!   above is map-mode-only. `WER_POV=1` starts in POV; `WER_POV_RADIUS`
+//!   sets the chunk draw radius in regions (default 3).
 //! - `F12` — write a debug dump into `./dump/<UTC datetime>/`: a screenshot
 //!   of the active view (map or POV) plus `state.txt` with the player/camera
 //!   state, steering, telemetry, dep-hash chain, and vault counters
@@ -65,9 +68,12 @@
 //! debugging/testing harness for POV rendering. Instructions:
 //! `size:WxH` (capture size, before the first snap), `pos:x,y[,z]`,
 //! `mouse:dx,dy` (simulated look drag, pixels), `move:f[,r[,u]]` (fly
-//! forward/right/up in world units), `settle[:n]` (world updates), and
-//! `snap:file.ppm`. Example:
-//! `wer --pov-script "pos:300,-10; snap:a.ppm; mouse:200,-50; move:150; snap:b.ppm"`
+//! forward/right/up in world units; in walk mode `f`/`r` move in the walk
+//! basis, `u` is ignored, and the eye snaps to the ground at the
+//! destination), `walk` / `fly` (toggle the 3D-2 walk mode, exactly like
+//! the live `F` key), `settle[:n]` (world updates), and `snap:file.ppm`.
+//! Example:
+//! `wer --pov-script "pos:300,-10; walk; move:200; snap:walk-a.ppm; mouse:400,0; move:200; snap:walk-b.ppm"`
 
 mod dump;
 mod executor;
@@ -865,6 +871,12 @@ impl App {
                 self.view_mode = ViewMode::Pov;
                 let ground = pov::entry_ground(&self.world.map, self.world.player);
                 self.pov_camera.enter_at(self.world.player, ground);
+                // Re-entering with walk mode still on grounds immediately
+                // (the §5.3 snap) instead of ramping down from entry height.
+                if self.pov_camera.walk {
+                    let (ground, _) = self.pov_ground();
+                    self.pov_camera.snap_to_ground(ground);
+                }
                 log::info!(
                     "view: POV at ({:.0}, {:.0}) radius {} (hold the left button to look; Tab returns to the map)",
                     self.world.player.0,
@@ -880,18 +892,23 @@ impl App {
         }
     }
 
-    /// Fly movement from held keys (plan §8.3): `W`/`S` along the full 3D
-    /// view direction (it is a fly camera), `A`/`D` strafe in the yaw plane,
-    /// `Space`/`LShift` world up/down. No collision of any kind — the camera
-    /// flies through hills until 3D-2. Bypasses `apply_movement` entirely.
+    /// POV movement from held keys. Fly (plan §8.3): `W`/`S` along the full
+    /// 3D view direction (it is a fly camera), `A`/`D` strafe in the yaw
+    /// plane, `Space`/`LShift` world up/down. Walk (3d-phase-2-plan.md
+    /// §5.3): `W`/`S` along the horizontal yaw direction — looking at your
+    /// feet must not stop you — `A`/`D` strafe, `Space`/`LShift` consumed
+    /// and ignored (reserved, design §2.1), then the terrain-following step
+    /// toward `ground + EYE_HEIGHT` under the vertical-rate clamp. No
+    /// lateral collision in either mode. Bypasses `apply_movement` entirely.
     fn apply_pov_movement(&mut self, dt: f64) {
         let down = |code| self.keys_down.contains(&code);
+        let walk = self.pov_camera.walk;
         let mut mv = glam::DVec3::ZERO;
         if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
-            mv += self.pov_camera.forward();
+            mv += self.pov_forward();
         }
         if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
-            mv -= self.pov_camera.forward();
+            mv -= self.pov_forward();
         }
         if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
             mv += self.pov_camera.right();
@@ -899,27 +916,79 @@ impl App {
         if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
             mv -= self.pov_camera.right();
         }
-        if down(KeyCode::Space) {
-            mv.z += 1.0;
-        }
-        if down(KeyCode::ShiftLeft) {
-            mv.z -= 1.0;
+        if !walk {
+            if down(KeyCode::Space) {
+                mv.z += 1.0;
+            }
+            if down(KeyCode::ShiftLeft) {
+                mv.z -= 1.0;
+            }
         }
         if mv != glam::DVec3::ZERO {
-            self.pov_camera.pos += mv.normalize() * (self.pov_camera.speed * dt);
+            let speed = if walk {
+                self.pov_camera.walk_speed
+            } else {
+                self.pov_camera.speed
+            };
+            self.pov_camera.pos += mv.normalize() * (speed * dt);
+        }
+        if walk {
+            let (ground, _) = self.pov_ground();
+            self.pov_camera.follow_ground(ground + pov::EYE_HEIGHT, dt);
+        }
+    }
+
+    /// The active mode's forward direction: the pitched view direction in
+    /// fly mode, the horizontal yaw direction in walk mode.
+    fn pov_forward(&self) -> glam::DVec3 {
+        if self.pov_camera.walk {
+            self.pov_camera.walk_forward()
+        } else {
+            self.pov_camera.forward()
+        }
+    }
+
+    /// The ground under the camera (3d-phase-2-plan.md §4.4): the rendered
+    /// mesh where the chunk is resident, the analytic fallback at the
+    /// loading frontier. The bool is the mesh-vs-analytic telemetry tag.
+    fn pov_ground(&self) -> (f64, bool) {
+        pov::walk_ground(
+            &self.pov_chunks,
+            &self.world.map,
+            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+        )
+    }
+
+    /// `F` in POV (3d-phase-2-plan.md §6.1): toggle walk ↔ fly. Entering
+    /// walk snaps the eye to the ground under the camera; returning to fly
+    /// keeps position and orientation.
+    fn toggle_walk(&mut self) {
+        let walk = !self.pov_camera.walk;
+        let (ground, mesh) = self.pov_ground();
+        self.pov_camera.set_walk(walk, ground);
+        if walk {
+            log::info!(
+                "pov: walk mode (ground {:.1}, {}; F returns to fly)",
+                ground,
+                if mesh { "mesh" } else { "analytic" }
+            );
+        } else {
+            log::info!("pov: fly mode");
         }
     }
 
     /// One-shot actions on key press.
     fn handle_press(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
         // The POV keybinding gate (3d-phase-1-plan.md §8.4): in POV only
-        // `Tab`, `Escape`, and the `F12` debug dump are handled; every map
-        // binding below stays map-mode-only. This gate is the whole guarantee
+        // `Tab`, `F` (walk ↔ fly, 3d-phase-2-plan.md §6.1), `Escape`, and
+        // the `F12` debug dump are handled; every map binding below stays
+        // map-mode-only. This gate is the whole guarantee
         // that map mode is pixel-identical — no map state can even be touched
         // from POV (the dump only reads and writes files).
         if self.view_mode == ViewMode::Pov {
             match code {
                 KeyCode::Tab => self.toggle_view_mode(),
+                KeyCode::KeyF => self.toggle_walk(),
                 KeyCode::F12 => self.debug_dump(),
                 KeyCode::Escape => event_loop.exit(),
                 _ => {}
@@ -1528,8 +1597,22 @@ impl App {
         if self.last_telemetry.elapsed().as_secs_f64() >= 1.0 {
             let c = self.pov_chunks.counters();
             let last = self.pov_counters_last;
+            // The mode tail: the walk form's mesh-vs-analytic tag is the
+            // observable for the frontier-fallback exit criterion
+            // (3d-phase-2-plan.md §6.2).
+            let mode = if self.pov_camera.walk {
+                let (ground, mesh) = self.pov_ground();
+                format!(
+                    "walk {:.0}u/s (ground {:.1}, {})",
+                    self.pov_camera.walk_speed,
+                    ground,
+                    if mesh { "mesh" } else { "analytic" }
+                )
+            } else {
+                format!("fly {:.0}u/s", self.pov_camera.speed)
+            };
             log::info!(
-                "pov: {} chunks | +meshed {} +remeshed {} +cancelled {} +stale {} +deferred {} | mesh {:.1}ms worker total | fly {:.0}u/s",
+                "pov: {} chunks | +meshed {} +remeshed {} +cancelled {} +stale {} +deferred {} | mesh {:.1}ms worker total | {mode}",
                 self.pov_chunks.len(),
                 c.meshed - last.meshed,
                 c.remeshed - last.remeshed,
@@ -1537,7 +1620,6 @@ impl App {
                 c.dropped_stale - last.dropped_stale,
                 c.uploads_deferred - last.uploads_deferred,
                 c.mesh_ms,
-                self.pov_camera.speed,
             );
             self.pov_counters_last = c;
         }
@@ -1848,7 +1930,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
 
     fn settle_world(
         map: &mut RegionMap,
-        camera: &PovCamera,
+        pos: (f64, f64),
         field: &PossibilityField,
         bias: &[f32; POSSIBILITY_DIMS],
         n: u32,
@@ -1856,7 +1938,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
         for _ in 0..n {
             // Zero travel, unbudgeted, inline: the screenshot-path settle.
             map.update(
-                (camera.pos.x, camera.pos.y),
+                pos,
                 0.0,
                 field,
                 &[],
@@ -1883,24 +1965,39 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                 Some(z) => camera.pos = glam::DVec3::new(x, y, z),
                 None => {
                     // Ground placement wants the covering region's realized
-                    // vector; one settle makes it resident first.
+                    // vector; one settle makes it resident first. In walk
+                    // mode `pos:` grounds at eye height (the §5.3 snap)
+                    // instead of hovering at entry height.
                     camera.pos.x = x;
                     camera.pos.y = y;
-                    settle_world(&mut map, &camera, &field, &bias, 1);
-                    camera.enter_at((x, y), pov::entry_ground(&map, (x, y)));
+                    settle_world(&mut map, (x, y), &field, &bias, 1);
+                    if camera.walk {
+                        let (ground, _) = pov::walk_ground(&chunks, &map, (x, y));
+                        camera.snap_to_ground(ground);
+                    } else {
+                        camera.enter_at((x, y), pov::entry_ground(&map, (x, y)));
+                    }
                 }
             },
-            pov::PovInstr::Mouse(dx, dy) => camera.look(dx, dy),
-            pov::PovInstr::Move { forward, right, up } => {
-                camera.pos += camera.forward() * forward
-                    + camera.right() * right
-                    + glam::DVec3::new(0.0, 0.0, up);
+            instr @ (pov::PovInstr::Mouse(..)
+            | pov::PovInstr::Move { .. }
+            | pov::PovInstr::Walk
+            | pov::PovInstr::Fly) => {
+                // The shared camera semantics (3d-phase-2-plan.md §6.4):
+                // `walk`/`fly` through the live toggle path, walk-mode
+                // `move` snapping to the settled ground at the destination.
+                let _ = pov::apply_camera_instr(&mut camera, &instr, &mut |x, y| {
+                    settle_world(&mut map, (x, y), &field, &bias, 1);
+                    pov::walk_ground(&chunks, &map, (x, y)).0
+                });
             }
-            pov::PovInstr::Settle(n) => settle_world(&mut map, &camera, &field, &bias, n),
+            pov::PovInstr::Settle(n) => {
+                settle_world(&mut map, (camera.pos.x, camera.pos.y), &field, &bias, n);
+            }
             pov::PovInstr::Snap(path) => {
                 // Tiles under the camera, then the chunk ring, must be
                 // settled so the snapshot shows the steady state.
-                settle_world(&mut map, &camera, &field, &bias, 8);
+                settle_world(&mut map, (camera.pos.x, camera.pos.y), &field, &bias, 8);
                 if capture.is_none() {
                     capture = Some(
                         renderer::pov::PovCapture::new(size.0, size.1)

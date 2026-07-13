@@ -271,6 +271,7 @@ impl App {
         writeln!(s, "[view]")?;
         let mode = match self.view_mode {
             ViewMode::Map => "map",
+            ViewMode::Pov if self.pov_camera.walk => "pov (3D walk camera)",
             ViewMode::Pov => "pov (3D fly camera)",
         };
         writeln!(s, "mode              : {mode}")?;
@@ -363,7 +364,25 @@ impl App {
             "right             : ({:.5}, {:.5}, {:.5})",
             right.x, right.y, right.z
         )?;
+        writeln!(
+            s,
+            "move_mode         : {}",
+            if cam.walk { "walk" } else { "fly" }
+        )?;
         writeln!(s, "fly_speed         : {:.1} u/s", cam.speed)?;
+        writeln!(s, "walk_speed        : {:.1} u/s", cam.walk_speed)?;
+        if cam.walk {
+            // The current ground and its source (mesh vs the analytic
+            // frontier fallback, 3d-phase-2-plan.md §6.3).
+            let (ground, mesh) =
+                pov::walk_ground(&self.pov_chunks, &self.world.map, (cam.pos.x, cam.pos.y));
+            writeln!(
+                s,
+                "ground            : {:.3} ({})",
+                ground,
+                if mesh { "mesh" } else { "analytic" }
+            )?;
+        }
         writeln!(s, "chunk_radius      : {} regions", self.pov_radius)?;
         writeln!(s, "resident_chunks   : {}", self.pov_chunks.len())?;
         if self.view_mode == ViewMode::Map {
