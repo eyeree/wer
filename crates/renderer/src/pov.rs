@@ -18,6 +18,12 @@ use std::collections::HashMap;
 /// The POV terrain shader (vertex-lit, fogged; plan §5.6).
 pub const SHADER_POV_TERRAIN: &str = include_str!("../shaders/pov_terrain.wgsl");
 
+/// Detail octaves the fragment shader continues above the authoritative
+/// terrain spectrum for **normal perturbation only** — the POV analogue of
+/// the map's refinement octaves (ADR 0017: derived presentation; vertices
+/// are never displaced, so the CPU heightfield stays the ground truth).
+pub const DETAIL_OCTAVES: usize = 3;
+
 /// Quads per region edge (4.0-unit spacing at `REGION_SIZE = 256`).
 pub const POV_MESH_RES: usize = 64;
 
@@ -94,7 +100,7 @@ pub fn chunk_indices() -> Vec<u32> {
     indices
 }
 
-/// One terrain vertex (28 bytes; plan §5.2).
+/// One terrain vertex (32 bytes; plan §5.2 + the baked-light extension).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PovVertex {
@@ -106,6 +112,12 @@ pub struct PovVertex {
     /// Alpha is reserved (255) — 3D-3's wetness gloss can repurpose it
     /// without a format change.
     pub color: [u8; 4],
+    /// Baked lighting, `Unorm8x4`: `[sun visibility, ambient occlusion,
+    /// reserved, reserved]`. The mesher ray-marches the heightfield toward
+    /// the fixed sun for `x` and measures multi-scale concavity for `y`;
+    /// both are derived presentation only (ADR 0017) — the shader multiplies
+    /// them into the sun and ambient terms respectively.
+    pub light: [u8; 4],
 }
 
 /// One chunk's mesh handed to [`crate::Renderer::render_pov`], already
@@ -118,6 +130,11 @@ pub struct TerrainChunkUpload {
     /// Region origin in world units, for the camera-relative offset (the
     /// renderer subtracts the camera in f64, then truncates).
     pub origin: [f64; 2],
+    /// Per-octave 64-bit base lattice indices of this chunk's origin for the
+    /// shader's detail-normal noise, `[ix.lo, ix.hi, iy.lo, iy.hi]` each.
+    /// Computed by the shell (it owns the world's noise scheme); the
+    /// renderer couriers them into the chunk uniform, world-agnostic.
+    pub detail_base: [[u32; 4]; DETAIL_OCTAVES],
     /// Exactly [`VERTS_PER_CHUNK`] vertices in the shared topology's order.
     pub vertices: Vec<PovVertex>,
 }
@@ -143,6 +160,10 @@ pub struct PovFrameParams {
     pub sky_ambient: [f32; 3],
     /// ...and below.
     pub ground_ambient: [f32; 3],
+    /// Detail-normal octaves, `[frac_x, frac_y, inv_wavelength, slope]`
+    /// each — opaque to the renderer; the shell derives them from the
+    /// terrain spectrum (see its `detail_octaves`).
+    pub detail: [[f32; 4]; DETAIL_OCTAVES],
 }
 
 /// std140-compatible mirror of the WGSL `PovParams`.
@@ -158,6 +179,7 @@ struct PovParamsRaw {
     _pad0: f32,
     ground_ambient: [f32; 3],
     _pad1: f32,
+    detail: [[f32; 4]; DETAIL_OCTAVES],
 }
 
 /// std140-compatible mirror of the WGSL `ChunkOffset`, written at a fixed
@@ -167,6 +189,8 @@ struct PovParamsRaw {
 struct ChunkOffsetRaw {
     offset: [f32; 3],
     _pad: f32,
+    /// The chunk's [`TerrainChunkUpload::detail_base`], vec4<u32> per octave.
+    detail_base: [[u32; 4]; DETAIL_OCTAVES],
 }
 
 /// Dynamic-offset stride for the per-chunk uniform. 256 is the largest
@@ -189,6 +213,7 @@ struct ChunkTable<B> {
 struct ChunkSlot<B> {
     buffer: B,
     origin: [f64; 2],
+    detail_base: [[u32; 4]; DETAIL_OCTAVES],
 }
 
 impl<B> Default for ChunkTable<B> {
@@ -211,12 +236,20 @@ impl<B> ChunkTable<B> {
 
     /// The slot for `handle`, reusing its live buffer on a re-upload, else a
     /// pooled buffer, else a fresh one from `create`.
-    fn upsert(&mut self, handle: u64, origin: [f64; 2], create: impl FnOnce() -> B) -> &mut B {
+    fn upsert(
+        &mut self,
+        handle: u64,
+        origin: [f64; 2],
+        detail_base: [[u32; 4]; DETAIL_OCTAVES],
+        create: impl FnOnce() -> B,
+    ) -> &mut B {
         let slot = self.chunks.entry(handle).or_insert_with(|| ChunkSlot {
             buffer: self.free.pop().unwrap_or_else(create),
             origin,
+            detail_base,
         });
         slot.origin = origin;
+        slot.detail_base = detail_base;
         &mut slot.buffer
     }
 
@@ -275,7 +308,8 @@ impl Pov {
             label: Some("pov-chunk-bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // The fragment stage reads the detail-noise lattice bases.
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
@@ -317,6 +351,11 @@ impl Pov {
                             format: wgpu::VertexFormat::Unorm8x4,
                             offset: 24,
                             shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Unorm8x4,
+                            offset: 28,
+                            shader_location: 3,
                         },
                     ],
                 }],
@@ -466,14 +505,16 @@ impl Pov {
                 );
                 continue;
             }
-            let buffer = self.table.upsert(upload.handle, upload.origin, || {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("pov-chunk-vertices"),
-                    size: CHUNK_BUFFER_BYTES,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            });
+            let buffer =
+                self.table
+                    .upsert(upload.handle, upload.origin, upload.detail_base, || {
+                        device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("pov-chunk-vertices"),
+                            size: CHUNK_BUFFER_BYTES,
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        })
+                    });
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&upload.vertices));
             bytes += CHUNK_BUFFER_BYTES;
         }
@@ -500,6 +541,7 @@ impl Pov {
             _pad0: 0.0,
             ground_ambient: frame.ground_ambient,
             _pad1: 0.0,
+            detail: frame.detail,
         };
         queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&raw));
 
@@ -528,6 +570,7 @@ impl Pov {
                     (-frame.camera_pos[2]) as f32,
                 ],
                 _pad: 0.0,
+                detail_base: slot.detail_base,
             };
             let at = i * CHUNK_UNIFORM_STRIDE as usize;
             offsets[at..at + core::mem::size_of::<ChunkOffsetRaw>()]
@@ -796,19 +839,20 @@ mod tests {
             next += 1;
             next
         };
-        let first = *table.upsert(1, [0.0, 0.0], &mut create);
+        let base = [[0u32; 4]; DETAIL_OCTAVES];
+        let first = *table.upsert(1, [0.0, 0.0], base, &mut create);
         assert_eq!(first, 1);
         // Re-upload to the same handle: same buffer, updated origin.
-        let again = *table.upsert(1, [256.0, 0.0], &mut create);
+        let again = *table.upsert(1, [256.0, 0.0], base, &mut create);
         assert_eq!(again, first, "re-upload must swap contents in place");
         assert_eq!(table.chunks[&1].origin, [256.0, 0.0]);
         // Evict, then upload a different handle: the pooled buffer returns.
         table.remove(1);
         assert_eq!(table.len(), 0);
-        let reused = *table.upsert(2, [512.0, 0.0], &mut create);
+        let reused = *table.upsert(2, [512.0, 0.0], base, &mut create);
         assert_eq!(reused, first, "eviction must feed the pool");
         // A second live handle allocates fresh.
-        let fresh = *table.upsert(3, [768.0, 0.0], &mut create);
+        let fresh = *table.upsert(3, [768.0, 0.0], base, &mut create);
         assert_eq!(fresh, 2);
         // Removing an unknown handle is a no-op.
         table.remove(99);

@@ -4,8 +4,11 @@
 //! **Derived presentation only (ADR 0017).** Every height the mesher emits is
 //! `world_core::terrain::elevation` through its bit-identical SIMD row twin
 //! (ADR 0016); every color is the 2D Composite per-cell logic
-//! ([`crate::viz::composite_cell_color`]) over the settled field tiles.
-//! Nothing here feeds back into world state, hashing, or persistence.
+//! ([`crate::viz::composite_cell_color`]) over the settled field tiles; the
+//! baked per-vertex light (sun visibility from a heightfield horizon march,
+//! ambient occlusion from multi-scale concavity) is float presentation math
+//! over the same elevation kernel and the fixed [`SUN_DIR`]. Nothing here
+//! feeds back into world state, hashing, or persistence.
 //!
 //! The mesher is a pure function of value snapshots (plan §6.1): no
 //! filesystem, no threads, no GPU, no `RegionMap` — so it is unit-testable,
@@ -16,7 +19,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
-use renderer::pov::{skirt_core_index, CORE_VERTS, POV_GRID, POV_MESH_RES, VERTS_PER_CHUNK};
+use renderer::pov::{
+    skirt_core_index, CORE_VERTS, DETAIL_OCTAVES, POV_GRID, POV_MESH_RES, VERTS_PER_CHUNK,
+};
 use renderer::{PovFrameParams, PovVertex, TerrainChunkUpload};
 use world_core::layer::{layer_decl, LAYER_TERRAIN};
 use world_core::{mix, simd, Biome, FieldTile, PossibilityVector, RegionCoord, REGION_SIZE};
@@ -27,6 +32,68 @@ use crate::viz::composite_cell_color;
 
 /// Vertex spacing in world units (`REGION_SIZE / POV_MESH_RES` = 4.0).
 const SPACING: f64 = REGION_SIZE / POV_MESH_RES as f64;
+
+/// The fixed sun direction (normalized, pointing from the sun toward the
+/// ground), shared by [`frame_params`] and the mesher's baked shadow march —
+/// the shading and the baked shadows must agree on one sun. Same azimuth as
+/// plan §4's original sun, elevation lowered to 20° (permanent late
+/// afternoon): this world's heightfield is smooth below ~100-unit
+/// wavelengths and its steepest flanks sit near 20°, so only a sun at or
+/// below that angle lets ridges cast real shadows or slope shading develop
+/// contrast — the definition the near-noon sun washed out entirely.
+const SUN_DIR: [f32; 3] = [0.840_446, 0.420_223, -0.342_020_14];
+
+/// Extra sample ring around the 65×65 vertex lattice for the
+/// central-difference normals (plan §6.3).
+const GRID_MARGIN: usize = 1;
+
+/// Sample-grid edge length: the vertex lattice plus the margin rings.
+const SAMPLE_GRID: usize = POV_GRID + 2 * GRID_MARGIN;
+
+/// Baked-shadow march: horizon samples along the horizontal toward-sun
+/// direction at exponentially spaced distances `BASE · GROWTH^k` — 8, 14.4,
+/// …, ≈490 world units, so nearby banks and distant ridgelines both cast
+/// while the per-chunk cost stays bounded (8 row-kernel calls per vertex
+/// row). Features beyond ~490 units (≈2 regions) cannot cast onto this
+/// chunk; at that range fog has mostly eaten the contrast anyway.
+const SHADOW_STEPS: usize = 8;
+const SHADOW_STEP_BASE: f64 = 2.0 * SPACING;
+const SHADOW_STEP_GROWTH: f64 = 1.8;
+
+/// Self-shadow bias in world units, subtracted from every horizon sample so
+/// a surface does not speckle-shadow itself right at the terminator.
+const SHADOW_BIAS: f32 = 0.5;
+
+/// Penumbra half-width in horizon-tangent space: the shadow edge fades over
+/// `sun_tan ± SOFTNESS` instead of cutting hard, hiding the 4-unit lattice
+/// stepping along shadow borders.
+const SHADOW_SOFTNESS: f32 = 0.15;
+
+/// Valley-scale AO lattice. The elevation field is smooth below ~100-unit
+/// wavelengths (pure low-octave fBm — measured, and visible in any
+/// transect), so occlusion lives at hollow/valley scale, far wider than the
+/// 4-unit vertex lattice can affordably tap. AO therefore reads a second,
+/// coarse height lattice: 32-unit spacing, [`AO_RADII`] taps at 64/128/256
+/// world units, margin sized so the widest tap stays on real samples.
+const COARSE_SPACING: f64 = 32.0;
+const COARSE_MARGIN: usize = 8;
+const COARSE_CELLS: usize = (REGION_SIZE / COARSE_SPACING) as usize;
+const COARSE_GRID: usize = COARSE_CELLS + 1 + 2 * COARSE_MARGIN;
+
+/// Baked-AO tap radii in coarse-lattice steps (64/128/256 world units).
+/// Must not exceed [`COARSE_MARGIN`].
+const AO_RADII: [usize; 3] = [2, 4, 8];
+
+/// Baked-AO response: occlusion slope × strength, capped so even the
+/// deepest hollow keeps some hemisphere fill. Tuned high — fBm concavities
+/// are shallow (slopes of a few percent), and AO is most of the definition
+/// valley floors get.
+const AO_STRENGTH: f32 = 2.5;
+const AO_MAX: f32 = 0.55;
+
+/// Detail-normal gain over the terrain spectrum's exact continuation
+/// (1.0 = the amplitude the missing octaves would really have).
+const DETAIL_STRENGTH: f32 = 1.0;
 
 /// How far the skirt's bottom ring hangs below the perimeter. The plan sized
 /// this at one grid step (4.0) for *drift* steps, but the dominant border
@@ -154,8 +221,8 @@ impl Default for PovCamera {
 /// The per-frame renderer parameters for the camera at `radius` regions
 /// (plan §4): fog from `0.55·R` to `0.95·R` with `R = (radius + 0.5) ·
 /// REGION_SIZE`, fog color = the clear color so geometry dissolves into sky,
-/// fixed sun and hemisphere ambients tuned so mid-day flat ground roughly
-/// matches the 2D palette's value range.
+/// the fixed sun ([`SUN_DIR`]) and hemisphere ambients tuned so flat ground
+/// roughly matches the 2D palette's value range.
 #[must_use]
 pub fn frame_params(
     camera: &PovCamera,
@@ -164,17 +231,77 @@ pub fn frame_params(
     clear: [f64; 4],
 ) -> PovFrameParams {
     let reach = (f64::from(radius) + 0.5) * REGION_SIZE;
-    let sun = glam::Vec3::new(0.4, 0.2, -0.9).normalize();
+    let sun = glam::Vec3::from_array(SUN_DIR);
     PovFrameParams {
         view_proj: camera.view_proj(aspect),
         camera_pos: [camera.pos.x, camera.pos.y, camera.pos.z],
         sun_dir: [sun.x, sun.y, sun.z],
+        detail: detail_octaves(),
         fog_color: [clear[0] as f32, clear[1] as f32, clear[2] as f32],
         fog_start: (0.55 * reach) as f32,
         fog_end: (0.95 * reach) as f32,
-        sky_ambient: [0.32, 0.34, 0.38],
-        ground_ambient: [0.14, 0.13, 0.12],
+        // Near the 3D-1 fill values: flat ground now sits at ~0.75 of full
+        // exposure (sun 0.41 + sky fill) instead of the old ~1.05 — the
+        // original tuning overexposed flat ground, clipping every
+        // sun-facing slope to the same white and erasing relief. The
+        // headroom is what lets slope contrast read in both directions.
+        sky_ambient: [0.34, 0.36, 0.40],
+        ground_ambient: [0.15, 0.14, 0.13],
     }
+}
+
+/// The per-frame detail-normal octave parameters `[frac_x, frac_y,
+/// 1/wavelength, slope]` — the POV analogue of `gpumap::refinement_octaves`:
+/// continue the terrain gradient spectrum at the octaves above its
+/// authoritative top (128/64/32-unit wavelengths), where this world's
+/// elevation function is otherwise perfectly smooth. Amplitude halves with
+/// wavelength, so each octave's apparent slope is the same constant; it is
+/// scaled by [`NORMAL_EXAGGERATION`] to match the vertex normals and by
+/// [`DETAIL_STRENGTH`] for taste, and uses the neutral relief amplitude
+/// (per-region tectonic scaling isn't worth per-chunk parameters for a
+/// shading-only term). Derived presentation (ADR 0017).
+fn detail_octaves() -> [[f32; 4]; DETAIL_OCTAVES] {
+    use world_core::terrain::{octave_offset, BASE_AMPLITUDE, BASE_WAVELENGTH, OCTAVES};
+    // pov_terrain.wgsl hashes the continued octaves as literal `5 + k`.
+    const _: () = assert!(OCTAVES == 5, "update pov_terrain.wgsl octave indices");
+    let norm: f32 = (0..OCTAVES).map(|k| 0.5f32.powi(k as i32)).sum();
+    let mut out = [[0f32; 4]; DETAIL_OCTAVES];
+    for (k, slot) in out.iter_mut().enumerate() {
+        let octave = OCTAVES + k as u32;
+        let wavelength = BASE_WAVELENGTH / f64::from(1u32 << octave);
+        let (ox, oy) = octave_offset(octave);
+        let amplitude = BASE_AMPLITUDE * 0.5f32.powi(octave as i32) / norm;
+        let slope = amplitude / wavelength as f32 * NORMAL_EXAGGERATION * DETAIL_STRENGTH;
+        *slot = [
+            (ox - ox.floor()) as f32,
+            (oy - oy.floor()) as f32,
+            (1.0 / wavelength) as f32,
+            slope,
+        ];
+    }
+    out
+}
+
+/// Per-octave 64-bit base lattice indices of a region's origin for the
+/// detail-normal noise — the chunk half of the anchoring ([`detail_octaves`]
+/// carries the fractional part, which is octave-global). A region origin is
+/// an exact multiple of every detail wavelength, so the base is exact
+/// integer math at any world coordinate; the shader adds only the small
+/// chunk-local lattice fraction in f32 (the map's refinement anchoring
+/// scheme, per chunk instead of per view).
+fn detail_base(coord: RegionCoord) -> [[u32; 4]; DETAIL_OCTAVES] {
+    use world_core::terrain::{octave_offset, BASE_WAVELENGTH, OCTAVES};
+    let mut out = [[0u32; 4]; DETAIL_OCTAVES];
+    for (k, slot) in out.iter_mut().enumerate() {
+        let octave = OCTAVES + k as u32;
+        let wavelength = BASE_WAVELENGTH / f64::from(1u32 << octave);
+        let cells = (REGION_SIZE / wavelength) as i64; // exact: 2, 4, 8
+        let (ox, oy) = octave_offset(octave);
+        let bx = (i64::from(coord.x) * cells + ox.floor() as i64) as u64;
+        let by = (i64::from(coord.y) * cells + oy.floor() as i64) as u64;
+        *slot = [bx as u32, (bx >> 32) as u32, by as u32, (by >> 32) as u32];
+    }
+    out
 }
 
 /// The terrain height under a world position for POV-entry camera placement:
@@ -248,20 +375,44 @@ pub fn mesh_region_chunk_cancellable(
 ) -> Option<ChunkMesh> {
     // 67×67 sample grid: the 65×65 vertex lattice plus one ring for central
     // differences, at SPACING, spanning [origin − 4, origin + 260] (§6.3).
-    const S: usize = POV_GRID + 2;
+    const S: usize = SAMPLE_GRID;
     let (ox, oy) = inputs.coord.origin();
-    let xs: Vec<f64> = (0..S).map(|g| ox + (g as f64 - 1.0) * SPACING).collect();
+    let margin = GRID_MARGIN as f64;
+    let xs: Vec<f64> = (0..S).map(|g| ox + (g as f64 - margin) * SPACING).collect();
     let mut h = vec![0f32; S * S];
     for g in 0..S {
         if g % 16 == 0 && cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let y = oy + (g as f64 - 1.0) * SPACING;
+        let y = oy + (g as f64 - margin) * SPACING;
         // One batched kernel call per row — the same kernel generation uses,
         // bit-identical to scalar `elevation` (ADR 0016), so vertex heights
         // are *exactly* `elevation(x, y, p)` (asserted by unit test).
         simd::elevation_row(&xs, y, &inputs.p, &mut h[g * S..(g + 1) * S]);
     }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    // Baked sun visibility (the shadow half of the vertex `light` bytes).
+    let sunvis = bake_sun_visibility(&h, (ox, oy), &inputs.p, cancel)?;
+
+    // Coarse height lattice for valley-scale AO (the other half): 25×25 at
+    // 32-unit spacing spanning [origin − 256, origin + 512].
+    let xsc: Vec<f64> = (0..COARSE_GRID)
+        .map(|g| ox + (g as f64 - COARSE_MARGIN as f64) * COARSE_SPACING)
+        .collect();
+    let mut hc = vec![0f32; COARSE_GRID * COARSE_GRID];
+    for g in 0..COARSE_GRID {
+        let y = oy + (g as f64 - COARSE_MARGIN as f64) * COARSE_SPACING;
+        simd::elevation_row(
+            &xsc,
+            y,
+            &inputs.p,
+            &mut hc[g * COARSE_GRID..(g + 1) * COARSE_GRID],
+        );
+    }
+    let occlusion = valley_occlusion(&hc);
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
@@ -278,13 +429,14 @@ pub fn mesh_region_chunk_cancellable(
     let mut heights = Vec::with_capacity(CORE_VERTS);
     for j in 0..POV_GRID {
         for i in 0..POV_GRID {
-            // Sample-grid index of vertex (i, j) is (i + 1, j + 1).
-            let e = h[(j + 1) * S + (i + 1)];
+            // Sample-grid index of vertex (i, j) is (i + MARGIN, j + MARGIN).
+            let (gi, gj) = (i + GRID_MARGIN, j + GRID_MARGIN);
+            let e = h[gj * S + gi];
             let normal = vertex_normal(
-                h[(j + 1) * S + i],
-                h[(j + 1) * S + (i + 2)],
-                h[j * S + (i + 1)],
-                h[(j + 2) * S + (i + 1)],
+                h[gj * S + gi - 1],
+                h[gj * S + gi + 1],
+                h[(gj - 1) * S + gi],
+                h[(gj + 1) * S + gi],
             );
             let (lx, ly) = (i as f64 * SPACING, j as f64 * SPACING);
             let river = bilinear(inputs.river, lx, ly);
@@ -297,13 +449,19 @@ pub fn mesh_region_chunk_cancellable(
                 position: [lx as f32, ly as f32, e],
                 normal,
                 color: [rgb[0], rgb[1], rgb[2], 255],
+                light: [
+                    quantize_light(sunvis[j * POV_GRID + i]),
+                    quantize_light(vertex_ao(&occlusion, lx, ly)),
+                    0,
+                    0,
+                ],
             });
             heights.push(e);
         }
     }
-    // The skirt bottom ring (plan §6.5): same (x, y), normal, and color as
-    // the perimeter vertex above — the skirt reads as the terrain
-    // continuing, not as a wall — z lowered by one grid step.
+    // The skirt bottom ring (plan §6.5): same (x, y), normal, color, and
+    // baked light as the perimeter vertex above — the skirt reads as the
+    // terrain continuing, not as a wall — z lowered by one grid step.
     for edge in 0..4 {
         for k in 0..POV_GRID {
             let mut v = vertices[skirt_core_index(edge, k)];
@@ -315,11 +473,154 @@ pub fn mesh_region_chunk_cancellable(
     Some(ChunkMesh { vertices, heights })
 }
 
-/// Central-difference normal (plan §6.3): `normalize((west − east,
-/// south − north, 2 · spacing · 2))`. Presentation-only float math; a flat
-/// heightfield yields exactly `(0, 0, 1)`.
+/// Baked sun visibility per core vertex — the terrain self-shadow term of
+/// the vertex `light` bytes. From each vertex, march the heightfield along
+/// the horizontal toward-sun direction at the [`SHADOW_STEPS`] exponential
+/// distances (one batched row-kernel call per vertex row per step — the same
+/// bit-identical kernel the height lattice uses), track the highest horizon
+/// tangent seen, and soft-threshold it against the sun's elevation tangent.
+///
+/// Derived presentation only (ADR 0017): deterministic float math over the
+/// region's terrain-quantized `p`, never an identity. Samples past the
+/// region border evaluate under *this* region's `p`, exactly like the
+/// heights themselves — the resulting border step is the one the skirt
+/// already hides (plan §6.4).
+fn bake_sun_visibility(
+    h: &[f32],
+    origin: (f64, f64),
+    p: &PossibilityVector,
+    cancel: &AtomicBool,
+) -> Option<Vec<f32>> {
+    // Horizontal unit vector pointing toward the sun, and the tangent of the
+    // sun's elevation above the horizon (1.0 at the 45° SUN_DIR).
+    let horiz = f64::hypot(f64::from(SUN_DIR[0]), f64::from(SUN_DIR[1]));
+    let toward = (
+        -f64::from(SUN_DIR[0]) / horiz,
+        -f64::from(SUN_DIR[1]) / horiz,
+    );
+    let sun_tan = (-f64::from(SUN_DIR[2]) / horiz) as f32;
+
+    // March distances, and each step's vertex-row x positions — x depends
+    // only on the column and the step, so each row is built once and reused
+    // by all 65 vertex rows.
+    let mut dists = [0f64; SHADOW_STEPS];
+    let mut d = SHADOW_STEP_BASE;
+    for slot in &mut dists {
+        *slot = d;
+        d *= SHADOW_STEP_GROWTH;
+    }
+    let step_xs: Vec<Vec<f64>> = dists
+        .iter()
+        .map(|d| {
+            (0..POV_GRID)
+                .map(|i| origin.0 + i as f64 * SPACING + toward.0 * d)
+                .collect()
+        })
+        .collect();
+
+    let mut vis = vec![0f32; CORE_VERTS];
+    let mut row = vec![0f32; POV_GRID];
+    let mut horizon = vec![0f32; POV_GRID];
+    for j in 0..POV_GRID {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let y = origin.1 + j as f64 * SPACING;
+        horizon.fill(f32::NEG_INFINITY);
+        for (k, &dist) in dists.iter().enumerate() {
+            simd::elevation_row(&step_xs[k], y + toward.1 * dist, p, &mut row);
+            let inv_d = (1.0 / dist) as f32;
+            for i in 0..POV_GRID {
+                let e = h[(j + GRID_MARGIN) * SAMPLE_GRID + i + GRID_MARGIN];
+                horizon[i] = horizon[i].max((row[i] - e - SHADOW_BIAS) * inv_d);
+            }
+        }
+        for i in 0..POV_GRID {
+            let lit = 1.0
+                - smoothstep(
+                    sun_tan - SHADOW_SOFTNESS,
+                    sun_tan + SHADOW_SOFTNESS,
+                    horizon[i],
+                );
+            vis[j * POV_GRID + i] = lit;
+        }
+    }
+    Some(vis)
+}
+
+/// Valley-scale occlusion over the region's own coarse nodes (a 9×9 patch):
+/// multi-scale concavity, how steeply the mean of the four axial neighbors
+/// at each [`AO_RADII`] radius rises above the node. Hollows and valley
+/// floors read positive; ridges and flats read zero. [`COARSE_MARGIN`]
+/// keeps every tap on real samples.
+fn valley_occlusion(hc: &[f32]) -> Vec<f32> {
+    let n = COARSE_CELLS + 1;
+    let mut out = vec![0f32; n * n];
+    for j in 0..n {
+        for i in 0..n {
+            let (gi, gj) = (i + COARSE_MARGIN, j + COARSE_MARGIN);
+            let e = hc[gj * COARSE_GRID + gi];
+            let mut occl = 0.0f32;
+            for &r in &AO_RADII {
+                let mean = 0.25
+                    * (hc[gj * COARSE_GRID + gi - r]
+                        + hc[gj * COARSE_GRID + gi + r]
+                        + hc[(gj - r) * COARSE_GRID + gi]
+                        + hc[(gj + r) * COARSE_GRID + gi]);
+                occl += ((mean - e) / (r as f32 * COARSE_SPACING as f32)).max(0.0);
+            }
+            out[j * n + i] = occl / AO_RADII.len() as f32;
+        }
+    }
+    out
+}
+
+/// The baked-AO byte value for a vertex at chunk-local `(lx, ly)`: bilinear
+/// over the [`valley_occlusion`] patch, mapped through strength and cap.
+fn vertex_ao(occlusion: &[f32], lx: f64, ly: f64) -> f32 {
+    let max = COARSE_CELLS as f64;
+    let gx = (lx / COARSE_SPACING).clamp(0.0, max);
+    let gy = (ly / COARSE_SPACING).clamp(0.0, max);
+    let (x0, y0) = (gx.floor().min(max - 1.0), gy.floor().min(max - 1.0));
+    let (i0, j0) = (x0 as usize, y0 as usize);
+    let (tx, ty) = ((gx - x0) as f32, (gy - y0) as f32);
+    let n = COARSE_CELLS + 1;
+    let v00 = occlusion[j0 * n + i0];
+    let v10 = occlusion[j0 * n + i0 + 1];
+    let v01 = occlusion[(j0 + 1) * n + i0];
+    let v11 = occlusion[(j0 + 1) * n + i0 + 1];
+    let top = v00 + (v10 - v00) * tx;
+    let bottom = v01 + (v11 - v01) * tx;
+    let occl = top + (bottom - top) * ty;
+    1.0 - (AO_STRENGTH * occl).min(AO_MAX)
+}
+
+/// The GLSL/WGSL `smoothstep`, for the baked shadow's soft threshold.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// A `[0, 1]` light factor to its `Unorm8` vertex byte (round to nearest).
+fn quantize_light(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+/// How much steeper the shading normals lean than the true surface. The
+/// plan §6.3 formula (`z = 2 · spacing · 2`) halved apparent slopes — the
+/// stray `· 2` read as terrain with no relief at all; `1.0` here is the
+/// mathematically true central-difference normal, and values above it
+/// deliberately exaggerate slope shading so this world's gentle fBm hills
+/// stay readable under the fixed sun. Presentation-only.
+const NORMAL_EXAGGERATION: f32 = 1.5;
+
+/// Central-difference normal (plan §6.3, with [`NORMAL_EXAGGERATION`]):
+/// `normalize((west − east, south − north, 2 · spacing / exaggeration))`.
+/// Presentation-only float math; a flat heightfield yields exactly
+/// `(0, 0, 1)`.
 fn vertex_normal(west: f32, east: f32, south: f32, north: f32) -> [f32; 3] {
-    let (nx, ny, nz) = (west - east, south - north, 2.0 * SPACING as f32 * 2.0);
+    let (nx, ny) = (west - east, south - north);
+    let nz = 2.0 * SPACING as f32 / NORMAL_EXAGGERATION;
     let len = (nx * nx + ny * ny + nz * nz).sqrt();
     [nx / len, ny / len, nz / len]
 }
@@ -616,6 +917,7 @@ impl PovChunkManager {
             uploads.push(TerrainChunkUpload {
                 handle,
                 origin: [ox, oy],
+                detail_base: detail_base(result.coord),
                 vertices: result.mesh.vertices,
             });
         }
@@ -1086,6 +1388,7 @@ mod tests {
                 assert_eq!(top.position[1], bottom.position[1]);
                 assert_eq!(top.color, bottom.color);
                 assert_eq!(top.normal, bottom.normal);
+                assert_eq!(top.light, bottom.light);
                 assert_eq!(
                     top.position[2] - bottom.position[2],
                     POV_SKIRT_DROP,
@@ -1126,6 +1429,90 @@ mod tests {
             let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             assert!((len - 1.0).abs() < 1e-5, "vertex {i} normal length {len}");
         }
+    }
+
+    #[test]
+    fn baked_ao_is_full_on_flats_and_ridges_and_dims_hollows() {
+        // Flat coarse lattice: zero concavity, full ambient everywhere.
+        let flat = vec![100.0f32; COARSE_GRID * COARSE_GRID];
+        let occl = valley_occlusion(&flat);
+        assert!(occl.iter().all(|&o| o == 0.0));
+        assert_eq!(vertex_ao(&occl, 128.0, 128.0), 1.0);
+        // A ridge node (above its neighbors) is convex: still full.
+        let center = COARSE_GRID / 2;
+        let mut ridge = flat.clone();
+        ridge[center * COARSE_GRID + center] = 200.0;
+        let node = (COARSE_CELLS / 2, COARSE_CELLS / 2);
+        let occl = valley_occlusion(&ridge);
+        assert_eq!(occl[node.1 * (COARSE_CELLS + 1) + node.0], 0.0);
+        // A deep hollow loses fill, floored at AO_MAX; a shallow one dims
+        // gently. The hollow node sits at the region-center vertex.
+        let mut hollow = flat.clone();
+        hollow[center * COARSE_GRID + center] = -300.0;
+        let deep = vertex_ao(&valley_occlusion(&hollow), 128.0, 128.0);
+        assert!((deep - (1.0 - AO_MAX)).abs() < 1e-6, "deep hollow at cap");
+        let mut dip = flat;
+        dip[center * COARSE_GRID + center] = 96.0;
+        let shallow = vertex_ao(&valley_occlusion(&dip), 128.0, 128.0);
+        assert!(shallow < 1.0 && shallow > deep, "shallow dip dims gently");
+    }
+
+    #[test]
+    fn detail_bases_are_lattice_continuous_across_regions() {
+        // Neighboring regions must anchor the same world lattice: stepping
+        // one region east advances octave k's x base by exactly
+        // REGION_SIZE / wavelength cells (2, 4, 8), and the shared
+        // fractional offset stays in [0, 1).
+        let a = detail_base(RegionCoord::new(10, -3));
+        let b = detail_base(RegionCoord::new(11, -3));
+        let c = detail_base(RegionCoord::new(10, -2));
+        for (k, cells) in [(0usize, 2i64), (1, 4), (2, 8)] {
+            let x = |s: &[u32; 4]| (u64::from(s[1]) << 32 | u64::from(s[0])) as i64;
+            let y = |s: &[u32; 4]| (u64::from(s[3]) << 32 | u64::from(s[2])) as i64;
+            assert_eq!(x(&b[k]) - x(&a[k]), cells, "octave {k} x step");
+            assert_eq!(y(&c[k]) - y(&a[k]), cells, "octave {k} y step");
+        }
+        for octave in detail_octaves() {
+            assert!((0.0..1.0).contains(&octave[0]));
+            assert!((0.0..1.0).contains(&octave[1]));
+            assert!(octave[2] > 0.0 && octave[3] > 0.0);
+        }
+        // The spectrum continuation: halving wavelength keeps slope equal.
+        let d = detail_octaves();
+        assert!((d[0][3] - d[1][3]).abs() < 1e-6);
+        assert!((d[0][2] * 2.0 - d[1][2]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn baked_light_quantization_and_smoothstep_are_sane() {
+        assert_eq!(quantize_light(0.0), 0);
+        assert_eq!(quantize_light(1.0), 255);
+        assert_eq!(quantize_light(-0.5), 0, "clamped below");
+        assert_eq!(quantize_light(2.0), 255, "clamped above");
+        assert_eq!(smoothstep(0.0, 1.0, -1.0), 0.0);
+        assert_eq!(smoothstep(0.0, 1.0, 2.0), 1.0);
+        assert_eq!(smoothstep(0.0, 1.0, 0.5), 0.5);
+    }
+
+    #[test]
+    fn open_terrain_bakes_mostly_lit_vertices() {
+        // Rolling settled terrain under the 45° sun: most vertices see the
+        // sun, every light byte pair is populated, and none exceeds full.
+        let map = settled_map();
+        let snap = Snapshot::of(&map, RegionCoord::new(0, 0));
+        let mesh = mesh_region_chunk(&snap.inputs());
+        let lit = mesh.vertices[..CORE_VERTS]
+            .iter()
+            .filter(|v| v.light[0] == 255)
+            .count();
+        assert!(
+            lit * 2 > CORE_VERTS,
+            "most open-terrain vertices are sunlit, got {lit}/{CORE_VERTS}"
+        );
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|v| v.light[2] == 0 && v.light[3] == 0));
     }
 
     #[test]
@@ -1202,6 +1589,7 @@ mod tests {
                     position: [0.0; 3],
                     normal: [0.0, 0.0, 1.0],
                     color: [0; 4],
+                    light: [255, 255, 0, 0],
                 };
                 VERTS_PER_CHUNK
             ],
