@@ -98,6 +98,9 @@ fn run() -> Result<(), String> {
                 check.counts.1,
                 check.counts.2
             );
+            if let Some(digest) = check.digest {
+                println!("digest sha256: {}", digest.to_hex());
+            }
             for finding in &check.findings {
                 eprintln!("  finding: {finding}");
             }

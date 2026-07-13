@@ -31,6 +31,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # Wire format for persisted records (phase-5-plan.md §4.1): `no_std`, compact,
 # and a stable specified encoding — pinned by golden byte fixtures regardless.
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
 glam = { version = "0.33", default-features = false, features = ["libm"] }
 bytemuck = { version = "1", features = ["derive"] }
 # Portable SIMD on stable Rust (SSE/AVX, NEON, wasm simd128 when enabled,

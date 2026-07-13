@@ -30,9 +30,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use world_core::{
     decode_record, encode_record, Anchor, AnchorSnapshot, AtlasBundle, DiscoveryRecord,
-    PossibilitySignature, PreserveRecord, RecordError, RecordKind, RegionCoord,
-    RegionSnapshotRecord, RouteNode, RouteRecord, SeenRecord, SessionSnapshot, StoreMeta,
-    POSSIBILITY_DIMS, WORLD_ALGORITHM_VERSION,
+    PossibilitySignature, PreserveRecord, RecordCanonicalError, RecordError, RecordKind,
+    RegionCoord, RegionSnapshotRecord, RouteNode, RouteRecord, SeenRecord, SessionSnapshot,
+    StoreMeta, POSSIBILITY_DIMS, WORLD_ALGORITHM_VERSION,
 };
 
 use crate::budget::Budget;
@@ -224,7 +224,7 @@ impl core::fmt::Display for VaultIssue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IssueIdentity {
     Stored(Vec<u8>),
-    Import(RecordKind, u64),
+    Import(RecordKind, u64, &'static str),
     Persistence(PersistenceOperation, Vec<u8>),
 }
 
@@ -459,28 +459,33 @@ impl<S: Storage> Vault<S> {
             Err(e) => return Err(e.into()),
         }
 
-        vault.load_namespace(b"disc/", RecordKind::Discovery, |v, r: DiscoveryRecord| {
-            if r.id != r.content_id() {
-                return Err("content id mismatch (corrupt or tampered)".into());
-            }
-            v.discoveries.insert(r.id, r);
-            Ok(())
-        })?;
-        vault.load_namespace(b"route/", RecordKind::Route, |v, r: RouteRecord| {
-            if r.id != r.content_id() {
-                return Err("content id mismatch (corrupt or tampered)".into());
-            }
+        vault.load_namespace(
+            b"disc/",
+            RecordKind::Discovery,
+            |v, key, r: DiscoveryRecord| {
+                require_record_key(key, b"disc/", r.id)?;
+                r.validate_canonical().map_err(|e| e.to_string())?;
+                v.discoveries.insert(r.id, r);
+                Ok(())
+            },
+        )?;
+        vault.load_namespace(b"route/", RecordKind::Route, |v, key, r: RouteRecord| {
+            require_record_key(key, b"route/", r.id)?;
+            r.validate_canonical().map_err(|e| e.to_string())?;
             v.routes.insert(r.id, r);
             Ok(())
         })?;
-        vault.load_namespace(b"pres/", RecordKind::Preserve, |v, r: PreserveRecord| {
-            if r.id != r.content_id() {
-                return Err("content id mismatch (corrupt or tampered)".into());
-            }
-            v.preserves.insert(r.id, r);
-            Ok(())
-        })?;
-        vault.load_namespace(b"seen/", RecordKind::Seen, |v, r: SeenRecord| {
+        vault.load_namespace(
+            b"pres/",
+            RecordKind::Preserve,
+            |v, key, r: PreserveRecord| {
+                require_record_key(key, b"pres/", r.id)?;
+                r.validate_canonical().map_err(|e| e.to_string())?;
+                v.preserves.insert(r.id, r);
+                Ok(())
+            },
+        )?;
+        vault.load_namespace(b"seen/", RecordKind::Seen, |v, _key, r: SeenRecord| {
             v.seen.insert(r.chunk, r);
             Ok(())
         })?;
@@ -507,7 +512,7 @@ impl<S: Storage> Vault<S> {
         &mut self,
         prefix: &[u8],
         kind: RecordKind,
-        mut insert: impl FnMut(&mut Self, T) -> Result<(), String>,
+        mut insert: impl FnMut(&mut Self, &[u8], T) -> Result<(), String>,
     ) -> Result<(), VaultError> {
         for key in self.store.keys_with_prefix(prefix)? {
             let bytes = match self.store.load(&key) {
@@ -518,7 +523,7 @@ impl<S: Storage> Vault<S> {
             let display_key = String::from_utf8_lossy(&key).into_owned();
             match decode_record::<T>(&bytes, kind) {
                 Ok((_, record)) => {
-                    if let Err(why) = insert(self, record) {
+                    if let Err(why) = insert(self, &key, record) {
                         self.record_issue(
                             IssueIdentity::Stored(key.clone()),
                             format!("{display_key} skipped: {why}"),
@@ -649,7 +654,11 @@ impl<S: Storage> Vault<S> {
         let id = record.id;
         match self.discoveries.entry(id) {
             std::collections::btree_map::Entry::Occupied(mut existing) => {
-                if existing.get_mut().merge_from(&record) {
+                if existing
+                    .get_mut()
+                    .merge_from(&record)
+                    .expect("same constructor output must have equal immutable body")
+                {
                     self.dirty.insert(DirtyKey::Discovery(id));
                 }
             }
@@ -674,7 +683,11 @@ impl<S: Storage> Vault<S> {
         let id = record.id;
         match self.preserves.entry(id) {
             std::collections::btree_map::Entry::Occupied(mut existing) => {
-                if existing.get_mut().merge_from(&record) {
+                if existing
+                    .get_mut()
+                    .merge_from(&record)
+                    .expect("same constructor output must have equal immutable body")
+                {
                     self.dirty.insert(DirtyKey::Preserve(id));
                 }
             }
@@ -740,7 +753,11 @@ impl<S: Storage> Vault<S> {
         let id = record.id;
         match self.routes.entry(id) {
             std::collections::btree_map::Entry::Occupied(mut existing) => {
-                if existing.get_mut().merge_from(&record) {
+                if existing
+                    .get_mut()
+                    .merge_from(&record)
+                    .expect("same constructor output must have equal immutable body")
+                {
                     self.dirty.insert(DirtyKey::Route(id));
                 }
             }
@@ -826,36 +843,51 @@ impl<S: Storage> Vault<S> {
     }
 
     /// Merge a bundle into this store (phase-5-plan.md §7.6, ADR 0014): union
-    /// by content id; a record whose stored id mismatches its recomputed fold
-    /// is rejected with a report, never partially applied. Commutative,
-    /// associative, idempotent — re-importing the same bundle changes nothing
-    /// and never double-counts usage.
+    /// by content id; records pass canonical body validation and same-id
+    /// immutable equality before any mutable fields merge. Rejected records are
+    /// reported and never partially applied.
     pub fn import(&mut self, bundle: &AtlasBundle) -> MergeStats {
         use std::collections::btree_map::Entry;
         let mut stats = MergeStats::default();
         let mut valid_result_sequence_max = self.meta.sequence;
 
         macro_rules! merge_namespace {
-            ($records:expr, $index:expr, $dirty:expr, $kind:expr) => {
+            ($records:expr, $index:expr, $dirty:expr, $kind:expr, $validate:expr) => {
                 for record in $records {
-                    if record.id != record.content_id() {
+                    if let Err(error) = $validate(record) {
                         stats.rejected += 1;
+                        let reason = import_reason(&error);
                         self.record_issue(
-                            IssueIdentity::Import($kind, record.id),
-                            format!(
-                                "import rejected {:?} {:#018x}: content id mismatch (corrupt or tampered)",
-                                $kind, record.id
-                            ),
+                            IssueIdentity::Import($kind, record.id, reason),
+                            format!("import rejected {:?} {:#018x}: {}", $kind, record.id, error),
                         );
                         continue;
                     }
                     let resulting_sequence = match $index.entry(record.id) {
                         Entry::Occupied(mut existing) => {
-                            if existing.get_mut().merge_from(record) {
-                                self.dirty.insert($dirty(record.id));
-                                stats.merged += 1;
-                            } else {
-                                stats.unchanged += 1;
+                            match existing.get_mut().merge_from(record) {
+                                Ok(true) => {
+                                    self.dirty.insert($dirty(record.id));
+                                    stats.merged += 1;
+                                }
+                                Ok(false) => {
+                                    stats.unchanged += 1;
+                                }
+                                Err(error) => {
+                                    stats.rejected += 1;
+                                    self.record_issue(
+                                        IssueIdentity::Import(
+                                            $kind,
+                                            record.id,
+                                            "immutable-conflict",
+                                        ),
+                                        format!(
+                                            "import rejected {:?} {:#018x}: {}",
+                                            $kind, record.id, error
+                                        ),
+                                    );
+                                    continue;
+                                }
                             }
                             existing.get().sequence
                         }
@@ -867,8 +899,7 @@ impl<S: Storage> Vault<S> {
                             sequence
                         }
                     };
-                    valid_result_sequence_max =
-                        valid_result_sequence_max.max(resulting_sequence);
+                    valid_result_sequence_max = valid_result_sequence_max.max(resulting_sequence);
                 }
             };
         }
@@ -877,19 +908,22 @@ impl<S: Storage> Vault<S> {
             &bundle.discoveries,
             self.discoveries,
             DirtyKey::Discovery,
-            RecordKind::Discovery
+            RecordKind::Discovery,
+            DiscoveryRecord::validate_canonical
         );
         merge_namespace!(
             &bundle.routes,
             self.routes,
             DirtyKey::Route,
-            RecordKind::Route
+            RecordKind::Route,
+            RouteRecord::validate_canonical
         );
         merge_namespace!(
             &bundle.preserves,
             self.preserves,
             DirtyKey::Preserve,
-            RecordKind::Preserve
+            RecordKind::Preserve,
+            PreserveRecord::validate_canonical
         );
         if valid_result_sequence_max > self.meta.sequence {
             self.meta.sequence = valid_result_sequence_max;
@@ -997,6 +1031,31 @@ impl<S: Storage> Vault<S> {
 pub fn apply_session_regions(map: &mut RegionMap, snap: &SessionSnapshot) {
     for region in &snap.regions {
         map.restore_region(region);
+    }
+}
+
+fn import_reason(error: &RecordCanonicalError) -> &'static str {
+    match error {
+        RecordCanonicalError::ContentIdMismatch { .. } => "content-id-mismatch",
+        RecordCanonicalError::RouteDiscoveryRefs { .. } => "route-discovery-refs",
+        RecordCanonicalError::PreserveRegions { .. } => "preserve-regions",
+    }
+}
+
+fn require_record_key(key: &[u8], prefix: &[u8], id: u64) -> Result<(), String> {
+    let expected = match prefix {
+        b"disc/" => discovery_key(id),
+        b"route/" => route_key(id),
+        b"pres/" => preserve_key(id),
+        _ => return Ok(()),
+    };
+    if key == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "storage key {} does not match decoded id {id:#018x}",
+            String::from_utf8_lossy(key)
+        ))
     }
 }
 
@@ -1315,6 +1374,64 @@ mod tests {
         assert_eq!(stats.added, 0);
         assert!(b.discoveries().is_empty());
         assert_eq!(b.issue_count(), 1);
+    }
+
+    #[test]
+    fn import_collapses_duplicate_equal_body_records() {
+        let mut source = Vault::open(MemoryStorage::new()).unwrap();
+        let id = source
+            .record_discovery(&anchor_at(0.0), 1, "first".into())
+            .unwrap();
+        let mut duplicate = source.export().discoveries[0].clone();
+        duplicate.sequence += 1;
+        duplicate.name = "second".into();
+        let bundle = AtlasBundle {
+            discoveries: vec![source.export().discoveries[0].clone(), duplicate],
+            ..AtlasBundle::default()
+        }
+        .canonicalized()
+        .unwrap();
+
+        let mut target = Vault::open(MemoryStorage::new()).unwrap();
+        let stats = target.import(&bundle);
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.rejected, 0);
+        assert_eq!(target.discoveries()[&id].name, "second");
+        let before = target.export();
+        let again = target.import(&bundle);
+        assert_eq!(again.unchanged, 1);
+        assert_eq!(target.export(), before);
+    }
+
+    #[test]
+    fn open_rejects_noncanonical_preserve_regions() {
+        let coord = RegionCoord::new(0, 0);
+        let sig = PossibilitySignature::of(world_core::PossibilityVector::neutral());
+        let mut record = PreserveRecord {
+            id: 0,
+            regions: vec![(coord, sig), (coord, sig)],
+            sequence: 7,
+            name: "legacy-duplicate".into(),
+            journal: String::new(),
+        };
+        record.id = record.content_id();
+        let mut store = MemoryStorage::new();
+        store
+            .store(
+                &preserve_key(record.id),
+                &encode_record(RecordKind::Preserve, &record),
+            )
+            .unwrap();
+
+        let vault = Vault::open(store).unwrap();
+        assert!(vault.preserves().is_empty());
+        assert_eq!(vault.issue_count(), 1);
+        assert!(vault
+            .issues()
+            .next()
+            .unwrap()
+            .message()
+            .contains("appears more than once"));
     }
 
     #[test]

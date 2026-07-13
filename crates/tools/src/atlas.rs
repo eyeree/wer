@@ -5,8 +5,9 @@
 //! No server anywhere: merge needs no coordinator (ADR 0014).
 
 use world_core::{
-    decode_record, encode_record, AtlasBundle, Envelope, PossibilitySignature, PreserveRecord,
-    RecordError, RecordKind, RegionCoord, RECORD_FORMAT_VERSION, WORLD_ALGORITHM_VERSION,
+    decode_record, encode_record, AtlasBundle, AtlasDigest, Envelope, PossibilitySignature,
+    PreserveRecord, RecordError, RecordKind, RegionCoord, RECORD_FORMAT_VERSION,
+    WORLD_ALGORITHM_VERSION,
 };
 use world_runtime::{MergeStats, Storage, Vault, VaultFlushError, VaultStats};
 
@@ -35,7 +36,9 @@ pub fn import_bundle_into<S: Storage>(
 /// Encode a bundle for the wire/file (canonical form: records sorted by id).
 #[must_use]
 pub fn encode_bundle(mut bundle: AtlasBundle) -> Vec<u8> {
-    bundle.canonicalize();
+    bundle
+        .canonicalize_checked()
+        .expect("bundle export must be canonicalizable");
     encode_record(RecordKind::Bundle, &bundle)
 }
 
@@ -51,6 +54,8 @@ pub struct BundleCheck {
     pub envelope: Envelope,
     /// Record counts: discoveries, routes, preserves.
     pub counts: (usize, usize, usize),
+    /// SHA-256 over the canonical encoded bundle content, when canonicalizable.
+    pub digest: Option<AtlasDigest>,
     /// Problems found. Empty means the bundle is valid and self-consistent.
     pub findings: Vec<String>,
 }
@@ -86,42 +91,51 @@ pub fn check_bundle(bytes: &[u8]) -> Result<BundleCheck, RecordError> {
     }
 
     for r in &bundle.discoveries {
-        if r.id != r.content_id() {
-            findings.push(format!(
-                "discovery {:#018x}: content id mismatch (corrupt or tampered)",
-                r.id
-            ));
+        if let Err(error) = r.validate_canonical() {
+            findings.push(error.to_string());
         }
     }
     for r in &bundle.routes {
-        if r.id != r.content_id() {
-            findings.push(format!(
-                "route {:#018x}: content id mismatch (corrupt or tampered)",
-                r.id
-            ));
+        if let Err(error) = r.validate_canonical() {
+            findings.push(error.to_string());
         }
         if r.nodes.is_empty() {
             findings.push(format!("route {:#018x}: empty node path", r.id));
         }
     }
     for r in &bundle.preserves {
-        if r.id != r.content_id() {
-            findings.push(format!(
-                "preserve {:#018x}: content id mismatch (corrupt or tampered)",
-                r.id
-            ));
+        if let Err(error) = r.validate_canonical() {
+            findings.push(error.to_string());
         }
         if r.regions.is_empty() {
             findings.push(format!("preserve {:#018x}: empty region set", r.id));
         }
     }
 
-    // Merge self-test (idempotence): a canonical bundle merged into itself is
-    // itself. Cheap, and catches a broken canonical form immediately.
-    let mut canonical = bundle.clone();
-    canonical.canonicalize();
-    if canonical != bundle {
-        findings.push("bundle is not in canonical (id-sorted) form".into());
+    flag_duplicate_ids(
+        "discovery",
+        bundle.discoveries.iter().map(|r| r.id),
+        &mut findings,
+    );
+    flag_duplicate_ids("route", bundle.routes.iter().map(|r| r.id), &mut findings);
+    flag_duplicate_ids(
+        "preserve",
+        bundle.preserves.iter().map(|r| r.id),
+        &mut findings,
+    );
+
+    let digest = match bundle.digest() {
+        Ok(digest) => Some(digest),
+        Err(error) => {
+            findings.push(format!("bundle canonicalization failed: {error}"));
+            None
+        }
+    };
+
+    if let Ok(canonical) = bundle.clone().canonicalized() {
+        if canonical != bundle {
+            findings.push("bundle is not in canonical set form".into());
+        }
     }
 
     Ok(BundleCheck {
@@ -131,8 +145,21 @@ pub fn check_bundle(bytes: &[u8]) -> Result<BundleCheck, RecordError> {
             bundle.routes.len(),
             bundle.preserves.len(),
         ),
+        digest,
         findings,
     })
+}
+
+fn flag_duplicate_ids(label: &str, ids: impl Iterator<Item = u64>, findings: &mut Vec<String>) {
+    let mut ids: Vec<u64> = ids.collect();
+    ids.sort_unstable();
+    ids.dedup_by(|a, b| {
+        let duplicate = a == b;
+        if duplicate {
+            findings.push(format!("{label} {:#018x}: duplicate record id", *a));
+        }
+        duplicate
+    });
 }
 
 /// Everything `wer-inspect --vault` reports for one position (phase-5-plan.md
@@ -158,10 +185,8 @@ pub struct VaultPositionReport {
     pub suppressed_issues: u64,
 }
 
-/// Select the lowest-id covering record and the last signature that record
-/// supplies for the coordinate. The latter mirrors ordered batch insertion in
-/// `RegionMap` when a legacy/non-canonical record repeats a coordinate; finding
-/// 25 remains responsible for defining and enforcing a duplicate policy.
+/// Select the lowest-id covering record. Preserve records are coordinate-keyed
+/// sets after A.10, so there is at most one signature per coordinate.
 fn effective_covering_preserve(
     preserves: &std::collections::BTreeMap<u64, PreserveRecord>,
     region: RegionCoord,
@@ -170,7 +195,6 @@ fn effective_covering_preserve(
         preserve
             .regions
             .iter()
-            .rev()
             .find(|(coord, _)| *coord == region)
             .map(|&(_, signature)| (id, preserve.name.clone(), signature))
     })
@@ -266,8 +290,8 @@ pub fn inspect_routes(store_dir: &str, x: f64, y: f64) -> Result<RouteQueryRepor
 mod tests {
     use super::*;
     use world_core::{
-        bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, DiscoveryRecord,
-        PossibilityDomain, PossibilityVector,
+        bound_target, domain_mask, encode_record, Anchor, AnchorKind, AnchorSource,
+        DiscoveryRecord, PossibilityDomain, PossibilityVector,
     };
     use world_runtime::{MemoryStorage, StorageError};
 
@@ -298,32 +322,63 @@ mod tests {
         let check = check_bundle(&bytes).unwrap();
         assert!(check.passed(), "{:?}", check.findings);
         assert_eq!(check.counts, (1, 0, 0));
+        assert!(check.digest.is_some());
     }
 
     #[test]
     fn check_flags_tampering() {
         let mut bundle = bundle_with_one_discovery();
         bundle.discoveries[0].strength_q ^= 1;
-        let bytes = encode_bundle(bundle);
+        let bytes = encode_record(RecordKind::Bundle, &bundle);
         let check = check_bundle(&bytes).unwrap();
         assert!(!check.passed());
     }
 
     #[test]
-    fn covering_preserve_uses_the_winning_records_last_duplicate_signature() {
+    fn covering_preserve_uses_the_winning_record_signature() {
         let coord = RegionCoord::new(0, 0);
-        let first = PossibilitySignature::of(PossibilityVector::neutral());
-        let mut last = first;
-        last.buckets[PossibilityDomain::Aesthetics.index()] = 4000;
-        let mut record = PreserveRecord::new(Vec::new(), 1, "duplicate".into());
-        record.regions = vec![(coord, first), (coord, last)];
-        record.id = record.content_id();
+        let signature = PossibilitySignature::of(PossibilityVector::neutral());
+        let record = PreserveRecord::new(vec![(coord, signature)], 1, "preserve".into());
         let id = record.id;
         let preserves = std::collections::BTreeMap::from([(id, record)]);
 
         assert_eq!(
             effective_covering_preserve(&preserves, coord),
-            Some((id, "duplicate".into(), last))
+            Some((id, "preserve".into(), signature))
+        );
+    }
+
+    #[test]
+    fn check_flags_canonical_set_violations() {
+        let mut bundle = bundle_with_one_discovery();
+        bundle.discoveries.push(bundle.discoveries[0].clone());
+        let bytes = encode_record(RecordKind::Bundle, &bundle);
+        let check = check_bundle(&bytes).unwrap();
+
+        assert!(check
+            .findings
+            .iter()
+            .any(|finding| finding.contains("duplicate record id")));
+        assert!(check
+            .findings
+            .iter()
+            .any(|finding| finding.contains("canonical set form")));
+    }
+
+    #[test]
+    fn digest_is_stable_across_canonical_order() {
+        let mut first = bundle_with_one_discovery();
+        let mut second = first.clone();
+        second.discoveries.reverse();
+
+        assert_eq!(
+            first.digest().unwrap().to_hex(),
+            second.digest().unwrap().to_hex()
+        );
+        first.discoveries[0].name = "changed".into();
+        assert_ne!(
+            first.digest().unwrap().to_hex(),
+            second.digest().unwrap().to_hex()
         );
     }
 

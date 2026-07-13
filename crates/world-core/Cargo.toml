@@ -19,6 +19,7 @@ wide = { workspace = true }
 # the wasm CI job enforces that they stay so.
 serde = { workspace = true }
 postcard = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

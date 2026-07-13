@@ -2093,11 +2093,16 @@ into one implementation unit.
    aggregate/habitat provenance and the explicit succession epoch are the
    identity-grade inputs.
 
-10. **Harden content equality and canonical set encoding** (findings 24 and
-    25). Compare immutable bodies when ids match, reject or deterministically
-    handle duplicates, and move public/untrusted exchange to a wider
-    cryptographic digest. Define tombstone and multi-replica counter semantics
-    before calling deletion and usage fully CRDT-compatible.
+10. **Completed: Harden content equality and canonical set encoding**
+    ([Improvement A.10](plans/prototype/improvement_A_10_content_equality_canonical_sets.md);
+    findings 24 and 25). Same-id discovery, route, and preserve records now
+    compare typed immutable bodies before mutable fields merge. Atlas bundles
+    are keyed sets by record id, equal-body duplicates collapse by the normal
+    merge law, conflicts are rejected, and `wer-atlas check` reports a
+    SHA-256 digest over canonical bundle bytes. Preserve coordinates are
+    coordinate-keyed sets, and route discovery refs are sorted unique ids.
+    Tombstones and per-replica route-usage counters remain separate future
+    work before deletion and usage can be called fully CRDT-compatible.
 
 11. **Make executor failure and shutdown bounded** (finding 30). Stop or clear
     queued work during shutdown, convert worker panics into structured failed
@@ -2643,25 +2648,42 @@ A bounded top-$k$ heap is an immediate improvement. Larger stores need a
 physical spatial index for corridors and a metric tree or quantized spatial
 index for eight-dimensional possibility signatures.
 
-#### 24. A 64-bit content fold is not proof of immutable equality
+#### 24. Resolved: A 64-bit content fold is not proof of immutable equality
 
-Merge logic assumes equal ids imply equal immutable fields "by construction."
-A 64-bit hash collision is unlikely but possible, and the mixer is not intended
-to authenticate untrusted internet bundles. On an id collision, merge does not
-compare immutable bodies.
+Previously, merge logic assumed equal ids implied equal immutable fields "by
+construction." A 64-bit hash collision is unlikely but possible, and the mixer
+is not intended to authenticate untrusted internet bundles. On an id collision,
+merge did not compare immutable bodies.
 
-Before public sharing, use a wider cryptographic digest, compare immutable
-content on equal ids, and optionally sign authored records. Also note that
-deletion is not a CRDT operation without tombstones, while `usage = max` loses
-independent traversal increments that a per-replica grow-only counter could
-retain.
+**Resolution (Improvement A.10):** Discovery, route, and preserve records now
+have typed immutable-body predicates, and checked merge returns a structured
+error on id mismatch or same-id immutable conflict before any mutable metadata
+is applied. Vault open/import and atlas canonicalization validate `id ==
+content_id`, canonical inner sets, and immutable equality before accepting or
+merging records. Public atlas tooling reports a SHA-256 digest over canonical
+encoded bundle content; it is a collision/tamper check for a digest obtained
+through a trusted channel, not an author signature. Authored signatures remain
+future work. Deletion is still not a CRDT operation without tombstones, and
+`usage = max` still loses independent traversal increments that a per-replica
+grow-only counter could retain.
 
-#### 25. Canonical "sets" preserve duplicate multiplicity
+#### 25. Resolved: Canonical "sets" preserve duplicate multiplicity
 
-Atlas canonicalization sorts but does not deduplicate record ids, and preserve
-construction sorts but does not deduplicate repeated region coordinates. Byte
-encoding and preserve identity can therefore depend on duplicates despite set
-language. Validate uniqueness and define an explicit duplicate policy.
+Previously, atlas canonicalization sorted but did not deduplicate record ids,
+and preserve construction sorted but did not deduplicate repeated region
+coordinates. Byte encoding and preserve identity could therefore depend on
+duplicates despite set language.
+
+**Resolution (Improvement A.10):** Bundle record vectors are canonical keyed
+sets by id. Equal-id records with equal immutable bodies collapse by the normal
+mutable merge law; equal-id records with unequal immutable bodies are rejected
+as collisions/tamper. Preserve region membership is a true coordinate-keyed set:
+exact duplicate coordinate/signature pairs collapse at construction, and
+duplicate coordinates with different signatures are invalid. Route discovery
+references are sorted and deduplicated by discovery id, documenting them as an
+ordered set rather than multiplicity-bearing journal entries. `wer-atlas check`
+reports duplicate ids, non-canonical route refs, duplicate preserve
+coordinates, empty public routes/preserves, and canonicalization failures.
 
 #### 26. Resolved: Overlapping preserves lacked ownership and conflict semantics
 
@@ -2697,8 +2719,8 @@ atomic batches and session restore, the native effective-owner deletion seam,
 end-to-end overlap and evicted-deletion tests, and the `wer-vault` sign-off
 scenario exercise these contracts. Separate UI calls remain distinct material
 history; only canonical synchronization batches reconcile once. Duplicate-
-coordinate canonicalization (finding 25) remains open; durable local delete
-failure handling is resolved by Improvement A.3 and finding 28.
+coordinate canonicalization is resolved by Improvement A.10; durable local
+delete failure handling is resolved by Improvement A.3 and finding 28.
 
 #### 27. Vault loading is eager and its interface is not browser-shaped
 
@@ -2745,9 +2767,8 @@ containing directory; durable ancestor creation and remove/not-found retries
 use directory barriers as well. Neutral scripted-storage tests, staged native
 file-operation tests, caller regressions, and the expanded `wer-vault` scenario
 exercise the ordering, bounded-reporting, retry, deletion, and sequence
-contracts. This does not add CRDT tombstones or resolve findings 24/25, and the
-synchronous eager interface/browser backend limitation in finding 27 remains
-open.
+contracts. This does not add CRDT tombstones or resolve the synchronous eager
+interface/browser backend limitation in finding 27.
 
 #### 29. Session exactness has narrower preconditions than its headline
 

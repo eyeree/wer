@@ -29,6 +29,7 @@
 //! bump [`RECORD_FORMAT_VERSION`] with a migration (phase-5-plan.md §9.4).
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::anchor::{Anchor, AnchorKind, AnchorSource};
 use crate::coord::RegionCoord;
@@ -49,6 +50,165 @@ const ROUTE_ID_BASIS: u64 = 0x2073_E4D1_8B5F_60C9;
 const PRESERVE_ID_BASIS: u64 = 0x94E5_1D3B_C82A_7F04;
 /// Fixed basis for the mutable-field merge tiebreak fold (§7.6).
 const MUTABLE_RANK_BASIS: u64 = 0x3A9C_60B7_E512_D8F4;
+
+/// A checked merge refused to combine two records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordMergeError {
+    /// The records do not address the same candidate id.
+    IdMismatch {
+        /// Existing/local id.
+        left: u64,
+        /// Incoming/remote id.
+        right: u64,
+    },
+    /// The ids match, but the immutable bodies do not.
+    ImmutableConflict {
+        /// The colliding id.
+        id: u64,
+    },
+}
+
+impl core::fmt::Display for RecordMergeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::IdMismatch { left, right } => {
+                write!(f, "record id mismatch: {left:#018x} != {right:#018x}")
+            }
+            Self::ImmutableConflict { id } => {
+                write!(f, "same-id immutable content conflict for {id:#018x}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for RecordMergeError {}
+
+/// Preserve region set canonicalization failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreserveRegionError {
+    /// One coordinate appears more than once with the same signature.
+    DuplicateRegion {
+        /// The duplicate coordinate.
+        coord: RegionCoord,
+    },
+    /// Entries are not in canonical coordinate order.
+    NonCanonicalOrder,
+    /// One coordinate was supplied with more than one signature.
+    ConflictingDuplicateRegion {
+        /// The duplicate coordinate.
+        coord: RegionCoord,
+    },
+}
+
+impl core::fmt::Display for PreserveRegionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DuplicateRegion { coord } => {
+                write!(f, "preserve region {:?} appears more than once", coord)
+            }
+            Self::NonCanonicalOrder => {
+                f.write_str("preserve regions are not in canonical coordinate order")
+            }
+            Self::ConflictingDuplicateRegion { coord } => write!(
+                f,
+                "preserve region {:?} appears with conflicting signatures",
+                coord
+            ),
+        }
+    }
+}
+
+impl core::error::Error for PreserveRegionError {}
+
+/// A shareable record body is not in canonical set form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordCanonicalError {
+    /// Stored id does not equal the recomputed content id.
+    ContentIdMismatch {
+        /// The record kind.
+        kind: RecordKind,
+        /// Stored id.
+        id: u64,
+    },
+    /// Route discovery refs are not sorted and unique.
+    RouteDiscoveryRefs {
+        /// Route id.
+        id: u64,
+    },
+    /// Preserve regions are not sorted and unique.
+    PreserveRegions {
+        /// Preserve id.
+        id: u64,
+        /// Detail.
+        source: PreserveRegionError,
+    },
+}
+
+impl core::fmt::Display for RecordCanonicalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ContentIdMismatch { kind, id } => {
+                write!(f, "{kind:?} {id:#018x}: content id mismatch")
+            }
+            Self::RouteDiscoveryRefs { id } => {
+                write!(f, "route {id:#018x}: discovery refs are not sorted unique")
+            }
+            Self::PreserveRegions { id, source } => {
+                write!(f, "preserve {id:#018x}: {source}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for RecordCanonicalError {}
+
+/// Bundle set canonicalization failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleCanonicalError {
+    /// A record body is malformed or non-canonical.
+    Record(RecordCanonicalError),
+    /// Duplicate ids could not be collapsed because immutable bodies differ.
+    Merge {
+        /// The record kind.
+        kind: RecordKind,
+        /// Merge error.
+        source: RecordMergeError,
+    },
+}
+
+impl core::fmt::Display for BundleCanonicalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Record(e) => e.fmt(f),
+            Self::Merge { kind, source } => write!(f, "{kind:?}: {source}"),
+        }
+    }
+}
+
+impl core::error::Error for BundleCanonicalError {}
+
+impl From<RecordCanonicalError> for BundleCanonicalError {
+    fn from(value: RecordCanonicalError) -> Self {
+        Self::Record(value)
+    }
+}
+
+/// SHA-256 digest of canonical public atlas content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AtlasDigest(pub [u8; 32]);
+
+impl AtlasDigest {
+    /// Lowercase hexadecimal encoding.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in self.0 {
+            use core::fmt::Write as _;
+            write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        out
+    }
+}
 
 /// What kind of value an [`Envelope`] wraps. The discriminant order is part of
 /// the record format contract.
@@ -380,21 +540,54 @@ impl DiscoveryRecord {
         h
     }
 
+    /// Whether the immutable body fields that define [`Self::content_id`] are
+    /// equal. Mutable presentation fields are deliberately excluded.
+    #[must_use]
+    pub fn immutable_eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.signature_seed == other.signature_seed
+            && self.target == other.target
+            && self.mask == other.mask
+            && self.kind == other.kind
+            && self.strength_q == other.strength_q
+            && self.falloff_q == other.falloff_q
+            && self.pos_q == other.pos_q
+    }
+
+    /// Validate that the stored id is honest.
+    pub fn validate_canonical(&self) -> Result<(), RecordCanonicalError> {
+        if self.id != self.content_id() {
+            return Err(RecordCanonicalError::ContentIdMismatch {
+                kind: RecordKind::Discovery,
+                id: self.id,
+            });
+        }
+        Ok(())
+    }
+
     /// Merge another store's copy of the same record (ADR 0014): immutable
-    /// fields are equal by construction (same id ⇒ same fold inputs); the
-    /// mutable fields resolve by [`mutable_rank`]. Returns whether `self`
-    /// changed. Commutative, associative, idempotent — machine-checked.
-    pub fn merge_from(&mut self, other: &Self) -> bool {
-        debug_assert_eq!(self.id, other.id, "merge_from requires matching ids");
+    /// fields must compare equal before mutable fields resolve by
+    /// [`mutable_rank`]. Returns whether `self` changed. Commutative,
+    /// associative, idempotent for equal immutable bodies — machine-checked.
+    pub fn merge_from(&mut self, other: &Self) -> Result<bool, RecordMergeError> {
+        if self.id != other.id {
+            return Err(RecordMergeError::IdMismatch {
+                left: self.id,
+                right: other.id,
+            });
+        }
+        if !self.immutable_eq(other) {
+            return Err(RecordMergeError::ImmutableConflict { id: self.id });
+        }
         if mutable_rank(other.sequence, &other.name, &other.journal)
             > mutable_rank(self.sequence, &self.name, &self.journal)
         {
             self.sequence = other.sequence;
             self.name.clone_from(&other.name);
             self.journal.clone_from(&other.journal);
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -455,7 +648,13 @@ pub struct RouteRecord {
 impl RouteRecord {
     /// Close a recorded path into a record.
     #[must_use]
-    pub fn new(nodes: Vec<RouteNode>, discoveries: Vec<u64>, sequence: u64, name: String) -> Self {
+    pub fn new(
+        nodes: Vec<RouteNode>,
+        mut discoveries: Vec<u64>,
+        sequence: u64,
+        name: String,
+    ) -> Self {
+        canonicalize_discovery_refs(&mut discoveries);
         let mut record = Self {
             id: 0,
             nodes,
@@ -485,10 +684,39 @@ impl RouteRecord {
         h
     }
 
+    /// Whether the immutable body fields that define [`Self::content_id`] are
+    /// equal.
+    #[must_use]
+    pub fn immutable_eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes && self.discoveries == other.discoveries
+    }
+
+    /// Validate that the body is canonical and its stored id is honest.
+    pub fn validate_canonical(&self) -> Result<(), RecordCanonicalError> {
+        if self.id != self.content_id() {
+            return Err(RecordCanonicalError::ContentIdMismatch {
+                kind: RecordKind::Route,
+                id: self.id,
+            });
+        }
+        if !discovery_refs_are_canonical(&self.discoveries) {
+            return Err(RecordCanonicalError::RouteDiscoveryRefs { id: self.id });
+        }
+        Ok(())
+    }
+
     /// Merge another store's copy: `usage` by `max` (idempotent), the mutable
     /// presentation fields by [`mutable_rank`]. Returns whether `self` changed.
-    pub fn merge_from(&mut self, other: &Self) -> bool {
-        debug_assert_eq!(self.id, other.id, "merge_from requires matching ids");
+    pub fn merge_from(&mut self, other: &Self) -> Result<bool, RecordMergeError> {
+        if self.id != other.id {
+            return Err(RecordMergeError::IdMismatch {
+                left: self.id,
+                right: other.id,
+            });
+        }
+        if !self.immutable_eq(other) {
+            return Err(RecordMergeError::ImmutableConflict { id: self.id });
+        }
         let mut changed = false;
         if other.usage > self.usage {
             self.usage = other.usage;
@@ -502,7 +730,7 @@ impl RouteRecord {
             self.journal.clone_from(&other.journal);
             changed = true;
         }
-        changed
+        Ok(changed)
     }
 }
 
@@ -529,13 +757,12 @@ impl PreserveRecord {
     /// Snapshot a set of regions' possibility states into a preserve. The
     /// entries are sorted into deterministic coordinate order so the content id
     /// is a function of the *set*.
-    #[must_use]
-    pub fn new(
+    pub fn try_new(
         mut regions: Vec<(RegionCoord, PossibilitySignature)>,
         sequence: u64,
         name: String,
-    ) -> Self {
-        regions.sort_unstable_by_key(|(c, _)| *c);
+    ) -> Result<Self, PreserveRegionError> {
+        canonicalize_preserve_regions(&mut regions)?;
         let mut record = Self {
             id: 0,
             regions,
@@ -544,7 +771,19 @@ impl PreserveRecord {
             journal: String::new(),
         };
         record.id = record.content_id();
-        record
+        Ok(record)
+    }
+
+    /// Snapshot a trusted set of regions. Panics only if a caller supplies the
+    /// same coordinate with conflicting signatures.
+    #[must_use]
+    pub fn new(
+        regions: Vec<(RegionCoord, PossibilitySignature)>,
+        sequence: u64,
+        name: String,
+    ) -> Self {
+        Self::try_new(regions, sequence, name)
+            .expect("preserve regions must be a coordinate-keyed set")
     }
 
     /// The content id: a fold of the sorted region set in a fixed,
@@ -562,20 +801,102 @@ impl PreserveRecord {
         h
     }
 
+    /// Whether the immutable body fields that define [`Self::content_id`] are
+    /// equal.
+    #[must_use]
+    pub fn immutable_eq(&self, other: &Self) -> bool {
+        self.regions == other.regions
+    }
+
+    /// Validate that the body is canonical and its stored id is honest.
+    pub fn validate_canonical(&self) -> Result<(), RecordCanonicalError> {
+        if self.id != self.content_id() {
+            return Err(RecordCanonicalError::ContentIdMismatch {
+                kind: RecordKind::Preserve,
+                id: self.id,
+            });
+        }
+        let mut canonical = self.regions.clone();
+        canonicalize_preserve_regions(&mut canonical).map_err(|source| {
+            RecordCanonicalError::PreserveRegions {
+                id: self.id,
+                source,
+            }
+        })?;
+        if canonical != self.regions {
+            let Some(coord) = self
+                .regions
+                .windows(2)
+                .find(|pair| pair[0].0 == pair[1].0)
+                .map(|pair| pair[0].0)
+            else {
+                return Err(RecordCanonicalError::PreserveRegions {
+                    id: self.id,
+                    source: PreserveRegionError::NonCanonicalOrder,
+                });
+            };
+            return Err(RecordCanonicalError::PreserveRegions {
+                id: self.id,
+                source: PreserveRegionError::DuplicateRegion { coord },
+            });
+        }
+        Ok(())
+    }
+
     /// Merge another store's copy: mutable presentation fields by
     /// [`mutable_rank`]. Returns whether `self` changed.
-    pub fn merge_from(&mut self, other: &Self) -> bool {
-        debug_assert_eq!(self.id, other.id, "merge_from requires matching ids");
+    pub fn merge_from(&mut self, other: &Self) -> Result<bool, RecordMergeError> {
+        if self.id != other.id {
+            return Err(RecordMergeError::IdMismatch {
+                left: self.id,
+                right: other.id,
+            });
+        }
+        if !self.immutable_eq(other) {
+            return Err(RecordMergeError::ImmutableConflict { id: self.id });
+        }
         if mutable_rank(other.sequence, &other.name, &other.journal)
             > mutable_rank(self.sequence, &self.name, &self.journal)
         {
             self.sequence = other.sequence;
             self.name.clone_from(&other.name);
             self.journal.clone_from(&other.journal);
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
+}
+
+fn canonicalize_discovery_refs(discoveries: &mut Vec<u64>) {
+    discoveries.sort_unstable();
+    discoveries.dedup();
+}
+
+fn discovery_refs_are_canonical(discoveries: &[u64]) -> bool {
+    discoveries.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn canonicalize_preserve_regions(
+    regions: &mut Vec<(RegionCoord, PossibilitySignature)>,
+) -> Result<(), PreserveRegionError> {
+    regions.sort_unstable_by_key(|(coord, _)| *coord);
+    let mut write = 0;
+    for read in 0..regions.len() {
+        if write > 0 && regions[write - 1].0 == regions[read].0 {
+            if regions[write - 1].1 != regions[read].1 {
+                return Err(PreserveRegionError::ConflictingDuplicateRegion {
+                    coord: regions[read].0,
+                });
+            }
+            continue;
+        }
+        if write != read {
+            regions[write] = regions[read];
+        }
+        write += 1;
+    }
+    regions.truncate(write);
+    Ok(())
 }
 
 /// Store-level metadata — the vault's `meta/store` header. The format and
@@ -788,11 +1109,42 @@ pub struct AtlasBundle {
 }
 
 impl AtlasBundle {
-    /// Sort every record list by id (canonical form).
+    /// Sort every record list by id, collapsing equal-id records only after
+    /// checked immutable equality.
+    pub fn canonicalize_checked(&mut self) -> Result<(), BundleCanonicalError> {
+        canonicalize_records(
+            &mut self.discoveries,
+            RecordKind::Discovery,
+            DiscoveryRecord::validate_canonical,
+            DiscoveryRecord::merge_from,
+        )?;
+        canonicalize_records(
+            &mut self.routes,
+            RecordKind::Route,
+            RouteRecord::validate_canonical,
+            RouteRecord::merge_from,
+        )?;
+        canonicalize_records(
+            &mut self.preserves,
+            RecordKind::Preserve,
+            PreserveRecord::validate_canonical,
+            PreserveRecord::merge_from,
+        )?;
+        Ok(())
+    }
+
+    /// Return a checked canonical copy.
+    pub fn canonicalized(mut self) -> Result<Self, BundleCanonicalError> {
+        self.canonicalize_checked()?;
+        Ok(self)
+    }
+
+    /// Sort every record list by id (canonical form). Panics if duplicate ids
+    /// cannot be lawfully collapsed; use [`Self::canonicalize_checked`] for
+    /// untrusted bundles.
     pub fn canonicalize(&mut self) {
-        self.discoveries.sort_unstable_by_key(|r| r.id);
-        self.routes.sort_unstable_by_key(|r| r.id);
-        self.preserves.sort_unstable_by_key(|r| r.id);
+        self.canonicalize_checked()
+            .expect("atlas bundle must be canonicalizable");
     }
 
     /// Total records in the bundle.
@@ -815,6 +1167,67 @@ impl AtlasBundle {
         self.discoveries.iter().all(|r| r.id == r.content_id())
             && self.routes.iter().all(|r| r.id == r.content_id())
             && self.preserves.iter().all(|r| r.id == r.content_id())
+    }
+
+    /// SHA-256 over the canonical encoded bundle record.
+    pub fn digest(&self) -> Result<AtlasDigest, BundleCanonicalError> {
+        let canonical = self.clone().canonicalized()?;
+        let bytes = encode_record(RecordKind::Bundle, &canonical);
+        let digest = Sha256::digest(&bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        Ok(AtlasDigest(out))
+    }
+}
+
+fn canonicalize_records<T>(
+    records: &mut Vec<T>,
+    kind: RecordKind,
+    validate: fn(&T) -> Result<(), RecordCanonicalError>,
+    merge: fn(&mut T, &T) -> Result<bool, RecordMergeError>,
+) -> Result<(), BundleCanonicalError>
+where
+    T: Clone,
+    T: HasRecordId,
+{
+    for record in records.iter() {
+        validate(record)?;
+    }
+    records.sort_unstable_by_key(HasRecordId::record_id);
+    let mut out: Vec<T> = Vec::with_capacity(records.len());
+    for record in records.drain(..) {
+        if let Some(existing) = out.last_mut() {
+            if existing.record_id() == record.record_id() {
+                merge(existing, &record)
+                    .map_err(|source| BundleCanonicalError::Merge { kind, source })?;
+                continue;
+            }
+        }
+        out.push(record);
+    }
+    *records = out;
+    Ok(())
+}
+
+trait HasRecordId {
+    fn record_id(&self) -> u64;
+}
+
+impl HasRecordId for DiscoveryRecord {
+    fn record_id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl HasRecordId for RouteRecord {
+    fn record_id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl HasRecordId for PreserveRecord {
+    fn record_id(&self) -> u64 {
+        self.id
     }
 }
 
@@ -1106,13 +1519,13 @@ mod tests {
         b.name = String::from("b-name");
         // a←b and b←a converge to the same record.
         let mut ab = a.clone();
-        ab.merge_from(&b);
+        ab.merge_from(&b).unwrap();
         let mut ba = b.clone();
-        ba.merge_from(&a);
+        ba.merge_from(&a).unwrap();
         assert_eq!(ab, ba);
         // Idempotent.
         let before = ab.clone();
-        assert!(!ab.merge_from(&before.clone()));
+        assert!(!ab.merge_from(&before.clone()).unwrap());
         assert_eq!(ab, before);
         // Equal sequences resolve by the deterministic content tiebreak,
         // still commutatively.
@@ -1120,9 +1533,9 @@ mod tests {
         c.sequence = 12;
         c.name = String::from("c-name");
         let mut bc = b.clone();
-        bc.merge_from(&c);
+        bc.merge_from(&c).unwrap();
         let mut cb = c.clone();
-        cb.merge_from(&b);
+        cb.merge_from(&b).unwrap();
         assert_eq!(bc, cb);
     }
 
@@ -1140,16 +1553,44 @@ mod tests {
         a.usage = 5;
         let mut b = base.clone();
         b.usage = 3;
-        assert!(!a.clone().merge_from(&b) || a.usage == 5);
+        assert!(!a.clone().merge_from(&b).unwrap() || a.usage == 5);
         let mut merged = a.clone();
-        merged.merge_from(&b);
+        merged.merge_from(&b).unwrap();
         assert_eq!(
             merged.usage, 5,
             "max, not sum: re-import never double-counts"
         );
         let mut merged2 = b.clone();
-        merged2.merge_from(&a);
+        merged2.merge_from(&a).unwrap();
         assert_eq!(merged2.usage, 5);
+    }
+
+    #[test]
+    fn merge_rejects_same_id_immutable_conflict() {
+        let mut base = sample_discovery();
+        let before = base.clone();
+        let mut tampered = base.clone();
+        tampered.strength_q ^= 1;
+        tampered.id = base.id;
+
+        assert_eq!(
+            base.merge_from(&tampered),
+            Err(RecordMergeError::ImmutableConflict { id: before.id })
+        );
+        assert_eq!(base, before);
+    }
+
+    #[test]
+    fn merge_allows_same_immutable_body_mutable_update() {
+        let mut base = sample_discovery();
+        let mut renamed = base.clone();
+        renamed.sequence = base.sequence + 1;
+        renamed.name = "renamed".into();
+        renamed.journal = "later".into();
+
+        assert_eq!(base.merge_from(&renamed), Ok(true));
+        assert_eq!(base.name, "renamed");
+        assert_eq!(base.journal, "later");
     }
 
     #[test]
@@ -1164,6 +1605,81 @@ mod tests {
         let a = PreserveRecord::new(regions, 0, String::new());
         let b = PreserveRecord::new(reversed, 5, String::from("named"));
         assert_eq!(a.id, b.id, "entry order and mutable fields must not matter");
+    }
+
+    #[test]
+    fn preserve_constructor_deduplicates_exact_regions() {
+        let sig = PossibilitySignature::of(PossibilityVector::neutral());
+        let coord = RegionCoord::new(1, 2);
+        let one = PreserveRecord::new(vec![(coord, sig)], 0, String::new());
+        let duplicate = PreserveRecord::new(vec![(coord, sig), (coord, sig)], 0, String::new());
+
+        assert_eq!(duplicate.regions, one.regions);
+        assert_eq!(duplicate.id, one.id);
+    }
+
+    #[test]
+    fn preserve_constructor_rejects_conflicting_duplicate_region() {
+        let coord = RegionCoord::new(1, 2);
+        let first = PossibilitySignature::of(PossibilityVector::neutral());
+        let mut second = first;
+        second.buckets[PossibilityDomain::Ecology.index()] ^= 1;
+
+        assert_eq!(
+            PreserveRecord::try_new(vec![(coord, first), (coord, second)], 0, String::new()),
+            Err(PreserveRegionError::ConflictingDuplicateRegion { coord })
+        );
+    }
+
+    #[test]
+    fn route_discovery_refs_are_canonical() {
+        let node = RouteNode {
+            pos_q: (0, 0),
+            signature: PossibilitySignature::of(PossibilityVector::neutral()),
+            cost_q: 10,
+            stability_q: 0,
+            anchor_sig: 0,
+        };
+        let route = RouteRecord::new(vec![node], vec![9, 3, 9, 1, 3], 0, String::new());
+
+        assert_eq!(route.discoveries, vec![1, 3, 9]);
+        assert_eq!(route.id, route.content_id());
+    }
+
+    #[test]
+    fn bundle_canonicalize_collapses_equal_duplicate_ids() {
+        let base = sample_discovery();
+        let mut later = base.clone();
+        later.sequence = base.sequence + 1;
+        later.name = "later".into();
+        let mut bundle = AtlasBundle {
+            discoveries: vec![later, base],
+            ..AtlasBundle::default()
+        };
+
+        bundle.canonicalize_checked().unwrap();
+
+        assert_eq!(bundle.discoveries.len(), 1);
+        assert_eq!(bundle.discoveries[0].name, "later");
+    }
+
+    #[test]
+    fn bundle_canonicalize_rejects_same_id_unequal_body() {
+        let base = sample_discovery();
+        let mut tampered = base.clone();
+        tampered.strength_q ^= 1;
+        tampered.id = base.id;
+        let mut bundle = AtlasBundle {
+            discoveries: vec![base.clone(), tampered],
+            ..AtlasBundle::default()
+        };
+
+        assert!(matches!(
+            bundle.canonicalize_checked(),
+            Err(BundleCanonicalError::Record(
+                RecordCanonicalError::ContentIdMismatch { .. }
+            ))
+        ));
     }
 
     #[test]
