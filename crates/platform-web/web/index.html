@@ -18,7 +18,22 @@
     <main class="app-shell" data-view="viewer">
       <section class="viewer">
         <div class="toolbar" aria-label="Viewer controls">
-          <button type="button" data-command="channel:composite" aria-pressed="true">Composite</button>
+          <select data-command="channel" aria-label="Map channel">
+            <option value="composite">Composite</option>
+            <option value="elevation">Elevation</option>
+            <option value="geology">Geology</option>
+            <option value="temperature">Temperature</option>
+            <option value="moisture">Moisture</option>
+            <option value="river">River</option>
+            <option value="wetness">Wetness</option>
+            <option value="soil">Soil</option>
+            <option value="biome">Biome</option>
+            <option value="vegetation">Vegetation</option>
+            <option value="herbivore">Herbivore</option>
+            <option value="predator">Predator</option>
+            <option value="diversity">Diversity</option>
+            <option value="species">Species</option>
+          </select>
           <button type="button" data-command="toggle:compose" aria-pressed="true">Compose</button>
           <button type="button" data-command="toggle:refinement" aria-pressed="false">Refine</button>
           <select data-command="tier" aria-label="Resource tier">
@@ -60,6 +75,8 @@
         <dl>
           <dt>Region</dt>
           <dd data-field="region">0, 0</dd>
+          <dt>Channel</dt>
+          <dd data-field="channel">composite</dd>
           <dt>Tier</dt>
           <dd data-field="tier">auto</dd>
           <dt>Executor</dt>

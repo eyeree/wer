@@ -15,6 +15,7 @@
 pub mod budget;
 pub mod generate;
 pub mod macrocache;
+pub mod mapcolor;
 pub mod pool;
 pub mod realize;
 pub mod region;

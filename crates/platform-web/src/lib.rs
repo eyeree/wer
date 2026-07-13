@@ -26,10 +26,18 @@ use world_core::{
     },
     route::attraction_anchors,
     species::{species_roster, species_seed},
-    terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, WORLD_ALGORITHM_VERSION,
+    terrain, Biome, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, POSSIBILITY_DIMS,
+    REGION_SIZE, WORLD_ALGORITHM_VERSION,
 };
+use world_runtime::budget::Budget;
+use world_runtime::stream::RegionMap;
 use world_runtime::task::{InlineExecutor, TaskExecutor};
 use world_runtime::tier::ResourceTier;
+use world_runtime::{
+    mapcolor, CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
+    CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH,
+    CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+};
 
 /// Shared native/wasm parity expectations. The wasm integration suite imports
 /// these exact constants, so the two execution gates cannot drift apart.
@@ -336,7 +344,33 @@ pub fn route_attraction_sample() -> u64 {
     h
 }
 
-#[derive(Debug, Clone)]
+/// The browser map channels (phase-7-plan.md §3.3 "map channel selection"):
+/// the presentation-only subset of the native shell's channel list the web
+/// toolbar exposes, painted from the shared `world_runtime::mapcolor` table
+/// so both viewers show the identical false-color world.
+const MAP_CHANNELS: [&str; 14] = [
+    "composite",
+    "elevation",
+    "geology",
+    "temperature",
+    "moisture",
+    "river",
+    "wetness",
+    "soil",
+    "biome",
+    "vegetation",
+    "herbivore",
+    "predator",
+    "diversity",
+    "species",
+];
+
+/// Settle passes for a fresh window: fresh regions snap to target at load,
+/// and a handful of extra passes drains realization/resonance — the same
+/// fixture count the native headless screenshot path uses.
+const SETTLE_PASSES: u32 = 8;
+
+#[derive(Debug)]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 struct WebAppState {
     frame_index: u64,
@@ -344,6 +378,18 @@ struct WebAppState {
     possibility: PossibilityVector,
     target: PossibilityVector,
     active_channel: u8,
+    /// The real streamed world window (phase-7-plan.md §4.1 milestone 2):
+    /// the same `RegionMap` the native shell drives, settled inline —
+    /// wasm has no threads here, and ADR 0018 makes the settled state
+    /// identical regardless.
+    map: RegionMap,
+    field: PossibilityField,
+    /// View half-extent in regions, derived from the tier's load radius
+    /// exactly as the native shell derives its composer size.
+    half_regions: i32,
+    /// Lazily settled on first compose so constructing the facade (and the
+    /// many native unit tests that never render) stays cheap.
+    settled: bool,
     tier: &'static str,
     cache_ceiling_mb: u32,
     runtime_tier: ResourceTier,
@@ -387,12 +433,18 @@ struct WebAppState {
 
 impl Default for WebAppState {
     fn default() -> Self {
+        let tier = ResourceTier::Low;
+        let cfg = tier.stream_config();
         Self {
             frame_index: 0,
             world_pos: (0.0, 0.0),
             possibility: PossibilityVector::neutral(),
             target: PossibilityVector::neutral(),
             active_channel: 0,
+            half_regions: (cfg.load_radius / REGION_SIZE).ceil() as i32,
+            map: RegionMap::new(cfg),
+            field: PossibilityField::default(),
+            settled: false,
             tier: "WebLow",
             cache_ceiling_mb: 48,
             runtime_tier: ResourceTier::Low,
@@ -474,6 +526,15 @@ impl WebAppState {
         self.last_command.push_str(command);
         if command.contains("channel:composite") {
             self.active_channel = 0;
+        } else if command.contains("\"id\":\"channel\"") {
+            // The channel select (phase-7-plan.md §3.3): value names index
+            // the shared MAP_CHANNELS table.
+            if let Some(index) = MAP_CHANNELS
+                .iter()
+                .position(|name| command.contains(&format!("\"value\":\"{name}\"")))
+            {
+                self.active_channel = index as u8;
+            }
         } else if command.contains("toggle:refinement") {
             self.refinement_enabled = !self.refinement_enabled;
             self.target.set(PossibilityDomain::Aesthetics, 0.625);
@@ -601,6 +662,36 @@ impl WebAppState {
             ResourceTier::High => 160,
         };
         self.refinement_enabled = tier.refinement();
+        // Tiers change the streamed window (radii, caches, organism density)
+        // but never world identity (ADR 0018), so rebuilding the map here
+        // re-settles to the same authoritative state at the new extent.
+        let cfg = tier.stream_config();
+        self.half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
+        self.map = RegionMap::new(cfg);
+        self.settled = false;
+    }
+
+    /// Settle the streamed window around the current position, inline. Fresh
+    /// regions snap to their target on load, so a fixed pass count fully
+    /// settles the view — the native headless screenshot fixture pattern.
+    fn ensure_settled(&mut self) {
+        if self.settled {
+            return;
+        }
+        let bias = [0.0f32; POSSIBILITY_DIMS];
+        for _ in 0..SETTLE_PASSES {
+            self.map.update(
+                self.world_pos,
+                0.0,
+                &self.field,
+                &[],
+                &bias,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+        }
+        self.settled = true;
     }
 
     fn region(&self) -> RegionCoord {
@@ -629,6 +720,7 @@ impl WebAppState {
                 "\"possibility\":{},",
                 "\"target\":{},",
                 "\"active_channel\":{},",
+                "\"channel\":\"{}\",",
                 "\"cache\":{{\"regions\":1,\"bytes\":0}},",
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
@@ -649,6 +741,7 @@ impl WebAppState {
             vector_json(self.possibility),
             vector_json(self.target),
             self.active_channel,
+            MAP_CHANNELS[usize::from(self.active_channel)],
             self.worker_mode,
             self.executor_parallelism,
             self.workers,
@@ -685,43 +778,171 @@ impl WebAppState {
         )
     }
 
+    /// Image edge length in pixels: one pixel per field cell across the
+    /// `2·half+1` region window, exactly like the native composer.
+    fn map_side(&self) -> usize {
+        (2 * self.half_regions + 1) as usize * usize::from(self.map.config().field_resolution)
+    }
+
+    /// The CPU map header. The pixel payload travels separately through
+    /// [`WebAppState::compose_map`] as raw bytes — a Phase 7-4 window is
+    /// hundreds of kilobytes, far too large for a number-per-byte JSON array.
     fn cpu_map_json(&self) -> String {
-        const WIDTH: usize = 96;
-        const HEIGHT: usize = 64;
-        let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 4);
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                let wx = self.world_pos.0 + (x as f64 - WIDTH as f64 * 0.5) * 8.0;
-                let wy = self.world_pos.1 + (y as f64 - HEIGHT as f64 * 0.5) * 8.0;
-                let coord = RegionCoord::from_world(wx, wy);
-                let (ox, oy) = coord.origin();
-                let local_x = (wx - ox).rem_euclid(world_core::REGION_SIZE) as u64;
-                let local_y = (wy - oy).rem_euclid(world_core::REGION_SIZE) as u64;
-                let feature = feature_hash(&FeatureKey {
-                    world_version: WORLD_ALGORITHM_VERSION,
-                    region: coord,
-                    layer: u16::from(self.active_channel),
-                    feature_index: (local_y * 256 + local_x) as u32,
-                    possibility_revision: 0,
-                });
-                let elevation = ((feature >> 8) & 0xff) as u8;
-                let moisture = ((feature >> 24) & 0xff) as u8;
-                let vegetation = ((feature >> 40) & 0xff) as u8;
-                pixels.push(elevation.saturating_div(2).saturating_add(38));
-                pixels.push(moisture.saturating_div(2).saturating_add(56));
-                pixels.push(vegetation.saturating_div(2).saturating_add(48));
-                pixels.push(255);
+        let side = self.map_side();
+        format!(
+            "{{\"kind\":\"rgba8\",\"renderer\":\"{}\",\"width\":{side},\"height\":{side},\"resolution\":{},\"channel\":\"{}\"}}",
+            self.renderer,
+            self.map.config().field_resolution,
+            MAP_CHANNELS[usize::from(self.active_channel)]
+        )
+    }
+
+    /// Compose the settled window into an RGBA8 image (row 0 = north), the
+    /// browser twin of the native `MapComposer` base pass: the same
+    /// `mapcolor` per-cell table over the same settled `RegionMap` channels,
+    /// plus the grid darkening and the player cross. Native-only overlays
+    /// (routes, preserves, organisms, pinned-flash) arrive with the vault
+    /// and realization steps of Phase 7.
+    fn compose_map(&mut self) -> Vec<u8> {
+        self.ensure_settled();
+        let side = self.map_side();
+        let mut pixels = vec![0u8; side * side * 4];
+        let center = RegionCoord::from_world(self.world_pos.0, self.world_pos.1);
+        let channel = MAP_CHANNELS[usize::from(self.active_channel)];
+
+        for row_region in 0..=(2 * self.half_regions) {
+            // Row 0 is the northernmost (max y) region.
+            let ry = center.y + self.half_regions - row_region;
+            for col_region in 0..=(2 * self.half_regions) {
+                let rx = center.x - self.half_regions + col_region;
+                let coord = RegionCoord::new(rx, ry);
+                self.paint_region(
+                    &mut pixels,
+                    coord,
+                    channel,
+                    row_region as usize,
+                    col_region as usize,
+                );
             }
         }
-        let encoded = pixels
-            .iter()
-            .map(u8::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "{{\"kind\":\"rgba8\",\"renderer\":\"{}\",\"width\":{WIDTH},\"height\":{HEIGHT},\"pixels\":[{encoded}]}}",
-            self.renderer
-        )
+
+        // The player cross (the native marker), drawn last so it stays
+        // visible over any channel. The window is centered on the player's
+        // *region*, so the marker sits at the player's own pixel, exactly
+        // like the native `draw_player_marker`.
+        let res = f64::from(self.map.config().field_resolution);
+        let cell = REGION_SIZE / res;
+        let west = f64::from(center.x - self.half_regions) * REGION_SIZE;
+        let north = f64::from(center.y + self.half_regions + 1) * REGION_SIZE;
+        let player_px = ((self.world_pos.0 - west) / cell) as i64;
+        let player_py = ((north - self.world_pos.1) / cell) as i64;
+        for d in -3i64..=3 {
+            for (px, py) in [(player_px + d, player_py), (player_px, player_py + d)] {
+                if px >= 0 && py >= 0 && (px as usize) < side && (py as usize) < side {
+                    let offset = (py as usize * side + px as usize) * 4;
+                    pixels[offset..offset + 3].copy_from_slice(&[245, 245, 245]);
+                }
+            }
+        }
+        pixels
+    }
+
+    /// Paint one region's cells into the window image — the browser twin of
+    /// the native `paint_region`, restricted to the channels the web toolbar
+    /// exposes.
+    fn paint_region(
+        &self,
+        pixels: &mut [u8],
+        coord: RegionCoord,
+        channel: &str,
+        row_region: usize,
+        col_region: usize,
+    ) {
+        let res = self.map.config().field_resolution;
+        let side = self.map_side();
+        let tiles = self.map.cache().get(coord);
+        let tile = |channel_index: usize| tiles.and_then(|t| t.channels[channel_index].as_deref());
+        let biome = tiles.and_then(|t| t.biome.as_deref());
+        let (origin_x, origin_y) = coord.origin();
+        let cell = REGION_SIZE / f64::from(res);
+
+        for cy in 0..res {
+            for cx in 0..res {
+                let scalar = |t: Option<&world_core::FieldTile<f32>>,
+                              paint: &dyn Fn(f32) -> [u8; 3]| {
+                    t.map(|t| paint(t.get(cx, cy)))
+                        .unwrap_or_else(|| mapcolor::missing_color(cx, cy))
+                };
+                let missing = || mapcolor::missing_color(cx, cy);
+                let world = || {
+                    (
+                        origin_x + (f64::from(cx) + 0.5) * cell,
+                        origin_y + (f64::from(cy) + 0.5) * cell,
+                    )
+                };
+                let mut rgb = match channel {
+                    "elevation" => scalar(tile(CHANNEL_ELEVATION), &mapcolor::elevation_color),
+                    "geology" => match tile(CHANNEL_HARDNESS) {
+                        Some(h) => {
+                            let (wx, wy) = world();
+                            mapcolor::geology_color(wx, wy, h.get(cx, cy))
+                        }
+                        None => missing(),
+                    },
+                    "temperature" => {
+                        scalar(tile(CHANNEL_TEMPERATURE), &mapcolor::temperature_color)
+                    }
+                    "moisture" => scalar(tile(CHANNEL_MOISTURE), &mapcolor::moisture_color),
+                    "river" => scalar(tile(CHANNEL_RIVER), &mapcolor::river_color),
+                    "wetness" => scalar(tile(CHANNEL_WETNESS), &mapcolor::wetness_color),
+                    "soil" => match (tile(CHANNEL_SOIL_DEPTH), tile(CHANNEL_FERTILITY)) {
+                        (Some(d), Some(f)) => mapcolor::soil_color(d.get(cx, cy), f.get(cx, cy)),
+                        _ => missing(),
+                    },
+                    "biome" => match biome {
+                        Some(b) => mapcolor::biome_color(Biome::from_id(b.get(cx, cy))),
+                        None => missing(),
+                    },
+                    "vegetation" => scalar(tile(CHANNEL_VEGETATION), &mapcolor::vegetation_color),
+                    "herbivore" => scalar(tile(CHANNEL_HERBIVORE), &mapcolor::herbivore_color),
+                    "predator" => scalar(tile(CHANNEL_PREDATOR), &mapcolor::predator_color),
+                    "diversity" => scalar(tile(CHANNEL_DIVERSITY), &mapcolor::diversity_color),
+                    "species" => match self.map.dominant_species_id(coord, cx, cy) {
+                        Some(id) => mapcolor::species_color(id),
+                        None => missing(),
+                    },
+                    // Composite (and any unknown name, defensively).
+                    _ => match (
+                        tile(CHANNEL_ELEVATION),
+                        biome,
+                        tile(CHANNEL_RIVER),
+                        tile(CHANNEL_WETNESS),
+                    ) {
+                        (Some(e), Some(b), Some(r), Some(w)) => mapcolor::composite_cell_color(
+                            e.get(cx, cy),
+                            Biome::from_id(b.get(cx, cy)),
+                            r.get(cx, cy),
+                            w.get(cx, cy),
+                            self.map.dominant_species_id(coord, cx, cy),
+                        ),
+                        _ => missing(),
+                    },
+                };
+                // Region grid, on by default like the native shell.
+                if cx == 0 || cy == 0 {
+                    rgb = mapcolor::lerp_rgb(rgb, [0, 0, 0], 0.35);
+                }
+
+                // Cell (cx, cy) has cy growing north; image rows grow south.
+                let px = col_region * usize::from(res) + usize::from(cx);
+                let py = row_region * usize::from(res) + usize::from(res - 1 - cy);
+                let offset = (py * side + px) * 4;
+                pixels[offset] = rgb[0];
+                pixels[offset + 1] = rgb[1];
+                pixels[offset + 2] = rgb[2];
+                pixels[offset + 3] = 255;
+            }
+        }
     }
 }
 
@@ -888,14 +1109,26 @@ mod wasm {
             Ok(JsValue::from_str(&self.state.snapshot_json()))
         }
 
-        /// Return a deterministic CPU-composed RGBA map tile for browser canvas
-        /// upload. This is the Phase 7-4 bootstrap renderer; WebGPU atlas
-        /// composition remains a later presentation path.
+        /// Return the CPU map header (size, channel, renderer) as JSON. The
+        /// pixel payload comes from [`WebApp::map_pixels`] as raw bytes —
+        /// the deterministic CPU-composed presentation of the settled window
+        /// (phase-7-plan.md §4.1 milestone 2); WebGPU atlas composition
+        /// remains a later presentation path.
         pub fn render_cpu_map(&mut self) -> Result<JsValue, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
             Ok(JsValue::from_str(&self.state.cpu_map_json()))
+        }
+
+        /// Compose the settled window and return the RGBA8 bytes (row 0 =
+        /// north), sized per the [`WebApp::render_cpu_map`] header. Settles
+        /// the window inline on first use.
+        pub fn map_pixels(&mut self) -> Result<Vec<u8>, JsValue> {
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            Ok(self.state.compose_map())
         }
 
         /// Apply one normalized command from the shared browser command
@@ -993,18 +1226,96 @@ mod tests {
         assert!(snapshot.contains("\"last_command\":\"{\\\"id\\\":\\\"toggle:refinement\\\"}\""));
     }
 
+    /// A small settle-able window so the map tests stay fast (the viz.rs
+    /// fixture pattern).
+    fn small_window_app() -> super::WebAppState {
+        use world_core::REGION_SIZE;
+        super::WebAppState {
+            map: world_runtime::RegionMap::new(world_runtime::StreamConfig {
+                near_radius: 1.5 * REGION_SIZE,
+                far_radius: 3.0 * REGION_SIZE,
+                load_radius: 3.0 * REGION_SIZE,
+                unload_radius: 4.0 * REGION_SIZE,
+                field_resolution: 8,
+                ..world_runtime::StreamConfig::default()
+            }),
+            half_regions: 3,
+            ..super::WebAppState::default()
+        }
+    }
+
     #[test]
-    fn cpu_map_json_is_nonblank_rgba() {
+    fn cpu_map_header_describes_the_window() {
         let app = super::WebAppState::default();
-        let map = app.cpu_map_json();
-        assert!(map.contains("\"kind\":\"rgba8\""));
-        assert!(map.contains("\"width\":96"));
-        assert!(map.contains("\"height\":64"));
-        assert!(map.contains("\"pixels\":["));
+        let header = app.cpu_map_json();
+        // Low tier: load radius 12 regions -> a 25-region window at the
+        // default 32 cells/region.
+        assert!(header.contains("\"kind\":\"rgba8\""));
+        assert!(header.contains("\"width\":800"));
+        assert!(header.contains("\"height\":800"));
+        assert!(header.contains("\"channel\":\"composite\""));
         assert!(
-            !map.contains("\"pixels\":[0,0,0,0"),
-            "bootstrap map should not be blank"
+            !header.contains("\"pixels\""),
+            "pixels travel as raw bytes, not JSON"
         );
+    }
+
+    #[test]
+    fn map_pixels_compose_the_settled_window() {
+        let mut app = small_window_app();
+        let side = app.map_side();
+        assert_eq!(side, 7 * 8);
+        let pixels = app.compose_map();
+        assert_eq!(pixels.len(), side * side * 4);
+        let first = &pixels[0..4];
+        assert!(
+            pixels.chunks_exact(4).any(|px| px != first),
+            "a composed window must not be a solid color"
+        );
+        assert!(
+            pixels.chunks_exact(4).all(|px| px[3] == 255),
+            "the map is opaque"
+        );
+
+        // Orientation + palette pin: an interior cell of region (0, 0) must
+        // match the shared mapcolor Composite table exactly, at the pixel
+        // the north-up layout places it (the viz.rs paint contract).
+        let coord = world_core::RegionCoord::new(0, 0);
+        let tiles = app.map.cache().get(coord).expect("settled window");
+        let (cx, cy) = (5u16, 5u16);
+        let expected = world_runtime::mapcolor::composite_cell_color(
+            tiles.channels[world_runtime::CHANNEL_ELEVATION]
+                .as_ref()
+                .expect("tile")
+                .get(cx, cy),
+            world_core::Biome::from_id(tiles.biome.as_ref().expect("tile").get(cx, cy)),
+            tiles.channels[world_runtime::CHANNEL_RIVER]
+                .as_ref()
+                .expect("tile")
+                .get(cx, cy),
+            tiles.channels[world_runtime::CHANNEL_WETNESS]
+                .as_ref()
+                .expect("tile")
+                .get(cx, cy),
+            app.map.dominant_species_id(coord, cx, cy),
+        );
+        let px = 3 * 8 + usize::from(cx);
+        let py = 3 * 8 + usize::from(8 - 1 - cy);
+        let offset = (py * side + px) * 4;
+        assert_eq!(&pixels[offset..offset + 3], &expected);
+    }
+
+    #[test]
+    fn channel_commands_change_the_painted_channel() {
+        let mut app = small_window_app();
+        let composite = app.compose_map();
+        app.apply_command("{\"id\":\"channel\",\"value\":\"elevation\"}");
+        assert!(app.cpu_map_json().contains("\"channel\":\"elevation\""));
+        let elevation = app.compose_map();
+        assert_ne!(composite, elevation, "channels paint differently");
+        app.apply_command("{\"id\":\"channel:composite\"}");
+        assert!(app.cpu_map_json().contains("\"channel\":\"composite\""));
+        assert_eq!(app.compose_map(), composite);
     }
 
     #[test]

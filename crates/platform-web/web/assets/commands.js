@@ -6,6 +6,12 @@ export const COMMANDS = [
     group: "Map",
   },
   {
+    id: "channel",
+    key: "",
+    label: "Map channel selection",
+    group: "Map",
+  },
+  {
     id: "toggle:compose",
     key: ",",
     label: "Toggle GPU compose",

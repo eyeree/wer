@@ -66,6 +66,7 @@ a {
 .toolbar,
 .status-bar {
   display: flex;
+  flex-wrap: wrap;
   min-height: 44px;
   align-items: center;
   gap: 8px;
