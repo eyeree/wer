@@ -31,6 +31,10 @@ struct PovParams {
     //  wobble anchor fraction x, y) — plan §4.3. Layout-identical to
     //  pov_terrain.wgsl's PovParams and the Rust PovParamsRaw.
     water: vec4<f32>,
+    // Live diagnostic toggles — unused here (the water toggle skips these
+    // passes CPU-side), declared for uniform-layout parity with
+    // pov_terrain.wgsl.
+    toggles: vec4<f32>,
 }
 
 struct ChunkOffset {
@@ -88,11 +92,17 @@ fn fresnel(cos_theta: f32) -> f32 {
 // pow-2.2 the terrain shader uses): DEEP_WATER beside elevation_color's
 // deep-ramp anchor [8, 16, 64]; RIVER_SHALLOW a darker cousin of the
 // composite river blue so ribbons read as surfaces, not paint.
-const DEEP_WATER: vec3<f32> = vec3<f32>(0.0005, 0.0023, 0.048);
-const SEA_ALPHA_LOW: f32 = 0.55;
-const SEA_ALPHA_HIGH: f32 = 0.88;
-const SEA_GLINT_POWER: f32 = 60.0;
-const SEA_GLINT_STRENGTH: f32 = 0.6;
+const DEEP_WATER: vec3<f32> = vec3<f32>(0.002, 0.012, 0.070);
+// A thin translucent film, not blue paint: the sea floor (a sediment ramp
+// with the cyan absorption cast baked in, `pov_sediment_color`) carries the
+// depth read; the surface contributes tint, wobble, and glint. Alpha still
+// rises toward grazing angles, where you could not see down anyway.
+const SEA_ALPHA_LOW: f32 = 0.30;
+const SEA_ALPHA_HIGH: f32 = 0.65;
+// Tight sparkle rather than a smeared white sheet (the old 60/0.6 lobe
+// blew out over wobbled normals).
+const SEA_GLINT_POWER: f32 = 90.0;
+const SEA_GLINT_STRENGTH: f32 = 0.35;
 
 // Distance fade of the wobble slope, so distant water does not shimmer on
 // llvmpipe's pixel grid (plan §4.3).

@@ -330,6 +330,9 @@ pub struct Renderer {
     debug_map: DebugMapPipeline,
     /// Second blit pipeline for the HUD panel strip in the GPU-map path.
     panel_blit: DebugMapPipeline,
+    /// Third blit pipeline for the small POV HUD chip (FPS counter), drawn
+    /// pixel-exact in the top-right corner after the POV pass.
+    pov_hud_blit: DebugMapPipeline,
     /// The Phase 6 atlas-composed map path (phase-6-plan.md §6.5), built
     /// lazily on the first GPU-mode frame.
     gpu_map: Option<GpuMap>,
@@ -419,6 +422,7 @@ impl Renderer {
 
         let debug_map = DebugMapPipeline::new(&device, config.format);
         let panel_blit = DebugMapPipeline::new(&device, config.format);
+        let pov_hud_blit = DebugMapPipeline::new(&device, config.format);
 
         Ok(Self {
             instance,
@@ -429,6 +433,7 @@ impl Renderer {
             config,
             debug_map,
             panel_blit,
+            pov_hud_blit,
             gpu_map: None,
             pov: None,
         })
@@ -730,12 +735,18 @@ impl Renderer {
     /// Returns `false` when no frame was drawn (surface loss), like the
     /// other entry points. No readback, no API that could ever produce one
     /// (ADR 0017).
+    ///
+    /// `hud` is an optional small RGBA8 chip (image, width, height) blitted
+    /// pixel-exact into the top-right corner after the POV pass — the shell's
+    /// FPS counter. World-agnostic like every upload: the renderer just
+    /// draws the image it is handed.
     pub fn render_pov(
         &mut self,
         frame: &PovFrameParams,
         uploads: &[TerrainChunkUpload],
         removes: &[u64],
         clear: [f64; 4],
+        hud: Option<(&[u8], u32, u32)>,
     ) -> bool {
         if self.pov.is_none() {
             self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.config.format));
@@ -761,10 +772,52 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("wer-frame-pov"),
             });
-        self.pov
-            .as_ref()
-            .expect("ensured above")
-            .draw(&mut encoder, &view, &draws, clear);
+        self.pov.as_ref().expect("ensured above").draw(
+            &mut encoder,
+            &view,
+            &draws,
+            clear,
+            frame.water,
+        );
+        // The HUD chip: a second tiny pass loading the POV result and
+        // blitting the image into the top-right corner, pixel-exact.
+        if let Some((rgba, w, h)) = hud {
+            self.pov_hud_blit
+                .upload(&self.device, &self.queue, rgba, w, h);
+            if let Some((_, bind_group, w, h)) = self.pov_hud_blit.texture.as_ref() {
+                let (sw, sh) = (self.config.width, self.config.height);
+                const PAD: u32 = 8;
+                if *w + PAD <= sw && *h + PAD <= sh {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("pov-hud-chip"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_viewport(
+                        (sw - w - PAD) as f32,
+                        PAD as f32,
+                        *w as f32,
+                        *h as f32,
+                        0.0,
+                        1.0,
+                    );
+                    pass.set_pipeline(&self.pov_hud_blit.pipeline);
+                    pass.set_bind_group(0, bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
         self.queue.submit(Some(encoder.finish()));
         surface_frame.present();
         true
