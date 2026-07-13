@@ -137,6 +137,36 @@ export const COMMANDS = [
     label: "Pointer lock",
     group: "View",
   },
+  {
+    id: "pov:walk",
+    key: "F",
+    label: "Toggle walk / fly",
+    group: "POV",
+  },
+  {
+    id: "pov:toggle-baked",
+    key: "B",
+    label: "Toggle baked lighting",
+    group: "POV",
+  },
+  {
+    id: "pov:toggle-detail",
+    key: "N",
+    label: "Toggle detail normals",
+    group: "POV",
+  },
+  {
+    id: "pov:toggle-water",
+    key: "",
+    label: "Toggle water passes",
+    group: "POV",
+  },
+  {
+    id: "pov:scale",
+    key: "",
+    label: "POV render scale",
+    group: "POV",
+  },
 ];
 
 export const commandById = new Map(COMMANDS.map((command) => [command.id, command]));

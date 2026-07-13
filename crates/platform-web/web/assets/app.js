@@ -135,7 +135,13 @@ const updateSnapshot = (snapshot) => {
   write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
   write("storage", snapshot.storage.mode);
   write("webgpu-status", `${snapshot.renderer.mode} / refine ${snapshot.renderer.refinement}`);
-  write("view", `${snapshot.view.mode}${snapshot.view.pov_supported ? "" : " / pov unavailable"}`);
+  const pov = snapshot.view.pov;
+  write(
+    "view",
+    snapshot.view.mode === "pov"
+      ? `pov (${pov.motion}, scale ${pov.render_scale}${pov.water ? "" : ", water off"})`
+      : `map${snapshot.view.pov_supported ? "" : " / pov unavailable"}`,
+  );
   appendDiagnostic(`settle_hash=${snapshot.settle_hash}`);
 };
 
@@ -163,6 +169,9 @@ for (const control of document.querySelectorAll("[data-command]")) {
     } else if (control.dataset.command === "worker") {
       appendDiagnostic(`worker:${control.value}`);
       dispatchCommand(`worker:${control.value}`);
+    } else if (control.dataset.command === "pov:scale") {
+      appendDiagnostic(`pov:scale:${control.value}`);
+      dispatchCommand("pov:scale", control.value);
     }
   });
 }
@@ -181,13 +190,17 @@ window.addEventListener("keydown", (event) => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
     return;
   }
+  const inPov = lastSnapshot?.view?.mode === "pov";
   for (const command of commandById.values()) {
-    if (command.key && event.key === command.key) {
-      event.preventDefault();
-      dispatchCommand(command.id);
-      appendDiagnostic(`key:${command.key}`);
-      break;
-    }
+    if (!command.key || event.key !== command.key) continue;
+    // The native shell's POV key gate (3d-phase-1-plan.md §8.4), mirrored:
+    // POV-group keys act only in POV mode, and Tab toggles the modes.
+    if (command.group === "POV" && !inPov) continue;
+    const id = command.id === "mode:pov" && inPov ? "mode:map" : command.id;
+    event.preventDefault();
+    dispatchCommand(id);
+    appendDiagnostic(`key:${command.key}`);
+    break;
   }
 });
 
