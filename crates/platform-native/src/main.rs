@@ -85,7 +85,7 @@ mod viz;
 use std::sync::Arc;
 use std::time::Instant;
 
-use renderer::{letterbox_viewport, Renderer};
+use renderer::{Renderer, SurfaceViewport};
 use viewer_host::action::{
     PreserveMutation, ServiceRequestId, ViewerAction, ViewerEffect, WorkerBackend,
 };
@@ -97,7 +97,7 @@ use viewer_host::controller::{
 #[cfg(test)]
 use viewer_host::input::InputFrame;
 use viewer_host::input::{InputContext, InputMapper, NormalizedInputEvent};
-use viewer_host::layout::{PresentationMode, ViewKind};
+use viewer_host::layout::{MapViewportProjection, PixelRect, PresentationMode, ViewKind};
 use viewer_host::map::{MapBackend, MapRenderRequest, PreparedMapSource};
 use viewer_host::panel::{PlatformTelemetry, Severity, ViewerWarning};
 use viewer_host::world::{
@@ -135,6 +135,116 @@ use viz::{Channel, MapComposer, MapDecor, Overlays};
 
 /// Letterbox color around the square map (linear RGBA).
 const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
+
+/// Exact physical rectangles for the native map plus its temporary bitmap
+/// information strip. The combined rectangle preserves the source HUD aspect,
+/// while the square left edge remains the single draw/pick destination used by
+/// the shared map projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeMapRects {
+    combined: PixelRect,
+    map: PixelRect,
+    panel: PixelRect,
+}
+
+impl NativeMapRects {
+    fn resolve(surface: PixelRect, map_side: u32, panel_width: u32) -> Option<Self> {
+        let source_width = map_side.checked_add(panel_width)?;
+        let combined = surface.fitted_aspect(source_width, map_side)?;
+        // The source is at least square, so its fitted physical rectangle is
+        // at least as wide as it is tall (including degenerate tiny surfaces).
+        let map_width = combined.height.min(combined.width);
+        let map = PixelRect::new(combined.x, combined.y, map_width, map_width);
+        let panel = PixelRect::new(
+            map.right(),
+            combined.y,
+            combined.width.saturating_sub(map.width),
+            combined.height,
+        );
+        if map.width == 0 || map.height == 0 || panel.width == 0 || panel.height == 0 {
+            return None;
+        }
+        Some(Self {
+            combined,
+            map,
+            panel,
+        })
+    }
+
+    const fn map_viewport(self) -> SurfaceViewport {
+        SurfaceViewport::new(self.map.x, self.map.y, self.map.width, self.map.height)
+    }
+
+    const fn panel_viewport(self) -> Option<SurfaceViewport> {
+        if self.panel.width == 0 || self.panel.height == 0 {
+            None
+        } else {
+            Some(SurfaceViewport::new(
+                self.panel.x,
+                self.panel.y,
+                self.panel.width,
+                self.panel.height,
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_map_rect_tests {
+    use super::*;
+
+    #[test]
+    fn native_map_and_panel_partition_one_aspect_fitted_rectangle() {
+        for (width, height) in [(1280, 720), (900, 700), (701, 509), (320, 200), (127, 511)] {
+            let surface = PixelRect::new(0, 0, width, height);
+            let rects = NativeMapRects::resolve(surface, 600, 300).unwrap();
+            assert!(surface.contains_rect(rects.combined));
+            assert_eq!(rects.map.x, rects.combined.x);
+            assert_eq!(rects.map.y, rects.combined.y);
+            assert_eq!(rects.map.width, rects.map.height);
+            assert_eq!(rects.map.height, rects.combined.height);
+            assert_eq!(rects.panel.x, rects.map.right());
+            assert_eq!(rects.panel.y, rects.combined.y);
+            assert_eq!(rects.panel.right(), rects.combined.right());
+            assert_eq!(rects.panel.bottom(), rects.combined.bottom());
+            assert!(!rects.map.overlaps(rects.panel));
+
+            let expected_panel = (u64::from(rects.combined.height) * 300 + 300) / 600;
+            assert!(u64::from(rects.panel.width).abs_diff(expected_panel) <= 1);
+        }
+    }
+
+    #[test]
+    fn panel_and_letterbox_are_outside_the_map_pick_projection() {
+        let surface = PixelRect::new(0, 0, 1280, 720);
+        let rects = NativeMapRects::resolve(surface, 600, 300).unwrap();
+        let projection = MapViewportProjection::new(rects.map, (12.5, -8.25), 3, 16, 8)
+            .expect("valid map geometry");
+
+        let map_center = (
+            f64::from(rects.map.x) + f64::from(rects.map.width) * 0.5,
+            f64::from(rects.map.y) + f64::from(rects.map.height) * 0.5,
+        );
+        assert!(projection.physical_to_world(map_center).is_some());
+        assert!(projection
+            .physical_to_world((f64::from(rects.map.right()), map_center.1))
+            .is_none());
+        assert!(projection
+            .physical_to_world((f64::from(rects.combined.x) - 0.5, map_center.1))
+            .is_none());
+    }
+
+    #[test]
+    fn tiny_surfaces_without_both_visible_source_panes_are_skipped() {
+        for surface in [
+            PixelRect::new(0, 0, 0, 0),
+            PixelRect::new(0, 0, 1, 1),
+            PixelRect::new(0, 0, 1, 2),
+        ] {
+            assert_eq!(NativeMapRects::resolve(surface, 600, 300), None);
+        }
+    }
+}
 
 #[cfg(test)]
 const PLAYER_SPEED: f64 = viewer_host::world::MAP_MOVEMENT_SPEED;
@@ -336,7 +446,7 @@ struct App {
     pov_fps_chip: Option<(Vec<u8>, u32, u32, String)>,
     /// Content hashes of the last uploaded overlay/panel strips, so an
     /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
-    overlay_hash: u64,
+    overlay_hashes: [u64; 2],
     panel_hash: u64,
     /// Map hover in physical surface pixels, sampled from shared frame input.
     cursor_pos: Option<(f64, f64)>,
@@ -435,7 +545,7 @@ impl App {
             pov_counters_last: PovCounters::default(),
             pov_organism_counters_last: PovOrganismCounters::default(),
             pov_fps_chip: None,
-            overlay_hash: 0,
+            overlay_hashes: [0; 2],
             panel_hash: 0,
             cursor_pos: None,
             regen_totals: [0; LAYER_COUNT as usize],
@@ -990,18 +1100,47 @@ impl App {
         })
     }
 
-    /// Map the mouse (window physical pixels) through the letterbox viewport
-    /// onto the composed image, then onto the world.
+    /// Resolve this frame's native HUD rectangles and exact map projection.
+    /// Rendering and pointer inversion both consume this value; neither path
+    /// reconstructs letterboxing or reads the composer's previous zoom.
+    fn map_frame_layout(
+        &self,
+        player: (f64, f64),
+        zoom: u32,
+    ) -> Option<(NativeMapRects, MapViewportProjection)> {
+        let (width, height) = self.renderer.as_ref()?.size();
+        let map_side = self.composer.side();
+        let panel_width = self.hud.size().0.checked_sub(map_side)?;
+        let rects =
+            NativeMapRects::resolve(PixelRect::new(0, 0, width, height), map_side, panel_width)?;
+        let projection = MapViewportProjection::new(
+            rects.map,
+            player,
+            self.composer.half_regions(),
+            self.controller.world().map().config().field_resolution,
+            zoom,
+        )?;
+        Some((rects, projection))
+    }
+
+    /// Map the mouse in physical surface pixels through the exact destination
+    /// used by this frame. Letterbox and panel points deliberately return
+    /// `None`.
+    fn cursor_world_in(&self, projection: MapViewportProjection) -> Option<(f64, f64)> {
+        let point = self.cursor_pos?;
+        projection.physical_to_world(point)
+    }
+
+    /// Current hover used by the debug-dump module outside the live frame.
+    /// Live presentation passes its already-resolved frame projection through
+    /// [`Self::cursor_world_in`] instead.
     fn cursor_world(&self) -> Option<(f64, f64)> {
-        let (mx, my) = self.cursor_pos?;
-        let surface = self.renderer.as_ref()?.size();
-        let image = self.hud.size();
-        let (vx, vy, vw, _) = letterbox_viewport(surface, image);
-        let scale = f64::from(vw) / f64::from(image.0);
-        let ix = (mx - f64::from(vx)) / scale;
-        let iy = (my - f64::from(vy)) / scale;
-        self.composer
-            .pixel_to_world(self.controller.world().traveler().position, ix, iy)
+        let world = self.controller.world();
+        let (_, projection) = self.map_frame_layout(
+            world.traveler().position,
+            self.controller.map_preferences().zoom,
+        )?;
+        self.cursor_world_in(projection)
     }
 
     /// Roll per-frame timings into the once-a-second fps / update-time
@@ -1120,7 +1259,12 @@ impl App {
             return;
         }
 
-        let cursor_world = self.cursor_world();
+        let Some((frame_rects, map_projection)) =
+            self.map_frame_layout(output.traveler, output.map.zoom)
+        else {
+            return;
+        };
+        let cursor_world = self.cursor_world_in(map_projection);
         let cursor =
             cursor_world.map(|world| Self::sample_cursor(self.controller.world().map(), world));
         // Zoomed in far enough, the cursor picks the organism marker under it
@@ -1142,6 +1286,7 @@ impl App {
                 MapRenderRequest {
                     map: world.map(),
                     player: output.traveler,
+                    destination: map_projection.destination,
                     channel: output.map.channel,
                     overlays: output.map.overlays,
                     anchors: world.anchors(),
@@ -1158,6 +1303,7 @@ impl App {
         };
         let use_gpu = packet.backend == MapBackend::GpuAtlas;
         let prepared_pixel_hash = packet.pixel_hash;
+        let map_side = packet.projection.side;
         let world = self.controller.world();
         let info = PanelInfo {
             fps: self.fps,
@@ -1202,42 +1348,58 @@ impl App {
                     (hash, changed.then_some((width, height)))
                 };
                 debug_assert_eq!(prepared_pixel_hash, gpu.overlay_hash);
-                let overlay_changed = prepared_pixel_hash != self.overlay_hash;
+                let pre_grid_changed = gpu.pre_grid_hash != self.overlay_hashes[0];
+                let post_grid_changed = gpu.post_grid_hash != self.overlay_hashes[1];
 
                 let compose_seconds = compose_start.elapsed().as_secs_f64();
                 let render_start = Instant::now();
                 if let Some(renderer) = self.renderer.as_mut() {
-                    let overlay = overlay_changed.then_some(gpu.overlay_rgba);
+                    let pre_grid = pre_grid_changed.then_some(gpu.pre_grid_rgba);
+                    let post_grid = post_grid_changed.then_some(gpu.post_grid_rgba);
                     let panel =
                         panel_w.map(|(width, height)| (self.hud.panel_pixels(), width, height));
-                    if let Some(bytes) = renderer.render_map_gpu(
+                    if let Some(bytes) = renderer.render_map_gpu_in(
                         &gpu.params,
                         &gpu.slots,
                         &gpu.uploads,
-                        overlay,
+                        pre_grid,
+                        post_grid,
                         panel,
+                        frame_rects.map_viewport(),
+                        frame_rects.panel_viewport(),
                         CLEAR_COLOR,
                     ) {
                         self.panel_hash = panel_hash;
-                        self.overlay_hash = prepared_pixel_hash;
+                        self.overlay_hashes = [gpu.pre_grid_hash, gpu.post_grid_hash];
                         upload_bytes = bytes;
                     } else {
                         // Atlas keys were consumed while preparing this packet;
                         // retry a complete upload after surface recovery.
                         self.atlas = AtlasManager::default();
                         self.panel_hash = 0;
-                        self.overlay_hash = 0;
+                        self.overlay_hashes = [0; 2];
                     }
                 }
                 (compose_seconds, render_start.elapsed().as_secs_f64())
             }
             PreparedMapSource::Cpu(cpu) => {
-                let (width, height) = self.hud.size();
-                let pixels = self.hud.compose(cpu.rgba, &info);
+                let (panel, panel_width, panel_height) = self.hud.panel_image(&info);
                 let compose_seconds = compose_start.elapsed().as_secs_f64();
                 let render_start = Instant::now();
                 if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.render_map(pixels, width, height, CLEAR_COLOR);
+                    renderer.render_map_and_panel_in(
+                        cpu.rgba,
+                        map_side,
+                        map_side,
+                        panel,
+                        panel_width,
+                        panel_height,
+                        frame_rects.map_viewport(),
+                        frame_rects
+                            .panel_viewport()
+                            .expect("native bitmap panel has a visible viewport"),
+                        CLEAR_COLOR,
+                    );
                 }
                 (compose_seconds, render_start.elapsed().as_secs_f64())
             }

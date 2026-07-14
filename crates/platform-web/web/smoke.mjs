@@ -12,6 +12,7 @@ const required = [
   "assets/storage.js",
   "assets/worker.js",
   "assets/manifest.json",
+  "assert-layout.mjs",
   "baselines/native-web-alignment-m0-layout.json",
   "generated/platform_web.js",
   "generated/platform_web_bg.wasm",
@@ -46,6 +47,18 @@ if (app.includes("app.pov_frame(") || app.includes("app.update(")) {
 }
 if (!app.includes("render_cpu_map")) {
   throw new Error("app.js does not render the CPU map buffer");
+}
+if (!app.includes("new ResizeObserver") || !app.includes("window.devicePixelRatio")) {
+  throw new Error("app.js does not derive physical canvas size from CSS and DPR");
+}
+if (!app.includes("app.resize_surface(width, height)")) {
+  throw new Error("app.js does not send the physical content rectangle through shared layout");
+}
+if (/canvas[^>]+(?:width|height)="\d+"/.test(html)) {
+  throw new Error("index.html keeps a fixed canvas backing-size authority");
+}
+if (app.includes("Math.min(canvas.width /")) {
+  throw new Error("app.js independently reconstructs the shared map fit");
 }
 if (!app.includes("app.map_descriptors()") || !app.includes("installMapControls")) {
   throw new Error("app.js does not build map controls from shared descriptors");

@@ -25,7 +25,11 @@ pub use controller::{
     ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewerController,
 };
 pub use inspect::{CellInfo, CursorInfo, EcologyInfo, HoverInfo, OrganismInfo};
-pub use layout::{PixelRect, PresentationMode, ViewKind, ViewLayout};
+pub use layout::{
+    resolve_view_layout, MapGridCoverage, MapViewportProjection, PixelRect, PresentationMode,
+    ResolvedViewLayout, ViewKind, ViewLayout, MAP_ROUND_TRIP_CELL_TOLERANCE, MAX_SPLIT_RATIO,
+    MIN_SPLIT_RATIO, SPLIT_DIVIDER_HIT_WIDTH,
+};
 pub use map::{
     map_pixel_hash, pick_organism, Channel, ChannelDescriptor, MapBackend, MapBackendFallback,
     MapDecor, MapDescriptorGroup, MapLayer, MapLayerDescriptor, MapOverlay, MapOverlayDescriptor,

@@ -12,8 +12,8 @@
 //! correctness reference; this path must only *look* the same at tile
 //! resolution (the A/B toggle is the parity eyeball).
 
-/// The GPU composition shader (fullscreen pass; false color + overlay blend +
-/// refinement octaves).
+/// The GPU composition shader (fullscreen pass; false color + ordered overlay
+/// blend + one destination-aware region grid + refinement octaves).
 pub const SHADER_COMPOSE_MAP: &str = include_str!("../shaders/compose_map.wgsl");
 
 /// One region-tile upload: the packed channel planes for one atlas slot.
@@ -64,9 +64,11 @@ pub struct GpuMapParams {
     /// transform to the field and sparse-overlay coordinates together so GPU
     /// composition matches the canonical CPU presenter's center crop.
     pub zoom: u32,
-    /// Width used when the canonical presenter rasterized grid lines into the
-    /// sparse overlay, in source map-cell units. This remains projection
-    /// metadata only: the GPU shader must not synthesize a second grid.
+    /// Whether the shader applies its single region-grid layer between the
+    /// pre-grid and post-grid sparse overlays.
+    pub grid_enabled: bool,
+    /// Region-grid width in source map-cell units. The shader rounds upward
+    /// and clamps this to `1..=resolution`, matching the canonical CPU path.
     pub grid_thickness_cells: f32,
     /// Refinement octaves (0..=3 used).
     pub refine: [RefineOctaveParams; 3],
@@ -99,11 +101,13 @@ struct MapParamsRaw {
     refine_octave_count: u32,
     zoom: f32,
     grid_thickness_cells: f32,
+    grid_enabled: u32,
+    _pad: [u32; 3],
     refine: [RefineOctaveRaw; 3],
 }
 
 /// GPU state for the atlas-composed map: the channel-plane atlases, the slot
-/// lookup, the overlay texture, and the composition pipeline.
+/// lookup, the ordered overlay textures, and the composition pipeline.
 #[derive(Debug)]
 pub struct GpuMap {
     pipeline: wgpu::RenderPipeline,
@@ -112,7 +116,8 @@ pub struct GpuMap {
     slot_buffer: wgpu::Buffer,
     planes: [wgpu::Texture; 4],
     ints: wgpu::Texture,
-    overlay: wgpu::Texture,
+    pre_grid_overlay: wgpu::Texture,
+    post_grid_overlay: wgpu::Texture,
     /// Atlas slots per row (slot → tile x/y).
     pub tiles_x: u32,
     /// Total atlas slot capacity.
@@ -170,8 +175,8 @@ impl GpuMap {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let overlay = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("map-overlay"),
+        let overlay_desc = |label| wgpu::TextureDescriptor {
+            label: Some(label),
             size: wgpu::Extent3d {
                 width: side,
                 height: side,
@@ -183,7 +188,9 @@ impl GpuMap {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        });
+        };
+        let pre_grid_overlay = device.create_texture(&overlay_desc("map-pre-grid-overlay"));
+        let post_grid_overlay = device.create_texture(&overlay_desc("map-post-grid-overlay"));
 
         let span = u64::from(side / resolution) * u64::from(side / resolution);
         let slot_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -243,6 +250,7 @@ impl GpuMap {
                 texture_entry(5, float_tex),
                 texture_entry(6, wgpu::TextureSampleType::Uint),
                 texture_entry(7, float_tex),
+                texture_entry(8, float_tex),
             ],
         });
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
@@ -280,7 +288,11 @@ impl GpuMap {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&view(&overlay)),
+                    resource: wgpu::BindingResource::TextureView(&view(&pre_grid_overlay)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&view(&post_grid_overlay)),
                 },
             ],
         });
@@ -323,7 +335,8 @@ impl GpuMap {
             slot_buffer,
             planes,
             ints,
-            overlay,
+            pre_grid_overlay,
+            post_grid_overlay,
             tiles_x,
             capacity,
             resolution,
@@ -388,15 +401,20 @@ impl GpuMap {
         bytes
     }
 
-    /// Upload the CPU-drawn sparse overlay (map-cell resolution RGBA8).
-    pub fn upload_overlay(&self, queue: &wgpu::Queue, rgba: &[u8]) -> u64 {
+    fn upload_overlay_texture(
+        &self,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        label: &str,
+        rgba: &[u8],
+    ) -> u64 {
         if rgba.len() != (self.side * self.side * 4) as usize {
-            log::error!("overlay upload size mismatch ({} bytes)", rgba.len());
+            log::error!("{label} upload size mismatch ({} bytes)", rgba.len());
             return 0;
         }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.overlay,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -414,6 +432,18 @@ impl GpuMap {
             },
         );
         u64::from(self.side) * u64::from(self.side) * 4
+    }
+
+    /// Upload the sparse straight-alpha layer before the shader-owned grid
+    /// (currently the pinned-revision flash), at map-cell resolution RGBA8.
+    pub fn upload_pre_grid_overlay(&self, queue: &wgpu::Queue, rgba: &[u8]) -> u64 {
+        self.upload_overlay_texture(queue, &self.pre_grid_overlay, "pre-grid overlay", rgba)
+    }
+
+    /// Upload the canonically ordered sparse straight-alpha layers after the
+    /// shader-owned grid, at map-cell resolution RGBA8.
+    pub fn upload_post_grid_overlay(&self, queue: &wgpu::Queue, rgba: &[u8]) -> u64 {
+        self.upload_overlay_texture(queue, &self.post_grid_overlay, "post-grid overlay", rgba)
     }
 
     /// Write this frame's slot lookup + parameters.
@@ -445,6 +475,8 @@ impl GpuMap {
             refine_octave_count: params.refine_count,
             zoom: params.zoom.max(1) as f32,
             grid_thickness_cells: params.grid_thickness_cells.max(1.0),
+            grid_enabled: u32::from(params.grid_enabled),
+            _pad: [0; 3],
             refine,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&raw));
@@ -464,6 +496,8 @@ impl GpuMap {
 mod tests {
     use super::*;
 
+    const GRID_ALPHA: f32 = 89.0 / 255.0;
+
     /// Convert an encoded-space WGSL palette result through the final sRGB
     /// attachment quantization. The shader converts to linear before writing;
     /// the sRGB target converts back, so this is the observable byte.
@@ -478,6 +512,50 @@ mod tests {
     fn wgsl_lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         let t = t.clamp(0.0, 1.0);
         std::array::from_fn(|index| a[index] + (b[index] - a[index]) * t)
+    }
+
+    fn transcribed_grid_cells(thickness: f32, resolution: u32) -> u32 {
+        thickness.ceil().clamp(1.0, resolution as f32) as u32
+    }
+
+    fn transcribed_grid_predicate(
+        source_x: u32,
+        source_y: u32,
+        resolution: u32,
+        thickness: f32,
+    ) -> bool {
+        let cells = transcribed_grid_cells(thickness, resolution);
+        source_x % resolution < cells || source_y % resolution >= resolution - cells
+    }
+
+    fn transcribed_source_cell(
+        destination_pixel: u32,
+        destination_extent: u32,
+        source_side: u32,
+        zoom: u32,
+    ) -> u32 {
+        let source_side = source_side as f32;
+        let center = source_side * 0.5;
+        let uv = (destination_pixel as f32 + 0.5) / destination_extent as f32;
+        (((uv * source_side - center) / zoom.max(1) as f32 + center) as u32)
+            .min(source_side as u32 - 1)
+    }
+
+    fn transcribed_overlay(base: [f32; 3], overlay: [f32; 4]) -> [f32; 3] {
+        wgsl_lerp(base, [overlay[0], overlay[1], overlay[2]], overlay[3])
+    }
+
+    fn transcribed_ordered_layers(
+        base: [f32; 3],
+        pre_grid: [f32; 4],
+        grid: bool,
+        post_grid: [f32; 4],
+    ) -> [f32; 3] {
+        let mut rgb = transcribed_overlay(base, pre_grid);
+        if grid {
+            rgb = wgsl_lerp(rgb, [0.0; 3], GRID_ALPHA);
+        }
+        transcribed_overlay(rgb, post_grid)
     }
 
     /// Rust transcription of WGSL `elevation_color`, intentionally using
@@ -544,16 +622,167 @@ mod tests {
             core::mem::offset_of!(MapParamsRaw, grid_thickness_cells),
             28
         );
-        assert_eq!(core::mem::offset_of!(MapParamsRaw, refine), 32);
-        assert_eq!(core::mem::size_of::<MapParamsRaw>(), 176);
+        assert_eq!(core::mem::offset_of!(MapParamsRaw, grid_enabled), 32);
+        assert_eq!(core::mem::offset_of!(MapParamsRaw, refine), 48);
+        assert_eq!(core::mem::size_of::<MapParamsRaw>(), 192);
     }
 
     #[test]
-    fn shader_has_no_independent_grid_composition() {
-        assert!(!SHADER_COMPOSE_MAP.contains("grid: u32"));
-        assert!(!SHADER_COMPOSE_MAP.contains("params.grid"));
-        assert!(SHADER_COMPOSE_MAP.contains("grid_thickness_cells: f32"));
-        assert!(SHADER_COMPOSE_MAP.contains("textureLoad(overlay"));
+    fn shader_bindings_and_order_encode_the_single_grid_contract() {
+        for required in [
+            "@group(0) @binding(7) var pre_grid_overlay: texture_2d<f32>;",
+            "@group(0) @binding(8) var post_grid_overlay: texture_2d<f32>;",
+            "grid_thickness_cells: f32,",
+            "grid_enabled: u32,",
+            "if params.grid_enabled != 0u {",
+            "ceil(params.grid_thickness_cells)",
+            "if local_x < grid_cells || local_y >= res - grid_cells {",
+            "const GRID_ALPHA: f32 = 89.0 / 255.0;",
+        ] {
+            assert!(
+                SHADER_COMPOSE_MAP.contains(required),
+                "WGSL grid contract lost `{required}`"
+            );
+        }
+
+        let pre = SHADER_COMPOSE_MAP
+            .find("let pre = textureLoad(")
+            .expect("pre-grid load");
+        let grid = SHADER_COMPOSE_MAP
+            .find("rgb = mix(rgb, vec3<f32>(0.0), GRID_ALPHA);")
+            .expect("single shader-owned grid blend");
+        let post = SHADER_COMPOSE_MAP
+            .find("let post = textureLoad(")
+            .expect("post-grid load");
+        let decode = SHADER_COMPOSE_MAP
+            .find("return vec4<f32>(srgb_to_linear(rgb), 1.0);")
+            .expect("final encoded-to-linear conversion");
+        assert!(pre < grid && grid < post && post < decode);
+        assert_eq!(
+            SHADER_COMPOSE_MAP
+                .matches("rgb = mix(rgb, vec3<f32>(0.0), GRID_ALPHA);")
+                .count(),
+            1
+        );
+        assert_eq!(
+            SHADER_COMPOSE_MAP
+                .matches("textureLoad(pre_grid_overlay")
+                .count(),
+            1
+        );
+        assert_eq!(
+            SHADER_COMPOSE_MAP
+                .matches("textureLoad(post_grid_overlay")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn grid_predicate_matches_cpu_cells_after_every_supported_zoom() {
+        let resolution = 8;
+        let source_side = 5 * resolution;
+        for destination_extent in [7, 15, 40, 63] {
+            for zoom in [1, 2, 4, 8, 16] {
+                for thickness in [0.1, 1.0, 1.01, 2.25, 7.01, 8.0, 99.0] {
+                    let cells = transcribed_grid_cells(thickness, resolution);
+                    assert_eq!(cells, (thickness.ceil() as u32).clamp(1, resolution));
+                    for destination_y in 0..destination_extent {
+                        let source_y = transcribed_source_cell(
+                            destination_y,
+                            destination_extent,
+                            source_side,
+                            zoom,
+                        );
+                        for destination_x in 0..destination_extent {
+                            let source_x = transcribed_source_cell(
+                                destination_x,
+                                destination_extent,
+                                source_side,
+                                zoom,
+                            );
+                            let cpu = source_x % resolution < cells
+                                || source_y % resolution >= resolution - cells;
+                            assert_eq!(
+                                transcribed_grid_predicate(
+                                    source_x,
+                                    source_y,
+                                    resolution,
+                                    thickness,
+                                ),
+                                cpu,
+                                "destination={destination_extent} zoom={zoom} thickness={thickness} source=({source_x},{source_y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_layer_transcription_keeps_pinned_grid_and_post_order() {
+        let base = [0.16, 0.42, 0.81];
+        let pre_grid = [1.0, 30.0 / 255.0, 30.0 / 255.0, 0.6];
+        let post_grid = [0.1, 0.9, 0.25, 0.45];
+        let after_pre = transcribed_overlay(base, pre_grid);
+        let after_grid = wgsl_lerp(after_pre, [0.0; 3], GRID_ALPHA);
+        let expected = transcribed_overlay(after_grid, post_grid);
+        let actual = transcribed_ordered_layers(base, pre_grid, true, post_grid);
+        for component in 0..3 {
+            assert!((actual[component] - expected[component]).abs() < f32::EPSILON);
+        }
+
+        let wrong_grid_before_pre =
+            transcribed_overlay(wgsl_lerp(base, [0.0; 3], GRID_ALPHA), pre_grid);
+        let wrong_grid_last = wgsl_lerp(
+            transcribed_overlay(after_pre, post_grid),
+            [0.0; 3],
+            GRID_ALPHA,
+        );
+        assert_ne!(actual, wrong_grid_before_pre);
+        assert_ne!(actual, wrong_grid_last);
+
+        // Exercise both branches at representative source cells and widths;
+        // post-grid alpha must remain effective after a darkened grid cell.
+        for thickness in [1.0, 1.25, 3.75] {
+            for (source, expected_grid) in [((0, 0), true), ((4, 2), false), ((4, 7), true)] {
+                let grid = transcribed_grid_predicate(source.0, source.1, 8, thickness);
+                if thickness <= 3.75 && source == (4, 2) {
+                    assert!(!grid);
+                } else {
+                    assert_eq!(grid, expected_grid);
+                }
+                let composed = transcribed_ordered_layers(base, pre_grid, grid, post_grid);
+                assert_eq!(
+                    composed,
+                    transcribed_overlay(
+                        if grid {
+                            wgsl_lerp(after_pre, [0.0; 3], GRID_ALPHA)
+                        } else {
+                            after_pre
+                        },
+                        post_grid,
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shader_grid_alpha_preserves_m4_gpu_bytes_and_tracks_cpu_quantization() {
+        for base in 0u8..=u8::MAX {
+            let encoded = f32::from(base) / 255.0;
+            let prior_folded_gpu = attachment_byte(encoded * (1.0 - 89.0 / 255.0));
+            let shader_owned = attachment_byte(wgsl_lerp([encoded; 3], [0.0; 3], GRID_ALPHA)[0]);
+            assert_eq!(shader_owned, prior_folded_gpu, "base byte {base}");
+
+            let cpu = world_runtime::mapcolor::lerp_rgb([base; 3], [0; 3], 0.35)[0];
+            assert!(
+                shader_owned.abs_diff(cpu) <= 1,
+                "base byte {base}: shader={shader_owned}, cpu={cpu}"
+            );
+        }
     }
 
     #[test]

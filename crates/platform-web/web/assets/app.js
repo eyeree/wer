@@ -10,12 +10,17 @@ let lastSnapshot;
 const registeredActions = new Set();
 // The wasm module namespace, kept for the async POV renderer bring-up.
 let wasmMod;
-// The canvas placement of the last drawn map image (letterboxed, square
-// source), so cursor picking inverts the exact draw transform.
+// Exact physical fitted rectangle returned by viewer_host::layout. JS uses it
+// only to blit/characterize; Rust owns inverse projection and picking.
 let mapViewport;
 let mapScratch;
 let mapScratchContext;
 let mapImageData;
+let mapCanvasContext;
+let surfaceResizeDirty = false;
+let surfaceBacking = { width: 1, height: 1, dpr: 1 };
+let surfaceResizeGeneration = 0;
+let resizeRedrawGeneration = 0;
 
 const write = (name, value, cls) => {
   const node = fields.get(name);
@@ -53,7 +58,8 @@ const appendDiagnostic = (message) => {
 
 const drawBootCanvas = () => {
   const canvas = document.getElementById("world-canvas");
-  const ctx = canvas.getContext("2d");
+  mapCanvasContext ??= canvas.getContext("2d");
+  const ctx = mapCanvasContext;
   if (!ctx) return;
   const w = canvas.width;
   const h = canvas.height;
@@ -89,8 +95,9 @@ let zoom = 1;
 // aspect. Zoom and every overlay have already been transformed together.
 const drawCpuMap = (header, pixels) => {
   const canvas = document.getElementById("world-canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx || header.kind !== "rgba8") return false;
+  mapCanvasContext ??= canvas.getContext("2d");
+  const ctx = mapCanvasContext;
+  if (!ctx || header.kind !== "rgba8" || !mapViewport) return false;
   if (!mapScratch || mapScratch.width !== header.width || mapScratch.height !== header.height) {
     mapScratch = document.createElement("canvas");
     mapScratch.width = header.width;
@@ -101,33 +108,40 @@ const drawCpuMap = (header, pixels) => {
   if (!mapScratchContext || !mapImageData) return false;
   mapImageData.data.set(pixels);
   mapScratchContext.putImageData(mapImageData, 0, 0);
-  const sw = header.width;
-  const sh = header.height;
-  const sx = 0;
-  const sy = 0;
-  const scale = Math.min(canvas.width / sw, canvas.height / sh);
-  const dw = sw * scale;
-  const dh = sh * scale;
-  const dx = (canvas.width - dw) / 2;
-  const dy = (canvas.height - dh) / 2;
-  mapViewport = {
-    dx,
-    dy,
-    dw,
-    dh,
-    sx,
-    sy,
-    sw,
-    sh,
+  Object.assign(mapViewport, {
+    sx: 0,
+    sy: 0,
+    sw: header.width,
+    sh: header.height,
     width: header.width,
     height: header.height,
     resolution: header.resolution,
-  };
+  });
   ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = "#0b0d0f";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(mapScratch, sx, sy, sw, sh, dx, dy, dw, dh);
+  ctx.drawImage(
+    mapScratch,
+    0,
+    0,
+    header.width,
+    header.height,
+    mapViewport.dx,
+    mapViewport.dy,
+    mapViewport.dw,
+    mapViewport.dh,
+  );
   return true;
+};
+
+const applySharedLayout = (layout) => {
+  const rect = layout?.map_content;
+  if (!rect) {
+    mapViewport = undefined;
+    return;
+  }
+  const [dx, dy, dw, dh] = rect;
+  mapViewport = { ...mapViewport, dx, dy, dw, dh };
 };
 
 // Report WebGPU availability. Returns whether the atlas/POV renderer path
@@ -192,6 +206,49 @@ const installMapControls = ({ channels, overlays }) => {
   }
 };
 
+// The CSS box is platform input; backing sizes and every shared rectangle are
+// physical pixels. ResizeObserver handles layout changes, while the resolution
+// media query catches DPR-only transitions between displays.
+const resizeViewerSurface = () => {
+  const host = document.querySelector(".canvas-host");
+  if (!host) return false;
+  const css = host.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(css.width * dpr));
+  const height = Math.max(1, Math.round(css.height * dpr));
+  if (
+    width === surfaceBacking.width &&
+    height === surfaceBacking.height &&
+    dpr === surfaceBacking.dpr
+  ) {
+    return false;
+  }
+  surfaceBacking = { width, height, dpr };
+  surfaceResizeGeneration += 1;
+  for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+  }
+  mapViewport = undefined;
+  surfaceResizeDirty = true;
+  const app = window.__werApp;
+  if (app) applySharedLayout(JSON.parse(app.resize_surface(width, height)));
+  scheduleFrame();
+  return true;
+};
+
+const resizeObserver = new ResizeObserver(() => resizeViewerSurface());
+resizeObserver.observe(document.querySelector(".canvas-host"));
+window.addEventListener("resize", resizeViewerSurface);
+
+let dprQuery;
+const watchDevicePixelRatio = () => {
+  dprQuery?.removeEventListener("change", watchDevicePixelRatio);
+  resizeViewerSurface();
+  dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+  dprQuery.addEventListener("change", watchDevicePixelRatio);
+};
+
 const initWasm = async () => {
   try {
     const mod = await import("../generated/platform_web.js");
@@ -199,6 +256,9 @@ const initWasm = async () => {
     wasmMod = mod;
     const app = new mod.WebApp(JSON.stringify({ tier: "auto", storage: false }));
     window.__werApp = app;
+    applySharedLayout(
+      JSON.parse(app.resize_surface(surfaceBacking.width, surfaceBacking.height)),
+    );
     for (const descriptor of JSON.parse(app.action_descriptors())) {
       registeredActions.add(descriptor.id);
     }
@@ -416,6 +476,7 @@ const viewerFrame = (now) => {
   const t0 = performance.now();
   const frame = JSON.parse(app.frame(dt, now / 1000));
   const snapshot = frame.snapshot;
+  applySharedLayout(frame.layout);
   window.__povStatus = frame.pov;
   if (frame.pov.active) {
     if (frame.pov.rendered) {
@@ -433,12 +494,23 @@ const viewerFrame = (now) => {
   updateSnapshot(snapshot);
   syncViewMode(snapshot, frame.map.path);
   let mapPresented = false;
+  const redrawsResize = surfaceResizeDirty;
   if (frame.map.active && frame.map.path === "cpu") {
-    mapPresented = frame.map_dirty ? renderMap() : mapViewport !== undefined;
+    mapPresented = frame.map_dirty || surfaceResizeDirty ? renderMap() : mapViewport !== undefined;
   } else if (frame.map.active && frame.map.path === "gpu-atlas") {
     mapPresented = frame.map.gpu_submitted;
   }
-  window.__mapStatus = { ...frame.map, presented: mapPresented };
+  if (mapPresented) {
+    if (redrawsResize) resizeRedrawGeneration = surfaceResizeGeneration;
+    surfaceResizeDirty = false;
+  }
+  window.__mapStatus = {
+    ...frame.map,
+    dirty: frame.map_dirty,
+    presented: mapPresented,
+    resize_generation: surfaceResizeGeneration,
+    resize_redraw_generation: resizeRedrawGeneration,
+  };
   if (frame.map.active && frame.map.path === "gpu-atlas") {
     perf.uploadKb = frame.map.upload_bytes / 1024;
   }
@@ -648,29 +720,14 @@ const updateMapHover = (event) => {
     write("cursor", "none");
     return;
   }
-  // Invert only the canvas letterbox here. Rust owns zoom and world
-  // projection through the same MapComposer that produced these pixels.
-  const rect = canvas.getBoundingClientRect();
-  const px = ((event.clientX - rect.left) / rect.width) * canvas.width;
-  const py = ((event.clientY - rect.top) / rect.height) * canvas.height;
-  const mx = mapViewport.sx + ((px - mapViewport.dx) / mapViewport.dw) * mapViewport.sw;
-  const my = mapViewport.sy + ((py - mapViewport.dy) / mapViewport.dh) * mapViewport.sh;
-  if (
-    mx < mapViewport.sx ||
-    my < mapViewport.sy ||
-    mx >= mapViewport.sx + mapViewport.sw ||
-    my >= mapViewport.sy + mapViewport.sh
-  ) {
-    write("cursor", "none");
-    return;
-  }
-  const world = JSON.parse(window.__werApp.map_world_at(mx, my));
+  const [physicalX, physicalY] = canvasPoint(canvas, event);
+  const world = JSON.parse(window.__werApp.map_world_at(physicalX, physicalY));
   if (!world) {
     write("cursor", "none");
     return;
   }
   const [wx, wy] = world;
-  const organism = JSON.parse(window.__werApp.map_organism_at(mx, my));
+  const organism = JSON.parse(window.__werApp.map_organism_at(physicalX, physicalY));
   write(
     "cursor",
     organism
@@ -753,6 +810,7 @@ window.__viewerCharacterization = () => {
       width: window.innerWidth,
       height: window.innerHeight,
       dpr: window.devicePixelRatio,
+      layoutContract: window.innerWidth <= 760 ? "stacked-scroll" : "bounded-desktop",
     },
     document: {
       clientWidth: documentElement.clientWidth,
@@ -771,6 +829,7 @@ window.__viewerCharacterization = () => {
     canvases: {
       map: canvas("#world-canvas"),
       pov: canvas("#pov-canvas"),
+      observedBacking: surfaceBacking,
       mapViewport:
         mapViewport === undefined
           ? null
@@ -795,6 +854,7 @@ window.__viewerCharacterization = () => {
   };
 };
 
+watchDevicePixelRatio();
 drawBootCanvas();
 const webgpuAvailable = probeWebGpu();
 initWorkerProbe();

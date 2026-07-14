@@ -6,7 +6,7 @@
     <title>Infinite World Exploration</title>
     <link rel="stylesheet" href="./assets/app.css" />
   </head>
-  <body>
+  <body class="viewer-page">
     <header class="site-header">
       <a class="brand" href="./">Infinite World Exploration</a>
       <nav aria-label="Site">
@@ -50,8 +50,8 @@
           </select>
         </div>
         <div class="canvas-host">
-          <canvas id="world-canvas" data-view-kind="map" width="960" height="540" tabindex="0" aria-label="World map"></canvas>
-          <canvas id="pov-canvas" data-view-kind="pov" width="960" height="540" tabindex="0" aria-label="POV view" hidden></canvas>
+          <canvas id="world-canvas" data-view-kind="map" tabindex="0" aria-label="World map"></canvas>
+          <canvas id="pov-canvas" data-view-kind="pov" tabindex="0" aria-label="POV view" hidden></canvas>
         </div>
         <div class="status-bar" role="status">
           <span data-field="wasm-status">Loading wasm</span>
