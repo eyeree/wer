@@ -9,7 +9,6 @@ const required = [
   "assets/app.css",
   "assets/app.js",
   "assets/benchmark.js",
-  "assets/commands.js",
   "assets/storage.js",
   "assets/worker.js",
   "assets/manifest.json",
@@ -42,8 +41,8 @@ if (!app.includes("new mod.WebApp")) {
 if (!app.includes("render_cpu_map")) {
   throw new Error("app.js does not render the CPU map buffer");
 }
-if (!app.includes("renderer:webgpu")) {
-  throw new Error("app.js does not expose WebGPU renderer selection");
+if (!app.includes("renderer_available")) {
+  throw new Error("app.js does not report WebGPU renderer availability");
 }
 if (!app.includes("new Worker")) {
   throw new Error("app.js does not initialize the worker probe");
@@ -54,19 +53,28 @@ if (!app.includes("openVault")) {
 if (!app.includes("runStartupBenchmark")) {
   throw new Error("app.js does not run startup benchmark");
 }
-if (!html.includes('data-command="mode:pov"')) {
+if (!html.includes('data-action="set-presentation" data-value="pov"')) {
   throw new Error("index.html does not expose POV mode control");
 }
-for (const control of ["pov:walk", "pov:toggle-baked", "pov:toggle-detail", "pov:toggle-water", "pov:scale"]) {
-  if (!html.includes(`data-command="${control}"`)) {
+if (!html.includes('data-action="set-presentation" data-value="split"')) {
+  throw new Error("index.html does not expose Split mode control");
+}
+for (const control of ["toggle-walk", "toggle-pov-shadow-ao", "toggle-pov-detail-normals", "toggle-pov-water", "set-pov-render-scale"]) {
+  if (!html.includes(`data-action="${control}"`)) {
     throw new Error(`index.html does not expose POV control ${control}`);
   }
 }
-if (!app.includes('command.group === "POV"')) {
-  throw new Error("app.js does not gate POV keys to POV mode");
+if (app.includes("MOVE_KEYS") || app.includes("POV_MOVE")) {
+  throw new Error("app.js contains a second hand-written binding table");
 }
-if (!app.includes('"mode:map" : command.id')) {
-  throw new Error("app.js does not toggle Tab between map and POV");
+if (app.includes("requestPointerLock") || app.includes("pointerlockchange")) {
+  throw new Error("app.js enables pointer-lock free look");
+}
+if (!app.includes("event.code") || !app.includes("event.repeat")) {
+  throw new Error("app.js does not forward KeyboardEvent.code/repeat");
+}
+if (!app.includes("setPointerCapture") || !app.includes("pointercancel")) {
+  throw new Error("app.js does not transport primary drag cancellation");
 }
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");
@@ -76,11 +84,10 @@ for (const heading of ["World Model", "Possibility", "Terrain"]) {
   }
 }
 
-const commands = await readFile(join(dist, "assets/commands.js"), "utf8");
 const help = await readFile(join(dist, "help/index.html"), "utf8");
-for (const match of commands.matchAll(/id: "([^"]+)"/g)) {
-  if (!help.includes(`data-help-command="${match[1]}"`)) {
-    throw new Error(`help page missing command ${match[1]}`);
+for (const match of html.matchAll(/data-action="([^"]+)"/g)) {
+  if (!help.includes(`data-help-action="${match[1]}"`)) {
+    throw new Error(`help page missing action ${match[1]}`);
   }
 }
 

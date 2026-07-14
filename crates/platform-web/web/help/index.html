@@ -27,35 +27,50 @@
           <tr><th>Command</th><th>Key</th><th>Control</th></tr>
         </thead>
         <tbody>
-          <tr data-help-command="channel:composite"><td>Composite channel</td><td>V</td><td>Channel select (Composite entry)</td></tr>
-          <tr data-help-command="channel"><td>Map channel selection (composite, elevation, geology, temperature, moisture, river, wetness, soil, biome, vegetation, herbivore, predator, diversity, species)</td><td>none</td><td>Channel select</td></tr>
-          <tr data-help-command="toggle:compose"><td>Toggle GPU compose</td><td>,</td><td>Compose toggle</td></tr>
-          <tr data-help-command="toggle:refinement"><td>Toggle refinement</td><td>.</td><td>Refine toggle</td></tr>
-          <tr data-help-command="tier"><td>Resource tier override</td><td>none</td><td>Tier select</td></tr>
-          <tr data-help-command="tier:benchmark"><td>Run startup benchmark</td><td>none</td><td>Automatic startup benchmark</td></tr>
-          <tr data-help-command="worker"><td>Worker mode override</td><td>none</td><td>Worker mode select</td></tr>
-          <tr data-help-command="renderer:webgpu"><td>Use WebGPU atlas</td><td>none</td><td>Automatic WebGPU detection</td></tr>
-          <tr data-help-command="renderer:cpu"><td>Use CPU map fallback</td><td>none</td><td>Reduced-mode fallback</td></tr>
-          <tr data-help-command="renderer:device-lost"><td>Handle WebGPU device loss</td><td>none</td><td>Automatic fallback</td></tr>
-          <tr data-help-command="worker:inline"><td>Inline execution</td><td>none</td><td>Worker mode override</td></tr>
-          <tr data-help-command="worker:workers"><td>Worker pool</td><td>none</td><td>Worker mode override</td></tr>
-          <tr data-help-command="worker:shared"><td>Shared-memory worker pool</td><td>none</td><td>Cross-origin isolated optimization</td></tr>
-          <tr data-help-command="worker:cancel-storm"><td>Cancel superseded worker jobs</td><td>none</td><td>Automatic queue drain</td></tr>
-          <tr data-help-command="storage:enable"><td>Enable IndexedDB storage</td><td>none</td><td>Automatic storage detection</td></tr>
-          <tr data-help-command="storage:disable"><td>Disable browser storage</td><td>none</td><td>Reduced storage mode</td></tr>
-          <tr data-help-command="storage:save"><td>Save session</td><td>none</td><td>Save button</td></tr>
-          <tr data-help-command="storage:reload"><td>Reload session</td><td>none</td><td>Reload recovery</td></tr>
-          <tr data-help-command="storage:export"><td>Export atlas bundle</td><td>none</td><td>Export button</td></tr>
-          <tr data-help-command="storage:import"><td>Import atlas bundle</td><td>none</td><td>Import button</td></tr>
-          <tr data-help-command="storage:reset"><td>Reset local vault</td><td>none</td><td>Reset button</td></tr>
-          <tr data-help-command="mode:map"><td>Map mode</td><td>Tab (from POV)</td><td>Map button</td></tr>
-          <tr data-help-command="mode:pov"><td>POV mode (needs WebGPU)</td><td>Tab</td><td>POV button</td></tr>
-          <tr data-help-command="pov:pointer-lock"><td>Pointer lock</td><td>none</td><td>POV browser control</td></tr>
-          <tr data-help-command="pov:walk"><td>POV: toggle walk / fly</td><td>F (POV mode)</td><td>Walk button</td></tr>
-          <tr data-help-command="pov:toggle-baked"><td>POV: toggle directional shadows and terrain AO</td><td>B (POV mode)</td><td>Shadows/AO button</td></tr>
-          <tr data-help-command="pov:toggle-detail"><td>POV: toggle per-fragment detail normals</td><td>N (POV mode)</td><td>Detail button</td></tr>
-          <tr data-help-command="pov:toggle-water"><td>POV: toggle the water passes (sea + rivers)</td><td>none</td><td>Water button</td></tr>
-          <tr data-help-command="pov:scale"><td>POV render scale (fps knob: the 3D pass rasterizes at 1.0/0.5/0.25 of the canvas)</td><td>none</td><td>POV scale select</td></tr>
+          <tr data-help-action="set-presentation"><td>Show Map, POV, or Split</td><td>none</td><td>View buttons</td></tr>
+          <tr data-help-action="toggle-primary-view"><td>Toggle Map/POV or move Split focus</td><td>Tab on a view surface</td><td>none</td></tr>
+          <tr data-help-action="focus-view"><td>Route view-scoped input to a pane</td><td>Primary click / Split Tab</td><td>none</td></tr>
+          <tr data-help-action="set-split-ratio"><td>Set the Map share in Split</td><td>none</td><td>future divider</td></tr>
+          <tr data-help-action="nudge-possibility"><td>Nudge a possibility domain</td><td>1–8; Shift reverses</td><td>none</td></tr>
+          <tr data-help-action="reset-possibility-bias"><td>Reset manual possibility bias</td><td>Z</td><td>none</td></tr>
+          <tr data-help-action="drop-anchor"><td>Drop an Emphasize or Suppress anchor</td><td>E / Q</td><td>none</td></tr>
+          <tr data-help-action="capture-anchor"><td>Capture traits under the traveler</td><td>K</td><td>none</td></tr>
+          <tr data-help-action="cycle-capture-category"><td>Cycle capture trait category</td><td>T</td><td>none</td></tr>
+          <tr data-help-action="toggle-capture-polarity"><td>Toggle capture polarity</td><td>Y</td><td>none</td></tr>
+          <tr data-help-action="clear-anchors"><td>Remove active anchors</td><td>C</td><td>none</td></tr>
+          <tr data-help-action="toggle-transition-mode"><td>Toggle deliberate transition movement</td><td>R</td><td>none</td></tr>
+          <tr data-help-action="save-session"><td>Persist the current session</td><td>O</td><td>Save button</td></tr>
+          <tr data-help-action="load-session"><td>Load the persisted session</td><td>L</td><td>none</td></tr>
+          <tr data-help-action="record-last-anchor"><td>Persist the last anchor as a discovery</td><td>B</td><td>none</td></tr>
+          <tr data-help-action="summon-discoveries"><td>Summon retained discoveries</td><td>I</td><td>none</td></tr>
+          <tr data-help-action="toggle-preserve"><td>Toggle a preserve at the traveler</td><td>P</td><td>none</td></tr>
+          <tr data-help-action="toggle-path-tracking"><td>Toggle path tracking</td><td>H</td><td>none</td></tr>
+          <tr data-help-action="toggle-route-recording"><td>Toggle route recording</td><td>J</td><td>none</td></tr>
+          <tr data-help-action="toggle-route-attraction"><td>Toggle route attraction</td><td>U</td><td>none</td></tr>
+          <tr data-help-action="clear-routes"><td>Clear retained routes</td><td>Delete</td><td>none</td></tr>
+          <tr data-help-action="cycle-map-channel"><td>Advance the visible map channel</td><td>V</td><td>none</td></tr>
+          <tr data-help-action="set-map-channel"><td>Select an exact map channel</td><td>none</td><td>Channel select</td></tr>
+          <tr data-help-action="toggle-overlay"><td>Toggle a map overlay</td><td>F / G / N / X / M</td><td>none</td></tr>
+          <tr data-help-action="zoom-in"><td>Increase map magnification</td><td>Wheel up</td><td>none</td></tr>
+          <tr data-help-action="zoom-out"><td>Decrease map magnification</td><td>Wheel down</td><td>none</td></tr>
+          <tr data-help-action="toggle-gpu-compose"><td>Toggle GPU atlas map composition</td><td>,</td><td>Compose button</td></tr>
+          <tr data-help-action="toggle-refinement"><td>Toggle map refinement</td><td>.</td><td>Refine button</td></tr>
+          <tr data-help-action="toggle-walk"><td>Toggle POV walk/fly movement</td><td>F in POV</td><td>Walk button</td></tr>
+          <tr data-help-action="toggle-pov-shadow-ao"><td>Toggle POV shadows and ambient occlusion</td><td>B in POV</td><td>Shadows/AO button</td></tr>
+          <tr data-help-action="toggle-pov-detail-normals"><td>Toggle POV detail normals</td><td>N in POV</td><td>Detail button</td></tr>
+          <tr data-help-action="toggle-pov-water"><td>Toggle POV water passes</td><td>V in POV</td><td>Water button</td></tr>
+          <tr data-help-action="set-pov-render-scale"><td>Set POV internal render scale</td><td>none</td><td>POV scale select</td></tr>
+          <tr data-help-action="set-resource-tier"><td>Select a resource tier</td><td>none</td><td>Tier select</td></tr>
+          <tr data-help-action="request-tier-benchmark"><td>Run the resource-tier benchmark</td><td>none</td><td>startup service</td></tr>
+          <tr data-help-action="set-worker-backend"><td>Select task execution strategy</td><td>none</td><td>Worker select</td></tr>
+          <tr data-help-action="cancel-superseded-jobs"><td>Cancel work superseded by newer requests</td><td>none</td><td>runtime service</td></tr>
+          <tr data-help-action="set-map-backend"><td>Select CPU or GPU atlas map rendering</td><td>none</td><td>runtime service</td></tr>
+          <tr data-help-action="set-storage-enabled"><td>Enable or disable platform storage</td><td>none</td><td>automatic storage detection</td></tr>
+          <tr data-help-action="reset-local-vault"><td>Reset platform-local vault data</td><td>none</td><td>Reset button</td></tr>
+          <tr data-help-action="request-atlas-import"><td>Open a platform atlas importer</td><td>none</td><td>Import button</td></tr>
+          <tr data-help-action="request-atlas-export"><td>Export an atlas bundle</td><td>none</td><td>Export button</td></tr>
+          <tr data-help-action="request-debug-dump"><td>Capture presentation diagnostics</td><td>F12</td><td>none</td></tr>
+          <tr data-help-action="request-exit"><td>Exit where the host supports it</td><td>Escape</td><td>none</td></tr>
         </tbody>
       </table>
       <p>
@@ -90,8 +105,8 @@
       <h2>POV Mode</h2>
       <p>
         POV mode hosts the same shared 3D terrain renderer as the native shell
-        on a WebGPU canvas. Click the canvas for pointer-lock mouse look (or
-        hold the left button to drag), move with WASD/arrows
+        on a WebGPU canvas. Hold the primary button and drag to look; pointer
+        capture keeps that drag active outside the canvas. Move with WASD/arrows
         (<code>Space</code>/<code>Shift</code> fly up/down), and use the mouse
         wheel to adjust the fly or walk speed. If no WebGPU adapter or device
         is available — or the device is lost — the viewer returns to map mode

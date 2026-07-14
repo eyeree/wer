@@ -78,19 +78,23 @@
 mod dump;
 mod executor;
 mod gpumap;
+mod input;
 mod panel;
 mod pov;
 mod viz;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use renderer::{letterbox_viewport, Renderer};
+use viewer_host::action::{NudgeDirection, ViewerAction};
+use viewer_host::input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent};
+use viewer_host::layout::{PresentationMode, ViewKind};
+use viewer_host::map::MapBackend;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 use world_core::{
     bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, Biome, PossibilityDomain,
@@ -135,89 +139,6 @@ const MAX_ZOOM: u32 = 16;
 /// organism in the panel instead of the region info.
 const ORGANISM_INFO_ZOOM: u32 = 4;
 
-/// Native touchpad pixels treated as one wheel notch. Kept as a named seam so
-/// the alignment characterization can replay line and pixel deltas exactly.
-const WHEEL_PIXELS_PER_NOTCH: f64 = 40.0;
-
-/// Raw map navigation components and their length from held physical keys.
-/// Keeping the length separate preserves the native movement operation order.
-fn map_navigation_components(keys_down: &HashSet<KeyCode>) -> (f64, f64, f64) {
-    let down = |code| keys_down.contains(&code);
-    let mut dx = 0.0;
-    let mut dy = 0.0;
-    if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
-        dy += 1.0;
-    }
-    if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
-        dy -= 1.0;
-    }
-    if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
-        dx -= 1.0;
-    }
-    if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
-        dx += 1.0;
-    }
-    let len = f64::hypot(dx, dy);
-    (dx, dy, len)
-}
-
-/// Final map movement delta with the pre-alignment floating-point operation
-/// order. Travel feeds convergence, so even a one-ULP reassociation here is an
-/// unintended behavior change during characterization.
-fn map_movement_delta(keys_down: &HashSet<KeyCode>, sprint: bool, dt: f64) -> Option<(f64, f64)> {
-    let (dx, dy, len) = map_navigation_components(keys_down);
-    if len == 0.0 {
-        return None;
-    }
-    let sprint = if sprint { 4.0 } else { 1.0 };
-    let step = PLAYER_SPEED * sprint * dt / len;
-    Some((dx * step, dy * step))
-}
-
-/// Forward/strafe/vertical intent from held POV keys. The camera basis is
-/// applied afterwards because pitched forward and world-up are not generally
-/// orthogonal; the resulting world vector retains the existing normalization.
-fn pov_navigation_axis(keys_down: &HashSet<KeyCode>, walk: bool) -> (f64, f64, f64) {
-    let down = |code| keys_down.contains(&code);
-    let forward = i8::from(down(KeyCode::KeyW) || down(KeyCode::ArrowUp))
-        - i8::from(down(KeyCode::KeyS) || down(KeyCode::ArrowDown));
-    let strafe = i8::from(down(KeyCode::KeyD) || down(KeyCode::ArrowRight))
-        - i8::from(down(KeyCode::KeyA) || down(KeyCode::ArrowLeft));
-    let vertical = if walk {
-        0
-    } else {
-        i8::from(down(KeyCode::Space)) - i8::from(down(KeyCode::ShiftLeft))
-    };
-    (f64::from(forward), f64::from(strafe), f64::from(vertical))
-}
-
-/// Add fractional wheel input and return complete signed notches, retaining
-/// the sub-notch remainder exactly as the native event path does today.
-fn accumulate_wheel(accum: &mut f64, delta: f64) -> i32 {
-    *accum += delta;
-    let mut notches = 0;
-    while *accum >= 1.0 {
-        notches += 1;
-        *accum -= 1.0;
-    }
-    while *accum <= -1.0 {
-        notches -= 1;
-        *accum += 1.0;
-    }
-    notches
-}
-
-/// Cursor delta while a primary-button drag is active. `None` is both the
-/// pre-press and post-release/cancel gate: pointer transport alone cannot look.
-fn primary_drag_delta(last: Option<(f64, f64)>, current: (f64, f64)) -> Option<(f64, f64)> {
-    last.map(|(x, y)| (current.0 - x, current.1 - y))
-}
-
-/// One-shot key presses dispatch only on their first non-repeat event.
-const fn dispatch_one_shot(repeat: bool) -> bool {
-    !repeat
-}
-
 /// Which presentation the shell drives (3d-phase-1-plan.md §8.1). Map mode
 /// is byte-for-byte the pre-POV path; POV renders the meshed terrain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,49 +147,31 @@ enum ViewMode {
     Pov,
 }
 
-/// The two one-shot bindings exercised by the Milestone 0 semantic trace.
-/// The full registry moves to `viewer-host` in Milestone 2; until then this
-/// narrow seam makes the trace execute the production key mapping/reducer.
+impl ViewMode {
+    const fn presentation(self) -> PresentationMode {
+        match self {
+            Self::Map => PresentationMode::Map,
+            Self::Pov => PresentationMode::Pov,
+        }
+    }
+
+    const fn view_kind(self) -> ViewKind {
+        match self {
+            Self::Map => ViewKind::Map,
+            Self::Pov => ViewKind::Pov,
+        }
+    }
+}
+
+/// Shell-owned effects produced by the interim native action reducer. The
+/// shared controller takes ownership of this boundary in Milestone 3; until
+/// then, action reduction remains typed and exhaustive without giving
+/// `viewer-host` access to winit or the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CharacterizedOneShot {
-    CycleMapChannel,
-    TogglePovShadowAo,
-}
-
-fn characterized_one_shot(mode: ViewMode, code: KeyCode) -> Option<CharacterizedOneShot> {
-    match (mode, code) {
-        (ViewMode::Map, KeyCode::KeyV) => Some(CharacterizedOneShot::CycleMapChannel),
-        (ViewMode::Pov, KeyCode::KeyB) => Some(CharacterizedOneShot::TogglePovShadowAo),
-        _ => None,
-    }
-}
-
-fn reduce_characterized_one_shot(
-    action: CharacterizedOneShot,
-    channel: &mut Channel,
-    pov_shadow_ao: &mut bool,
-) {
-    match action {
-        CharacterizedOneShot::CycleMapChannel => *channel = channel.next(),
-        CharacterizedOneShot::TogglePovShadowAo => *pov_shadow_ao = !*pov_shadow_ao,
-    }
-}
-
-/// Arm/release the native POV look gate from an actual mouse-button event.
-fn update_primary_drag_gate(
-    mode: ViewMode,
-    button: MouseButton,
-    pressed: bool,
-    cursor: Option<(f64, f64)>,
-    drag_from: &mut Option<(f64, f64)>,
-) {
-    if mode == ViewMode::Pov && button == MouseButton::Left {
-        *drag_from = if pressed { cursor } else { None };
-    }
-}
-
-fn cancel_primary_drag(drag_from: &mut Option<(f64, f64)>) {
-    *drag_from = None;
+enum NativeActionEffect {
+    None,
+    DebugDump,
+    Exit,
 }
 
 /// Remove the runtime's effective preserve owner and only that record's
@@ -907,11 +810,11 @@ struct App {
     pov_organisms: PovOrganismManager,
     /// Chunk draw radius in regions (`WER_POV_RADIUS`, default 3).
     pov_radius: i32,
-    /// Mouse look is a left-button drag (WSLg/XWayland delivers unusable
-    /// raw `DeviceEvent` deltas — absolute jumps — so look input reads
-    /// window-space cursor deltas instead). `Some(last cursor position)`
-    /// while the button is held in POV.
-    pov_look_from: Option<(f64, f64)>,
+    /// Canonical binding, held-state, wheel, and primary-drag authority.
+    input: InputMapper,
+    /// Thin winit spelling/coordinate adapter; its cursor is also the
+    /// presentation-only map-hover position.
+    winit_input: input::WinitInputAdapter,
     /// The previous telemetry second's POV counters, for the delta log line.
     pov_counters_last: PovCounters,
     /// Previous organism lifecycle totals for the POV telemetry delta line.
@@ -932,18 +835,13 @@ struct App {
     /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
     overlay_hash: u64,
     panel_hash: u64,
-    keys_down: HashSet<KeyCode>,
-    modifiers: ModifiersState,
-    /// Mouse position in window physical pixels, when over the window.
+    /// Map hover in physical surface pixels, sampled from shared frame input.
     cursor_pos: Option<(f64, f64)>,
     /// Mouse-wheel view magnification (powers of two, 1..=MAX_ZOOM).
     /// Presentation only; past [`ORGANISM_INFO_ZOOM`] the cursor picks
     /// organisms. Zoomed views compose on the CPU so the base field and the
     /// overlays stay aligned.
     zoom: u32,
-    /// Fractional scroll accumulated toward the next zoom step (touchpads
-    /// deliver many small pixel deltas per notch).
-    scroll_accum: f64,
     /// Cumulative regenerated-tile counts per layer (panel telemetry).
     regen_totals: [u64; LAYER_COUNT as usize],
     /// The most recent `World::update` counters, kept for the `F12` debug
@@ -1013,7 +911,8 @@ impl App {
                 .ok()
                 .and_then(|v| v.parse::<i32>().ok())
                 .map_or(3, |r| r.clamp(1, 8)),
-            pov_look_from: None,
+            input: InputMapper::default(),
+            winit_input: input::WinitInputAdapter::default(),
             pov_counters_last: PovCounters::default(),
             pov_organism_counters_last: PovOrganismCounters::default(),
             pov_toggles: PovToggles::default(),
@@ -1024,11 +923,8 @@ impl App {
                 .map_or(1.0, |s| s.clamp(0.25, 1.0)),
             overlay_hash: 0,
             panel_hash: 0,
-            keys_down: HashSet::new(),
-            modifiers: ModifiersState::empty(),
             cursor_pos: None,
             zoom: 1,
-            scroll_accum: 0.0,
             regen_totals: [0; LAYER_COUNT as usize],
             last_stats: FrameStats::default(),
             last_frame: Instant::now(),
@@ -1050,9 +946,8 @@ impl App {
     }
 
     /// Continuous movement from held keys, scaled by real elapsed time.
-    fn apply_movement(&mut self, dt: f64) {
-        let Some((dx, dy)) = map_movement_delta(&self.keys_down, self.modifiers.shift_key(), dt)
-        else {
+    fn apply_movement(&mut self, input: InputFrame, dt: f64) {
+        let Some((dx, dy)) = input.map_movement_delta(PLAYER_SPEED, dt) else {
             return;
         };
         self.world.player.0 += dx;
@@ -1089,8 +984,49 @@ impl App {
             }
             ViewMode::Pov => {
                 self.view_mode = ViewMode::Map;
-                self.pov_look_from = None;
                 log::info!("view: map");
+            }
+        }
+    }
+
+    fn input_context(&self) -> InputContext {
+        InputContext {
+            mode: self.view_mode.presentation(),
+            focused: self.view_mode.view_kind(),
+            surface_focused: self.winit_input.surface_focused(),
+        }
+    }
+
+    /// One ordered consumer for keyboard, pointer, wheel, and future native
+    /// controls. Events enqueue through the shared mapper; only typed actions
+    /// reach [`Self::apply_action`].
+    fn handle_input_event(&mut self, event: NormalizedInputEvent, event_loop: &ActiveEventLoop) {
+        let context = self.input_context();
+        self.input.handle_event(event, context);
+        self.process_actions(event_loop);
+    }
+
+    fn process_actions(&mut self, event_loop: &ActiveEventLoop) {
+        let actions: Vec<_> = self.input.drain_actions().collect();
+        for action in actions {
+            let previous_mode = self.view_mode;
+            let effect = self.apply_action(action);
+            let context = self.input_context();
+            self.input.set_context(context);
+            if previous_mode == ViewMode::Pov && self.view_mode != ViewMode::Pov {
+                // Match the old native toggle: leaving POV cancels only the
+                // look gesture, while held movement keys remain held.
+                self.input.handle_event(
+                    NormalizedInputEvent::PointerCancelled {
+                        pointer: input::MOUSE_POINTER_ID,
+                    },
+                    context,
+                );
+            }
+            match effect {
+                NativeActionEffect::None => {}
+                NativeActionEffect::DebugDump => self.debug_dump(),
+                NativeActionEffect::Exit => event_loop.exit(),
             }
         }
     }
@@ -1103,9 +1039,15 @@ impl App {
     /// and ignored (reserved, design §2.1), then the terrain-following step
     /// toward `ground + EYE_HEIGHT` under the vertical-rate clamp. No
     /// lateral collision in either mode. Bypasses `apply_movement` entirely.
-    fn apply_pov_movement(&mut self, dt: f64) {
+    fn apply_pov_movement(&mut self, input: InputFrame, dt: f64) {
         let walk = self.pov_camera.walk;
-        let (forward, strafe, vertical) = pov_navigation_axis(&self.keys_down, walk);
+        let strafe = f64::from(input.pov_axis[0]);
+        let forward = f64::from(input.pov_axis[1]);
+        let vertical = if walk {
+            0.0
+        } else {
+            f64::from(input.pov_axis[2])
+        };
         let mut mv = glam::DVec3::ZERO;
         mv += self.pov_forward() * forward;
         mv += self.pov_camera.right() * strafe;
@@ -1163,95 +1105,46 @@ impl App {
         }
     }
 
-    /// One-shot actions on key press.
-    fn handle_press(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
-        if let Some(action) = characterized_one_shot(self.view_mode, code) {
-            reduce_characterized_one_shot(
-                action,
-                &mut self.channel,
-                &mut self.pov_toggles.shadow_ao,
-            );
-            match action {
-                CharacterizedOneShot::CycleMapChannel => {
-                    log::info!("channel: {}", self.channel.name());
+    /// Interim typed action reducer. It is intentionally exhaustive: raw
+    /// winit values never reach viewer state, and adding a shared action
+    /// requires an explicit native decision until Milestone 3 moves this
+    /// reducer into `viewer-host`.
+    fn apply_action(&mut self, action: ViewerAction) -> NativeActionEffect {
+        match action {
+            ViewerAction::SetPresentation(mode) => match mode {
+                PresentationMode::Map if self.view_mode == ViewMode::Pov => {
+                    self.toggle_view_mode();
                 }
-                CharacterizedOneShot::TogglePovShadowAo => {
-                    log::info!(
-                        "pov: directional shadows and terrain AO {}",
-                        onoff(self.pov_toggles.shadow_ao)
-                    );
+                PresentationMode::Pov if self.view_mode == ViewMode::Map => {
+                    self.toggle_view_mode();
                 }
+                PresentationMode::Split => {
+                    log::warn!("Split presentation lands with the shared controller in M10");
+                }
+                PresentationMode::Map | PresentationMode::Pov => {}
+            },
+            ViewerAction::TogglePrimaryView => self.toggle_view_mode(),
+            ViewerAction::FocusView(_view) => {
+                // A single native pane is always focused. Split introduces
+                // persistent pane focus in Milestone 10.
             }
-            return;
-        }
-        // The POV keybinding gate (3d-phase-1-plan.md §8.4): in POV only
-        // `Tab`, `F` (walk ↔ fly, 3d-phase-2-plan.md §6.1), the `B`/`N`/`V`
-        // diagnostic toggles, `Escape`, and the `F12` debug dump are handled;
-        // every map binding below stays map-mode-only. This gate is the whole
-        // guarantee that map mode is pixel-identical — no map state can even
-        // be touched from POV (the dump only reads and writes files).
-        if self.view_mode == ViewMode::Pov {
-            match code {
-                KeyCode::Tab => self.toggle_view_mode(),
-                KeyCode::KeyF => self.toggle_walk(),
-                KeyCode::KeyN => {
-                    self.pov_toggles.detail_normals = !self.pov_toggles.detail_normals;
-                    log::info!(
-                        "pov: detail normals {} (per-fragment lattice hashing)",
-                        onoff(self.pov_toggles.detail_normals)
-                    );
-                }
-                KeyCode::KeyV => {
-                    self.pov_toggles.water = !self.pov_toggles.water;
-                    log::info!(
-                        "pov: water passes {} (sea plane + river overlays)",
-                        onoff(self.pov_toggles.water)
-                    );
-                }
-                KeyCode::F12 => self.debug_dump(),
-                KeyCode::Escape => event_loop.exit(),
-                _ => {}
+            ViewerAction::SetSplitRatio(_ratio) => {
+                log::warn!("split ratio ignored before Split presentation lands");
             }
-            return;
-        }
-        if code == KeyCode::Tab {
-            self.toggle_view_mode();
-            return;
-        }
-        let nudge_domain = match code {
-            KeyCode::Digit1 => Some(PossibilityDomain::Planetary),
-            KeyCode::Digit2 => Some(PossibilityDomain::Climate),
-            KeyCode::Digit3 => Some(PossibilityDomain::Geology),
-            KeyCode::Digit4 => Some(PossibilityDomain::Hydrology),
-            KeyCode::Digit5 => Some(PossibilityDomain::Ecology),
-            KeyCode::Digit6 => Some(PossibilityDomain::Morphology),
-            KeyCode::Digit7 => Some(PossibilityDomain::Behavior),
-            KeyCode::Digit8 => Some(PossibilityDomain::Aesthetics),
-            _ => None,
-        };
-        if let Some(domain) = nudge_domain {
-            let step = if self.modifiers.shift_key() {
-                -NUDGE_STEP
-            } else {
-                NUDGE_STEP
-            };
-            let dim = &mut self.world.bias[domain.index()];
-            *dim = (*dim + step).clamp(-1.0, 1.0);
-            log::info!("bias {:?} -> {:+.2}", domain, *dim);
-            return;
-        }
-
-        match code {
-            KeyCode::KeyZ => {
+            ViewerAction::NudgePossibility { domain, direction } => {
+                let step = match direction {
+                    NudgeDirection::Up => NUDGE_STEP,
+                    NudgeDirection::Down => -NUDGE_STEP,
+                };
+                let dim = &mut self.world.bias[domain.index()];
+                *dim = (*dim + step).clamp(-1.0, 1.0);
+                log::info!("bias {:?} -> {:+.2}", domain, *dim);
+            }
+            ViewerAction::ResetPossibilityBias => {
                 self.world.bias = [0.0; POSSIBILITY_DIMS];
                 log::info!("bias reset");
             }
-            KeyCode::KeyE | KeyCode::KeyQ => {
-                let kind = if code == KeyCode::KeyE {
-                    AnchorKind::Emphasize
-                } else {
-                    AnchorKind::Suppress
-                };
+            ViewerAction::DropAnchor(kind) => {
                 // Manual debug anchor: the Phase 1 behaviour is the bound-target
                 // special case — Emphasize pulls the masked domains toward 1.0,
                 // Suppress pushes them away from it (phase-4-plan.md §4.1).
@@ -1276,7 +1169,7 @@ impl App {
                     self.world.anchors.len()
                 );
             }
-            KeyCode::KeyK => {
+            ViewerAction::CaptureAnchor => {
                 // Capture the feature under the player into a run-local anchor
                 // (phase-4-plan.md §7.1): reads the covering region's baseline,
                 // the nearest authoritative slot-0 organism or the environment
@@ -1303,7 +1196,7 @@ impl App {
                     None => log::info!("nothing capturable under the player yet"),
                 }
             }
-            KeyCode::KeyT => {
+            ViewerAction::CycleCaptureCategory => {
                 let all = TraitCategory::ALL;
                 let i = all
                     .iter()
@@ -1312,14 +1205,18 @@ impl App {
                 self.capture_category = all[(i + 1) % all.len()];
                 log::info!("capture category: {}", self.capture_category.name());
             }
-            KeyCode::KeyY => {
+            ViewerAction::ToggleCapturePolarity => {
                 self.capture_polarity = match self.capture_polarity {
                     AnchorKind::Emphasize => AnchorKind::Suppress,
                     AnchorKind::Suppress => AnchorKind::Emphasize,
                 };
                 log::info!("capture polarity: {:?}", self.capture_polarity);
             }
-            KeyCode::KeyR => {
+            ViewerAction::ClearAnchors => {
+                self.world.anchors.clear();
+                log::info!("anchors cleared");
+            }
+            ViewerAction::ToggleTransitionMode => {
                 self.world.transition_mode = !self.world.transition_mode;
                 log::info!(
                     "movement mode: {}",
@@ -1330,19 +1227,14 @@ impl App {
                     }
                 );
             }
-            KeyCode::KeyC => {
-                self.world.anchors.clear();
-                log::info!("anchors cleared");
-            }
-            KeyCode::KeyO => self.world.save_session(),
-            KeyCode::KeyL => self.world.load_session(),
-            KeyCode::KeyB => self.world.record_last_anchor(),
-            KeyCode::KeyI => self.world.summon_discoveries(),
-            KeyCode::KeyP => self.world.toggle_preserve(),
-            KeyCode::KeyJ => self.world.toggle_route_recording(),
-            KeyCode::KeyH => self.world.toggle_path_tracking(),
-            KeyCode::Delete => self.world.clear_routes(),
-            KeyCode::KeyU => {
+            ViewerAction::SaveSession => self.world.save_session(),
+            ViewerAction::LoadSession => self.world.load_session(),
+            ViewerAction::RecordLastAnchor => self.world.record_last_anchor(),
+            ViewerAction::SummonDiscoveries => self.world.summon_discoveries(),
+            ViewerAction::TogglePreserve => self.world.toggle_preserve(),
+            ViewerAction::TogglePathTracking => self.world.toggle_path_tracking(),
+            ViewerAction::ToggleRouteRecording => self.world.toggle_route_recording(),
+            ViewerAction::ToggleRouteAttraction => {
                 self.world.route_attraction = !self.world.route_attraction;
                 log::info!(
                     "route attraction {}",
@@ -1353,38 +1245,117 @@ impl App {
                     }
                 );
             }
-            KeyCode::KeyF => {
-                self.overlays.discovered = !self.overlays.discovered;
+            ViewerAction::ClearRoutes => self.world.clear_routes(),
+            ViewerAction::CycleMapChannel => {
+                self.channel = self.channel.next();
+                log::info!("channel: {}", self.channel.name());
             }
-            KeyCode::KeyG => {
-                self.overlays.grid = !self.overlays.grid;
+            ViewerAction::SetMapChannel(channel) => {
+                self.channel = channel;
+                log::info!("channel: {}", self.channel.name());
             }
-            KeyCode::KeyN => {
-                self.overlays.rings = !self.overlays.rings;
+            ViewerAction::ToggleOverlay(overlay) => {
+                let enabled = !self.overlays.enabled(overlay);
+                self.overlays.set(overlay, enabled);
             }
-            KeyCode::KeyX => {
-                self.overlays.pinned_flash = !self.overlays.pinned_flash;
+            ViewerAction::ZoomIn => {
+                self.set_zoom((self.zoom * 2).min(MAX_ZOOM));
             }
-            KeyCode::KeyM => {
-                self.overlays.organisms = !self.overlays.organisms;
+            ViewerAction::ZoomOut => {
+                self.set_zoom((self.zoom / 2).max(1));
             }
-            KeyCode::Comma => {
+            ViewerAction::ToggleGpuCompose => {
                 self.gpu_compose = !self.gpu_compose;
                 log::info!(
                     "map compose: {} (A/B parity toggle, phase-6-plan.md §6.5)",
                     if self.gpu_compose { "GPU" } else { "CPU" }
                 );
             }
-            KeyCode::Period => {
+            ViewerAction::ToggleRefinement => {
                 self.refinement = !self.refinement;
                 log::info!(
                     "GPU refinement octaves {}",
                     if self.refinement { "on" } else { "off" }
                 );
             }
-            KeyCode::F12 => self.debug_dump(),
-            KeyCode::Escape => event_loop.exit(),
-            _ => {}
+            ViewerAction::ToggleWalk => self.toggle_walk(),
+            ViewerAction::TogglePovShadowAo => {
+                self.pov_toggles.shadow_ao = !self.pov_toggles.shadow_ao;
+                log::info!(
+                    "pov: directional shadows and terrain AO {}",
+                    onoff(self.pov_toggles.shadow_ao)
+                );
+            }
+            ViewerAction::TogglePovDetailNormals => {
+                self.pov_toggles.detail_normals = !self.pov_toggles.detail_normals;
+                log::info!(
+                    "pov: detail normals {} (per-fragment lattice hashing)",
+                    onoff(self.pov_toggles.detail_normals)
+                );
+            }
+            ViewerAction::TogglePovWater => {
+                self.pov_toggles.water = !self.pov_toggles.water;
+                log::info!(
+                    "pov: water passes {} (sea plane + river overlays)",
+                    onoff(self.pov_toggles.water)
+                );
+            }
+            ViewerAction::SetPovRenderScale(scale) => {
+                if scale.is_finite() {
+                    self.pov_scale = scale.clamp(0.25, 1.0);
+                }
+            }
+            ViewerAction::SetResourceTier(tier) => {
+                if tier != self.tier {
+                    log::warn!(
+                        "resource tier changes require a native restart (active: {}, requested: {})",
+                        self.tier.name(),
+                        tier.name()
+                    );
+                }
+            }
+            ViewerAction::RequestTierBenchmark => {
+                log::warn!("the native shell has no live tier-benchmark service");
+            }
+            ViewerAction::SetWorkerBackend(_backend) => {
+                log::warn!("worker backend changes require a native restart");
+            }
+            ViewerAction::CancelSupersededJobs => {
+                log::warn!("native task cancellation is scheduler-owned");
+            }
+            ViewerAction::SetMapBackend(backend) => {
+                self.gpu_compose = backend == MapBackend::GpuAtlas;
+            }
+            ViewerAction::SetStorageEnabled(enabled) => {
+                if enabled != self.world.vault.is_some() {
+                    log::warn!("native vault availability is fixed when the process starts");
+                }
+            }
+            ViewerAction::ResetLocalVault => {
+                log::warn!("native vault reset is not exposed as an in-view operation");
+            }
+            ViewerAction::RequestAtlasImport | ViewerAction::RequestAtlasExport => {
+                log::warn!("use wer-atlas for native atlas transfers");
+            }
+            ViewerAction::RequestDebugDump => return NativeActionEffect::DebugDump,
+            ViewerAction::RequestExit => return NativeActionEffect::Exit,
+        }
+        NativeActionEffect::None
+    }
+
+    fn set_zoom(&mut self, zoom: u32) {
+        let before = self.zoom;
+        self.zoom = zoom.clamp(1, MAX_ZOOM);
+        if self.zoom != before {
+            log::info!(
+                "zoom x{}{}",
+                self.zoom,
+                if self.zoom >= ORGANISM_INFO_ZOOM {
+                    " (organism picking active)"
+                } else {
+                    ""
+                }
+            );
         }
     }
 
@@ -1601,19 +1572,38 @@ impl App {
         }
     }
 
-    fn frame(&mut self) {
+    fn frame(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f64().min(0.1);
         self.last_frame = now;
 
+        // Actions are normally drained immediately after each raw event so a
+        // following event observes the new view context. This second drain is
+        // the shared path for future button/controller producers.
+        self.process_actions(event_loop);
+        let context = self.input_context();
+        self.input.set_context(context);
+        let input = self.input.take_frame();
+        self.cursor_pos = input.map_pointer.map(|point| (point[0], point[1]));
+        if self.view_mode == ViewMode::Pov {
+            self.pov_camera
+                .look(input.look_delta[0], input.look_delta[1]);
+            for _ in 0..input.wheel_steps.max(0) {
+                self.pov_camera.scroll_speed(true);
+            }
+            for _ in 0..(-input.wheel_steps).max(0) {
+                self.pov_camera.scroll_speed(false);
+            }
+        }
+
         match self.view_mode {
-            ViewMode::Map => self.apply_movement(dt),
+            ViewMode::Map => self.apply_movement(input, dt),
             ViewMode::Pov => {
                 // The POV camera *is* the player (plan §8.1): recenter the
                 // world before `update` so streaming, retarget, and
                 // realization follow the camera — travel-fueled drift works
                 // identically to map-mode travel.
-                self.apply_pov_movement(dt);
+                self.apply_pov_movement(input, dt);
                 self.world.player = (self.pov_camera.pos.x, self.pov_camera.pos.y);
             }
         }
@@ -2003,78 +1993,44 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.input.enqueue_action(ViewerAction::RequestExit);
+                self.process_actions(event_loop);
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers.state();
+                let event = self.winit_input.modifiers_changed(modifiers.state());
+                self.handle_input_event(event, event_loop);
+            }
+            WindowEvent::Focused(focused) => {
+                let event = self.winit_input.focus_changed(focused);
+                self.handle_input_event(event, event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // POV drag look: window-space deltas while the left button
-                // is held — the same math `--pov-script` simulates with
-                // `mouse:dx,dy`. (Raw device deltas are unusable under
-                // WSLg/XWayland: they arrive as absolute jumps.)
-                let current = (position.x, position.y);
-                if let Some((dx, dy)) = primary_drag_delta(self.pov_look_from, current) {
-                    self.pov_camera.look(dx, dy);
-                    self.pov_look_from = Some((position.x, position.y));
-                }
-                self.cursor_pos = Some(current);
+                let event = self
+                    .winit_input
+                    .cursor_moved(position, self.view_mode.view_kind());
+                self.handle_input_event(event, event_loop);
             }
             WindowEvent::CursorLeft { .. } => {
-                self.cursor_pos = None;
-                cancel_primary_drag(&mut self.pov_look_from);
+                let event = self.winit_input.cursor_left();
+                self.handle_input_event(event, event_loop);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                // Mouse look is active only while the left button is held
-                // in POV; releasing (or leaving the window) ends the drag.
-                update_primary_drag_gate(
-                    self.view_mode,
-                    button,
-                    state == ElementState::Pressed,
-                    self.cursor_pos,
-                    &mut self.pov_look_from,
-                );
+                if let Some(event) =
+                    self.winit_input
+                        .mouse_input(state, button, self.view_mode.view_kind())
+                {
+                    self.handle_input_event(event, event_loop);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let delta = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-                    // Touchpads scroll in pixels; ~40 px per wheel notch.
-                    MouseScrollDelta::PixelDelta(pos) => pos.y / WHEEL_PIXELS_PER_NOTCH,
-                };
-                let notches = accumulate_wheel(&mut self.scroll_accum, delta);
-                if self.view_mode == ViewMode::Pov {
-                    // Wheel = fly-speed multiplier in POV (plan §8.3); the
-                    // map zoom below stays map-mode-only.
-                    for _ in 0..notches.max(0) {
-                        self.pov_camera.scroll_speed(true);
-                    }
-                    for _ in 0..(-notches).max(0) {
-                        self.pov_camera.scroll_speed(false);
-                    }
-                    return;
-                }
-                let before = self.zoom;
-                for _ in 0..notches.max(0) {
-                    self.zoom = (self.zoom * 2).min(MAX_ZOOM);
-                }
-                for _ in 0..(-notches).max(0) {
-                    self.zoom = (self.zoom / 2).max(1);
-                }
-                if self.zoom != before {
-                    log::info!(
-                        "zoom x{}{}",
-                        self.zoom,
-                        if self.zoom >= ORGANISM_INFO_ZOOM {
-                            " (organism picking active)"
-                        } else {
-                            ""
-                        }
-                    );
-                }
+                let event = self.winit_input.wheel(delta, self.view_mode.view_kind());
+                self.handle_input_event(event, event_loop);
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -2085,19 +2041,13 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => match state {
-                ElementState::Pressed => {
-                    self.keys_down.insert(code);
-                    if dispatch_one_shot(repeat) {
-                        self.handle_press(code, event_loop);
-                    }
+            } => {
+                if let Some(event) = self.winit_input.key_event(code, state, repeat) {
+                    self.handle_input_event(event, event_loop);
                 }
-                ElementState::Released => {
-                    self.keys_down.remove(&code);
-                }
-            },
+            }
             WindowEvent::RedrawRequested => {
-                self.frame();
+                self.frame(event_loop);
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
@@ -2940,7 +2890,38 @@ mod preserve_lifecycle_tests {
 mod alignment_characterization_tests {
     use super::*;
     use std::fmt::Write as _;
+    use viewer_host::input::WHEEL_PIXELS_PER_NOTCH;
+    use winit::dpi::PhysicalPosition;
+    use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+    use winit::keyboard::{KeyCode, ModifiersState};
     use world_runtime::{Budget, InlineExecutor};
+
+    fn context(mode: PresentationMode) -> InputContext {
+        let focused = match mode {
+            PresentationMode::Map => ViewKind::Map,
+            PresentationMode::Pov => ViewKind::Pov,
+            PresentationMode::Split => panic!("characterization uses one visible pane"),
+        };
+        InputContext {
+            mode,
+            focused,
+            surface_focused: true,
+        }
+    }
+
+    fn send_key(
+        adapter: &input::WinitInputAdapter,
+        mapper: &mut InputMapper,
+        mode: PresentationMode,
+        code: KeyCode,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        let event = adapter
+            .key_event(code, state, repeat)
+            .expect("characterization key is supported");
+        mapper.handle_event(event, context(mode))
+    }
 
     fn settled_map() -> RegionMap {
         let cfg = StreamConfig {
@@ -2974,7 +2955,7 @@ mod alignment_characterization_tests {
     }
 
     #[test]
-    fn map_movement_helper_preserves_legacy_evaluation_order() {
+    fn shared_map_movement_preserves_legacy_evaluation_order() {
         let controls = [
             KeyCode::KeyW,
             KeyCode::KeyS,
@@ -2987,30 +2968,51 @@ mod alignment_characterization_tests {
         ];
         let dts = [0.0, 0.000_002_999_991, 0.007, 0.1, 1.0 / 60.0];
         for mask in 0u16..(1 << controls.len()) {
-            let keys: HashSet<_> = controls
-                .iter()
-                .enumerate()
-                .filter_map(|(index, &key)| (mask & (1 << index) != 0).then_some(key))
-                .collect();
             for sprint in [false, true] {
+                let mut adapter = input::WinitInputAdapter::default();
+                let mut mapper = InputMapper::default();
+                for (index, &key) in controls.iter().enumerate() {
+                    if mask & (1 << index) != 0 {
+                        assert!(send_key(
+                            &adapter,
+                            &mut mapper,
+                            PresentationMode::Map,
+                            key,
+                            ElementState::Pressed,
+                            false,
+                        ));
+                    }
+                }
+                if sprint {
+                    let event = adapter.modifiers_changed(ModifiersState::SHIFT);
+                    mapper.handle_event(event, context(PresentationMode::Map));
+                }
+                let frame = mapper.take_frame();
+                let down = |code| {
+                    controls
+                        .iter()
+                        .enumerate()
+                        .any(|(index, &candidate)| candidate == code && mask & (1 << index) != 0)
+                };
+                let mut dx: f64 = 0.0;
+                let mut dy: f64 = 0.0;
+                if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
+                    dy += 1.0;
+                }
+                if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
+                    dy -= 1.0;
+                }
+                if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
+                    dx -= 1.0;
+                }
+                if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
+                    dx += 1.0;
+                }
+                assert_eq!(frame.map_axis, [dx as i8, dy as i8]);
+                assert_eq!(frame.sprint, sprint);
                 for dt in dts {
                     // The pre-characterization `apply_movement` expression,
                     // copied as an independent bit-exact oracle.
-                    let down = |code| keys.contains(&code);
-                    let mut dx: f64 = 0.0;
-                    let mut dy: f64 = 0.0;
-                    if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
-                        dy += 1.0;
-                    }
-                    if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
-                        dy -= 1.0;
-                    }
-                    if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
-                        dx -= 1.0;
-                    }
-                    if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
-                        dx += 1.0;
-                    }
                     let len = f64::hypot(dx, dy);
                     let expected = if len == 0.0 {
                         None
@@ -3019,11 +3021,11 @@ mod alignment_characterization_tests {
                         let step = PLAYER_SPEED * multiplier * dt / len;
                         Some((dx * step, dy * step))
                     };
-                    let actual = map_movement_delta(&keys, sprint, dt);
+                    let bridged = frame.map_movement_delta(PLAYER_SPEED, dt);
                     assert_eq!(
-                        actual.map(|(x, y)| (x.to_bits(), y.to_bits())),
+                        bridged.map(|(x, y)| (x.to_bits(), y.to_bits())),
                         expected.map(|(x, y)| (x.to_bits(), y.to_bits())),
-                        "mask {mask:#05x}, sprint {sprint}, dt {dt:?}"
+                        "shared frame mask {mask:#05x}, sprint {sprint}, dt {dt:?}"
                     );
                 }
             }
@@ -3148,23 +3150,38 @@ mod alignment_characterization_tests {
         );
     }
 
-    /// A semantic Map/POV input trace over the pure seams used by the current
-    /// winit adapter. Milestone 2 replays the same fixture through the shared
-    /// mapper; this freezes held movement, diagonal normalization, one-shot
-    /// repeat suppression, fractional wheels, and primary-held POV look.
+    /// A semantic Map/POV trace through the production winit adapter, shared
+    /// mapper, and typed App reducer. It freezes held movement, diagonal
+    /// normalization, one-shot repeat suppression, fractional wheels, and
+    /// primary-held POV look without retaining a second binding authority.
     #[test]
     fn native_input_characterization() {
         let mut actual = String::from("native-input-characterization-v1\n");
-        let mut keys = HashSet::new();
         let dt = 0.1f64;
+        let mut adapter = input::WinitInputAdapter::default();
+        let mut mapper = InputMapper::default();
+        let mut app = App::new(true, ResourceTier::Low);
+        app.channel = Channel::Composite;
+        app.pov_toggles.shadow_ao = true;
 
-        keys.insert(KeyCode::KeyW);
-        let components_w = map_navigation_components(&keys);
-        let axis_w = (
-            components_w.0 / components_w.2,
-            components_w.1 / components_w.2,
+        assert!(send_key(
+            &adapter,
+            &mut mapper,
+            PresentationMode::Map,
+            KeyCode::KeyW,
+            ElementState::Pressed,
+            false,
+        ));
+        let frame_w = mapper.take_frame();
+        let (axis_w_x, axis_w_y) = (
+            f64::from(frame_w.map_axis[0]),
+            f64::from(frame_w.map_axis[1]),
         );
-        let delta_w = map_movement_delta(&keys, false, dt).expect("W is active");
+        let axis_w_len = f64::hypot(axis_w_x, axis_w_y);
+        let axis_w = (axis_w_x / axis_w_len, axis_w_y / axis_w_len);
+        let delta_w = frame_w
+            .map_movement_delta(PLAYER_SPEED, dt)
+            .expect("W is active");
         writeln!(
             &mut actual,
             "map held=KeyW axis={:016x},{:016x} delta={:016x},{:016x}",
@@ -3175,13 +3192,24 @@ mod alignment_characterization_tests {
         )
         .unwrap();
 
-        keys.insert(KeyCode::KeyD);
-        let components_wd = map_navigation_components(&keys);
-        let axis_wd = (
-            components_wd.0 / components_wd.2,
-            components_wd.1 / components_wd.2,
+        assert!(send_key(
+            &adapter,
+            &mut mapper,
+            PresentationMode::Map,
+            KeyCode::KeyD,
+            ElementState::Pressed,
+            false,
+        ));
+        let frame_wd = mapper.take_frame();
+        let (axis_wd_x, axis_wd_y) = (
+            f64::from(frame_wd.map_axis[0]),
+            f64::from(frame_wd.map_axis[1]),
         );
-        let delta_wd = map_movement_delta(&keys, false, dt).expect("W+D is active");
+        let axis_wd_len = f64::hypot(axis_wd_x, axis_wd_y);
+        let axis_wd = (axis_wd_x / axis_wd_len, axis_wd_y / axis_wd_len);
+        let delta_wd = frame_wd
+            .map_movement_delta(PLAYER_SPEED, dt)
+            .expect("W+D is active");
         writeln!(
             &mut actual,
             "map held=KeyD+KeyW axis={:016x},{:016x} delta={:016x},{:016x}",
@@ -3192,57 +3220,114 @@ mod alignment_characterization_tests {
         )
         .unwrap();
 
-        let mut channel = Channel::Composite;
-        let mut shadow_ao = true;
-        let first_action = dispatch_one_shot(false)
-            .then(|| characterized_one_shot(ViewMode::Map, KeyCode::KeyV))
-            .flatten();
-        if let Some(action) = first_action {
-            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
+        assert!(send_key(
+            &adapter,
+            &mut mapper,
+            PresentationMode::Map,
+            KeyCode::KeyV,
+            ElementState::Pressed,
+            false,
+        ));
+        let first_actions: Vec<_> = mapper.drain_actions().collect();
+        let first_action = first_actions == [ViewerAction::CycleMapChannel];
+        for action in first_actions {
+            assert_eq!(app.apply_action(action), NativeActionEffect::None);
         }
-        let repeat_action = dispatch_one_shot(true)
-            .then(|| characterized_one_shot(ViewMode::Map, KeyCode::KeyV))
-            .flatten();
-        if let Some(action) = repeat_action {
-            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
-        }
+        assert!(send_key(
+            &adapter,
+            &mut mapper,
+            PresentationMode::Map,
+            KeyCode::KeyV,
+            ElementState::Pressed,
+            true,
+        ));
+        let repeat_actions: Vec<_> = mapper.drain_actions().collect();
         writeln!(
             &mut actual,
             "map one-shot=KeyV first={} repeat={} channel={}",
-            first_action.is_some(),
-            repeat_action.is_some(),
-            channel.name()
+            first_action,
+            !repeat_actions.is_empty(),
+            app.channel.name()
         )
         .unwrap();
 
-        let mut wheel = 0.0;
-        let first_notches = accumulate_wheel(&mut wheel, 15.0 / WHEEL_PIXELS_PER_NOTCH);
+        let wheel_steps = |actions: &[ViewerAction]| -> i32 {
+            actions
+                .iter()
+                .map(|action| match action {
+                    ViewerAction::ZoomIn => 1,
+                    ViewerAction::ZoomOut => -1,
+                    other => panic!("unexpected wheel action {other:?}"),
+                })
+                .sum()
+        };
+        let mut map_pixels = 15.0;
+        let event = adapter.wheel(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 15.0)),
+            ViewKind::Map,
+        );
+        assert!(mapper.handle_event(event, context(PresentationMode::Map)));
+        let actions: Vec<_> = mapper.drain_actions().collect();
+        let first_notches = wheel_steps(&actions);
+        let mut map_steps = first_notches;
+        for action in actions {
+            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+        }
+        let remainder = map_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(map_steps);
         writeln!(
             &mut actual,
             "map wheel-pixel=15 notches={first_notches} remainder={:016x}",
-            wheel.to_bits()
+            remainder.to_bits()
         )
         .unwrap();
-        let second_notches = accumulate_wheel(&mut wheel, 30.0 / WHEEL_PIXELS_PER_NOTCH);
+        map_pixels += 30.0;
+        let event = adapter.wheel(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 30.0)),
+            ViewKind::Map,
+        );
+        assert!(mapper.handle_event(event, context(PresentationMode::Map)));
+        let actions: Vec<_> = mapper.drain_actions().collect();
+        let second_notches = wheel_steps(&actions);
+        map_steps += second_notches;
+        for action in actions {
+            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+        }
+        let remainder = map_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(map_steps);
         writeln!(
             &mut actual,
             "map wheel-pixel=30 notches={second_notches} remainder={:016x}",
-            wheel.to_bits()
+            remainder.to_bits()
         )
         .unwrap();
-        let reverse_notches = accumulate_wheel(&mut wheel, -50.0 / WHEEL_PIXELS_PER_NOTCH);
+        map_pixels -= 50.0;
+        let event = adapter.wheel(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -50.0)),
+            ViewKind::Map,
+        );
+        assert!(mapper.handle_event(event, context(PresentationMode::Map)));
+        let actions: Vec<_> = mapper.drain_actions().collect();
+        let reverse_notches = wheel_steps(&actions);
+        map_steps += reverse_notches;
+        for action in actions {
+            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+        }
+        let remainder = map_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(map_steps);
         writeln!(
             &mut actual,
             "map wheel-pixel=-50 notches={reverse_notches} remainder={:016x}",
-            wheel.to_bits()
+            remainder.to_bits()
         )
         .unwrap();
 
-        let mut camera = PovCamera::new();
-        let (forward, strafe, vertical) = pov_navigation_axis(&keys, false);
-        let mut pov_delta =
-            camera.forward() * forward + camera.right() * strafe + glam::DVec3::Z * vertical;
-        pov_delta = pov_delta.normalize() * (camera.speed * dt);
+        mapper.set_context(context(PresentationMode::Pov));
+        let pov_frame = mapper.take_frame();
+        let strafe = f64::from(pov_frame.pov_axis[0]);
+        let forward = f64::from(pov_frame.pov_axis[1]);
+        let vertical = f64::from(pov_frame.pov_axis[2]);
+        let mut pov_delta = app.pov_camera.forward() * forward
+            + app.pov_camera.right() * strafe
+            + glam::DVec3::Z * vertical;
+        pov_delta = pov_delta.normalize() * (app.pov_camera.speed * dt);
         writeln!(
             &mut actual,
             "pov held=KeyD+KeyW axis={:016x},{:016x},{:016x} delta={:016x},{:016x},{:016x}",
@@ -3255,99 +3340,117 @@ mod alignment_characterization_tests {
         )
         .unwrap();
 
-        let unheld = primary_drag_delta(None, (100.0, 100.0));
-        writeln!(&mut actual, "pov move-unheld look={}", unheld.is_some()).unwrap();
-        let mut drag_from = None;
-        update_primary_drag_gate(
-            ViewMode::Pov,
-            MouseButton::Left,
-            true,
-            Some((100.0, 100.0)),
-            &mut drag_from,
-        );
-        let drag = primary_drag_delta(drag_from, (112.0, 92.0)).expect("primary drag");
-        camera.look(drag.0, drag.1);
-        drag_from = Some((112.0, 92.0));
-        assert_eq!(drag_from, Some((112.0, 92.0)));
+        let event = adapter.cursor_moved(PhysicalPosition::new(100.0, 100.0), ViewKind::Pov);
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let unheld = mapper.take_frame().look_delta != [0.0, 0.0];
+        writeln!(&mut actual, "pov move-unheld look={unheld}").unwrap();
+        let event = adapter
+            .mouse_input(ElementState::Pressed, MouseButton::Left, ViewKind::Pov)
+            .expect("cursor position arms the drag");
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let event = adapter.cursor_moved(PhysicalPosition::new(112.0, 92.0), ViewKind::Pov);
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let drag = mapper.take_frame().look_delta;
+        app.pov_camera.look(drag[0], drag[1]);
         writeln!(
             &mut actual,
             "pov drag delta={:016x},{:016x} yaw={:08x} pitch={:08x}",
-            drag.0.to_bits(),
-            drag.1.to_bits(),
-            camera.yaw.to_bits(),
-            camera.pitch.to_bits()
+            drag[0].to_bits(),
+            drag[1].to_bits(),
+            app.pov_camera.yaw.to_bits(),
+            app.pov_camera.pitch.to_bits()
         )
         .unwrap();
-        update_primary_drag_gate(
-            ViewMode::Pov,
-            MouseButton::Left,
-            false,
-            Some((112.0, 92.0)),
-            &mut drag_from,
-        );
-        let after_release = primary_drag_delta(drag_from, (140.0, 140.0));
+        let event = adapter
+            .mouse_input(ElementState::Released, MouseButton::Left, ViewKind::Pov)
+            .expect("release retains the cursor position");
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let event = adapter.cursor_moved(PhysicalPosition::new(140.0, 140.0), ViewKind::Pov);
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let after_release = mapper.take_frame().look_delta != [0.0, 0.0];
         writeln!(
             &mut actual,
             "pov move-released look={} yaw={:08x} pitch={:08x}",
-            after_release.is_some(),
-            camera.yaw.to_bits(),
-            camera.pitch.to_bits()
+            after_release,
+            app.pov_camera.yaw.to_bits(),
+            app.pov_camera.pitch.to_bits()
         )
         .unwrap();
-        update_primary_drag_gate(
-            ViewMode::Pov,
-            MouseButton::Left,
+        let event = adapter
+            .mouse_input(ElementState::Pressed, MouseButton::Left, ViewKind::Pov)
+            .expect("second press retains the cursor position");
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let event = adapter.cursor_left();
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let event = adapter.cursor_moved(PhysicalPosition::new(150.0, 150.0), ViewKind::Pov);
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let after_cancel = mapper.take_frame().look_delta != [0.0, 0.0];
+        writeln!(&mut actual, "pov move-cancelled look={after_cancel}").unwrap();
+
+        assert!(send_key(
+            &adapter,
+            &mut mapper,
+            PresentationMode::Pov,
+            KeyCode::KeyB,
+            ElementState::Pressed,
+            false,
+        ));
+        let first_actions: Vec<_> = mapper.drain_actions().collect();
+        let pov_first = first_actions == [ViewerAction::TogglePovShadowAo];
+        for action in first_actions {
+            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+        }
+        assert!(send_key(
+            &adapter,
+            &mut mapper,
+            PresentationMode::Pov,
+            KeyCode::KeyB,
+            ElementState::Pressed,
             true,
-            Some((140.0, 140.0)),
-            &mut drag_from,
+        ));
+        let repeat_actions: Vec<_> = mapper.drain_actions().collect();
+        writeln!(
+            &mut actual,
+            "pov one-shot=KeyB first={} repeat={} shadow-ao={}",
+            pov_first,
+            !repeat_actions.is_empty(),
+            app.pov_toggles.shadow_ao
+        )
+        .unwrap();
+
+        let mut pov_pixels = 20.0;
+        let event = adapter.wheel(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 20.0)),
+            ViewKind::Pov,
         );
-        cancel_primary_drag(&mut drag_from); // CursorLeft / pointer cancellation.
-        let after_cancel = primary_drag_delta(drag_from, (150.0, 150.0));
-        writeln!(
-            &mut actual,
-            "pov move-cancelled look={}",
-            after_cancel.is_some()
-        )
-        .unwrap();
-
-        let pov_first = dispatch_one_shot(false)
-            .then(|| characterized_one_shot(ViewMode::Pov, KeyCode::KeyB))
-            .flatten();
-        if let Some(action) = pov_first {
-            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
-        }
-        let pov_repeat = dispatch_one_shot(true)
-            .then(|| characterized_one_shot(ViewMode::Pov, KeyCode::KeyB))
-            .flatten();
-        if let Some(action) = pov_repeat {
-            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
-        }
-        writeln!(
-            &mut actual,
-            "pov one-shot=KeyB first={} repeat={} shadow-ao={shadow_ao}",
-            pov_first.is_some(),
-            pov_repeat.is_some()
-        )
-        .unwrap();
-
-        wheel = 0.0;
-        let pov_first_wheel = accumulate_wheel(&mut wheel, 20.0 / WHEEL_PIXELS_PER_NOTCH);
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let pov_first_wheel = mapper.take_frame().wheel_steps;
+        let mut pov_steps = pov_first_wheel;
+        let remainder = pov_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(pov_steps);
         writeln!(
             &mut actual,
             "pov wheel-pixel=20 notches={pov_first_wheel} remainder={:016x} speed={:016x}",
-            wheel.to_bits(),
-            camera.speed.to_bits()
+            remainder.to_bits(),
+            app.pov_camera.speed.to_bits()
         )
         .unwrap();
-        let pov_second_wheel = accumulate_wheel(&mut wheel, 25.0 / WHEEL_PIXELS_PER_NOTCH);
+        pov_pixels += 25.0;
+        let event = adapter.wheel(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 25.0)),
+            ViewKind::Pov,
+        );
+        assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
+        let pov_second_wheel = mapper.take_frame().wheel_steps;
+        pov_steps += pov_second_wheel;
         for _ in 0..pov_second_wheel.max(0) {
-            camera.scroll_speed(true);
+            app.pov_camera.scroll_speed(true);
         }
+        let remainder = pov_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(pov_steps);
         writeln!(
             &mut actual,
             "pov wheel-pixel=25 notches={pov_second_wheel} remainder={:016x} speed={:016x}",
-            wheel.to_bits(),
-            camera.speed.to_bits()
+            remainder.to_bits(),
+            app.pov_camera.speed.to_bits()
         )
         .unwrap();
 

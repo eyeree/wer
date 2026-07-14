@@ -1,6 +1,5 @@
-import { commandById } from "./commands.js";
 import { runStartupBenchmark } from "./benchmark.js";
-import { exportSnapshot, openVault } from "./storage.js";
+import { openVault } from "./storage.js";
 
 const fields = new Map(
   Array.from(document.querySelectorAll("[data-field]"), (node) => [node.dataset.field, node]),
@@ -8,6 +7,7 @@ const fields = new Map(
 
 let workerProbe;
 let lastSnapshot;
+const registeredActions = new Set();
 // The wasm module namespace, kept for the async POV renderer bring-up.
 let wasmMod;
 // The canvas placement of the last drawn map image (letterboxed, square
@@ -79,12 +79,10 @@ const drawBootCanvas = () => {
 };
 
 // The view magnification (native main.rs: mouse wheel, powers of two up to
-// MAX_ZOOM). Presentation-only, exactly like the native `magnify()` — a
+// the shared reducer's cap). Presentation-only, exactly like native `magnify()` — a
 // nearest-neighbor center crop that reveals no data beyond the field
 // resolution.
-const MAX_ZOOM = 16;
 let zoom = 1;
-let scrollAccum = 0;
 // The last composed frame, kept so wheel zoom redraws without recomposing.
 let lastMapFrame;
 
@@ -155,6 +153,15 @@ const initWasm = async () => {
     wasmMod = mod;
     const app = new mod.WebApp(JSON.stringify({ tier: "auto", storage: false }));
     window.__werApp = app;
+    for (const descriptor of JSON.parse(app.action_descriptors())) {
+      registeredActions.add(descriptor.id);
+    }
+    for (const control of document.querySelectorAll("[data-action]")) {
+      if (!registeredActions.has(control.dataset.action)) {
+        appendDiagnostic(`unregistered-action:${control.dataset.action}`);
+        control.disabled = true;
+      }
+    }
     const hash = mod.origin_feature_hash();
     const hex = `0x${hash.toString(16).padStart(16, "0")}`;
     write("wasm-status", "wasm loaded", "ok");
@@ -186,13 +193,11 @@ const initWorkerProbe = () => {
 const initStorage = async () => {
   const state = await openVault();
   appendDiagnostic(`storage:${state.mode}`);
-  if (state.available) dispatchCommand("storage:enable");
+  if (state.available) dispatchAction("set-storage-enabled", "true");
 };
 
 const initBenchmark = () => {
-  const result = runStartupBenchmark();
-  appendDiagnostic(`benchmark:${result.ms.toFixed(3)}ms/${result.hardwareConcurrency} cores`);
-  dispatchCommand("tier:benchmark", result);
+  dispatchAction("request-tier-benchmark");
 };
 
 const renderMap = () => {
@@ -211,32 +216,34 @@ const renderMap = () => {
 
 // Mirror the wasm snapshot into the toolbar so toggles visibly register:
 // buttons carry pressed state, selects show the mode the runtime is in.
-// One command registry, one source of truth (phase-7-plan.md §3.3).
+// Shared action descriptors are the one source of truth (alignment plan §5.2).
 const syncControls = (snapshot) => {
   const pov = snapshot.view.pov;
   const pressed = {
-    "toggle:compose": snapshot.renderer.compose,
-    "toggle:refinement": snapshot.renderer.refinement,
-    "mode:map": snapshot.view.mode === "map",
-    "mode:pov": snapshot.view.mode === "pov",
-    "pov:walk": pov.motion === "walk",
-    "pov:toggle-baked": pov.shadow_ao,
-    "pov:toggle-detail": pov.detail_normals,
-    "pov:toggle-water": pov.water,
+    "toggle-gpu-compose": snapshot.renderer.compose,
+    "toggle-refinement": snapshot.renderer.refinement,
+    "toggle-walk": pov.motion === "walk",
+    "toggle-pov-shadow-ao": pov.shadow_ao,
+    "toggle-pov-detail-normals": pov.detail_normals,
+    "toggle-pov-water": pov.water,
   };
-  for (const [command, state] of Object.entries(pressed)) {
-    const control = document.querySelector(`button[data-command="${command}"]`);
+  for (const [action, state] of Object.entries(pressed)) {
+    const control = document.querySelector(`button[data-action="${action}"]`);
     if (control) control.setAttribute("aria-pressed", String(state));
   }
+  for (const control of document.querySelectorAll('button[data-action="set-presentation"]')) {
+    control.setAttribute("aria-pressed", String(control.dataset.value === snapshot.view.mode));
+  }
   const selectValues = {
-    channel: snapshot.channel,
-    worker: { inline: "inline", workers: "workers", "shared-memory": "shared" }[
+    "set-map-channel": snapshot.channel,
+    "set-resource-tier": snapshot.tier.runtime,
+    "set-worker-backend": { inline: "inline", workers: "workers", "shared-memory": "shared-workers" }[
       snapshot.executor.mode
     ],
-    "pov:scale": pov.render_scale === 0.25 ? "quarter" : pov.render_scale === 0.5 ? "half" : "full",
+    "set-pov-render-scale": `${pov.render_scale}`,
   };
-  for (const [command, value] of Object.entries(selectValues)) {
-    const control = document.querySelector(`select[data-command="${command}"]`);
+  for (const [action, value] of Object.entries(selectValues)) {
+    const control = document.querySelector(`select[data-action="${action}"]`);
     if (control && value !== undefined) control.value = value;
   }
 };
@@ -248,6 +255,8 @@ const updateSnapshot = (snapshot) => {
   write("tier", `${snapshot.tier.name} / ${snapshot.tier.cache_ceiling_mb} MB`);
   write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
   write("storage", snapshot.storage.mode);
+  zoom = snapshot.zoom;
+  write("zoom", `x${zoom}`);
   write("webgpu-status", `${snapshot.renderer.mode} / refine ${snapshot.renderer.refinement}`);
   const pov = snapshot.view.pov;
   write(
@@ -260,100 +269,29 @@ const updateSnapshot = (snapshot) => {
   syncViewMode(snapshot);
 };
 
-const dispatchCommand = (id, value) => {
+const dispatchAction = (id, value = "") => {
   const app = window.__werApp;
   if (!app) {
-    appendDiagnostic(`command-dropped (wasm not ready): ${id}`);
+    appendDiagnostic(`action-dropped (wasm not ready): ${id}`);
     return;
   }
-  const snapshot = JSON.parse(app.apply_command(JSON.stringify({ id, value })));
-  updateSnapshot(snapshot);
-  appendDiagnostic(`settle_hash=${snapshot.settle_hash}`);
-  renderMap();
-};
-
-// Map-mode movement, mirroring the native shell (main.rs `apply_movement`):
-// WASD/arrows move continuously while held at 500 u/s (Shift sprints x4) —
-// the speed itself lives in the wasm facade; JS only reports held keys per
-// animation frame. The rAF loop runs only while a movement key is down, so
-// an idle viewer costs nothing.
-const MOVE_KEYS = new Map([
-  ["ArrowUp", [0, 1]],
-  ["KeyW", [0, 1]],
-  ["ArrowDown", [0, -1]],
-  ["KeyS", [0, -1]],
-  ["ArrowLeft", [-1, 0]],
-  ["KeyA", [-1, 0]],
-  ["ArrowRight", [1, 0]],
-  ["KeyD", [1, 0]],
-]);
-const heldMoves = new Set();
-let sprintHeld = false;
-let moveFrame = 0;
-let lastMoveTime = 0;
-
-const movementFrame = (now) => {
-  moveFrame = 0;
-  const app = window.__werApp;
-  const inMap = lastSnapshot?.view?.mode !== "pov";
-  if (!app || !inMap || heldMoves.size === 0) return;
-  const dt = Math.min(now - (lastMoveTime || now), 100);
-  lastMoveTime = now;
-  let mx = 0;
-  let my = 0;
-  for (const code of heldMoves) {
-    const [dx, dy] = MOVE_KEYS.get(code);
-    mx += dx;
-    my += dy;
+  try {
+    app.action(id, value === "" ? undefined : `${value}`);
+    appendDiagnostic(`action:${id}${value === "" ? "" : `=${value}`}`);
+    scheduleFrame();
+  } catch (error) {
+    appendDiagnostic(`action-rejected:${id}:${String(error)}`);
   }
-  const input = { move_x: Math.sign(mx), move_y: Math.sign(my), sprint: sprintHeld };
-  const t0 = performance.now();
-  const snapshot = JSON.parse(app.update(dt, JSON.stringify(input)));
-  perf.updateMs = performance.now() - t0;
-  updateSnapshot(snapshot);
-  renderMap();
-  // The native once-per-second fps roll (main.rs `update_telemetry`).
-  perf.frames += 1;
-  if (now - perf.lastRoll >= 1000) {
-    perf.fps = Math.round((perf.frames * 1000) / (now - (perf.lastRoll || now - 1000)));
-    perf.frames = 0;
-    perf.lastRoll = now;
-  }
-  moveFrame = requestAnimationFrame(movementFrame);
 };
 
-const startMovement = () => {
-  if (moveFrame) return;
-  lastMoveTime = 0;
-  perf.frames = 0;
-  perf.lastRoll = 0;
-  moveFrame = requestAnimationFrame(movementFrame);
-};
-
-// ---- POV mode (phase-7-plan.md §9.9): host the shared 3D renderer on the
-// POV canvas. The wasm facade owns camera/meshing/rendering; JS owns the
-// canvas swap, the rAF loop, held keys, pointer-lock mouse look, and the
-// wheel speed control — the same split as the native winit shell.
-const POV_MOVE = new Map([
-  ["KeyW", ["move_y", 1]],
-  ["ArrowUp", ["move_y", 1]],
-  ["KeyS", ["move_y", -1]],
-  ["ArrowDown", ["move_y", -1]],
-  ["KeyD", ["move_x", 1]],
-  ["ArrowRight", ["move_x", 1]],
-  ["KeyA", ["move_x", -1]],
-  ["ArrowLeft", ["move_x", -1]],
-  ["Space", ["move_z", 1]],
-  ["ShiftLeft", ["move_z", -1]],
-]);
+// The browser adapter forwards primitive DOM facts only. Binding selection,
+// held state, repeat suppression, wheel accumulation, and drag-look gating all
+// live in viewer_host::InputMapper on the wasm side.
 let povActive = false;
 let povEntering = false;
-const povHeld = new Set();
-let povLook = { dx: 0, dy: 0 };
-let povWheel = 0;
-let povFrameHandle = 0;
-let povLastTime = 0;
 let povFailures = 0;
+let viewerFrameHandle = 0;
+let lastViewerTime = 0;
 
 const povCanvas = () => document.getElementById("pov-canvas");
 
@@ -368,7 +306,8 @@ const enterPov = async () => {
     appendDiagnostic(`pov init failed: ${String(error)}`);
     // The device-loss path: back to map mode with the CPU map (the
     // phase-7 "unsupported-feature paths return to map mode cleanly").
-    dispatchCommand("renderer:device-lost");
+    window.__werApp?.renderer_lost();
+    scheduleFrame();
     return;
   }
   povEntering = false;
@@ -377,74 +316,76 @@ const enterPov = async () => {
   document.getElementById("world-canvas").hidden = true;
   povCanvas().hidden = false;
   povCanvas().focus();
-  povLastTime = 0;
+  lastViewerTime = 0;
   perf.frames = 0;
   perf.lastRoll = 0;
-  appendDiagnostic("pov: shared 3D renderer active (click canvas for mouse look)");
-  povFrameHandle = requestAnimationFrame(povFrame);
+  appendDiagnostic("pov: shared 3D renderer active (hold primary button to look)");
+  scheduleFrame();
 };
 
 const exitPov = () => {
   if (!povActive) return;
   povActive = false;
-  cancelAnimationFrame(povFrameHandle);
-  povFrameHandle = 0;
-  povHeld.clear();
-  if (document.pointerLockElement) document.exitPointerLock();
   povCanvas().hidden = true;
   document.getElementById("world-canvas").hidden = false;
   renderMap();
 };
 
-const povFrame = (now) => {
-  if (!povActive) return;
+const handleEffects = () => {
   const app = window.__werApp;
-  if (!app || lastSnapshot?.view?.mode !== "pov") {
-    exitPov();
-    return;
-  }
-  const dt = Math.min(now - (povLastTime || now), 100);
-  povLastTime = now;
-  const input = {
-    time: now / 1000,
-    look_dx: povLook.dx,
-    look_dy: povLook.dy,
-    wheel: povWheel,
-    move_x: 0,
-    move_y: 0,
-    move_z: 0,
-  };
-  povLook = { dx: 0, dy: 0 };
-  povWheel = 0;
-  for (const code of povHeld) {
-    const [axis, dir] = POV_MOVE.get(code);
-    input[axis] += dir;
-  }
-  input.move_x = Math.sign(input.move_x);
-  input.move_y = Math.sign(input.move_y);
-  input.move_z = Math.sign(input.move_z);
-  const t0 = performance.now();
-  const status = JSON.parse(app.pov_frame(dt, JSON.stringify(input)));
-  perf.updateMs = performance.now() - t0;
-  // Debug handle: the last POV frame status, readable from the console.
-  window.__povStatus = status;
-  if (status.rendered) {
-    povFailures = 0;
-  } else {
-    povFailures += 1;
-    if (povFailures > 30) {
-      appendDiagnostic("pov: renderer failing; returning to map mode");
-      dispatchCommand("renderer:device-lost");
-      return;
+  if (!app) return;
+  for (const effect of JSON.parse(app.take_effects())) {
+    if (effect.kind === "benchmark") {
+      const result = runStartupBenchmark();
+      app.benchmark_result(result.ms);
+      appendDiagnostic(`benchmark:${result.ms.toFixed(3)}ms/${result.hardwareConcurrency} cores`);
+    } else {
+      appendDiagnostic(`service-pending:${effect.kind}`);
     }
   }
+};
+
+const viewerFrame = (now) => {
+  viewerFrameHandle = 0;
+  const app = window.__werApp;
+  if (!app) return;
+  const dt = Math.min(now - (lastViewerTime || now), 100);
+  lastViewerTime = now;
+  const t0 = performance.now();
+  let snapshot;
+  let renderMapFrame = false;
+  if (lastSnapshot?.view?.mode === "pov") {
+    const status = JSON.parse(app.pov_frame(dt, now / 1000));
+    window.__povStatus = status;
+    snapshot = JSON.parse(app.info_snapshot());
+    if (status.rendered) {
+      povFailures = 0;
+    } else {
+      povFailures += 1;
+      if (povFailures > 30) {
+        appendDiagnostic("pov: renderer failing; returning to map mode");
+        app.renderer_lost();
+      }
+    }
+  } else {
+    snapshot = JSON.parse(app.update(dt));
+    renderMapFrame = true;
+  }
+  perf.updateMs = performance.now() - t0;
+  updateSnapshot(snapshot);
+  if (renderMapFrame) renderMap();
+  handleEffects();
   perf.frames += 1;
   if (now - perf.lastRoll >= 1000) {
     perf.fps = Math.round((perf.frames * 1000) / (now - (perf.lastRoll || now - 1000)));
     perf.frames = 0;
     perf.lastRoll = now;
   }
-  povFrameHandle = requestAnimationFrame(povFrame);
+  if (povActive || app.needs_frame()) scheduleFrame();
+};
+
+const scheduleFrame = () => {
+  if (!viewerFrameHandle) viewerFrameHandle = requestAnimationFrame(viewerFrame);
 };
 
 // Keep the canvas swap and frame loop in lockstep with the facade's view
@@ -458,36 +399,6 @@ const syncViewMode = (snapshot) => {
   }
 };
 
-// Mouse look: pointer lock on click (the plan's browser control), with
-// plain drag-look as the fallback, mirroring the native drag scheme.
-document.getElementById("pov-canvas").addEventListener("click", () => {
-  if (povActive && !document.pointerLockElement) {
-    document.getElementById("pov-canvas").requestPointerLock();
-  }
-});
-document.addEventListener("pointerlockchange", () => {
-  if (document.pointerLockElement === povCanvas()) {
-    appendDiagnostic("pov: pointer lock (Esc releases)");
-    dispatchCommand("pov:pointer-lock");
-  }
-});
-document.getElementById("pov-canvas").addEventListener("pointermove", (event) => {
-  if (!povActive) return;
-  if (document.pointerLockElement === povCanvas() || event.buttons & 1) {
-    povLook.dx += event.movementX;
-    povLook.dy += event.movementY;
-  }
-});
-document.getElementById("pov-canvas").addEventListener(
-  "wheel",
-  (event) => {
-    event.preventDefault();
-    if (!povActive) return;
-    povWheel += event.deltaMode === 1 ? -event.deltaY : -event.deltaY / 40;
-  },
-  { passive: false },
-);
-
 // ---- Throttled info panel (the native painted panel, phase-7-plan.md §3.2:
 // an HTML info panel replaces it in the browser). Stats refresh at 2 Hz —
 // never per frame — so the panel cannot meaningfully affect performance.
@@ -500,7 +411,7 @@ const updatePanelStats = (snapshot) => {
   const stats = snapshot.stats;
   if (!stats) return;
   write("player", `${snapshot.world_pos[0].toFixed(0)}, ${snapshot.world_pos[1].toFixed(0)}`);
-  write("fps", moveFrame || povActive ? `${perf.fps}` : "idle");
+  write("fps", viewerFrameHandle || povActive ? `${perf.fps}` : "idle");
   write("update-ms", millis(perf.updateMs));
   write("compose-ms", millis(perf.composeMs));
   write("present-ms", millis(perf.presentMs));
@@ -542,40 +453,15 @@ setInterval(() => {
   updatePanelStats(JSON.parse(app.info_snapshot()));
 }, PANEL_REFRESH_MS);
 
-for (const control of document.querySelectorAll("button[data-command]")) {
-  if (!commandById.has(control.dataset.command)) {
-    appendDiagnostic(`unregistered-command:${control.dataset.command}`);
-  }
+for (const control of document.querySelectorAll("button[data-action]")) {
   control.addEventListener("click", () => {
-    appendDiagnostic(`command:${control.dataset.command}`);
-    dispatchCommand(control.dataset.command);
+    dispatchAction(control.dataset.action, control.dataset.value ?? "");
   });
 }
 
-for (const control of document.querySelectorAll("select[data-command]")) {
-  if (!commandById.has(control.dataset.command)) {
-    appendDiagnostic(`unregistered-command:${control.dataset.command}`);
-  }
+for (const control of document.querySelectorAll("select[data-action]")) {
   control.addEventListener("change", () => {
-    const id = control.dataset.command;
-    appendDiagnostic(`${id}:${control.value}`);
-    // Worker modes are distinct command ids (they mirror native runtime
-    // switches); the other selects pass their value with one id.
-    if (id === "worker") {
-      dispatchCommand(`worker:${control.value}`);
-    } else {
-      dispatchCommand(id, control.value);
-    }
-  });
-}
-
-const exportButton = document.querySelector('[data-command="storage:export"]');
-if (exportButton) {
-  exportButton.addEventListener("click", () => {
-    if (!lastSnapshot) return;
-    const href = exportSnapshot(lastSnapshot);
-    appendDiagnostic(`export:${href.slice(0, 16)}`);
-    URL.revokeObjectURL(href);
+    dispatchAction(control.dataset.action, control.value);
   });
 }
 
@@ -583,70 +469,106 @@ window.addEventListener("keydown", (event) => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
     return;
   }
-  const inPov = lastSnapshot?.view?.mode === "pov";
-  sprintHeld = event.shiftKey;
-  if (!inPov && MOVE_KEYS.has(event.code)) {
-    event.preventDefault();
-    heldMoves.add(event.code);
-    startMovement();
-    return;
-  }
-  if (inPov && POV_MOVE.has(event.code)) {
-    event.preventDefault();
-    povHeld.add(event.code);
-    return;
-  }
-  for (const command of commandById.values()) {
-    if (!command.key || event.key !== command.key) continue;
-    // The native shell's POV key gate (3d-phase-1-plan.md §8.4), mirrored:
-    // POV-group keys act only in POV mode, and Tab toggles the modes.
-    if (command.group === "POV" && !inPov) continue;
-    const id = command.id === "mode:pov" && inPov ? "mode:map" : command.id;
-    event.preventDefault();
-    dispatchCommand(id);
-    appendDiagnostic(`key:${command.key}`);
-    break;
-  }
+  const app = window.__werApp;
+  if (!app) return;
+  const handled = app.key_event(
+    event.code,
+    true,
+    event.repeat,
+    event.shiftKey,
+    event.ctrlKey,
+    event.altKey,
+    event.metaKey,
+  );
+  if (handled) event.preventDefault();
+  scheduleFrame();
 });
 
-document.getElementById("world-canvas").addEventListener(
-  "wheel",
-  (event) => {
-    event.preventDefault();
-    if (lastSnapshot?.view?.mode === "pov") return;
-    // Native accumulator semantics: line scrolls count notches directly,
-    // pixel scrolls (touchpads) count ~40px per notch.
-    scrollAccum += event.deltaMode === 1 ? -event.deltaY : -event.deltaY / 40;
-    let next = zoom;
-    while (scrollAccum >= 1) {
-      next = Math.min(next * 2, MAX_ZOOM);
-      scrollAccum -= 1;
-    }
-    while (scrollAccum <= -1) {
-      next = Math.max(next / 2, 1);
-      scrollAccum += 1;
-    }
-    if (next !== zoom) {
-      zoom = next;
-      write("zoom", `x${zoom}`);
-      if (lastMapFrame) drawCpuMap(lastMapFrame.header, lastMapFrame.pixels);
-    }
-  },
-  { passive: false },
-);
-
 window.addEventListener("keyup", (event) => {
-  sprintHeld = event.shiftKey;
-  heldMoves.delete(event.code);
-  povHeld.delete(event.code);
+  const app = window.__werApp;
+  if (!app) return;
+  const handled = app.key_event(
+    event.code,
+    false,
+    false,
+    event.shiftKey,
+    event.ctrlKey,
+    event.altKey,
+    event.metaKey,
+  );
+  if (handled) event.preventDefault();
+  scheduleFrame();
 });
 
 // Held keys must not survive focus loss (alt-tab mid-move).
 window.addEventListener("blur", () => {
-  heldMoves.clear();
-  povHeld.clear();
-  sprintHeld = false;
+  window.__werApp?.host_focus(false);
+  scheduleFrame();
 });
+window.addEventListener("focus", () => window.__werApp?.host_focus(true));
+
+const canvasPoint = (canvas, event) => {
+  const rect = canvas.getBoundingClientRect();
+  return [
+    ((event.clientX - rect.left) / rect.width) * canvas.width,
+    ((event.clientY - rect.top) / rect.height) * canvas.height,
+  ];
+};
+
+for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
+  const view = canvas.dataset.viewKind;
+  canvas.addEventListener("focus", () => window.__werApp?.surface_focus(true));
+  canvas.addEventListener("blur", () => window.__werApp?.surface_focus(false));
+  canvas.addEventListener("pointerdown", (event) => {
+    const app = window.__werApp;
+    if (!app) return;
+    canvas.focus();
+    const [x, y] = canvasPoint(canvas, event);
+    const handled = app.pointer_button(event.pointerId, event.button, true, x, y, view);
+    if (event.button === 0) canvas.setPointerCapture(event.pointerId);
+    if (handled) event.preventDefault();
+    scheduleFrame();
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    const app = window.__werApp;
+    if (!app) return;
+    const [x, y] = canvasPoint(canvas, event);
+    if (app.pointer_move(event.pointerId, x, y, view)) scheduleFrame();
+  });
+  canvas.addEventListener("pointerup", (event) => {
+    const app = window.__werApp;
+    if (!app) return;
+    const [x, y] = canvasPoint(canvas, event);
+    const handled = app.pointer_button(event.pointerId, event.button, false, x, y, view);
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    if (handled) event.preventDefault();
+    scheduleFrame();
+  });
+  canvas.addEventListener("pointercancel", (event) => {
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    window.__werApp?.pointer_cancel(event.pointerId);
+    scheduleFrame();
+  });
+  canvas.addEventListener("lostpointercapture", (event) => {
+    window.__werApp?.pointer_cancel(event.pointerId);
+    scheduleFrame();
+  });
+  canvas.addEventListener(
+    "wheel",
+    (event) => {
+      const app = window.__werApp;
+      if (!app) return;
+      const lines = event.deltaMode === WheelEvent.DOM_DELTA_LINE;
+      const delta =
+        event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? -event.deltaY * canvas.height
+          : -event.deltaY;
+      if (app.wheel(delta, lines, view)) event.preventDefault();
+      scheduleFrame();
+    },
+    { passive: false },
+  );
+}
 
 document.getElementById("world-canvas").addEventListener("pointermove", (event) => {
   const canvas = event.currentTarget;
@@ -802,7 +724,8 @@ const webgpuAvailable = probeWebGpu();
 initWorkerProbe();
 await initWasm();
 if (webgpuAvailable) {
-  dispatchCommand("renderer:webgpu");
+  window.__werApp.renderer_available();
+  scheduleFrame();
 }
 await initStorage();
 initBenchmark();
