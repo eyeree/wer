@@ -37,3 +37,6 @@ font8x8 = { workspace = true }
 [dev-dependencies]
 # Byte-exact mesher determinism assertions (3d-phase-1-plan.md §10).
 bytemuck = { workspace = true }
+# Collision-resistant digests keep the native CPU-map characterization
+# fixtures compact while still pinning the complete RGBA byte stream.
+sha2 = { workspace = true }

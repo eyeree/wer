@@ -1690,6 +1690,7 @@ dependencies = [
  "pollster",
  "pov-host",
  "renderer",
+ "sha2",
  "tools",
  "winit",
  "world-core",

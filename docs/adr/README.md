@@ -38,3 +38,4 @@ Format: [Michael Nygard's template](https://cognitect.com/blog/2011/11/15/docume
 | [0025](0025-anchor-steering-uses-canonical-multisets.md) | Anchor steering uses canonical multisets | Accepted |
 | [0026](0026-route-attraction-is-globally-bounded.md) | Route attraction is globally bounded and resonance scores final desire | Accepted |
 | [0027](0027-fixed-point-drainage-and-halo-sampled-terrain.md) | Fixed-point drainage and halo-sampled Terrain boundaries | Accepted |
+| [0028](0028-shared-viewer-host-and-one-world-multi-view.md) | Shared viewer host and one-world multi-view presentation | Accepted |

@@ -718,6 +718,85 @@ const inspectCursor = (wx, wy) => {
   write("cursor-biome", cell.biome === null ? "—" : cell.biome);
 };
 
+// Milestone 0 characterization probe. Browser automation calls this stable,
+// read-only surface instead of reconstructing layout selectors or parsing
+// screenshots. The intentionally broken pre-alignment geometry is committed
+// as evidence, then replaced by behavioral assertions in the viewport
+// milestone. GPU pixels are never read back (ADR 0017).
+window.__viewerCharacterization = () => {
+  const round = (value) => Math.round(value * 1000) / 1000;
+  const rect = (selector) => {
+    const node = document.querySelector(selector);
+    if (!node) return null;
+    const box = node.getBoundingClientRect();
+    return {
+      x: round(box.x),
+      y: round(box.y),
+      width: round(box.width),
+      height: round(box.height),
+      right: round(box.right),
+      bottom: round(box.bottom),
+    };
+  };
+  const canvas = (selector) => {
+    const node = document.querySelector(selector);
+    return node
+      ? {
+          hidden: node.hidden,
+          css: rect(selector),
+          backing: { width: node.width, height: node.height },
+        }
+      : null;
+  };
+  const documentElement = document.documentElement;
+  const snapshot = window.__werApp ? JSON.parse(window.__werApp.info_snapshot()) : null;
+  return {
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      dpr: window.devicePixelRatio,
+    },
+    document: {
+      clientWidth: documentElement.clientWidth,
+      clientHeight: documentElement.clientHeight,
+      scrollWidth: documentElement.scrollWidth,
+      scrollHeight: documentElement.scrollHeight,
+    },
+    boxes: {
+      appShell: rect(".app-shell"),
+      viewer: rect(".viewer"),
+      toolbar: rect(".toolbar"),
+      canvasHost: rect(".canvas-host"),
+      statusBar: rect(".status-bar"),
+      infoPanel: rect(".info-panel"),
+    },
+    canvases: {
+      map: canvas("#world-canvas"),
+      pov: canvas("#pov-canvas"),
+      mapViewport:
+        mapViewport === undefined
+          ? null
+          : Object.fromEntries(
+              Object.entries(mapViewport).map(([key, value]) => [
+                key,
+                typeof value === "number" ? round(value) : value,
+              ]),
+            ),
+    },
+    renderer: snapshot
+      ? {
+          mode: snapshot.renderer.mode,
+          compose: snapshot.renderer.compose,
+          refinement: snapshot.renderer.refinement,
+          viewMode: snapshot.view.mode,
+          povSupported: snapshot.view.pov_supported,
+          domStatus: document.querySelector('[data-field="webgpu-status"]')?.textContent ?? null,
+          povStatus: window.__povStatus ?? null,
+        }
+      : null,
+  };
+};
+
 drawBootCanvas();
 const webgpuAvailable = probeWebGpu();
 initWorkerProbe();

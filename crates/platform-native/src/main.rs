@@ -88,7 +88,7 @@ use std::time::Instant;
 
 use renderer::{letterbox_viewport, Renderer};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -135,12 +135,140 @@ const MAX_ZOOM: u32 = 16;
 /// organism in the panel instead of the region info.
 const ORGANISM_INFO_ZOOM: u32 = 4;
 
+/// Native touchpad pixels treated as one wheel notch. Kept as a named seam so
+/// the alignment characterization can replay line and pixel deltas exactly.
+const WHEEL_PIXELS_PER_NOTCH: f64 = 40.0;
+
+/// Raw map navigation components and their length from held physical keys.
+/// Keeping the length separate preserves the native movement operation order.
+fn map_navigation_components(keys_down: &HashSet<KeyCode>) -> (f64, f64, f64) {
+    let down = |code| keys_down.contains(&code);
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
+        dy += 1.0;
+    }
+    if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
+        dy -= 1.0;
+    }
+    if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
+        dx -= 1.0;
+    }
+    if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
+        dx += 1.0;
+    }
+    let len = f64::hypot(dx, dy);
+    (dx, dy, len)
+}
+
+/// Final map movement delta with the pre-alignment floating-point operation
+/// order. Travel feeds convergence, so even a one-ULP reassociation here is an
+/// unintended behavior change during characterization.
+fn map_movement_delta(keys_down: &HashSet<KeyCode>, sprint: bool, dt: f64) -> Option<(f64, f64)> {
+    let (dx, dy, len) = map_navigation_components(keys_down);
+    if len == 0.0 {
+        return None;
+    }
+    let sprint = if sprint { 4.0 } else { 1.0 };
+    let step = PLAYER_SPEED * sprint * dt / len;
+    Some((dx * step, dy * step))
+}
+
+/// Forward/strafe/vertical intent from held POV keys. The camera basis is
+/// applied afterwards because pitched forward and world-up are not generally
+/// orthogonal; the resulting world vector retains the existing normalization.
+fn pov_navigation_axis(keys_down: &HashSet<KeyCode>, walk: bool) -> (f64, f64, f64) {
+    let down = |code| keys_down.contains(&code);
+    let forward = i8::from(down(KeyCode::KeyW) || down(KeyCode::ArrowUp))
+        - i8::from(down(KeyCode::KeyS) || down(KeyCode::ArrowDown));
+    let strafe = i8::from(down(KeyCode::KeyD) || down(KeyCode::ArrowRight))
+        - i8::from(down(KeyCode::KeyA) || down(KeyCode::ArrowLeft));
+    let vertical = if walk {
+        0
+    } else {
+        i8::from(down(KeyCode::Space)) - i8::from(down(KeyCode::ShiftLeft))
+    };
+    (f64::from(forward), f64::from(strafe), f64::from(vertical))
+}
+
+/// Add fractional wheel input and return complete signed notches, retaining
+/// the sub-notch remainder exactly as the native event path does today.
+fn accumulate_wheel(accum: &mut f64, delta: f64) -> i32 {
+    *accum += delta;
+    let mut notches = 0;
+    while *accum >= 1.0 {
+        notches += 1;
+        *accum -= 1.0;
+    }
+    while *accum <= -1.0 {
+        notches -= 1;
+        *accum += 1.0;
+    }
+    notches
+}
+
+/// Cursor delta while a primary-button drag is active. `None` is both the
+/// pre-press and post-release/cancel gate: pointer transport alone cannot look.
+fn primary_drag_delta(last: Option<(f64, f64)>, current: (f64, f64)) -> Option<(f64, f64)> {
+    last.map(|(x, y)| (current.0 - x, current.1 - y))
+}
+
+/// One-shot key presses dispatch only on their first non-repeat event.
+const fn dispatch_one_shot(repeat: bool) -> bool {
+    !repeat
+}
+
 /// Which presentation the shell drives (3d-phase-1-plan.md §8.1). Map mode
 /// is byte-for-byte the pre-POV path; POV renders the meshed terrain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Map,
     Pov,
+}
+
+/// The two one-shot bindings exercised by the Milestone 0 semantic trace.
+/// The full registry moves to `viewer-host` in Milestone 2; until then this
+/// narrow seam makes the trace execute the production key mapping/reducer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharacterizedOneShot {
+    CycleMapChannel,
+    TogglePovShadowAo,
+}
+
+fn characterized_one_shot(mode: ViewMode, code: KeyCode) -> Option<CharacterizedOneShot> {
+    match (mode, code) {
+        (ViewMode::Map, KeyCode::KeyV) => Some(CharacterizedOneShot::CycleMapChannel),
+        (ViewMode::Pov, KeyCode::KeyB) => Some(CharacterizedOneShot::TogglePovShadowAo),
+        _ => None,
+    }
+}
+
+fn reduce_characterized_one_shot(
+    action: CharacterizedOneShot,
+    channel: &mut Channel,
+    pov_shadow_ao: &mut bool,
+) {
+    match action {
+        CharacterizedOneShot::CycleMapChannel => *channel = channel.next(),
+        CharacterizedOneShot::TogglePovShadowAo => *pov_shadow_ao = !*pov_shadow_ao,
+    }
+}
+
+/// Arm/release the native POV look gate from an actual mouse-button event.
+fn update_primary_drag_gate(
+    mode: ViewMode,
+    button: MouseButton,
+    pressed: bool,
+    cursor: Option<(f64, f64)>,
+    drag_from: &mut Option<(f64, f64)>,
+) {
+    if mode == ViewMode::Pov && button == MouseButton::Left {
+        *drag_from = if pressed { cursor } else { None };
+    }
+}
+
+fn cancel_primary_drag(drag_from: &mut Option<(f64, f64)>) {
+    *drag_from = None;
 }
 
 /// Remove the runtime's effective preserve owner and only that record's
@@ -923,29 +1051,12 @@ impl App {
 
     /// Continuous movement from held keys, scaled by real elapsed time.
     fn apply_movement(&mut self, dt: f64) {
-        let mut dx = 0.0;
-        let mut dy = 0.0;
-        let down = |code| self.keys_down.contains(&code);
-        if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
-            dy += 1.0;
-        }
-        if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
-            dy -= 1.0;
-        }
-        if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
-            dx -= 1.0;
-        }
-        if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
-            dx += 1.0;
-        }
-        if dx == 0.0 && dy == 0.0 {
+        let Some((dx, dy)) = map_movement_delta(&self.keys_down, self.modifiers.shift_key(), dt)
+        else {
             return;
-        }
-        let len = f64::hypot(dx, dy);
-        let sprint = if self.modifiers.shift_key() { 4.0 } else { 1.0 };
-        let step = PLAYER_SPEED * sprint * dt / len;
-        self.world.player.0 += dx * step;
-        self.world.player.1 += dy * step;
+        };
+        self.world.player.0 += dx;
+        self.world.player.1 += dy;
     }
 
     /// Toggle Map ↔ POV (`Tab`, 3d-phase-1-plan.md §8.1). Entering POV
@@ -993,29 +1104,12 @@ impl App {
     /// toward `ground + EYE_HEIGHT` under the vertical-rate clamp. No
     /// lateral collision in either mode. Bypasses `apply_movement` entirely.
     fn apply_pov_movement(&mut self, dt: f64) {
-        let down = |code| self.keys_down.contains(&code);
         let walk = self.pov_camera.walk;
+        let (forward, strafe, vertical) = pov_navigation_axis(&self.keys_down, walk);
         let mut mv = glam::DVec3::ZERO;
-        if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
-            mv += self.pov_forward();
-        }
-        if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
-            mv -= self.pov_forward();
-        }
-        if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
-            mv += self.pov_camera.right();
-        }
-        if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
-            mv -= self.pov_camera.right();
-        }
-        if !walk {
-            if down(KeyCode::Space) {
-                mv.z += 1.0;
-            }
-            if down(KeyCode::ShiftLeft) {
-                mv.z -= 1.0;
-            }
-        }
+        mv += self.pov_forward() * forward;
+        mv += self.pov_camera.right() * strafe;
+        mv.z += vertical;
         if mv != glam::DVec3::ZERO {
             let speed = if walk {
                 self.pov_camera.walk_speed
@@ -1071,6 +1165,25 @@ impl App {
 
     /// One-shot actions on key press.
     fn handle_press(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
+        if let Some(action) = characterized_one_shot(self.view_mode, code) {
+            reduce_characterized_one_shot(
+                action,
+                &mut self.channel,
+                &mut self.pov_toggles.shadow_ao,
+            );
+            match action {
+                CharacterizedOneShot::CycleMapChannel => {
+                    log::info!("channel: {}", self.channel.name());
+                }
+                CharacterizedOneShot::TogglePovShadowAo => {
+                    log::info!(
+                        "pov: directional shadows and terrain AO {}",
+                        onoff(self.pov_toggles.shadow_ao)
+                    );
+                }
+            }
+            return;
+        }
         // The POV keybinding gate (3d-phase-1-plan.md §8.4): in POV only
         // `Tab`, `F` (walk ↔ fly, 3d-phase-2-plan.md §6.1), the `B`/`N`/`V`
         // diagnostic toggles, `Escape`, and the `F12` debug dump are handled;
@@ -1081,13 +1194,6 @@ impl App {
             match code {
                 KeyCode::Tab => self.toggle_view_mode(),
                 KeyCode::KeyF => self.toggle_walk(),
-                KeyCode::KeyB => {
-                    self.pov_toggles.shadow_ao = !self.pov_toggles.shadow_ao;
-                    log::info!(
-                        "pov: directional shadows and terrain AO {}",
-                        onoff(self.pov_toggles.shadow_ao)
-                    );
-                }
                 KeyCode::KeyN => {
                     self.pov_toggles.detail_normals = !self.pov_toggles.detail_normals;
                     log::info!(
@@ -1249,10 +1355,6 @@ impl App {
             }
             KeyCode::KeyF => {
                 self.overlays.discovered = !self.overlays.discovered;
-            }
-            KeyCode::KeyV => {
-                self.channel = self.channel.next();
-                log::info!("channel: {}", self.channel.name());
             }
             KeyCode::KeyG => {
                 self.overlays.grid = !self.overlays.grid;
@@ -1915,54 +2017,52 @@ impl ApplicationHandler for App {
                 // is held — the same math `--pov-script` simulates with
                 // `mouse:dx,dy`. (Raw device deltas are unusable under
                 // WSLg/XWayland: they arrive as absolute jumps.)
-                if let Some(last) = self.pov_look_from {
-                    self.pov_camera
-                        .look(position.x - last.0, position.y - last.1);
+                let current = (position.x, position.y);
+                if let Some((dx, dy)) = primary_drag_delta(self.pov_look_from, current) {
+                    self.pov_camera.look(dx, dy);
                     self.pov_look_from = Some((position.x, position.y));
                 }
-                self.cursor_pos = Some((position.x, position.y));
+                self.cursor_pos = Some(current);
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_pos = None;
-                self.pov_look_from = None;
+                cancel_primary_drag(&mut self.pov_look_from);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 // Mouse look is active only while the left button is held
                 // in POV; releasing (or leaving the window) ends the drag.
-                if self.view_mode == ViewMode::Pov && button == winit::event::MouseButton::Left {
-                    self.pov_look_from = match state {
-                        ElementState::Pressed => self.cursor_pos,
-                        ElementState::Released => None,
-                    };
-                }
+                update_primary_drag_gate(
+                    self.view_mode,
+                    button,
+                    state == ElementState::Pressed,
+                    self.cursor_pos,
+                    &mut self.pov_look_from,
+                );
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.scroll_accum += match delta {
+                let delta = match delta {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
                     // Touchpads scroll in pixels; ~40 px per wheel notch.
-                    MouseScrollDelta::PixelDelta(pos) => pos.y / 40.0,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y / WHEEL_PIXELS_PER_NOTCH,
                 };
+                let notches = accumulate_wheel(&mut self.scroll_accum, delta);
                 if self.view_mode == ViewMode::Pov {
                     // Wheel = fly-speed multiplier in POV (plan §8.3); the
                     // map zoom below stays map-mode-only.
-                    while self.scroll_accum >= 1.0 {
+                    for _ in 0..notches.max(0) {
                         self.pov_camera.scroll_speed(true);
-                        self.scroll_accum -= 1.0;
                     }
-                    while self.scroll_accum <= -1.0 {
+                    for _ in 0..(-notches).max(0) {
                         self.pov_camera.scroll_speed(false);
-                        self.scroll_accum += 1.0;
                     }
                     return;
                 }
                 let before = self.zoom;
-                while self.scroll_accum >= 1.0 {
+                for _ in 0..notches.max(0) {
                     self.zoom = (self.zoom * 2).min(MAX_ZOOM);
-                    self.scroll_accum -= 1.0;
                 }
-                while self.scroll_accum <= -1.0 {
+                for _ in 0..(-notches).max(0) {
                     self.zoom = (self.zoom / 2).max(1);
-                    self.scroll_accum += 1.0;
                 }
                 if self.zoom != before {
                     log::info!(
@@ -1988,7 +2088,7 @@ impl ApplicationHandler for App {
             } => match state {
                 ElementState::Pressed => {
                     self.keys_down.insert(code);
-                    if !repeat {
+                    if dispatch_one_shot(repeat) {
                         self.handle_press(code, event_loop);
                     }
                 }
@@ -2833,5 +2933,427 @@ mod preserve_lifecycle_tests {
         let forward = run(false, false, "forward");
         let reversed = run(true, true, "reversed");
         assert_eq!(forward, reversed);
+    }
+}
+
+#[cfg(test)]
+mod alignment_characterization_tests {
+    use super::*;
+    use std::fmt::Write as _;
+    use world_runtime::{Budget, InlineExecutor};
+
+    fn settled_map() -> RegionMap {
+        let cfg = StreamConfig {
+            near_radius: 1.5 * REGION_SIZE,
+            far_radius: 3.0 * REGION_SIZE,
+            load_radius: 3.0 * REGION_SIZE,
+            unload_radius: 4.0 * REGION_SIZE,
+            field_resolution: 8,
+            ..StreamConfig::default()
+        };
+        let field = PossibilityField::default();
+        let bias = [0.0f32; POSSIBILITY_DIMS];
+        let mut map = RegionMap::new(cfg);
+        for _ in 0..6 {
+            map.update(
+                (0.0, 0.0),
+                0.0,
+                &field,
+                &[],
+                &bias,
+                &Budget::unlimited(),
+                &InlineExecutor,
+                false,
+            );
+        }
+        map
+    }
+
+    fn option_f32_bits(value: Option<f32>) -> String {
+        value.map_or_else(|| String::from("none"), |v| format!("{:08x}", v.to_bits()))
+    }
+
+    #[test]
+    fn map_movement_helper_preserves_legacy_evaluation_order() {
+        let controls = [
+            KeyCode::KeyW,
+            KeyCode::KeyS,
+            KeyCode::KeyA,
+            KeyCode::KeyD,
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowRight,
+        ];
+        let dts = [0.0, 0.000_002_999_991, 0.007, 0.1, 1.0 / 60.0];
+        for mask in 0u16..(1 << controls.len()) {
+            let keys: HashSet<_> = controls
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &key)| (mask & (1 << index) != 0).then_some(key))
+                .collect();
+            for sprint in [false, true] {
+                for dt in dts {
+                    // The pre-characterization `apply_movement` expression,
+                    // copied as an independent bit-exact oracle.
+                    let down = |code| keys.contains(&code);
+                    let mut dx: f64 = 0.0;
+                    let mut dy: f64 = 0.0;
+                    if down(KeyCode::KeyW) || down(KeyCode::ArrowUp) {
+                        dy += 1.0;
+                    }
+                    if down(KeyCode::KeyS) || down(KeyCode::ArrowDown) {
+                        dy -= 1.0;
+                    }
+                    if down(KeyCode::KeyA) || down(KeyCode::ArrowLeft) {
+                        dx -= 1.0;
+                    }
+                    if down(KeyCode::KeyD) || down(KeyCode::ArrowRight) {
+                        dx += 1.0;
+                    }
+                    let len = f64::hypot(dx, dy);
+                    let expected = if len == 0.0 {
+                        None
+                    } else {
+                        let multiplier = if sprint { 4.0 } else { 1.0 };
+                        let step = PLAYER_SPEED * multiplier * dt / len;
+                        Some((dx * step, dy * step))
+                    };
+                    let actual = map_movement_delta(&keys, sprint, dt);
+                    assert_eq!(
+                        actual.map(|(x, y)| (x.to_bits(), y.to_bits())),
+                        expected.map(|(x, y)| (x.to_bits(), y.to_bits())),
+                        "mask {mask:#05x}, sprint {sprint}, dt {dt:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pins the semantic source values that the native panel samples before
+    /// the model and conversion code move to `viewer-host` (alignment M0).
+    /// Float bits are recorded exactly; this is not a formatted HUD-pixel
+    /// fixture and it does not extend presentation values into world identity.
+    #[test]
+    fn native_panel_source_characterization() {
+        let map = settled_map();
+        let source = map
+            .organisms()
+            .min_by_key(|organism| (organism.id, organism.slot))
+            .copied()
+            .expect("settled characterization map has organisms");
+        let cursor = App::sample_cursor(&map, source.world_pos);
+        let organism = App::pick_organism(&map, source.world_pos)
+            .expect("sampling at a rendered organism selects an organism");
+        assert_eq!(organism.id, source.id);
+        assert_eq!(organism.species, source.species);
+        let ecology = cursor
+            .ecology
+            .as_ref()
+            .expect("the selected organism's settled cell has ecology");
+
+        let mut actual = String::from("native-panel-source-characterization-v1\n");
+        writeln!(
+            &mut actual,
+            "cursor.world {:016x} {:016x}",
+            cursor.world.0.to_bits(),
+            cursor.world.1.to_bits()
+        )
+        .unwrap();
+        writeln!(
+            &mut actual,
+            "cursor.region {} {}",
+            cursor.region.0, cursor.region.1
+        )
+        .unwrap();
+        writeln!(&mut actual, "cursor.status {}", cursor.status).unwrap();
+        writeln!(
+            &mut actual,
+            "cursor.stability {:08x}",
+            cursor.stability.to_bits()
+        )
+        .unwrap();
+        writeln!(&mut actual, "cursor.revision {}", cursor.revision).unwrap();
+        for (name, value) in [
+            ("elevation", cursor.elevation),
+            ("temperature", cursor.temperature),
+            ("moisture", cursor.moisture),
+            ("hardness", cursor.hardness),
+            ("river", cursor.river),
+            ("wetness", cursor.wetness),
+            ("soil-depth", cursor.soil_depth),
+            ("fertility", cursor.fertility),
+            ("vegetation", cursor.vegetation),
+            ("canopy", cursor.canopy),
+        ] {
+            writeln!(&mut actual, "cursor.{name} {}", option_f32_bits(value)).unwrap();
+        }
+        writeln!(
+            &mut actual,
+            "cursor.biome {}",
+            cursor.biome.unwrap_or("none")
+        )
+        .unwrap();
+        writeln!(&mut actual, "ecology.roster-size {}", ecology.roster_size).unwrap();
+        writeln!(&mut actual, "ecology.dominant {:016x}", ecology.dominant_id).unwrap();
+        writeln!(
+            &mut actual,
+            "ecology.trophic {} {} {} {} {}",
+            ecology.trophic_counts[0],
+            ecology.trophic_counts[1],
+            ecology.trophic_counts[2],
+            ecology.trophic_counts[3],
+            ecology.trophic_counts[4]
+        )
+        .unwrap();
+        writeln!(
+            &mut actual,
+            "ecology.pressure {:08x} {:08x} {:08x}",
+            ecology.herbivore.to_bits(),
+            ecology.predator.to_bits(),
+            ecology.diversity.to_bits()
+        )
+        .unwrap();
+        writeln!(&mut actual, "organism.id {:016x}", organism.id).unwrap();
+        writeln!(&mut actual, "organism.slot {}", source.slot).unwrap();
+        writeln!(
+            &mut actual,
+            "organism.cell {} {}",
+            source.cell.cx, source.cell.cy
+        )
+        .unwrap();
+        writeln!(&mut actual, "organism.species {:016x}", organism.species).unwrap();
+        writeln!(&mut actual, "organism.trophic {}", organism.trophic).unwrap();
+        writeln!(
+            &mut actual,
+            "organism.world {:016x} {:016x}",
+            organism.world.0.to_bits(),
+            organism.world.1.to_bits()
+        )
+        .unwrap();
+        writeln!(
+            &mut actual,
+            "organism.expressed {:08x} {:08x} {:08x} {:08x} {:08x}",
+            organism.hue.to_bits(),
+            organism.luminance.to_bits(),
+            organism.size.to_bits(),
+            organism.activity.to_bits(),
+            organism.aggression.to_bits()
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual.trim_end(),
+            include_str!("../tests/fixtures/native_panel_source_characterization.txt").trim_end()
+        );
+    }
+
+    /// A semantic Map/POV input trace over the pure seams used by the current
+    /// winit adapter. Milestone 2 replays the same fixture through the shared
+    /// mapper; this freezes held movement, diagonal normalization, one-shot
+    /// repeat suppression, fractional wheels, and primary-held POV look.
+    #[test]
+    fn native_input_characterization() {
+        let mut actual = String::from("native-input-characterization-v1\n");
+        let mut keys = HashSet::new();
+        let dt = 0.1f64;
+
+        keys.insert(KeyCode::KeyW);
+        let components_w = map_navigation_components(&keys);
+        let axis_w = (
+            components_w.0 / components_w.2,
+            components_w.1 / components_w.2,
+        );
+        let delta_w = map_movement_delta(&keys, false, dt).expect("W is active");
+        writeln!(
+            &mut actual,
+            "map held=KeyW axis={:016x},{:016x} delta={:016x},{:016x}",
+            axis_w.0.to_bits(),
+            axis_w.1.to_bits(),
+            delta_w.0.to_bits(),
+            delta_w.1.to_bits()
+        )
+        .unwrap();
+
+        keys.insert(KeyCode::KeyD);
+        let components_wd = map_navigation_components(&keys);
+        let axis_wd = (
+            components_wd.0 / components_wd.2,
+            components_wd.1 / components_wd.2,
+        );
+        let delta_wd = map_movement_delta(&keys, false, dt).expect("W+D is active");
+        writeln!(
+            &mut actual,
+            "map held=KeyD+KeyW axis={:016x},{:016x} delta={:016x},{:016x}",
+            axis_wd.0.to_bits(),
+            axis_wd.1.to_bits(),
+            delta_wd.0.to_bits(),
+            delta_wd.1.to_bits()
+        )
+        .unwrap();
+
+        let mut channel = Channel::Composite;
+        let mut shadow_ao = true;
+        let first_action = dispatch_one_shot(false)
+            .then(|| characterized_one_shot(ViewMode::Map, KeyCode::KeyV))
+            .flatten();
+        if let Some(action) = first_action {
+            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
+        }
+        let repeat_action = dispatch_one_shot(true)
+            .then(|| characterized_one_shot(ViewMode::Map, KeyCode::KeyV))
+            .flatten();
+        if let Some(action) = repeat_action {
+            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
+        }
+        writeln!(
+            &mut actual,
+            "map one-shot=KeyV first={} repeat={} channel={}",
+            first_action.is_some(),
+            repeat_action.is_some(),
+            channel.name()
+        )
+        .unwrap();
+
+        let mut wheel = 0.0;
+        let first_notches = accumulate_wheel(&mut wheel, 15.0 / WHEEL_PIXELS_PER_NOTCH);
+        writeln!(
+            &mut actual,
+            "map wheel-pixel=15 notches={first_notches} remainder={:016x}",
+            wheel.to_bits()
+        )
+        .unwrap();
+        let second_notches = accumulate_wheel(&mut wheel, 30.0 / WHEEL_PIXELS_PER_NOTCH);
+        writeln!(
+            &mut actual,
+            "map wheel-pixel=30 notches={second_notches} remainder={:016x}",
+            wheel.to_bits()
+        )
+        .unwrap();
+        let reverse_notches = accumulate_wheel(&mut wheel, -50.0 / WHEEL_PIXELS_PER_NOTCH);
+        writeln!(
+            &mut actual,
+            "map wheel-pixel=-50 notches={reverse_notches} remainder={:016x}",
+            wheel.to_bits()
+        )
+        .unwrap();
+
+        let mut camera = PovCamera::new();
+        let (forward, strafe, vertical) = pov_navigation_axis(&keys, false);
+        let mut pov_delta =
+            camera.forward() * forward + camera.right() * strafe + glam::DVec3::Z * vertical;
+        pov_delta = pov_delta.normalize() * (camera.speed * dt);
+        writeln!(
+            &mut actual,
+            "pov held=KeyD+KeyW axis={:016x},{:016x},{:016x} delta={:016x},{:016x},{:016x}",
+            forward.to_bits(),
+            strafe.to_bits(),
+            vertical.to_bits(),
+            pov_delta.x.to_bits(),
+            pov_delta.y.to_bits(),
+            pov_delta.z.to_bits()
+        )
+        .unwrap();
+
+        let unheld = primary_drag_delta(None, (100.0, 100.0));
+        writeln!(&mut actual, "pov move-unheld look={}", unheld.is_some()).unwrap();
+        let mut drag_from = None;
+        update_primary_drag_gate(
+            ViewMode::Pov,
+            MouseButton::Left,
+            true,
+            Some((100.0, 100.0)),
+            &mut drag_from,
+        );
+        let drag = primary_drag_delta(drag_from, (112.0, 92.0)).expect("primary drag");
+        camera.look(drag.0, drag.1);
+        drag_from = Some((112.0, 92.0));
+        assert_eq!(drag_from, Some((112.0, 92.0)));
+        writeln!(
+            &mut actual,
+            "pov drag delta={:016x},{:016x} yaw={:08x} pitch={:08x}",
+            drag.0.to_bits(),
+            drag.1.to_bits(),
+            camera.yaw.to_bits(),
+            camera.pitch.to_bits()
+        )
+        .unwrap();
+        update_primary_drag_gate(
+            ViewMode::Pov,
+            MouseButton::Left,
+            false,
+            Some((112.0, 92.0)),
+            &mut drag_from,
+        );
+        let after_release = primary_drag_delta(drag_from, (140.0, 140.0));
+        writeln!(
+            &mut actual,
+            "pov move-released look={} yaw={:08x} pitch={:08x}",
+            after_release.is_some(),
+            camera.yaw.to_bits(),
+            camera.pitch.to_bits()
+        )
+        .unwrap();
+        update_primary_drag_gate(
+            ViewMode::Pov,
+            MouseButton::Left,
+            true,
+            Some((140.0, 140.0)),
+            &mut drag_from,
+        );
+        cancel_primary_drag(&mut drag_from); // CursorLeft / pointer cancellation.
+        let after_cancel = primary_drag_delta(drag_from, (150.0, 150.0));
+        writeln!(
+            &mut actual,
+            "pov move-cancelled look={}",
+            after_cancel.is_some()
+        )
+        .unwrap();
+
+        let pov_first = dispatch_one_shot(false)
+            .then(|| characterized_one_shot(ViewMode::Pov, KeyCode::KeyB))
+            .flatten();
+        if let Some(action) = pov_first {
+            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
+        }
+        let pov_repeat = dispatch_one_shot(true)
+            .then(|| characterized_one_shot(ViewMode::Pov, KeyCode::KeyB))
+            .flatten();
+        if let Some(action) = pov_repeat {
+            reduce_characterized_one_shot(action, &mut channel, &mut shadow_ao);
+        }
+        writeln!(
+            &mut actual,
+            "pov one-shot=KeyB first={} repeat={} shadow-ao={shadow_ao}",
+            pov_first.is_some(),
+            pov_repeat.is_some()
+        )
+        .unwrap();
+
+        wheel = 0.0;
+        let pov_first_wheel = accumulate_wheel(&mut wheel, 20.0 / WHEEL_PIXELS_PER_NOTCH);
+        writeln!(
+            &mut actual,
+            "pov wheel-pixel=20 notches={pov_first_wheel} remainder={:016x} speed={:016x}",
+            wheel.to_bits(),
+            camera.speed.to_bits()
+        )
+        .unwrap();
+        let pov_second_wheel = accumulate_wheel(&mut wheel, 25.0 / WHEEL_PIXELS_PER_NOTCH);
+        for _ in 0..pov_second_wheel.max(0) {
+            camera.scroll_speed(true);
+        }
+        writeln!(
+            &mut actual,
+            "pov wheel-pixel=25 notches={pov_second_wheel} remainder={:016x} speed={:016x}",
+            wheel.to_bits(),
+            camera.speed.to_bits()
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual.trim_end(),
+            include_str!("../tests/fixtures/native_input_characterization.txt").trim_end()
+        );
     }
 }

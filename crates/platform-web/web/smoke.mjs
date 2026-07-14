@@ -13,6 +13,7 @@ const required = [
   "assets/storage.js",
   "assets/worker.js",
   "assets/manifest.json",
+  "baselines/native-web-alignment-m0-layout.json",
   "generated/platform_web.js",
   "generated/platform_web_bg.wasm",
 ];
@@ -84,6 +85,36 @@ for (const match of commands.matchAll(/id: "([^"]+)"/g)) {
 }
 
 JSON.parse(await readFile(join(dist, "assets/manifest.json"), "utf8"));
+const layout = JSON.parse(
+  await readFile(join(dist, "baselines/native-web-alignment-m0-layout.json"), "utf8"),
+);
+if (layout.schema !== "native-web-alignment-layout-characterization-v1") {
+  throw new Error("layout characterization has an unknown schema");
+}
+if (layout.gpuPixelsCaptured !== false) {
+  throw new Error("layout characterization must not contain GPU pixel captures");
+}
+const expectedLayoutCases = ["1280x720@1", "900x700@1", "700x700@1"];
+if (
+  layout.cases.length !== expectedLayoutCases.length ||
+  layout.cases.some((entry, index) => entry.name !== expectedLayoutCases[index])
+) {
+  throw new Error("layout characterization does not contain the required viewport matrix");
+}
+for (const entry of layout.cases) {
+  const measured = entry.measured;
+  if (
+    !measured?.viewport ||
+    !measured?.document ||
+    !measured?.canvases?.map?.css ||
+    !measured?.canvases?.map?.backing ||
+    !measured?.boxes?.canvasHost ||
+    !measured?.boxes?.infoPanel ||
+    !measured?.renderer?.mode
+  ) {
+    throw new Error(`layout characterization case ${entry.name} is incomplete`);
+  }
+}
 const generatedJs = await readFile(join(dist, "generated/platform_web.js"), "utf8");
 if (generatedJs.includes("crates/platform-web/web")) {
   throw new Error("generated wasm glue contains a source-tree asset path");
