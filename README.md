@@ -239,7 +239,13 @@ view-scoped keys/wheel to the clicked pane; `Tab` swaps focus while a view
 surface owns keyboard focus. The Help page builds its control table at runtime
 from the shared Rust action/binding descriptors. Use `?tier=low`, `?tier=mid`,
 or `?tier=high` to pin the startup resource tier for diagnostics (the shipped
-default is Low).
+default is Low). The browser information dock keeps Inspection and Ecology in
+their own scrollable panels; Inspection shows two label/value pairs per row and
+keeps the last valid Map/POV sample while the pointer moves into the dock. Drag
+the vertical dividers to resize adjacent panels, or the horizontal divider to
+trade space between the dock and the Map/POV views; focus a divider and use its
+arrow keys for the keyboard equivalent. The selected relative sizes survive
+viewport resizing.
 
 For headless functional debugging, inspect
 `window.__viewerCharacterization()`, `window.__mapStatus`,

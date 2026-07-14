@@ -2797,7 +2797,9 @@ mod tests {
         assert!(app.contains("app.panel_document("));
         assert!(app.contains("applyPanelDocument"));
         assert!(app.contains("app.map_hover(wx, wy)"));
-        assert!(app.contains("app.clear_hover()"));
+        assert!(!app.contains("app.clear_hover()"));
+        assert!(app.contains("inspectionSource"));
+        assert!(app.contains("if (sourceChanged) requestPanelRefresh(true)"));
         assert!(!app.contains("MAP_CHANNELS"));
         assert!(!app.contains("paint_region"));
         assert!(!app.contains("compose_map"));
@@ -3240,6 +3242,41 @@ mod tests {
     }
 
     #[test]
+    fn map_and_pov_keep_separate_latched_inspection_sources() {
+        let mut state = small_controller_app();
+        settle(&mut state);
+        assert!(state.set_hover_world(Some((10.0, 10.0))));
+        state.set_renderer_webgpu();
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
+        let pov = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(pov.output.mode, viewer_host::PresentationMode::Pov);
+        let pov_panel: serde_json::Value = serde_json::from_str(
+            &state
+                .panel_document_json()
+                .expect("serialize empty POV hover")
+                .expect("POV panel"),
+        )
+        .expect("typed POV panel");
+        assert_eq!(pov_panel["model"]["hover"]["kind"], "none");
+
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Map,
+        ));
+        let map = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(map.output.mode, viewer_host::PresentationMode::Map);
+        let map_panel: serde_json::Value = serde_json::from_str(
+            &state
+                .panel_document_json()
+                .expect("serialize restored Map hover")
+                .expect("Map panel"),
+        )
+        .expect("typed Map panel");
+        assert_eq!(map_panel["model"]["hover"]["kind"], "terrain");
+    }
+
+    #[test]
     fn map_input_uses_the_shared_movement_contract() {
         let mut state = small_controller_app();
         let moved = state.frame(
@@ -3379,6 +3416,25 @@ mod tests {
             orientation,
             "unheld hover movement never becomes camera look"
         );
+
+        let latched = state.frame_at(0.0, viewer_host::input::InputFrame::default(), 8.0);
+        assert!(!latched.hover_changed);
+        assert_eq!(state.pov_hover.geometry_queries(), queries);
+        assert!(matches!(
+            state.pov_hover.hover(),
+            viewer_host::HoverInfo::Terrain(_) | viewer_host::HoverInfo::Organism(_)
+        ));
+        let panel: serde_json::Value = serde_json::from_str(
+            &state
+                .panel_document_json()
+                .expect("serialize latched POV hover")
+                .expect("POV panel without a surface pointer"),
+        )
+        .expect("typed latched POV panel");
+        assert_ne!(panel["model"]["hover"]["kind"], "none");
+
+        state.renderer_lost();
+        assert_eq!(state.pov_hover.hover(), &viewer_host::HoverInfo::None);
     }
 
     #[test]

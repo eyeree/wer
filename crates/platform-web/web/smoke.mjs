@@ -38,11 +38,35 @@ const panelColumns = Array.from(
   html.matchAll(/data-panel-column="([^"]+)"/g),
   (match) => match[1],
 );
+const expectedPanelColumns = ["explorer", "inspection", "world", "ecology", "system"];
 if (
-  panelColumns.length !== 3 ||
-  panelColumns.some((column, index) => column !== ["explorer", "world", "system"][index])
+  panelColumns.length !== expectedPanelColumns.length ||
+  panelColumns.some((column, index) => column !== expectedPanelColumns[index])
 ) {
-  throw new Error("index.html must mount exactly the explorer/world/system panel columns");
+  throw new Error(`index.html must mount the panel columns ${expectedPanelColumns.join(",")}`);
+}
+const panelResizers = Array.from(
+  html.matchAll(/data-panel-resizer="([^"]+)"/g),
+  (match) => match[1],
+);
+if (
+  panelResizers.length !== expectedPanelColumns.length - 1 ||
+  panelResizers.some((resizer, index) => resizer !== `${index}`)
+) {
+  throw new Error("index.html must interleave four ordered panel resizers");
+}
+const infoPanelResizers = Array.from(html.matchAll(/data-info-panel-resizer/g));
+if (
+  infoPanelResizers.length !== 1 ||
+  !html.includes('aria-orientation="horizontal"') ||
+  !(
+    html.indexOf('id="viewer-surface"') < html.indexOf("data-info-panel-resizer") &&
+    html.indexOf("data-info-panel-resizer") < html.indexOf('id="information-panel"')
+  )
+) {
+  throw new Error(
+    "index.html must place one horizontal resizer between viewer and information panel",
+  );
 }
 if (!html.includes("data-panel-document") || !html.includes("data-platform-field=\"diagnostics\"")) {
   throw new Error("index.html does not separate the shared panel from platform diagnostics");
@@ -93,8 +117,35 @@ for (const property of ["field.value", "field.severity", "field.visible"]) {
 if (!app.includes("panelFields = new Map()") || !app.includes("dataset.panelField")) {
   throw new Error("app.js does not preserve stable DOM nodes by panel field id");
 }
-if (!app.includes("app.map_hover(wx, wy)") || !app.includes("app.clear_hover()")) {
-  throw new Error("app.js does not route hover inspection through the shared sampler");
+if (
+  !app.includes("PANEL_SECTION_HOSTS") ||
+  !app.includes('["hover", "inspection"]') ||
+  !app.includes('["ecology", "ecology"]')
+) {
+  throw new Error("app.js does not promote Inspection and Ecology into top-level panel hosts");
+}
+if (
+  !app.includes("installPanelResizers") ||
+  !app.includes("panelShares") ||
+  !app.includes("resizePanelPair")
+) {
+  throw new Error("app.js does not retain fractional draggable panel sizing");
+}
+if (
+  !app.includes("installInfoPanelResizer") ||
+  !app.includes("infoPanelRowShares") ||
+  !app.includes("resizeInfoPanelRows")
+) {
+  throw new Error("app.js does not retain fractional draggable viewer/information sizing");
+}
+if (!app.includes("app.map_hover(wx, wy)") || app.includes("app.clear_hover()")) {
+  throw new Error("app.js does not retain the last shared Map inspection sample");
+}
+if (
+  !app.includes("inspectionSource") ||
+  !app.includes("if (sourceChanged) requestPanelRefresh(true)")
+) {
+  throw new Error("app.js does not refresh when the selected Map/POV inspection source changes");
 }
 for (const legacy of [
   "app.info_snapshot(",
@@ -194,8 +245,34 @@ if (!app.includes("setPointerCapture") || !app.includes("pointercancel")) {
 }
 
 const css = await readFile(join(dist, "assets/app.css"), "utf8");
-if (!css.includes("grid-template-columns: repeat(3, minmax(0, 1fr))")) {
-  throw new Error("app.css does not define the three-column desktop information dock");
+for (const column of expectedPanelColumns) {
+  if (!css.includes(`--panel-${column}-share`)) {
+    throw new Error(`app.css does not define the ${column} fractional panel track`);
+  }
+}
+if (
+  !css.includes(".panel-resizer") ||
+  !css.includes("cursor: col-resize") ||
+  !css.includes("touch-action: none")
+) {
+  throw new Error("app.css does not expose draggable panel dividers");
+}
+if (
+  !css.includes(".info-panel-resizer") ||
+  !css.includes("cursor: row-resize") ||
+  !css.includes("--viewer-row-share") ||
+  !css.includes("--info-panel-row-share")
+) {
+  throw new Error("app.css does not expose a fractional draggable information-panel divider");
+}
+if (
+  !css.includes('[data-panel-column="inspection"] [data-panel-section="hover"] dl') ||
+  !css.includes(
+    '[data-panel-column="inspection"] [data-panel-section="hover"] .panel-field dt',
+  ) ||
+  !css.includes("grid-column: auto")
+) {
+  throw new Error("app.css does not lay Inspection out as two label/value pairs per row");
 }
 if (!css.includes(".panel-column") || !css.includes("overflow-y: auto")) {
   throw new Error("app.css does not give each desktop panel column bounded scrolling");

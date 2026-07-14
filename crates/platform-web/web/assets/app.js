@@ -378,9 +378,17 @@ const syncControls = (presentation) => {
   }
 };
 
+const inspectionSource = (presentation) =>
+  presentation.view.mode === "pov" ||
+  (presentation.view.mode === "split" && presentation.view.focused === "pov")
+    ? "pov"
+    : "map";
+
 const updatePresentation = (presentation) => {
+  const sourceChanged =
+    lastPresentation && inspectionSource(lastPresentation) !== inspectionSource(presentation);
   lastPresentation = presentation;
-  if (presentation.view.mode === "pov") clearPanelHover();
+  if (sourceChanged) requestPanelRefresh(true);
   zoom = presentation.map.zoom;
   writeStatus(
     "webgpu-status",
@@ -579,18 +587,43 @@ const syncViewMode = (presentation, mapPath = "cpu") => {
 };
 
 // ---- Shared information document -------------------------------------------------
-// Rust owns sampling, labels, formatting, severity, and column placement. The
-// browser creates one accessible node per stable id, then mutates only the
-// value/severity/visibility properties that actually changed. Normal frame
-// telemetry is capped at 2 Hz; hover invalidation is intentionally immediate.
+// Rust owns sampling, labels, formatting, severity, and the native three-lane
+// grouping. The browser promotes the hover and ecology sections into dedicated
+// top-level hosts, then mutates only the value/severity/visibility properties
+// that actually changed. Normal frame telemetry is capped at 2 Hz; hover
+// invalidation is intentionally immediate.
 const PANEL_REFRESH_MS = 500;
 const panelRoot = document.querySelector("[data-panel-document]");
+const panelLayout = document.querySelector(".panel-columns");
+const appShell = document.querySelector(".app-shell");
+const viewerNode = document.querySelector(".viewer");
+const infoPanelNode = document.querySelector(".info-panel");
+const infoPanelResizerNode = document.querySelector("[data-info-panel-resizer]");
+const panelColumnNodes = Array.from(document.querySelectorAll("[data-panel-column]"));
 const panelColumnHosts = new Map(
-  Array.from(document.querySelectorAll("[data-panel-column]"), (node) => [
-    node.dataset.panelColumn,
-    node,
-  ]),
+  panelColumnNodes.map((node) => [node.dataset.panelColumn, node]),
 );
+const panelResizerNodes = Array.from(document.querySelectorAll("[data-panel-resizer]"));
+const PANEL_SECTION_HOSTS = new Map([
+  ["hover", "inspection"],
+  ["ecology", "ecology"],
+]);
+const PANEL_DRAG_MIN_COLUMN_WIDTH = 136;
+const PANEL_KEYBOARD_STEP = 16;
+const INFO_PANEL_DRAG_MIN_VIEWER_HEIGHT = 180;
+const INFO_PANEL_DRAG_MIN_PANEL_HEIGHT = 120;
+const INFO_PANEL_KEYBOARD_STEP = 16;
+// Shares stay unitless: CSS resolves them against each new dock width, so a
+// user-selected proportion survives ordinary and narrow -> desktop resizes.
+const panelShares = panelColumnNodes.map((node) =>
+  node.dataset.panelColumn === "inspection" ? 2 : 1,
+);
+// The same fractional contract applies vertically. Resizing the information
+// dock changes only these adjacent rows, leaving the overall shell height and
+// therefore the browser viewport contract unchanged.
+const infoPanelRowShares = [7, 3];
+let activePanelResize = null;
+let activeInfoPanelResize = null;
 const panelSections = new Map();
 const panelFields = new Map();
 let panelDomUpdates = 0;
@@ -611,6 +644,258 @@ const recordPanelMutation = (fieldId = null) => {
 
 const safeDomId = (kind, id) =>
   `panel-${kind}-${id.replaceAll(/[^A-Za-z0-9_-]/g, "-")}`;
+
+const updatePanelResizerValue = (index) => {
+  const resizer = panelResizerNodes[index];
+  const leftWidth = panelColumnNodes[index]?.getBoundingClientRect().width ?? 0;
+  const rightWidth = panelColumnNodes[index + 1]?.getBoundingClientRect().width ?? 0;
+  const pairWidth = leftWidth + rightWidth;
+  if (!resizer || !(pairWidth > 0)) return;
+  const minimumLeft = Math.min(PANEL_DRAG_MIN_COLUMN_WIDTH, leftWidth);
+  const minimumRight = Math.min(PANEL_DRAG_MIN_COLUMN_WIDTH, rightWidth);
+  const percentage = Math.round((leftWidth / pairWidth) * 100);
+  resizer.setAttribute("aria-valuemin", `${Math.floor((minimumLeft / pairWidth) * 100)}`);
+  resizer.setAttribute(
+    "aria-valuemax",
+    `${Math.ceil(((pairWidth - minimumRight) / pairWidth) * 100)}`,
+  );
+  resizer.setAttribute("aria-valuenow", `${percentage}`);
+  resizer.setAttribute(
+    "aria-valuetext",
+    `${panelColumnNodes[index].ariaLabel} ${percentage}%, ${panelColumnNodes[index + 1].ariaLabel} ${100 - percentage}%`,
+  );
+};
+
+const updatePanelResizerValues = () => {
+  for (let index = 0; index < panelResizerNodes.length; index += 1) {
+    updatePanelResizerValue(index);
+  }
+};
+
+const applyPanelShares = () => {
+  if (!panelLayout) return;
+  for (const [index, node] of panelColumnNodes.entries()) {
+    panelLayout.style.setProperty(
+      `--panel-${node.dataset.panelColumn}-share`,
+      `${panelShares[index]}fr`,
+    );
+  }
+  updatePanelResizerValues();
+};
+
+const resizePanelPair = (
+  index,
+  requestedLeftWidth,
+  pairWidth,
+  pairShares,
+  minimumLeft,
+  minimumRight,
+) => {
+  if (!(pairWidth > 0) || !(pairShares > 0)) return;
+  const leftWidth = Math.max(
+    minimumLeft,
+    Math.min(pairWidth - minimumRight, requestedLeftWidth),
+  );
+  const leftShare = pairShares * (leftWidth / pairWidth);
+  panelShares[index] = leftShare;
+  panelShares[index + 1] = pairShares - leftShare;
+  applyPanelShares();
+};
+
+const finishPanelResize = (event) => {
+  const resize = activePanelResize;
+  if (!resize || (event && event.pointerId !== resize.pointerId)) return;
+  activePanelResize = null;
+  delete resize.resizer.dataset.dragging;
+  document.body.classList.remove("panel-resizing");
+  if (resize.resizer.hasPointerCapture(resize.pointerId)) {
+    resize.resizer.releasePointerCapture(resize.pointerId);
+  }
+};
+
+const installPanelResizers = () => {
+  if (!panelLayout || panelResizerNodes.length !== panelColumnNodes.length - 1) return;
+  for (const resizer of panelResizerNodes) {
+    const index = Number.parseInt(resizer.dataset.panelResizer ?? "", 10);
+    if (!Number.isInteger(index) || index < 0 || index + 1 >= panelColumnNodes.length) {
+      throw new Error(`invalid panel resizer index ${resizer.dataset.panelResizer}`);
+    }
+    resizer.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || activePanelResize || activeInfoPanelResize) return;
+      const leftWidth = panelColumnNodes[index].getBoundingClientRect().width;
+      const rightWidth = panelColumnNodes[index + 1].getBoundingClientRect().width;
+      activePanelResize = {
+        index,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startLeftWidth: leftWidth,
+        pairWidth: leftWidth + rightWidth,
+        pairShares: panelShares[index] + panelShares[index + 1],
+        minimumLeft: Math.min(PANEL_DRAG_MIN_COLUMN_WIDTH, leftWidth),
+        minimumRight: Math.min(PANEL_DRAG_MIN_COLUMN_WIDTH, rightWidth),
+        resizer,
+      };
+      resizer.dataset.dragging = "true";
+      document.body.classList.add("panel-resizing");
+      resizer.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    resizer.addEventListener("pointermove", (event) => {
+      const resize = activePanelResize;
+      if (!resize || event.pointerId !== resize.pointerId || resize.resizer !== resizer) return;
+      resizePanelPair(
+        resize.index,
+        resize.startLeftWidth + event.clientX - resize.startX,
+        resize.pairWidth,
+        resize.pairShares,
+        resize.minimumLeft,
+        resize.minimumRight,
+      );
+      event.preventDefault();
+    });
+    resizer.addEventListener("pointerup", finishPanelResize);
+    resizer.addEventListener("pointercancel", finishPanelResize);
+    resizer.addEventListener("lostpointercapture", finishPanelResize);
+    resizer.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      const leftWidth = panelColumnNodes[index].getBoundingClientRect().width;
+      const rightWidth = panelColumnNodes[index + 1].getBoundingClientRect().width;
+      const direction = event.key === "ArrowLeft" ? -1 : 1;
+      resizePanelPair(
+        index,
+        leftWidth + direction * PANEL_KEYBOARD_STEP * (event.shiftKey ? 3 : 1),
+        leftWidth + rightWidth,
+        panelShares[index] + panelShares[index + 1],
+        Math.min(PANEL_DRAG_MIN_COLUMN_WIDTH, leftWidth),
+        Math.min(PANEL_DRAG_MIN_COLUMN_WIDTH, rightWidth),
+      );
+      event.preventDefault();
+    });
+  }
+  applyPanelShares();
+};
+
+installPanelResizers();
+
+const updateInfoPanelResizerValue = () => {
+  if (!infoPanelResizerNode || !viewerNode || !infoPanelNode) return;
+  const viewerHeight = viewerNode.getBoundingClientRect().height;
+  const panelHeight = infoPanelNode.getBoundingClientRect().height;
+  const pairHeight = viewerHeight + panelHeight;
+  if (!(pairHeight > 0)) return;
+  const minimumViewer = Math.min(INFO_PANEL_DRAG_MIN_VIEWER_HEIGHT, viewerHeight);
+  const minimumPanel = Math.min(INFO_PANEL_DRAG_MIN_PANEL_HEIGHT, panelHeight);
+  const percentage = Math.round((viewerHeight / pairHeight) * 100);
+  infoPanelResizerNode.setAttribute(
+    "aria-valuemin",
+    `${Math.floor((minimumViewer / pairHeight) * 100)}`,
+  );
+  infoPanelResizerNode.setAttribute(
+    "aria-valuemax",
+    `${Math.ceil(((pairHeight - minimumPanel) / pairHeight) * 100)}`,
+  );
+  infoPanelResizerNode.setAttribute("aria-valuenow", `${percentage}`);
+  infoPanelResizerNode.setAttribute(
+    "aria-valuetext",
+    `Viewer ${percentage}%, information panel ${100 - percentage}%`,
+  );
+};
+
+const applyInfoPanelRowShares = () => {
+  if (!appShell) return;
+  appShell.style.setProperty("--viewer-row-share", `${infoPanelRowShares[0]}fr`);
+  appShell.style.setProperty("--info-panel-row-share", `${infoPanelRowShares[1]}fr`);
+  updateInfoPanelResizerValue();
+};
+
+const resizeInfoPanelRows = (
+  requestedViewerHeight,
+  pairHeight,
+  pairShares,
+  minimumViewer,
+  minimumPanel,
+) => {
+  if (!(pairHeight > 0) || !(pairShares > 0)) return;
+  const viewerHeight = Math.max(
+    minimumViewer,
+    Math.min(pairHeight - minimumPanel, requestedViewerHeight),
+  );
+  infoPanelRowShares[0] = pairShares * (viewerHeight / pairHeight);
+  infoPanelRowShares[1] = pairShares - infoPanelRowShares[0];
+  applyInfoPanelRowShares();
+};
+
+const finishInfoPanelResize = (event) => {
+  const resize = activeInfoPanelResize;
+  if (!resize || (event && event.pointerId !== resize.pointerId)) return;
+  activeInfoPanelResize = null;
+  delete resize.resizer.dataset.dragging;
+  document.body.classList.remove("info-panel-resizing");
+  if (resize.resizer.hasPointerCapture(resize.pointerId)) {
+    resize.resizer.releasePointerCapture(resize.pointerId);
+  }
+};
+
+const installInfoPanelResizer = () => {
+  if (!infoPanelResizerNode || !viewerNode || !infoPanelNode) return;
+  infoPanelResizerNode.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || activeInfoPanelResize || activePanelResize) return;
+    const viewerHeight = viewerNode.getBoundingClientRect().height;
+    const panelHeight = infoPanelNode.getBoundingClientRect().height;
+    activeInfoPanelResize = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startViewerHeight: viewerHeight,
+      pairHeight: viewerHeight + panelHeight,
+      pairShares: infoPanelRowShares[0] + infoPanelRowShares[1],
+      minimumViewer: Math.min(INFO_PANEL_DRAG_MIN_VIEWER_HEIGHT, viewerHeight),
+      minimumPanel: Math.min(INFO_PANEL_DRAG_MIN_PANEL_HEIGHT, panelHeight),
+      resizer: infoPanelResizerNode,
+    };
+    infoPanelResizerNode.dataset.dragging = "true";
+    document.body.classList.add("info-panel-resizing");
+    infoPanelResizerNode.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  infoPanelResizerNode.addEventListener("pointermove", (event) => {
+    const resize = activeInfoPanelResize;
+    if (!resize || event.pointerId !== resize.pointerId) return;
+    resizeInfoPanelRows(
+      resize.startViewerHeight + event.clientY - resize.startY,
+      resize.pairHeight,
+      resize.pairShares,
+      resize.minimumViewer,
+      resize.minimumPanel,
+    );
+    event.preventDefault();
+  });
+  infoPanelResizerNode.addEventListener("pointerup", finishInfoPanelResize);
+  infoPanelResizerNode.addEventListener("pointercancel", finishInfoPanelResize);
+  infoPanelResizerNode.addEventListener("lostpointercapture", finishInfoPanelResize);
+  infoPanelResizerNode.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    const viewerHeight = viewerNode.getBoundingClientRect().height;
+    const panelHeight = infoPanelNode.getBoundingClientRect().height;
+    const direction = event.key === "ArrowUp" ? -1 : 1;
+    resizeInfoPanelRows(
+      viewerHeight + direction * INFO_PANEL_KEYBOARD_STEP * (event.shiftKey ? 3 : 1),
+      viewerHeight + panelHeight,
+      infoPanelRowShares[0] + infoPanelRowShares[1],
+      Math.min(INFO_PANEL_DRAG_MIN_VIEWER_HEIGHT, viewerHeight),
+      Math.min(INFO_PANEL_DRAG_MIN_PANEL_HEIGHT, panelHeight),
+    );
+    event.preventDefault();
+  });
+  applyInfoPanelRowShares();
+};
+
+installInfoPanelResizer();
+window.addEventListener("resize", () => {
+  window.requestAnimationFrame(() => {
+    updatePanelResizerValues();
+    updateInfoPanelResizerValue();
+  });
+});
 
 const newPanelField = (field, sectionId, attached) => {
   const row = document.createElement("div");
@@ -642,8 +927,9 @@ const newPanelField = (field, sectionId, attached) => {
 };
 
 const newPanelSection = (section) => {
-  const host = panelColumnHosts.get(section.column);
-  if (!host) throw new Error(`panel document named unknown column ${section.column}`);
+  const hostName = PANEL_SECTION_HOSTS.get(section.id) ?? section.column;
+  const host = panelColumnHosts.get(hostName);
+  if (!host) throw new Error(`panel document named unknown host ${hostName}`);
 
   const node = document.createElement("section");
   node.className = "panel-section";
@@ -825,8 +1111,11 @@ document.querySelector(".toolbar")?.addEventListener("change", (event) => {
 
 window.addEventListener("keydown", (event) => {
   if (
-    event.target instanceof Element &&
-    event.target.closest("button,input,select,textarea,[contenteditable='true']")
+    event.defaultPrevented ||
+    (event.target instanceof Element &&
+      event.target.closest(
+        "button,input,select,textarea,[contenteditable='true'],[role='separator']",
+      ))
   ) {
     return;
   }
@@ -846,6 +1135,15 @@ window.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keyup", (event) => {
+  if (
+    event.defaultPrevented ||
+    (event.target instanceof Element &&
+      event.target.closest(
+        "button,input,select,textarea,[contenteditable='true'],[role='separator']",
+      ))
+  ) {
+    return;
+  }
   const app = window.__werApp;
   if (!app) return;
   const handled = app.key_event(
@@ -934,11 +1232,6 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     window.__werApp?.pointer_cancel(event.pointerId);
     scheduleFrame();
   });
-  canvas.addEventListener("pointerleave", (event) => {
-    if (canvas.hasPointerCapture(event.pointerId)) return;
-    window.__werApp?.pointer_cancel(event.pointerId);
-    scheduleFrame();
-  });
   canvas.addEventListener("lostpointercapture", (event) => {
     capturedPointerViews.delete(event.pointerId);
     if (expectedCaptureLosses.delete(event.pointerId)) return;
@@ -964,29 +1257,21 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
   );
 }
 
-let hoverEngaged = false;
 let lastHoverSample = Number.NEGATIVE_INFINITY;
-
-const clearPanelHover = () => {
-  const app = window.__werApp;
-  if (!app || !hoverEngaged) return;
-  app.clear_hover();
-  hoverEngaged = false;
-  requestPanelRefresh(true);
-};
 
 const updateMapHover = (event) => {
   const canvas = event.currentTarget;
   const app = window.__werApp;
   const mode = lastPresentation?.view.mode;
+  // Inspection is an observation, not transient pointer chrome. An inactive
+  // surface or a letterbox/other-pane point supplies no new observation, so
+  // retain the last valid sample while the user moves into the dock to read it.
   if (!app || !mapViewport || (mode !== "map" && mode !== "split") || canvas.hidden) {
-    clearPanelHover();
     return;
   }
   const [physicalX, physicalY] = canvasPoint(canvas, event);
   const world = JSON.parse(app.map_world_at(physicalX, physicalY));
   if (!world) {
-    clearPanelHover();
     return;
   }
   const now = performance.now();
@@ -994,14 +1279,21 @@ const updateMapHover = (event) => {
   lastHoverSample = now;
   const [wx, wy] = world;
   app.map_hover(wx, wy);
-  hoverEngaged = true;
   requestPanelRefresh(true);
 };
 
 document.getElementById("world-canvas").addEventListener("pointermove", updateMapHover);
 document.getElementById("pov-canvas").addEventListener("pointermove", updateMapHover);
-document.getElementById("world-canvas").addEventListener("pointerleave", clearPanelHover);
-document.getElementById("pov-canvas").addEventListener("pointerleave", clearPanelHover);
+// Keep the last valid Map sample while the pointer crosses the status bar into
+// a scrollable panel (including the page-scrolling narrow layout). Surface
+// pointer state still ends outside the shell; a captured drag keeps its
+// established outside-surface semantics.
+document.querySelector(".app-shell")?.addEventListener("pointerleave", (event) => {
+  if (!capturedPointerViews.has(event.pointerId)) {
+    window.__werApp?.pointer_cancel(event.pointerId);
+  }
+  scheduleFrame();
+});
 
 // Milestone 0 characterization probe. Browser automation calls this stable,
 // read-only surface instead of reconstructing layout selectors or parsing
@@ -1035,6 +1327,7 @@ window.__viewerCharacterization = () => {
   };
   const documentElement = document.documentElement;
   const columnNodes = Array.from(document.querySelectorAll("[data-panel-column]"));
+  const resizerNodes = Array.from(document.querySelectorAll("[data-panel-resizer]"));
   const columnsStyle = document.querySelector(".panel-columns")
     ? getComputedStyle(document.querySelector(".panel-columns"))
     : null;
@@ -1057,6 +1350,7 @@ window.__viewerCharacterization = () => {
       toolbar: rect(".toolbar"),
       canvasHost: rect(".canvas-host"),
       statusBar: rect(".status-bar"),
+      infoPanelResizer: rect("[data-info-panel-resizer]"),
       infoPanel: rect(".info-panel"),
     },
     panel: {
@@ -1066,6 +1360,34 @@ window.__viewerCharacterization = () => {
       gridTemplateColumns: columnsStyle?.gridTemplateColumns ?? null,
       sections: panelSections.size,
       fields: panelFields.size,
+      shares: [...panelShares],
+      rowShares: [...infoPanelRowShares],
+      rowResizer: infoPanelResizerNode
+        ? {
+            box: nodeRect(infoPanelResizerNode),
+            display: getComputedStyle(infoPanelResizerNode).display,
+            orientation: infoPanelResizerNode.getAttribute("aria-orientation"),
+            minimum: Number.parseInt(
+              infoPanelResizerNode.getAttribute("aria-valuemin") ?? "",
+              10,
+            ),
+            maximum: Number.parseInt(
+              infoPanelResizerNode.getAttribute("aria-valuemax") ?? "",
+              10,
+            ),
+            value: Number.parseInt(
+              infoPanelResizerNode.getAttribute("aria-valuenow") ?? "",
+              10,
+            ),
+          }
+        : null,
+      sectionHosts: Object.fromEntries(
+        ["hover", "ecology"].map((id) => [
+          id,
+          document.querySelector(`[data-panel-section="${id}"]`)?.parentElement?.dataset
+            .panelColumn ?? null,
+        ]),
+      ),
       columns: columnNodes.map((node) => ({
         id: node.dataset.panelColumn,
         connected: node.isConnected,
@@ -1073,6 +1395,15 @@ window.__viewerCharacterization = () => {
         overflowY: getComputedStyle(node).overflowY,
         scrollHeight: node.scrollHeight,
         clientHeight: node.clientHeight,
+      })),
+      resizers: resizerNodes.map((node) => ({
+        index: Number.parseInt(node.dataset.panelResizer ?? "", 10),
+        box: nodeRect(node),
+        display: getComputedStyle(node).display,
+        orientation: node.getAttribute("aria-orientation"),
+        minimum: Number.parseInt(node.getAttribute("aria-valuemin") ?? "", 10),
+        maximum: Number.parseInt(node.getAttribute("aria-valuemax") ?? "", 10),
+        value: Number.parseInt(node.getAttribute("aria-valuenow") ?? "", 10),
       })),
       status: window.__panelStatus(),
     },

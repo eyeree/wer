@@ -251,10 +251,12 @@ impl PovHoverCache {
     /// Update the cached POV hit and rebuild its semantic information.
     ///
     /// `surface_pointer` is expressed in the same physical surface pixels as
-    /// `pov_pane`. A missing pane/pointer, a point outside the half-open pane,
-    /// or an invalid camera ray resolves to [`HoverInfo::None`] without
-    /// querying resident geometry. `true` means the semantic hover value
-    /// changed, which shells use for immediate panel invalidation.
+    /// `pov_pane`. A missing pane/pointer or a point outside the half-open pane
+    /// retains the last valid observation so moving into an information panel
+    /// cannot erase the information needed there. A routed camera ray still
+    /// replaces that observation, including with [`HoverInfo::None`] when it
+    /// misses. `true` means the semantic hover value changed, which shells use
+    /// for immediate panel invalidation.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
@@ -272,8 +274,8 @@ impl PovHoverCache {
                 .map(|local| (pointer, pane, local))
         });
 
-        let next_key = routed.map(|(pointer, pane, _)| {
-            PovHoverGeometryKey::new(
+        if let Some((pointer, pane, local)) = routed {
+            let next_key = PovHoverGeometryKey::new(
                 pointer,
                 pane,
                 camera,
@@ -281,16 +283,16 @@ impl PovHoverCache {
                 organisms,
                 fog_end,
                 time_seconds,
-            )
-        });
-        if self.geometry_key != next_key {
-            self.geometry_key = next_key;
-            self.hit = routed
-                .and_then(|(_, pane, local)| camera.screen_ray(local, [pane.width, pane.height]))
-                .and_then(|ray| {
-                    self.geometry_queries = self.geometry_queries.saturating_add(1);
-                    pov_host::raycast_scene(chunks, organisms, ray, time_seconds, fog_end)
-                });
+            );
+            if self.geometry_key.as_ref() != Some(&next_key) {
+                self.geometry_key = Some(next_key);
+                self.hit = camera
+                    .screen_ray(local, [pane.width, pane.height])
+                    .and_then(|ray| {
+                        self.geometry_queries = self.geometry_queries.saturating_add(1);
+                        pov_host::raycast_scene(chunks, organisms, ray, time_seconds, fog_end)
+                    });
+            }
         }
 
         let next_hover = pov_scene_hover(map, self.hit.as_ref());
@@ -788,8 +790,9 @@ mod tests {
         ));
         assert_eq!(cache.geometry_queries(), 5);
 
-        // Outside/missing pane state clears the cached hit without querying
-        // the resident geometry. Returning inside performs one fresh query.
+        // Outside/missing pane state keeps the last observation without
+        // querying resident geometry. Returning with changed routed geometry
+        // performs one fresh query.
         assert!(!update(
             &mut cache,
             &camera,
@@ -867,6 +870,19 @@ mod tests {
             time_seconds,
         ));
         assert_eq!(cache.geometry_queries(), 1);
+        let retained_hover = cache.hover().clone();
+        assert!(!cache.update(
+            &map,
+            &camera,
+            &chunks,
+            &organisms,
+            None,
+            Some(pane),
+            fog_end,
+            time_seconds,
+        ));
+        assert_eq!(cache.hover(), &retained_hover);
+        assert_eq!(cache.geometry_queries(), 1);
 
         update(
             &mut map,
@@ -890,5 +906,18 @@ mod tests {
         };
         assert_eq!(cell.status, CellStatus::Generating);
         assert_eq!(cache.geometry_queries(), 1);
+
+        assert!(cache.update(
+            &map,
+            &camera,
+            &chunks,
+            &organisms,
+            Some([pointer[0] + 1.0, pointer[1]]),
+            Some(pane),
+            fog_end,
+            time_seconds,
+        ));
+        assert_eq!(cache.hover(), &HoverInfo::None);
+        assert_eq!(cache.geometry_queries(), 2);
     }
 }

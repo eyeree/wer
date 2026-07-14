@@ -14,6 +14,7 @@ const cases = [
   { width: 901, height: 701, dpr: 1.25, contract: "bounded-desktop" },
   { width: 901, height: 701, dpr: 1, contract: "bounded-desktop" },
 ];
+const panelColumnIds = ["explorer", "inspection", "world", "ecology", "system"];
 
 const agent = (args, capture = false) =>
   execFileSync("agent-browser", ["--session", session, ...args], {
@@ -130,10 +131,15 @@ try {
       `${name}: panel labels/values clipped horizontally: ${JSON.stringify(clippedPanelText)}`,
     );
     assert(
-      layout.panel.columns.length === 3 &&
-        layout.panel.columns.map((column) => column.id).join(",") === "explorer,world,system" &&
+      layout.panel.columns.length === panelColumnIds.length &&
+        layout.panel.columns.map((column) => column.id).join(",") === panelColumnIds.join(",") &&
         layout.panel.columns.every((column) => column.connected && column.box.width > 0),
-      `${name}: shared document is not mounted in exactly three stable columns`,
+      `${name}: shared document is not mounted in five stable top-level panels`,
+    );
+    assert(
+      layout.panel.sectionHosts.hover === "inspection" &&
+        layout.panel.sectionHosts.ecology === "ecology",
+      `${name}: Inspection or Ecology was not promoted into its dedicated host`,
     );
 
     const document = layout.document;
@@ -151,8 +157,9 @@ try {
       }
       const columns = layout.panel.columns;
       assert(
-        layout.panel.gridTemplateColumns.trim().split(/\s+/).length === 3,
-        `${name}: desktop panel grid did not resolve to three columns`,
+        layout.panel.gridTemplateColumns.trim().split(/\s+/).length ===
+          panelColumnIds.length + layout.panel.resizers.length,
+        `${name}: desktop panel grid did not resolve to five panels plus dividers`,
       );
       assert(
         columns.every(
@@ -163,10 +170,30 @@ try {
         ),
         `${name}: desktop panel columns are not independently bounded and scrollable`,
       );
+      assert(layout.panel.resizers.length === columns.length - 1, `${name}: wrong divider count`);
+      for (const [index, resizer] of layout.panel.resizers.entries()) {
+        assert(
+          resizer.display !== "none" &&
+            resizer.orientation === "vertical" &&
+            resizer.minimum <= resizer.value &&
+            resizer.value <= resizer.maximum &&
+            resizer.box.width > 0 &&
+            columns[index].box.right <= resizer.box.x + 0.001 &&
+            resizer.box.right <= columns[index + 1].box.x + 0.001,
+          `${name}: divider ${index} is not between its adjacent panels`,
+        );
+      }
+      const rowResizer = layout.panel.rowResizer;
       assert(
-        columns[0].box.right <= columns[1].box.x + 0.001 &&
-          columns[1].box.right <= columns[2].box.x + 0.001,
-        `${name}: desktop panel columns overlap`,
+        rowResizer !== null &&
+          rowResizer.display !== "none" &&
+          rowResizer.orientation === "horizontal" &&
+          rowResizer.minimum <= rowResizer.value &&
+          rowResizer.value <= rowResizer.maximum &&
+          rowResizer.box.height > 0 &&
+          layout.boxes.viewer.bottom <= rowResizer.box.y + 0.001 &&
+          rowResizer.box.bottom <= layout.boxes.infoPanel.y + 0.001,
+        `${name}: information-panel divider is not between viewer and dock`,
       );
     } else {
       assert(document.scrollWidth === document.clientWidth, `${name}: narrow layout overflowed horizontally`);
@@ -182,12 +209,348 @@ try {
         `${name}: narrow panel did not become a one-column page-scroll stack`,
       );
       assert(
-        columns[0].box.bottom <= columns[1].box.y + 0.001 &&
-          columns[1].box.bottom <= columns[2].box.y + 0.001,
-        `${name}: narrow panel columns overlap vertically`,
+        layout.panel.resizers.length === columns.length - 1 &&
+          layout.panel.resizers.every((resizer) => resizer.display === "none"),
+        `${name}: narrow layout did not hide every panel divider`,
       );
+      assert(
+        layout.panel.rowResizer?.display === "none",
+        `${name}: narrow layout did not hide the information-panel divider`,
+      );
+      for (let index = 0; index + 1 < columns.length; index += 1) {
+        assert(
+          columns[index].box.bottom <= columns[index + 1].box.y + 0.001,
+          `${name}: narrow panel ${columns[index].id} overlaps ${columns[index + 1].id}`,
+        );
+      }
     }
   }
+
+  const panelMetrics = () =>
+    evaluate(`(() => {
+      const panel = window.__viewerCharacterization().panel;
+      const widths = panel.columns.map((column) => column.box.width);
+      const total = widths.reduce((sum, width) => sum + width, 0);
+      return {
+        widths,
+        ratios: widths.map((width) => width / total),
+        shares: panel.shares,
+        resizers: panel.resizers,
+        generation: window.__mapStatus.resize_generation,
+      };
+    })()`);
+  const beforePanelDrag = panelMetrics();
+  const firstDivider = beforePanelDrag.resizers[0].box;
+  const dividerPoint = {
+    x: Math.round(firstDivider.x + firstDivider.width / 2),
+    y: Math.round(firstDivider.y + firstDivider.height / 2),
+  };
+  agent(["mouse", "move", String(dividerPoint.x), String(dividerPoint.y)]);
+  agent(["mouse", "down", "left"]);
+  agent(["mouse", "move", String(dividerPoint.x + 24), String(dividerPoint.y)]);
+  agent(["mouse", "up", "left"]);
+  agent(["wait", "--fn", "window.__viewerCharacterization().panel.shares[0] > 1"]);
+  const afterPanelDrag = panelMetrics();
+  assert(
+    afterPanelDrag.widths[0] > beforePanelDrag.widths[0] + 20 &&
+      afterPanelDrag.widths[1] < beforePanelDrag.widths[1] - 20 &&
+      closeEnough(
+        afterPanelDrag.widths[0] + afterPanelDrag.widths[1],
+        beforePanelDrag.widths[0] + beforePanelDrag.widths[1],
+        0.01,
+      ) &&
+      afterPanelDrag.widths
+        .slice(2)
+        .every((width, index) => closeEnough(width, beforePanelDrag.widths[index + 2], 0.01)),
+    `dragging a divider did not resize only its adjacent panels: ${JSON.stringify({ beforePanelDrag, afterPanelDrag })}`,
+  );
+
+  agent(["set", "viewport", "1100", "740", "1"]);
+  agent([
+    "wait",
+    "--fn",
+    `window.__mapStatus.resize_generation > ${afterPanelDrag.generation} && window.__mapStatus.resize_redraw_generation === window.__mapStatus.resize_generation`,
+  ]);
+  const afterDesktopResize = panelMetrics();
+  assert(
+    afterDesktopResize.ratios.every((ratio, index) =>
+      closeEnough(ratio, afterPanelDrag.ratios[index], 0.001),
+    ),
+    `desktop resize changed the user-selected panel ratios: ${JSON.stringify({ afterPanelDrag, afterDesktopResize })}`,
+  );
+
+  agent(["set", "viewport", "700", "700", "1"]);
+  agent([
+    "wait",
+    "--fn",
+    `window.__mapStatus.resize_generation > ${afterDesktopResize.generation} && window.__viewerCharacterization().viewport.layoutContract === "stacked-scroll"`,
+  ]);
+  const narrowPanelShares = panelMetrics();
+  assert(
+    narrowPanelShares.resizers.every((resizer) => resizer.display === "none") &&
+      narrowPanelShares.shares.every((share, index) =>
+        closeEnough(share, afterPanelDrag.shares[index], 1e-9),
+      ),
+    `narrow layout discarded the user-selected panel shares: ${JSON.stringify(narrowPanelShares)}`,
+  );
+
+  agent(["set", "viewport", "1100", "740", "1"]);
+  agent([
+    "wait",
+    "--fn",
+    `window.__mapStatus.resize_generation > ${narrowPanelShares.generation} && window.__mapStatus.resize_redraw_generation === window.__mapStatus.resize_generation`,
+  ]);
+  const restoredPanelRatios = panelMetrics();
+  assert(
+    restoredPanelRatios.ratios.every((ratio, index) =>
+      closeEnough(ratio, afterPanelDrag.ratios[index], 0.001),
+    ),
+    `returning from narrow layout did not restore panel ratios: ${JSON.stringify({ afterPanelDrag, restoredPanelRatios })}`,
+  );
+
+  const hoverBaseline = evaluate(`(() => {
+    const view = window.__viewerCharacterization();
+    const canvas = document.getElementById("world-canvas");
+    const box = canvas.getBoundingClientRect();
+    const map = view.canvases.mapViewport;
+    return {
+      point: {
+        x: Math.round(box.left + ((map.dx + map.dw / 2) / canvas.width) * box.width),
+        y: Math.round(box.top + ((map.dy + map.dh / 2) / canvas.height) * box.height),
+      },
+      invalidPoint: map.dx > 1
+        ? {
+            x: Math.round(box.left + ((map.dx / 2) / canvas.width) * box.width),
+            y: Math.round(box.top + ((map.dy + map.dh / 2) / canvas.height) * box.height),
+          }
+        : {
+            x: Math.round(box.left + ((map.dx + map.dw / 2) / canvas.width) * box.width),
+            y: Math.round(box.top + ((map.dy / 2) / canvas.height) * box.height),
+          },
+      invalidWorld: JSON.parse(
+        window.__werApp.map_world_at(
+          map.dx > 1 ? map.dx / 2 : map.dx + map.dw / 2,
+          map.dx > 1 ? map.dy + map.dh / 2 : map.dy / 2,
+        ),
+      ),
+      scrollHeights: Object.fromEntries(
+        view.panel.columns.map((column) => [column.id, column.scrollHeight]),
+      ),
+    };
+  })()`);
+  agent(["mouse", "move", String(hoverBaseline.point.x), String(hoverBaseline.point.y)]);
+  agent([
+    "wait",
+    "--fn",
+    `document.querySelector('[data-panel-field-row="hover.terrain.status"]')?.hidden === false && document.querySelector('[data-panel-field-row="ecology.roster-size"]')?.hidden === false`,
+  ]);
+  const hoverExpanded = evaluate(`(() => {
+    const view = window.__viewerCharacterization();
+    const inspection = view.panel.columns.find((column) => column.id === "inspection");
+    const fieldValue = (id) => document.querySelector(
+      '[data-panel-field="' + id + '"]',
+    )?.textContent;
+    const grid = document.querySelector('[data-panel-section="hover"] dl');
+    const rows = Array.from(grid.children)
+      .filter((row) => !row.hidden && row.dataset.span !== "wide")
+      .map((row) => {
+        const term = row.querySelector("dt").getBoundingClientRect();
+        const description = row.querySelector("dd").getBoundingClientRect();
+        return {
+          id: row.dataset.panelFieldRow,
+          termX: term.x,
+          termTop: term.top,
+          descriptionX: description.x,
+          descriptionTop: description.top,
+        };
+      });
+    return {
+      scrollHeights: Object.fromEntries(
+        view.panel.columns.map((column) => [column.id, column.scrollHeight]),
+      ),
+      inspectionPoint: {
+        x: Math.round(inspection.box.x + inspection.box.width / 2),
+        y: Math.round(inspection.box.y + 24),
+      },
+      gridTracks: getComputedStyle(grid).gridTemplateColumns.trim().split(/\\s+/),
+      rows,
+      signature: {
+        kind: fieldValue("hover.kind"),
+        world: fieldValue("hover.terrain.world"),
+        status: fieldValue("hover.terrain.status"),
+        ecology: fieldValue("ecology.roster-size"),
+      },
+    };
+  })()`);
+  assert(
+    hoverBaseline.invalidWorld === null &&
+      hoverExpanded.scrollHeights.explorer === hoverBaseline.scrollHeights.explorer &&
+      hoverExpanded.scrollHeights.world === hoverBaseline.scrollHeights.world &&
+      hoverExpanded.scrollHeights.inspection >= hoverBaseline.scrollHeights.inspection &&
+      hoverExpanded.signature.kind !== "none",
+    `hover content changed a non-hover panel scroll extent: ${JSON.stringify({ hoverBaseline, hoverExpanded })}`,
+  );
+  const labelOrigins = hoverExpanded.rows
+    .map((row) => row.termX)
+    .filter((origin, index, origins) =>
+      origins.findIndex((candidate) => closeEnough(candidate, origin, 1)) === index,
+    )
+    .sort((left, right) => left - right);
+  const laneCounts = labelOrigins.map(
+    (origin) => hoverExpanded.rows.filter((row) => closeEnough(row.termX, origin, 1)).length,
+  );
+  assert(
+    hoverExpanded.gridTracks.length === 4 &&
+      hoverExpanded.rows.length > 1 &&
+      labelOrigins.length === 2 &&
+      Math.abs(laneCounts[0] - laneCounts[1]) <= 1 &&
+      hoverExpanded.rows.every(
+        (row) =>
+          row.descriptionX > row.termX && closeEnough(row.termTop, row.descriptionTop, 1),
+      ) &&
+      hoverExpanded.rows.every(
+        (row, index, rows) =>
+          index % 2 === 1 ||
+          index + 1 >= rows.length ||
+          (rows[index + 1].termX > row.descriptionX &&
+            closeEnough(rows[index + 1].termTop, row.termTop, 1)),
+      ),
+    `Inspection did not distribute visible fields evenly across two label/value columns: ${JSON.stringify({ tracks: hoverExpanded.gridTracks, rows: hoverExpanded.rows, laneCounts })}`,
+  );
+  agent([
+    "mouse",
+    "move",
+    String(hoverBaseline.invalidPoint.x),
+    String(hoverBaseline.invalidPoint.y),
+  ]);
+  agent([
+    "mouse",
+    "move",
+    String(hoverExpanded.inspectionPoint.x),
+    String(hoverExpanded.inspectionPoint.y),
+  ]);
+  // The pointer transition is physical; target the following scroll at the
+  // panel so this harness does not depend on agent-browser's process-local
+  // low-level wheel coordinates.
+  agent([
+    "scroll",
+    "down",
+    "600",
+    "--selector",
+    '[data-panel-column="inspection"]',
+  ]);
+  agent([
+    "wait",
+    "--fn",
+    `(() => { const inspection = document.querySelector('[data-panel-column="inspection"]'); return (inspection.scrollHeight - inspection.clientHeight <= 1 || inspection.scrollTop > 0) && document.querySelector('[data-panel-field="hover.kind"]')?.textContent !== "none"; })()`,
+  ]);
+  const retainedHover = evaluate(`(() => {
+    const inspection = document.querySelector('[data-panel-column="inspection"]');
+    const fieldValue = (id) => document.querySelector(
+      '[data-panel-field="' + id + '"]',
+    )?.textContent;
+    return {
+      signature: {
+        kind: fieldValue("hover.kind"),
+        world: fieldValue("hover.terrain.world"),
+        status: fieldValue("hover.terrain.status"),
+        ecology: fieldValue("ecology.roster-size"),
+      },
+      terrainVisible:
+        document.querySelector('[data-panel-field-row="hover.terrain.status"]')?.hidden === false,
+      ecologyVisible:
+        document.querySelector('[data-panel-field-row="ecology.roster-size"]')?.hidden === false,
+      scrollTop: inspection.scrollTop,
+      maxScroll: inspection.scrollHeight - inspection.clientHeight,
+    };
+  })()`);
+  assert(
+    JSON.stringify(retainedHover.signature) === JSON.stringify(hoverExpanded.signature) &&
+      retainedHover.terrainVisible &&
+      retainedHover.ecologyVisible &&
+      (retainedHover.maxScroll <= 1 || retainedHover.scrollTop > 0),
+    `moving into and scrolling Inspection cleared the last hover: ${JSON.stringify(retainedHover)}`,
+  );
+
+  const dockMetrics = () =>
+    evaluate(`(() => {
+      const view = window.__viewerCharacterization();
+      const viewerHeight = view.boxes.viewer.height;
+      const panelHeight = view.boxes.infoPanel.height;
+      return {
+        viewer: view.boxes.viewer,
+        panel: view.boxes.infoPanel,
+        resizer: view.panel.rowResizer,
+        canvasHost: view.boxes.canvasHost,
+        ratio: panelHeight / (viewerHeight + panelHeight),
+        rowShares: view.panel.rowShares,
+        columnShares: view.panel.shares,
+        columnWidths: view.panel.columns.map((column) => column.box.width),
+        mapBacking: view.canvases.map.backing,
+        povBacking: view.canvases.pov.backing,
+        generation: window.__mapStatus.resize_generation,
+        redrawGeneration: window.__mapStatus.resize_redraw_generation,
+        dpr: window.devicePixelRatio,
+      };
+    })()`);
+  const beforeDockDrag = dockMetrics();
+  const dockDividerPoint = {
+    x: Math.round(beforeDockDrag.resizer.box.x + beforeDockDrag.resizer.box.width / 2),
+    y: Math.round(beforeDockDrag.resizer.box.y + beforeDockDrag.resizer.box.height / 2),
+  };
+  agent(["mouse", "move", String(dockDividerPoint.x), String(dockDividerPoint.y)]);
+  agent(["mouse", "down", "left"]);
+  agent(["mouse", "move", String(dockDividerPoint.x), String(dockDividerPoint.y - 48)]);
+  agent(["mouse", "up", "left"]);
+  agent([
+    "wait",
+    "--fn",
+    `window.__viewerCharacterization().panel.rowShares[0] < ${beforeDockDrag.rowShares[0]} && window.__mapStatus.resize_generation > ${beforeDockDrag.generation} && window.__mapStatus.resize_redraw_generation === window.__mapStatus.resize_generation`,
+  ]);
+  const afterDockDrag = dockMetrics();
+  assert(
+    afterDockDrag.viewer.height < beforeDockDrag.viewer.height - 40 &&
+      afterDockDrag.panel.height > beforeDockDrag.panel.height + 40 &&
+      closeEnough(
+        afterDockDrag.viewer.height + afterDockDrag.panel.height,
+        beforeDockDrag.viewer.height + beforeDockDrag.panel.height,
+        1,
+      ) &&
+      afterDockDrag.canvasHost.height < beforeDockDrag.canvasHost.height - 40 &&
+      afterDockDrag.mapBacking.height < beforeDockDrag.mapBacking.height - 40 * afterDockDrag.dpr &&
+      afterDockDrag.mapBacking.height ===
+        Math.round(afterDockDrag.canvasHost.height * afterDockDrag.dpr) &&
+      afterDockDrag.mapBacking.width ===
+        Math.round(afterDockDrag.canvasHost.width * afterDockDrag.dpr) &&
+      JSON.stringify(afterDockDrag.mapBacking) === JSON.stringify(afterDockDrag.povBacking) &&
+      afterDockDrag.columnShares.every((share, index) =>
+        closeEnough(share, beforeDockDrag.columnShares[index], 1e-9),
+      ) &&
+      afterDockDrag.columnWidths.every((width, index) =>
+        closeEnough(width, beforeDockDrag.columnWidths[index], 0.01),
+      ),
+    `dragging the information divider did not transfer space only from the viewer: ${JSON.stringify({ beforeDockDrag, afterDockDrag })}`,
+  );
+
+  agent(["set", "viewport", "1100", "840", "1"]);
+  agent([
+    "wait",
+    "--fn",
+    `window.__mapStatus.resize_generation > ${afterDockDrag.generation} && window.__mapStatus.resize_redraw_generation === window.__mapStatus.resize_generation && window.__viewerCharacterization().canvases.map.backing.height === Math.round(window.__viewerCharacterization().boxes.canvasHost.height * window.devicePixelRatio)`,
+  ]);
+  const afterDockWindowResize = dockMetrics();
+  assert(
+    closeEnough(afterDockWindowResize.ratio, afterDockDrag.ratio, 0.002) &&
+      afterDockWindowResize.rowShares.every((share, index) =>
+        closeEnough(share, afterDockDrag.rowShares[index], 1e-9),
+      ) &&
+      afterDockWindowResize.columnShares.every((share, index) =>
+        closeEnough(share, afterDockDrag.columnShares[index], 1e-9),
+      ) &&
+      JSON.stringify(afterDockWindowResize.mapBacking) ===
+        JSON.stringify(afterDockWindowResize.povBacking),
+    `window resize did not preserve the viewer/information ratio: ${JSON.stringify({ afterDockDrag, afterDockWindowResize })}`,
+  );
 
   const cadence = evaluate(`(() => {
     // First synchronize the injected DOM count with the readout. Its own text

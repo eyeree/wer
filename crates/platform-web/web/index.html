@@ -16,7 +16,7 @@
       </nav>
     </header>
     <main class="app-shell" data-view="viewer">
-      <section class="viewer">
+      <section id="viewer-surface" class="viewer">
         <div class="toolbar" aria-label="Viewer controls">
           <div class="toolbar-group" role="group" aria-label="View">
             <span class="toolbar-group-label" aria-hidden="true">View</span>
@@ -87,11 +87,105 @@
           <span data-status-field="map-decor-status">Map decor pending</span>
         </div>
       </section>
-      <aside class="info-panel" aria-label="World information" data-panel-document aria-busy="true">
+      <div
+        class="info-panel-resizer"
+        data-info-panel-resizer
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize viewer and information panel"
+        aria-controls="viewer-surface information-panel"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="70"
+        tabindex="0"
+      ></div>
+      <aside
+        id="information-panel"
+        class="info-panel"
+        aria-label="World information"
+        data-panel-document
+        aria-busy="true"
+      >
         <div class="panel-columns">
-          <div class="panel-column" data-panel-column="explorer" role="region" aria-label="Explorer information"></div>
-          <div class="panel-column" data-panel-column="world" role="region" aria-label="World information"></div>
-          <div class="panel-column" data-panel-column="system" role="region" aria-label="System information"></div>
+          <div
+            id="panel-column-explorer"
+            class="panel-column"
+            data-panel-column="explorer"
+            role="region"
+            aria-label="Explorer information"
+          ></div>
+          <div
+            class="panel-resizer"
+            data-panel-resizer="0"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize Explorer and Inspection panels"
+            aria-controls="panel-column-explorer panel-column-inspection"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            tabindex="0"
+          ></div>
+          <div
+            id="panel-column-inspection"
+            class="panel-column"
+            data-panel-column="inspection"
+            role="region"
+            aria-label="Inspection information"
+          ></div>
+          <div
+            class="panel-resizer"
+            data-panel-resizer="1"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize Inspection and World panels"
+            aria-controls="panel-column-inspection panel-column-world"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            tabindex="0"
+          ></div>
+          <div
+            id="panel-column-world"
+            class="panel-column"
+            data-panel-column="world"
+            role="region"
+            aria-label="World information"
+          ></div>
+          <div
+            class="panel-resizer"
+            data-panel-resizer="2"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize World and Ecology panels"
+            aria-controls="panel-column-world panel-column-ecology"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            tabindex="0"
+          ></div>
+          <div
+            id="panel-column-ecology"
+            class="panel-column"
+            data-panel-column="ecology"
+            role="region"
+            aria-label="Ecology information"
+          ></div>
+          <div
+            class="panel-resizer"
+            data-panel-resizer="3"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize Ecology and System panels"
+            aria-controls="panel-column-ecology panel-column-system"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            tabindex="0"
+          ></div>
+          <div
+            id="panel-column-system"
+            class="panel-column"
+            data-panel-column="system"
+            role="region"
+            aria-label="System information"
+          ></div>
         </div>
         <details class="platform-diagnostics">
           <summary>Browser diagnostics</summary>

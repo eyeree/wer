@@ -68,8 +68,14 @@ a {
 }
 
 .app-shell {
+  --viewer-row-share: 7fr;
+  --info-panel-row-share: 3fr;
+  --info-panel-divider-size: 9px;
+
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(160px, 30vh);
+  grid-template-rows:
+    minmax(0, var(--viewer-row-share)) var(--info-panel-divider-size)
+    minmax(0, var(--info-panel-row-share));
   grid-template-columns: minmax(0, 1fr);
   width: 100%;
   height: calc(100dvh - 56px);
@@ -222,13 +228,58 @@ button[aria-pressed="true"] {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border-top: 1px solid var(--line);
   background: var(--panel);
 }
 
+.info-panel-resizer {
+  position: relative;
+  z-index: 2;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.info-panel-resizer::before {
+  position: absolute;
+  inset: -8px 0;
+  content: "";
+}
+
+.info-panel-resizer::after {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: var(--line);
+  content: "";
+  transform: translateY(-50%);
+}
+
+.info-panel-resizer:is(:hover, :focus-visible, [data-dragging="true"])::after {
+  height: 3px;
+  background: var(--accent);
+}
+
+.info-panel-resizer:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .panel-columns {
+  --panel-divider-size: 9px;
+
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns:
+    minmax(0, var(--panel-explorer-share, 1fr)) var(--panel-divider-size)
+    minmax(0, var(--panel-inspection-share, 1fr)) var(--panel-divider-size)
+    minmax(0, var(--panel-world-share, 1fr)) var(--panel-divider-size)
+    minmax(0, var(--panel-ecology-share, 1fr)) var(--panel-divider-size)
+    minmax(0, var(--panel-system-share, 1fr));
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -240,12 +291,56 @@ button[aria-pressed="true"] {
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-gutter: stable;
-  border-left: 1px solid var(--line);
   padding: 10px 12px 16px;
 }
 
-.panel-column:first-child {
-  border-left: 0;
+.panel-resizer {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.panel-resizer::before {
+  position: absolute;
+  inset: 0 -8px 0 0;
+  content: "";
+}
+
+.panel-resizer::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--line);
+  content: "";
+  transform: translateX(-50%);
+}
+
+.panel-resizer:is(:hover, :focus-visible, [data-dragging="true"])::after {
+  width: 3px;
+  background: var(--accent);
+}
+
+.panel-resizer:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+body.panel-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+body.info-panel-resizing {
+  cursor: row-resize;
+  user-select: none;
 }
 
 .panel-section + .panel-section {
@@ -265,10 +360,22 @@ button[aria-pressed="true"] {
 
 .panel-section dl {
   display: grid;
-  grid-template-columns: minmax(96px, 36%) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 36%) minmax(0, 1fr);
   gap: 5px 10px;
   margin: 0;
   font-size: 13px;
+}
+
+[data-panel-column="inspection"] [data-panel-section="hover"] dl {
+  grid-template-columns:
+    minmax(0, 0.8fr) minmax(0, 1.2fr)
+    minmax(0, 0.8fr) minmax(0, 1.2fr);
+  column-gap: 8px;
+}
+
+[data-panel-column="inspection"] [data-panel-section="hover"] .panel-field dt,
+[data-panel-column="inspection"] [data-panel-section="hover"] .panel-field dd {
+  grid-column: auto;
 }
 
 .panel-field {
@@ -452,6 +559,10 @@ pre {
     overflow: visible;
   }
 
+  .info-panel-resizer {
+    display: none;
+  }
+
   .panel-columns {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -468,6 +579,10 @@ pre {
 
   .panel-column:first-child {
     border-top: 0;
+  }
+
+  .panel-resizer {
+    display: none;
   }
 
   .panel-section dl {
