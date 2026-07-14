@@ -131,6 +131,56 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 ```
 
+## Debugging the browser build (agent-browser)
+
+Build and serve the static artifact, then drive it with the `agent-browser`
+CLI:
+
+```sh
+cargo run --bin web-build     # rebuild target/web-dist (wasm + assets)
+cargo run --bin web-serve     # serve at http://localhost:8080/
+agent-browser open http://localhost:8080/
+```
+
+For anything **WebGL/WebGPU** (the map atlas, POV terrain), know the
+environment's traps before trusting a screenshot:
+
+- **agent-browser's own headless Chrome has no WebGPU adapter** — POV init
+  fails there by design (that exercises the fallback-to-map path, which is
+  itself worth testing). And in headless Chrome, WebGPU canvas content does
+  **not composite into screenshots**: a white/black canvas in a capture is
+  an artifact, not a rendering bug. Verify headless runs functionally
+  instead — `window.__povStatus` (the last POV frame's status JSON:
+  `rendered`, camera, chunk counts), the info panel, and the diagnostics
+  log.
+- **For real, visible GPU output, drive the Windows Chrome over CDP** (WSL2
+  localhost forwarding reaches it in both directions):
+
+  ```sh
+  pwsh.exe -NoProfile -Command '& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\agent-browser\chrome-cdp-profile" --no-first-run'
+  agent-browser --session win --cdp 9222 open http://localhost:8080/
+  ```
+
+  Use a **named `--session`**: with a plain `--cdp` flag an existing local
+  session silently wins and you end up evaluating in the wrong browser —
+  check `navigator.userAgent` says `Windows NT` before trusting results.
+  Windows Chrome composites WebGPU canvases into screenshots correctly and
+  has a hardware adapter, so `agent-browser --session win --cdp 9222
+  screenshot out.png` shows the real render.
+- **Compare against native ground truth** at the same pose with the
+  headless capture harness (ADR 0021), e.g.
+  `cargo run --release --bin wer -- --pov-script "pos:0,0; mouse:-60,100;
+  snap:/tmp/native-pov.ppm"` — pixel-level tone differences between that
+  and the browser screenshot localize the bug (a uniformly darker browser
+  render was the missing-sRGB-view symptom: WebGPU canvases refuse sRGB
+  *swapchain* formats, so the renderer routes through an sRGB **view**
+  format — see `render_format` in `crates/renderer/src/lib.rs`).
+- A SwiftShader WebGPU adapter is available in WSL headless Chrome via
+  `--enable-unsafe-webgpu --enable-unsafe-swiftshader
+  --use-webgpu-adapter=swiftshader` (launch your own Chrome with
+  `--remote-debugging-port` and connect with `--cdp`) — good for exercising
+  the code path, subject to the screenshot caveat above.
+
 **Before you consider a change done, it must pass what CI runs** (see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `fmt --check`, `clippy`,
 `check`, and `test` on the whole workspace natively, plus a `wasm32` `cargo

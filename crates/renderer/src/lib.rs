@@ -346,6 +346,12 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// The format every pipeline targets and surface views are created
+    /// with: the sRGB twin of the swapchain format. Equal to
+    /// `config.format` everywhere except the WebGPU canvas route, where the
+    /// swapchain must stay non-sRGB and the encode happens through a view
+    /// format instead.
+    render_format: wgpu::TextureFormat,
     debug_map: DebugMapPipeline,
     /// Second blit pipeline for the HUD panel strip in the GPU-map path.
     panel_blit: DebugMapPipeline,
@@ -430,18 +436,43 @@ impl Renderer {
         let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or(RendererError::NoSurfaceConfig)?;
+        // Every pipeline here writes linear color and relies on an sRGB
+        // render target to encode it. Native surfaces default to an sRGB
+        // swapchain format (the first arm), but a WebGPU canvas only
+        // accepts the non-sRGB variant as its swapchain format — presenting
+        // linear values raw, which reads as a uniformly dark scene — and
+        // instead exposes the sRGB twin as a *view* format. `render_format`
+        // is what every pipeline targets and every surface view is created
+        // with, so both routes encode identically.
+        let capabilities = surface.get_capabilities(&adapter);
+        let srgb = config.format.add_srgb_suffix();
+        let render_format = if srgb == config.format {
+            config.format
+        } else if capabilities.formats.contains(&srgb) {
+            log::info!("surface format {:?} -> sRGB {:?}", config.format, srgb);
+            config.format = srgb;
+            srgb
+        } else {
+            log::info!(
+                "surface format {:?} stays; rendering through sRGB view {:?}",
+                config.format,
+                srgb
+            );
+            config.view_formats.push(srgb);
+            srgb
+        };
         // Frame pacing (phase-6-plan.md M1): vsync (FIFO) is the pacer — the
         // shell blocks in `get_current_texture`/`present` instead of
         // busy-looping. `WER_PRESENT_MODE` overrides for profiling runs
         // (`immediate`/`mailbox` uncap the frame rate to expose true frame
         // cost; wall-clock remains telemetry, never an output input).
-        config.present_mode = present_mode_from_env(&surface.get_capabilities(&adapter));
+        config.present_mode = present_mode_from_env(&capabilities);
         log::info!("present mode: {:?}", config.present_mode);
         surface.configure(&device, &config);
 
-        let debug_map = DebugMapPipeline::new(&device, config.format);
-        let panel_blit = DebugMapPipeline::new(&device, config.format);
-        let pov_hud_blit = DebugMapPipeline::new(&device, config.format);
+        let debug_map = DebugMapPipeline::new(&device, render_format);
+        let panel_blit = DebugMapPipeline::new(&device, render_format);
+        let pov_hud_blit = DebugMapPipeline::new(&device, render_format);
 
         Ok(Self {
             instance,
@@ -450,11 +481,22 @@ impl Renderer {
             device,
             queue,
             config,
+            render_format,
             debug_map,
             panel_blit,
             pov_hud_blit,
             gpu_map: None,
             pov: None,
+        })
+    }
+
+    /// A render-target view of an acquired surface frame, in
+    /// [`Self::render_format`](field) — the sRGB view that makes the WebGPU
+    /// canvas route encode like the native sRGB swapchain.
+    fn surface_view(&self, frame: &wgpu::SurfaceTexture) -> wgpu::TextureView {
+        frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.render_format),
+            ..Default::default()
         })
     }
 
@@ -538,9 +580,7 @@ impl Renderer {
             return false;
         };
 
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = self.surface_view(&frame);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -591,9 +631,7 @@ impl Renderer {
             return false;
         };
         let (_, bind_group, _, _) = self.debug_map.texture.as_ref().expect("uploaded above");
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = self.surface_view(&frame);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -664,7 +702,7 @@ impl Renderer {
         if rebuild {
             self.gpu_map = Some(GpuMap::new(
                 &self.device,
-                self.config.format,
+                self.render_format,
                 span * span,
                 params.resolution,
                 side,
@@ -690,9 +728,7 @@ impl Renderer {
         }
 
         let frame = self.acquire_frame()?;
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = self.surface_view(&frame);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -774,7 +810,7 @@ impl Renderer {
         pov_scale: f32,
     ) -> bool {
         if self.pov.is_none() {
-            self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.config.format));
+            self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.render_format));
             log::info!(
                 "pov pipeline built: {} verts/chunk, {} indices shared",
                 pov::VERTS_PER_CHUNK,
@@ -794,9 +830,7 @@ impl Renderer {
         let Some(surface_frame) = self.acquire_frame() else {
             return false;
         };
-        let view = surface_frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = self.surface_view(&surface_frame);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
