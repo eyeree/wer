@@ -1814,7 +1814,7 @@ impl ApplicationHandler for App {
         // which WSLg does routinely.
         let surface_window = window.clone();
         let renderer = pollster::block_on(Renderer::new(
-            move || surface_window.clone().into(),
+            Box::new(move || surface_window.clone().into()),
             size.width,
             size.height,
         ))

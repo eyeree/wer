@@ -16,6 +16,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }
+# The browser POV host (phase-7-plan.md §9.9): the same shared camera/mesher/
+# chunk-manager stack the native shell drives, plus the wgpu renderer it
+# feeds. Both compile on native too, so the facade stays unit-testable.
+pov-host = { path = "../pov-host" }
+renderer = { path = "../renderer" }
+glam = { workspace = true, features = ["f64"] }
 log = { workspace = true }
 
 # Browser-only dependencies. Gating them to the wasm target keeps a native
@@ -23,8 +29,9 @@ log = { workspace = true }
 # the real build target (`wasm32-unknown-unknown`) still gets everything.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
 console_error_panic_hook = { workspace = true }
-web-sys = { workspace = true, features = ["console"] }
+web-sys = { workspace = true, features = ["console", "HtmlCanvasElement"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = { workspace = true }

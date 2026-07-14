@@ -67,9 +67,12 @@ cancellation, amortization, and tier (ADR 0018), machine-checked by the
 scale harness (`wer-scale`). The possibility vector is still one scalar per
 domain, and there is no networking or account/server subsystem.
 The browser shell now builds to `target/web-dist` with viewer/docs/help routes,
-wasm facade snapshots, CPU map presentation, WebGPU/worker/storage/tier/POV
-fallback controls, and a `web-signoff` harness. Browser networking and accounts
-still do not exist; POV remains gated on the shared 3D renderer surface.
+wasm facade snapshots, real CPU map composition from the streamed `RegionMap`
+(shared per-cell colors in `world_runtime::mapcolor`), map movement/zoom/panel
+parity with the native shell, and a `web-signoff` harness. POV mode hosts the
+shared 3D renderer (`crates/pov-host` + `crates/renderer`) on a WebGPU canvas,
+with device-loss/unsupported fallbacks returning to map mode. Browser
+networking and accounts still do not exist.
 
 Post-Phase-6 Improvement A.8 deliberately changes Terrain and Drainage output
 under their layer-local version boundary: `WORLD_ALGORITHM_VERSION` remains 2,
@@ -148,6 +151,7 @@ so core simulation/generation compiles for native *and* `wasm32` from the start
 | `crates/world-core` | neutral lib | Deterministic hashing, coordinates, possibility space. Pure computation. |
 | `crates/world-runtime` | neutral lib | Region lifecycle + abstract `Storage` / `TaskExecutor` traits. |
 | `crates/renderer` | platform lib | wgpu/WGSL renderer (clear-screen only for now). |
+| `crates/pov-host` | platform lib | Shared 3D POV host: fly/walk camera, pure terrain mesher, chunk scheduling — one implementation for the native and browser shells. |
 | `crates/platform-native` | bin `wer` | winit window + event loop; native services. |
 | `crates/platform-web` | cdylib+rlib | wasm-bindgen smoke shell; grows into the browser runtime. |
 | `crates/tools` | bin `wer-inspect` | Inspectors, validators, replay tools. |

@@ -104,12 +104,23 @@ button[aria-pressed="true"] {
   background: #18352b;
 }
 
-#world-canvas {
+.canvas-host {
+  min-height: 360px;
+  background: #0b0d0f;
+}
+
+#world-canvas,
+#pov-canvas {
   display: block;
   width: 100%;
   height: 100%;
   min-height: 360px;
   background: #0b0d0f;
+}
+
+#world-canvas[hidden],
+#pov-canvas[hidden] {
+  display: none;
 }
 
 .info-panel {
@@ -124,11 +135,31 @@ button[aria-pressed="true"] {
   font-size: 22px;
 }
 
+.info-panel h2 {
+  margin: 14px 0 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.info-panel .regen-line {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .info-panel dl {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr);
-  gap: 8px 12px;
-  margin: 0 0 16px;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0 0 12px;
+  font-size: 13px;
 }
 
 .info-panel dt {
@@ -148,6 +179,17 @@ pre {
   padding: 12px;
   background: #0d0f12;
   color: var(--muted);
+}
+
+/* The diagnostics log never grows the panel: fixed height, newest entries
+   scrolled into view, oldest entries pruned by app.js. */
+.info-panel pre[data-field="diagnostics"] {
+  height: 180px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 12px;
 }
 
 .doc-page {

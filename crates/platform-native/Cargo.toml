@@ -23,6 +23,7 @@ world-runtime = { path = "../world-runtime", features = ["pass-timing"] }
 # tools crate has no windowing/GPU dependencies, so this stays lightweight.
 tools = { path = "../tools" }
 renderer = { path = "../renderer" }
+pov-host = { path = "../pov-host" }
 # Camera math for the POV fly camera (3d-phase-1-plan.md §4): the shell
 # computes matrices and hands the renderer plain arrays. `f64` for the
 # camera position (world coordinates are f64 everywhere else).

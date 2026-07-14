@@ -63,7 +63,10 @@
             <option value="quarter">POV scale 0.25</option>
           </select>
         </div>
-        <canvas id="world-canvas" width="960" height="540" tabindex="0" aria-label="World map"></canvas>
+        <div class="canvas-host">
+          <canvas id="world-canvas" width="960" height="540" tabindex="0" aria-label="World map"></canvas>
+          <canvas id="pov-canvas" width="960" height="540" tabindex="0" aria-label="POV view" hidden></canvas>
+        </div>
         <div class="status-bar" role="status">
           <span data-field="wasm-status">Loading wasm</span>
           <span data-field="origin-hash">origin hash pending</span>
@@ -73,6 +76,8 @@
       <aside class="info-panel" aria-label="World information">
         <h1>Viewer</h1>
         <dl>
+          <dt>Player</dt>
+          <dd data-field="player">0, 0</dd>
           <dt>Region</dt>
           <dd data-field="region">0, 0</dd>
           <dt>Channel</dt>
@@ -83,11 +88,76 @@
           <dd data-field="executor">inline</dd>
           <dt>Storage</dt>
           <dd data-field="storage">memory</dd>
-          <dt>Cursor</dt>
-          <dd data-field="cursor">none</dd>
+          <dt>Zoom</dt>
+          <dd data-field="zoom">x1</dd>
           <dt>View</dt>
           <dd data-field="view">map</dd>
         </dl>
+        <h2>Performance</h2>
+        <dl>
+          <dt>fps</dt>
+          <dd data-field="fps">idle</dd>
+          <dt>update</dt>
+          <dd data-field="update-ms">—</dd>
+          <dt>compose</dt>
+          <dd data-field="compose-ms">—</dd>
+          <dt>present</dt>
+          <dd data-field="present-ms">—</dd>
+          <dt>upload</dt>
+          <dd data-field="upload-kb">—</dd>
+        </dl>
+        <h2>Streaming</h2>
+        <dl>
+          <dt>regions</dt>
+          <dd data-field="stat-regions">0</dd>
+          <dt>cache</dt>
+          <dd data-field="stat-cache">0</dd>
+          <dt>pool</dt>
+          <dd data-field="stat-pool">0</dd>
+          <dt>jobs</dt>
+          <dd data-field="stat-jobs">0</dd>
+          <dt>deferred</dt>
+          <dd data-field="stat-deferred">0</dd>
+          <dt>converged</dt>
+          <dd data-field="stat-converged">0</dd>
+          <dt>cost</dt>
+          <dd data-field="stat-cost">0</dd>
+          <dt>rosters</dt>
+          <dd data-field="stat-rosters">0</dd>
+        </dl>
+        <h2>Ecology</h2>
+        <dl>
+          <dt>organisms</dt>
+          <dd data-field="stat-organisms">0</dd>
+          <dt>realized</dt>
+          <dd data-field="stat-realized">0</dd>
+          <dt>resonance</dt>
+          <dd data-field="stat-resonance">0</dd>
+          <dt>anchors</dt>
+          <dd data-field="stat-anchors">0</dd>
+        </dl>
+        <h2>Regen by layer</h2>
+        <p class="regen-line" data-field="regen-by-layer">—</p>
+        <h2>Cursor</h2>
+        <dl>
+          <dt>world</dt>
+          <dd data-field="cursor">none</dd>
+          <dt>status</dt>
+          <dd data-field="cursor-status">—</dd>
+          <dt>stability</dt>
+          <dd data-field="cursor-stability">—</dd>
+          <dt>elev/temp/moist</dt>
+          <dd data-field="cursor-etm">—</dd>
+          <dt>rock/river/wet</dt>
+          <dd data-field="cursor-rrw">—</dd>
+          <dt>soil/fert/veg</dt>
+          <dd data-field="cursor-sfv">—</dd>
+          <dt>biome</dt>
+          <dd data-field="cursor-biome">—</dd>
+        </dl>
+        <h2>Bias</h2>
+        <p class="regen-line" data-field="bias">—</p>
+        <h2>Log</h2>
         <pre data-field="diagnostics">initializing browser runtime</pre>
       </aside>
     </main>

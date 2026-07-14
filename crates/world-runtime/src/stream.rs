@@ -52,7 +52,7 @@ use crate::generate::{
     full_region_payload_bytes, generate_layer, layer_channels, GeneratedTile, LayerInputs,
     RegionCache, RegionTiles, TerrainPossibilityHalo, TileBuffers, CHANNEL_DIVERSITY,
     CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR,
-    CHANNEL_RIVER, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    CHANNEL_RIVER, CHANNEL_SLOPE, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 use crate::macrocache::MacroCache;
 use crate::pool::TilePool;
@@ -651,6 +651,41 @@ impl RegionMap {
     #[must_use]
     pub const fn macro_cache(&self) -> &MacroCache {
         &self.macro_cache
+    }
+
+    /// A dep-hash fold over a region's resident presentation tiles, or
+    /// `None` while nothing is resident. This is the staleness key derived
+    /// presentation caches use (the GPU map atlas's delta uploads and the
+    /// POV chunk provenance, ADR 0017): equal keys mean bit-identical
+    /// authoritative inputs, so a consumer may keep what it built. Slope is
+    /// excluded — it is Terrain's own centered derivation (ADR 0028), so
+    /// the elevation dep-hash already covers it.
+    #[must_use]
+    pub fn presentation_key(&self, coord: RegionCoord) -> Option<u64> {
+        let tiles = self.cache.get(coord)?;
+        let mut h: u64 = 0xA71A_50FF_EE00_0006;
+        let mut presence = 0u64;
+        for (i, tile) in tiles.channels.iter().enumerate() {
+            if i == CHANNEL_SLOPE {
+                continue;
+            }
+            if let Some(tile) = tile {
+                presence |= 1 << i;
+                h = mix(h, tile.dep_hash);
+            }
+        }
+        if let Some(biome) = &tiles.biome {
+            presence |= 1 << 13;
+            h = mix(h, biome.dep_hash);
+        }
+        if let Some(dominant) = &tiles.dominant {
+            presence |= 1 << 14;
+            h = mix(h, dominant.dep_hash);
+        }
+        if presence == 0 {
+            return None;
+        }
+        Some(mix(h, presence))
     }
 
     /// The roster cache (memoized `(roster, food web)` per signature).

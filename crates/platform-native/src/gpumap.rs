@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use renderer::{MapTileUpload, RefineOctaveParams};
-use world_core::{mix, RegionCoord, REGION_SIZE};
+use world_core::{RegionCoord, REGION_SIZE};
 use world_runtime::{RegionMap, CHANNEL_SLOPE};
 
 use crate::viz::Channel;
@@ -57,34 +57,12 @@ impl AtlasManager {
     /// present and which inputs they were generated from. Regenerating a tile
     /// changes its dep hash; settling back to identical inputs reproduces the
     /// same key — and, by ADR 0008, the same bytes, so skipping the upload is
-    /// exact, not approximate. `pub(crate)`: the POV chunk key folds this tile
-    /// provenance together with its coherently captured current Terrain halo
-    /// (3d-phase-1-plan.md §7.1).
+    /// exact, not approximate. Hosted by the neutral `RegionMap` (so the
+    /// browser shell keys its presentation caches identically); the POV chunk
+    /// key folds this tile provenance together with its coherently captured
+    /// current Terrain halo (3d-phase-1-plan.md §7.1).
     pub(crate) fn region_key(map: &RegionMap, coord: RegionCoord) -> Option<u64> {
-        let tiles = map.cache().get(coord)?;
-        let mut h: u64 = 0xA71A_50FF_EE00_0006;
-        let mut presence = 0u64;
-        for (i, tile) in tiles.channels.iter().enumerate() {
-            if i == CHANNEL_SLOPE {
-                continue;
-            }
-            if let Some(tile) = tile {
-                presence |= 1 << i;
-                h = mix(h, tile.dep_hash);
-            }
-        }
-        if let Some(biome) = &tiles.biome {
-            presence |= 1 << 13;
-            h = mix(h, biome.dep_hash);
-        }
-        if let Some(dominant) = &tiles.dominant {
-            presence |= 1 << 14;
-            h = mix(h, dominant.dep_hash);
-        }
-        if presence == 0 {
-            return None;
-        }
-        Some(mix(h, presence))
+        map.presentation_key(coord)
     }
 
     /// Sync the atlas to the visible window: assign/evict slots, build the

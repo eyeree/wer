@@ -1688,6 +1688,7 @@ dependencies = [
  "glam",
  "log",
  "pollster",
+ "pov-host",
  "renderer",
  "tools",
  "winit",
@@ -1700,8 +1701,12 @@ name = "platform-web"
 version = "0.0.1"
 dependencies = [
  "console_error_panic_hook",
+ "glam",
  "log",
+ "pov-host",
+ "renderer",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
  "world-core",
@@ -1781,6 +1786,18 @@ dependencies = [
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
  "serde",
+]
+
+[[package]]
+name = "pov-host"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "renderer",
+ "world-core",
+ "world-runtime",
 ]
 
 [[package]]
@@ -1956,6 +1973,7 @@ dependencies = [
  "bytemuck",
  "log",
  "naga",
+ "web-sys",
  "wgpu",
  "world-core",
 ]

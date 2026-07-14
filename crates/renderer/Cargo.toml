@@ -17,6 +17,11 @@ log = { workspace = true }
 # Plain-old-data casting for the GPU-map uniform layout (phase-6-plan.md §6.5).
 bytemuck = { workspace = true }
 
+# The browser shell hands the renderer an HTML canvas as its surface target
+# (phase-7-plan.md §9.9); wgpu itself already binds web-sys on this target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
+
 [dev-dependencies]
 # WGSL parse+validate in CI without a GPU (phase-6-plan.md §11.5).
 naga = { version = "29", features = ["wgsl-in"] }

@@ -390,6 +390,25 @@ struct WebAppState {
     /// Lazily settled on first compose so constructing the facade (and the
     /// many native unit tests that never render) stays cheap.
     settled: bool,
+    /// The per-domain steering bias (zeros until the bias keys are wired in
+    /// the browser), fed to every stream update like the native shell's.
+    bias: [f32; POSSIBILITY_DIMS],
+    /// Last stream update's statistics — the data source for the browser
+    /// info panel, mirroring the native painted panel (panel.rs).
+    last_stats: world_runtime::FrameStats,
+    /// Cumulative finished region-layer integrations by layer id (the
+    /// native panel's REGEN BY LAYER block).
+    regen_totals: [u64; world_core::layer::LAYER_COUNT as usize],
+    /// The shared POV host (phase-7-plan.md §9.9): the same fly/walk camera
+    /// and chunk lifecycle manager the native shell drives. The wasm side
+    /// feeds its uploads to the wgpu renderer; on native these power the
+    /// facade unit tests without any GPU.
+    pov_camera: pov_host::PovCamera,
+    pov_chunks: pov_host::PovChunkManager,
+    /// Meshed-chunk radius around the camera (the native `WER_POV_RADIUS`
+    /// default), reduced on the Low tier — inline meshing pays the whole
+    /// window on POV entry, so the small tier keeps entry snappy.
+    pov_radius: i32,
     tier: &'static str,
     cache_ceiling_mb: u32,
     runtime_tier: ResourceTier,
@@ -445,6 +464,12 @@ impl Default for WebAppState {
             map: RegionMap::new(cfg),
             field: PossibilityField::default(),
             settled: false,
+            bias: [0.0; POSSIBILITY_DIMS],
+            last_stats: world_runtime::FrameStats::default(),
+            regen_totals: [0; world_core::layer::LAYER_COUNT as usize],
+            pov_camera: pov_host::PovCamera::new(),
+            pov_chunks: pov_host::PovChunkManager::new(),
+            pov_radius: 2,
             tier: "WebLow",
             cache_ceiling_mb: 48,
             runtime_tier: ResourceTier::Low,
@@ -505,20 +530,163 @@ impl WebAppState {
 
     fn update(&mut self, dt_ms: f64, input: &str) {
         self.frame_index = self.frame_index.wrapping_add(1);
-        let step = (dt_ms / 16.666_667).clamp(0.0, 4.0);
-        let speed = 3.0 * step;
+        // The native shell's movement contract (main.rs `apply_movement`):
+        // 500 world units/sec, Shift sprint x4, diagonals normalized, dt
+        // clamped to 100ms so a hitch never teleports the player.
+        const PLAYER_SPEED: f64 = 500.0;
+        let dt = (dt_ms / 1000.0).clamp(0.0, 0.1);
+        let mut dx = 0.0;
+        let mut dy = 0.0;
         if input.contains("\"move_x\":1") {
-            self.world_pos.0 += speed;
+            dx += 1.0;
         }
         if input.contains("\"move_x\":-1") {
-            self.world_pos.0 -= speed;
+            dx -= 1.0;
         }
         if input.contains("\"move_y\":1") {
-            self.world_pos.1 += speed;
+            dy += 1.0;
         }
         if input.contains("\"move_y\":-1") {
-            self.world_pos.1 -= speed;
+            dy -= 1.0;
         }
+        let last = self.world_pos;
+        let len = f64::hypot(dx, dy);
+        if len > 0.0 {
+            let sprint = if input.contains("\"sprint\":true") {
+                4.0
+            } else {
+                1.0
+            };
+            let step = PLAYER_SPEED * sprint * dt / len;
+            self.world_pos.0 += dx * step;
+            self.world_pos.1 += dy * step;
+        }
+        // Travel is the per-frame displacement that fuels convergence
+        // (ADR 0006), exactly as the native `WorldState::update` computes it.
+        // Budgeted streaming keeps the window following the player; the
+        // initial full settle still belongs to the first compose.
+        if self.settled {
+            let travel = f64::hypot(self.world_pos.0 - last.0, self.world_pos.1 - last.1);
+            let bias = self.bias;
+            let stats = self.map.update(
+                self.world_pos,
+                travel,
+                &self.field,
+                &[],
+                &bias,
+                &self.runtime_tier.budget(),
+                &InlineExecutor,
+                false,
+            );
+            self.absorb_stats(stats);
+        }
+    }
+
+    /// One POV frame's host work, mirroring the native `apply_pov_movement`
+    /// and `frame_pov` pair: look, move (fly: full 3D forward, strafe, and
+    /// up/down; walk: yaw-plane forward and strafe, then terrain following),
+    /// a budgeted stream update at the (unmoved) player like the native
+    /// shell's, and the chunk sync that yields this frame's uploads and
+    /// removes for the shared renderer.
+    fn pov_step(
+        &mut self,
+        dt_ms: f64,
+        input: &str,
+    ) -> (Vec<renderer::TerrainChunkUpload>, Vec<u64>) {
+        self.frame_index = self.frame_index.wrapping_add(1);
+        let dt = (dt_ms / 1000.0).clamp(0.0, 0.1);
+        let look_dx = json_number(input, "look_dx").unwrap_or(0.0);
+        let look_dy = json_number(input, "look_dy").unwrap_or(0.0);
+        if look_dx != 0.0 || look_dy != 0.0 {
+            self.pov_camera.look(look_dx, look_dy);
+        }
+        // Wheel notches adjust the active mode's speed (the native POV
+        // wheel behavior).
+        let wheel = json_number(input, "wheel").unwrap_or(0.0) as i32;
+        for _ in 0..wheel.abs() {
+            self.pov_camera.scroll_speed(wheel > 0);
+        }
+
+        let walk = self.pov_camera.walk;
+        let forward = if walk {
+            self.pov_camera.walk_forward()
+        } else {
+            self.pov_camera.forward()
+        };
+        let mut mv = glam::DVec3::ZERO;
+        if input.contains("\"move_y\":1") {
+            mv += forward;
+        }
+        if input.contains("\"move_y\":-1") {
+            mv -= forward;
+        }
+        if input.contains("\"move_x\":1") {
+            mv += self.pov_camera.right();
+        }
+        if input.contains("\"move_x\":-1") {
+            mv -= self.pov_camera.right();
+        }
+        if !walk {
+            if input.contains("\"move_z\":1") {
+                mv.z += 1.0;
+            }
+            if input.contains("\"move_z\":-1") {
+                mv.z -= 1.0;
+            }
+        }
+        if mv != glam::DVec3::ZERO {
+            let speed = if walk {
+                self.pov_camera.walk_speed
+            } else {
+                self.pov_camera.speed
+            };
+            self.pov_camera.pos += mv.normalize() * (speed * dt);
+        }
+        if walk {
+            let (ground, _) = pov_host::walk_ground(
+                &self.pov_chunks,
+                &self.map,
+                (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            );
+            self.pov_camera
+                .follow_ground(ground + pov_host::EYE_HEIGHT, dt);
+        }
+
+        // The world keeps streaming around the player (not the camera),
+        // exactly like the native shell: chunks past the loaded window mesh
+        // from the analytic frontier and dissolve into fog.
+        if self.settled {
+            let bias = self.bias;
+            let stats = self.map.update(
+                self.world_pos,
+                0.0,
+                &self.field,
+                &[],
+                &bias,
+                &self.runtime_tier.budget(),
+                &InlineExecutor,
+                false,
+            );
+            self.absorb_stats(stats);
+        }
+        self.pov_chunks.sync(
+            &self.map,
+            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            self.pov_radius,
+            &InlineExecutor,
+        )
+    }
+
+    /// Fold one stream update's statistics into the panel's rolling state.
+    fn absorb_stats(&mut self, stats: world_runtime::FrameStats) {
+        for (total, count) in self
+            .regen_totals
+            .iter_mut()
+            .zip(stats.regenerated_by_layer.iter())
+        {
+            *total += *count as u64;
+        }
+        self.last_stats = stats;
     }
 
     fn apply_command(&mut self, command: &str) {
@@ -593,6 +761,21 @@ impl WebAppState {
         } else if command.contains("mode:pov") {
             if self.pov_supported {
                 self.view_mode = "pov";
+                // Entering POV places the camera at eye level over the
+                // player (native `toggle_view_mode`); re-entering with walk
+                // still on grounds immediately instead of ramping down.
+                // `entry_ground` falls back analytically before the first
+                // settle, so no eager settle is forced here.
+                let ground = pov_host::entry_ground(&self.map, self.world_pos);
+                self.pov_camera.enter_at(self.world_pos, ground);
+                if self.pov_camera.walk {
+                    let (ground, _) = pov_host::walk_ground(
+                        &self.pov_chunks,
+                        &self.map,
+                        (self.pov_camera.pos.x, self.pov_camera.pos.y),
+                    );
+                    self.pov_camera.snap_to_ground(ground);
+                }
             } else {
                 self.view_mode = "map";
                 self.warnings.push(String::from(
@@ -605,7 +788,15 @@ impl WebAppState {
         } else if command.contains("pov:pointer-lock") {
             self.pointer_lock = self.pov_supported;
         } else if command.contains("pov:walk") {
+            // The native `F` toggle: entering walk snaps the eye to the
+            // ground under the camera.
             self.pov_walk = !self.pov_walk;
+            let (ground, _) = pov_host::walk_ground(
+                &self.pov_chunks,
+                &self.map,
+                (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            );
+            self.pov_camera.set_walk(self.pov_walk, ground);
         } else if command.contains("pov:toggle-baked") {
             self.pov_baked_light = !self.pov_baked_light;
         } else if command.contains("pov:toggle-detail") {
@@ -678,9 +869,9 @@ impl WebAppState {
         if self.settled {
             return;
         }
-        let bias = [0.0f32; POSSIBILITY_DIMS];
+        let bias = self.bias;
         for _ in 0..SETTLE_PASSES {
-            self.map.update(
+            let stats = self.map.update(
                 self.world_pos,
                 0.0,
                 &self.field,
@@ -690,6 +881,7 @@ impl WebAppState {
                 &InlineExecutor,
                 false,
             );
+            self.absorb_stats(stats);
         }
         self.settled = true;
     }
@@ -728,6 +920,8 @@ impl WebAppState {
                 "\"view\":{{\"mode\":\"{}\",\"pov_supported\":{},\"pointer_lock\":{},",
                 "\"pov\":{{\"motion\":\"{}\",\"baked_light\":{},\"detail_normals\":{},\"water\":{},\"render_scale\":{:.2}}}}},",
                 "\"tier\":{{\"name\":\"{}\",\"runtime\":\"{}\",\"cache_ceiling_mb\":{},\"benchmark_ms\":{:.3}}},",
+                "\"bias\":{},",
+                "\"stats\":{},",
                 "\"settle_hash\":\"{:#018x}\",",
                 "\"last_command\":\"{}\",",
                 "\"warnings\":[{}]",
@@ -768,6 +962,8 @@ impl WebAppState {
             self.runtime_tier.name(),
             self.cache_ceiling_mb,
             self.benchmark_ms,
+            bias_json(&self.bias),
+            self.stats_json(),
             self.settle_hash(),
             json_escape(&self.last_command),
             self.warnings
@@ -775,6 +971,123 @@ impl WebAppState {
                 .map(|warning| format!("\"{}\"", json_escape(warning)))
                 .collect::<Vec<_>>()
                 .join(",")
+        )
+    }
+
+    /// The streaming/ecology statistics block for the browser info panel —
+    /// the same values the native painted panel reads from `FrameStats`
+    /// (panel.rs), plus the cumulative per-layer regen totals.
+    fn stats_json(&self) -> String {
+        let stats = &self.last_stats;
+        let regen = world_core::layer::LAYERS
+            .iter()
+            .zip(self.regen_totals.iter())
+            .map(|(layer, total)| format!("{{\"name\":\"{}\",\"total\":{total}}}", layer.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            concat!(
+                "{{",
+                "\"loaded\":{},\"evicted\":{},\"converged\":{},",
+                "\"dispatched\":{},\"regenerated\":{},\"macro_jobs\":{},",
+                "\"regen_cost\":{},\"deferred_regens\":{},\"active_regions\":{},",
+                "\"cache_bytes\":{},\"macro_cache_bytes\":{},",
+                "\"rosters_built\":{},\"roster_cache_bytes\":{},",
+                "\"authoritative_realized\":{},\"organisms_realized\":{},\"organisms\":{},",
+                "\"resonance\":{:.3},\"resonance_nodes\":{},\"anchors\":{},",
+                "\"cancelled\":{},\"dropped\":{},\"failed\":{},",
+                "\"pool_hits\":{},\"pool_misses\":{},\"pool_bytes\":{},",
+                "\"regen_by_layer\":[{}]",
+                "}}"
+            ),
+            stats.loaded,
+            stats.evicted,
+            stats.converged,
+            stats.layers_dispatched,
+            stats.layers_regenerated,
+            stats.macro_jobs,
+            stats.regen_cost_spent,
+            stats.deferred_regens,
+            stats.active_regions,
+            stats.cache_bytes,
+            stats.macro_cache_bytes,
+            stats.rosters_built,
+            stats.roster_cache_bytes,
+            stats.authoritative_organisms_realized,
+            stats.organisms_realized,
+            stats.organisms,
+            stats.resonance_strength,
+            stats.resonance_nodes,
+            stats.anchors_active,
+            stats.jobs_cancelled,
+            stats.results_dropped,
+            stats.jobs_failed,
+            stats.pool_hits,
+            stats.pool_misses,
+            stats.pool_bytes,
+            regen,
+        )
+    }
+
+    /// The native panel's CURSOR block, as JSON: the settled channel values
+    /// of the cell under a world position. Reads the cache only — never
+    /// generates — so hovering costs nothing.
+    fn inspect_json(&self, wx: f64, wy: f64) -> String {
+        let coord = RegionCoord::from_world(wx, wy);
+        let res = self.map.config().field_resolution;
+        let cell = REGION_SIZE / f64::from(res);
+        let (ox, oy) = coord.origin();
+        let cx = (((wx - ox) / cell) as i64).clamp(0, i64::from(res) - 1) as u16;
+        let cy = (((wy - oy) / cell) as i64).clamp(0, i64::from(res) - 1) as u16;
+        let state = self.map.get(coord);
+        let tiles = self.map.cache().get(coord);
+        let channel =
+            |index: usize| tiles.and_then(|t| t.channels[index].as_deref().map(|t| t.get(cx, cy)));
+        let number =
+            |value: Option<f32>| value.map_or_else(|| String::from("null"), |v| format!("{v:.3}"));
+        let biome = tiles.and_then(|t| t.biome.as_deref()).map_or_else(
+            || String::from("null"),
+            |b| format!("\"{:?}\"", Biome::from_id(b.get(cx, cy))),
+        );
+        let status = state.map_or("unloaded", |s| match s.status {
+            world_runtime::GenerationStatus::Unloaded => "unloaded",
+            world_runtime::GenerationStatus::Generating => "generating",
+            world_runtime::GenerationStatus::Ready => "ready",
+        });
+        format!(
+            concat!(
+                "{{",
+                "\"world\":[{:.0},{:.0}],\"region\":[{},{}],\"cell\":[{},{}],",
+                "\"status\":\"{}\",\"stability\":{},\"revision\":{},",
+                "\"elevation\":{},\"temperature\":{},\"moisture\":{},",
+                "\"hardness\":{},\"river\":{},\"wetness\":{},",
+                "\"soil_depth\":{},\"fertility\":{},\"vegetation\":{},",
+                "\"herbivore\":{},\"predator\":{},\"diversity\":{},",
+                "\"biome\":{}",
+                "}}"
+            ),
+            wx,
+            wy,
+            coord.x,
+            coord.y,
+            cx,
+            cy,
+            status,
+            state.map_or_else(|| String::from("null"), |s| format!("{:.2}", s.stability)),
+            state.map_or_else(|| String::from("null"), |s| s.revision.to_string()),
+            number(channel(CHANNEL_ELEVATION)),
+            number(channel(CHANNEL_TEMPERATURE)),
+            number(channel(CHANNEL_MOISTURE)),
+            number(channel(CHANNEL_HARDNESS)),
+            number(channel(CHANNEL_RIVER)),
+            number(channel(CHANNEL_WETNESS)),
+            number(channel(CHANNEL_SOIL_DEPTH)),
+            number(channel(CHANNEL_FERTILITY)),
+            number(channel(CHANNEL_VEGETATION)),
+            number(channel(CHANNEL_HERBIVORE)),
+            number(channel(CHANNEL_PREDATOR)),
+            number(channel(CHANNEL_DIVERSITY)),
+            biome,
         )
     }
 
@@ -946,6 +1259,25 @@ impl WebAppState {
     }
 }
 
+/// Extract a numeric field from a flat JSON object string — the facade's
+/// serde-free input contract (matching the `contains` command parsing).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn json_number(input: &str, key: &str) -> Option<f64> {
+    let pattern = format!("\"{key}\":");
+    let start = input.find(&pattern)? + pattern.len();
+    let rest = &input[start..];
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    rest[..end].trim().parse().ok()
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn bias_json(bias: &[f32; POSSIBILITY_DIMS]) -> String {
+    format!(
+        "[{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}]",
+        bias[0], bias[1], bias[2], bias[3], bias[4], bias[5], bias[6], bias[7]
+    )
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn vector_json(vector: PossibilityVector) -> String {
     format!(
@@ -971,7 +1303,40 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
+    use std::cell::RefCell;
+
     use wasm_bindgen::prelude::*;
+
+    /// The native shell's clear/fog color, mirrored (main.rs `CLEAR_COLOR`).
+    const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
+
+    thread_local! {
+        /// The shared wgpu renderer over the POV canvas. A thread-local slot
+        /// (wasm is single-threaded) rather than a `WebApp` field because
+        /// device acquisition is async on WebGPU — JS awaits [`pov_init`]
+        /// once, then per-frame calls stay synchronous.
+        static POV_RENDERER: RefCell<Option<renderer::Renderer>> = const { RefCell::new(None) };
+    }
+
+    /// Bring up the shared 3D renderer over the given canvas
+    /// (phase-7-plan.md §9.9). Idempotent; safe to call again after a
+    /// device loss (the old renderer is dropped and rebuilt). Rejects when
+    /// no adapter/device is available — the caller falls back to map mode.
+    #[wasm_bindgen]
+    pub async fn pov_init(
+        canvas: web_sys::HtmlCanvasElement,
+        width: u32,
+        height: u32,
+    ) -> Result<(), JsValue> {
+        if POV_RENDERER.with(|slot| slot.borrow().is_some()) {
+            return Ok(());
+        }
+        let built = renderer::Renderer::new(renderer::canvas_surface_source(canvas), width, height)
+            .await
+            .map_err(|err| JsValue::from_str(&format!("pov renderer init failed: {err}")))?;
+        POV_RENDERER.with(|slot| *slot.borrow_mut() = Some(built));
+        Ok(())
+    }
 
     /// wasm entry point, invoked automatically when the module is instantiated.
     #[wasm_bindgen(start)]
@@ -1147,6 +1512,79 @@ mod wasm {
             Ok(JsValue::from_str(&self.state.snapshot_json()))
         }
 
+        /// The cursor block (the native panel's CURSOR readout): settled
+        /// channel values of the cell under a world position, as JSON.
+        /// Cache-read only.
+        pub fn inspect(&self, world_x: f64, world_y: f64) -> Result<JsValue, JsValue> {
+            Ok(JsValue::from_str(
+                &self.state.inspect_json(world_x, world_y),
+            ))
+        }
+
+        /// One POV frame (the native `frame_pov`): apply look/move input,
+        /// stream, sync chunks, and draw through the shared renderer set up
+        /// by [`pov_init`]. Returns a small JSON status; `rendered:false`
+        /// means the renderer is missing or the surface failed — the caller
+        /// should fall back to map mode after repeated failures.
+        pub fn pov_frame(&mut self, dt_ms: f64, input: JsValue) -> Result<JsValue, JsValue> {
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            if self.state.view_mode != "pov" {
+                return Ok(JsValue::from_str("{\"active\":false,\"rendered\":false}"));
+            }
+            let input = input.as_string().unwrap_or_default();
+            let (uploads, removes) = self.state.pov_step(dt_ms, &input);
+            // The water-wobble clock, wrapped at the shader period like the
+            // native shell so f32 never loses phase precision.
+            let time = super::json_number(&input, "time")
+                .unwrap_or(0.0)
+                .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
+            let rendered = POV_RENDERER.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let Some(renderer) = slot.as_mut() else {
+                    return false;
+                };
+                let (w, h) = renderer.size();
+                let params = pov_host::frame_params(
+                    &self.state.pov_camera,
+                    w as f32 / h.max(1) as f32,
+                    self.state.pov_radius,
+                    CLEAR_COLOR,
+                    time,
+                    pov_host::PovToggles {
+                        baked_light: self.state.pov_baked_light,
+                        detail_normals: self.state.pov_detail_normals,
+                        water: self.state.pov_water,
+                    },
+                );
+                renderer.render_pov(
+                    &params,
+                    &uploads,
+                    &removes,
+                    CLEAR_COLOR,
+                    None,
+                    self.state.pov_render_scale,
+                )
+            });
+            let camera = &self.state.pov_camera;
+            let counters = self.state.pov_chunks.counters();
+            Ok(JsValue::from_str(&format!(
+                concat!(
+                    "{{\"active\":true,\"rendered\":{},",
+                    "\"camera\":[{:.1},{:.1},{:.1}],",
+                    "\"chunks\":{},\"meshed\":{},\"uploads\":{}}}"
+                ),
+                rendered,
+                camera.pos.x,
+                camera.pos.y,
+                camera.pos.z,
+                self.state.pov_chunks.len(),
+                counters.meshed,
+                uploads.len(),
+            )))
+        }
+
         /// Stop accepting frame updates.
         pub fn shutdown(&mut self) {
             self.shutdown = true;
@@ -1245,6 +1683,46 @@ mod tests {
     }
 
     #[test]
+    fn movement_matches_the_native_speed_contract() {
+        // main.rs `apply_movement`: 500 u/s, sprint x4, normalized
+        // diagonals, dt clamped to 100ms.
+        let mut app = super::WebAppState::default();
+        app.update(16.666_667, "{\"move_x\":1}");
+        assert!((app.world_pos.0 - 500.0 / 60.0).abs() < 0.01);
+        assert_eq!(app.world_pos.1, 0.0);
+
+        let mut diagonal = super::WebAppState::default();
+        diagonal.update(1000.0, "{\"move_x\":1,\"move_y\":1}");
+        let expected = 500.0 * 0.1 / std::f64::consts::SQRT_2;
+        assert!((diagonal.world_pos.0 - expected).abs() < 1e-9);
+        assert!((diagonal.world_pos.1 - expected).abs() < 1e-9);
+
+        let mut sprint = super::WebAppState::default();
+        sprint.update(16.666_667, "{\"move_x\":-1,\"sprint\":true}");
+        assert!((sprint.world_pos.0 + 4.0 * 500.0 / 60.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn movement_streams_the_window_after_the_first_settle() {
+        let mut app = small_window_app();
+        app.compose_map();
+        // Sprint east; budgeted per-frame updates must keep the streamed
+        // window following the player (the native streaming contract).
+        for _ in 0..40 {
+            app.update(100.0, "{\"move_x\":1,\"sprint\":true}");
+        }
+        for _ in 0..5 {
+            app.update(100.0, "{}");
+        }
+        let center = world_core::RegionCoord::from_world(app.world_pos.0, app.world_pos.1);
+        assert!(app.world_pos.0 >= 8000.0 - 1e-6);
+        assert!(
+            app.map.cache().get(center).is_some(),
+            "the window followed the player"
+        );
+    }
+
+    #[test]
     fn cpu_map_header_describes_the_window() {
         let app = super::WebAppState::default();
         let header = app.cpu_map_json();
@@ -1303,6 +1781,70 @@ mod tests {
         let py = 3 * 8 + usize::from(8 - 1 - cy);
         let offset = (py * side + px) * 4;
         assert_eq!(&pixels[offset..offset + 3], &expected);
+    }
+
+    #[test]
+    fn snapshot_carries_panel_stats_and_inspect_reads_the_cursor_cell() {
+        let mut app = small_window_app();
+        app.compose_map();
+        let snapshot = app.snapshot_json();
+        assert!(snapshot.contains("\"stats\":{\"loaded\":"));
+        assert!(snapshot.contains("\"regen_by_layer\":[{\"name\":\"terrain\",\"total\":"));
+        assert!(snapshot.contains("\"bias\":[0.000"));
+        assert!(app.last_stats.active_regions > 0);
+        assert!(app.regen_totals.iter().sum::<u64>() > 0);
+
+        let inside = app.inspect_json(10.0, 10.0);
+        assert!(inside.contains("\"region\":[0,0]"));
+        assert!(inside.contains("\"status\":\"ready\""));
+        assert!(inside.contains("\"biome\":\""));
+        assert!(!inside.contains("\"elevation\":null"));
+
+        let outside = app.inspect_json(1e7, 1e7);
+        assert!(outside.contains("\"status\":\"unloaded\""));
+        assert!(outside.contains("\"elevation\":null"));
+    }
+
+    #[test]
+    fn pov_step_moves_the_camera_and_meshes_chunks() {
+        let mut app = small_window_app();
+        app.compose_map();
+        app.set_renderer_webgpu();
+        app.apply_command("{\"id\":\"mode:pov\"}");
+        assert_eq!(app.view_mode, "pov");
+
+        let before = app.pov_camera.pos;
+        let (uploads, _) = app.pov_step(100.0, "{\"move_y\":1,\"time\":0}");
+        assert!(
+            !app.pov_chunks.is_empty(),
+            "chunks meshed around the camera"
+        );
+        assert!(
+            !uploads.is_empty(),
+            "first sync yields amortized chunk uploads"
+        );
+        let moved = app.pov_camera.pos - before;
+        assert!(moved.length() > 0.0, "fly movement advanced the camera");
+
+        let yaw = app.pov_camera.yaw;
+        app.pov_step(16.0, "{\"look_dx\":100,\"look_dy\":0}");
+        assert_ne!(app.pov_camera.yaw, yaw, "look input turns the camera");
+
+        // Walk mode grounds the camera and keeps it grounded while moving.
+        app.apply_command("{\"id\":\"pov:walk\"}");
+        assert!(app.pov_camera.walk);
+        for _ in 0..30 {
+            app.pov_step(100.0, "{\"move_y\":1,\"time\":0}");
+        }
+        let (ground, _) = pov_host::walk_ground(
+            &app.pov_chunks,
+            &app.map,
+            (app.pov_camera.pos.x, app.pov_camera.pos.y),
+        );
+        assert!(
+            (app.pov_camera.pos.z - (ground + pov_host::EYE_HEIGHT)).abs() < 1.0,
+            "walk mode follows the terrain at eye height"
+        );
     }
 
     #[test]

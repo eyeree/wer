@@ -267,32 +267,6 @@ fn influence_color(anchors: &[Anchor], world: (f64, f64)) -> [u8; 3] {
     lerp_rgb([18, 18, 22], DOMAIN_TINTS[dominant], total.clamp(0.0, 1.0))
 }
 
-/// The POV sea-floor albedo: wet sand at the waterline picking up a cyan
-/// water-absorption cast within the first ~25 units of depth, then falling
-/// off into dark teal by ~140 — the depth tint real shallows have, baked
-/// into the floor so it shades with the terrain while the surface stays a
-/// subtle film. The 2D map keeps [`elevation_color`]'s blue *depth* ramp (a
-/// map legend, not a material); painting the 3D sea floor with that blue
-/// made the ocean read as opaque blue terrain instead of water over sand,
-/// so the POV mesher diverges here deliberately. Presentation-only, like
-/// every color in this module.
-pub(crate) fn pov_sediment_color(e: f32) -> [u8; 3] {
-    let depth = -e;
-    if depth <= 25.0 {
-        lerp_rgb(
-            [168, 150, 118],
-            [96, 124, 118],
-            (depth / 25.0).clamp(0.0, 1.0),
-        )
-    } else {
-        lerp_rgb(
-            [96, 124, 118],
-            [12, 34, 44],
-            ((depth - 25.0) / 115.0).clamp(0.0, 1.0),
-        )
-    }
-}
-
 /// Composes the active window into an RGBA8 image, one pixel per field cell,
 /// and tracks pinned-region revisions for the changed-while-pinned detector.
 #[derive(Debug)]

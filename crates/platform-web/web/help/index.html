@@ -87,12 +87,18 @@
         can run in inline, worker-pool, or shared-memory worker-pool modes. The
         inline path remains the deterministic fallback.
       </p>
+      <h2>POV Mode</h2>
+      <p>
+        POV mode hosts the same shared 3D terrain renderer as the native shell
+        on a WebGPU canvas. Click the canvas for pointer-lock mouse look (or
+        hold the left button to drag), move with WASD/arrows
+        (<code>Space</code>/<code>Shift</code> fly up/down), and use the mouse
+        wheel to adjust the fly or walk speed. If no WebGPU adapter or device
+        is available — or the device is lost — the viewer returns to map mode
+        with a warning.
+      </p>
       <h2>Unsupported</h2>
       <p>
-        POV mode, its controls (walk/fly, the lighting and water toggles, the
-        render scale), and its WebGPU/device-loss gating are wired; hosting the
-        shared 3D terrain renderer in the browser canvas is the remaining
-        Phase 7-9 work, so the POV canvas does not draw terrain yet.
         Networking, accounts, hosted worlds, multiplayer, and authoritative GPU
         simulation are outside Phase 7.
       </p>

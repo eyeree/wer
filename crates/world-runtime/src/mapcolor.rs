@@ -182,6 +182,33 @@ pub fn composite_color(e: f32, biome: Biome, river: f32, wetness: f32) -> [u8; 3
     lerp_rgb(rgb, [130, 125, 120], ((e - 500.0) / 400.0).clamp(0.0, 1.0))
 }
 
+/// The POV sea-floor albedo: wet sand at the waterline picking up a cyan
+/// water-absorption cast within the first ~25 units of depth, then falling
+/// off into dark teal by ~140 — the depth tint real shallows have, baked
+/// into the floor so it shades with the terrain while the surface stays a
+/// subtle film. The 2D map keeps [`elevation_color`]'s blue *depth* ramp (a
+/// map legend, not a material); painting the 3D sea floor with that blue
+/// made the ocean read as opaque blue terrain instead of water over sand,
+/// so the POV mesher diverges here deliberately. Presentation-only, like
+/// every color in this module.
+#[must_use]
+pub fn pov_sediment_color(e: f32) -> [u8; 3] {
+    let depth = -e;
+    if depth <= 25.0 {
+        lerp_rgb(
+            [168, 150, 118],
+            [96, 124, 118],
+            (depth / 25.0).clamp(0.0, 1.0),
+        )
+    } else {
+        lerp_rgb(
+            [96, 124, 118],
+            [12, 34, 44],
+            ((depth - 25.0) / 115.0).clamp(0.0, 1.0),
+        )
+    }
+}
+
 /// The full per-cell Composite color — [`composite_color`] plus the
 /// dominant-species land tint — shared by the 2D map's `paint_region`, the
 /// 3D mesher's per-vertex material (3d-phase-1-plan.md §6.4), and the browser

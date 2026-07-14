@@ -317,7 +317,26 @@ impl DebugMapPipeline {
 /// (compositor restart, WSLg/driver hiccup) can be recreated from scratch
 /// instead of crashing the app: reconfiguring a dead `VkSurfaceKHR` is a fatal
 /// validation error, recreating it is routine.
-type SurfaceSource = Box<dyn Fn() -> wgpu::SurfaceTarget<'static> + Send + Sync>;
+/// The surface-source callback (see [`Renderer::new`]). Native window
+/// handles are `Send + Sync` and the bound keeps the renderer usable from
+/// any thread; on wasm the browser canvas is inherently single-threaded, so
+/// the bounds are dropped — WebGPU itself runs on the main thread there.
+#[cfg(not(target_arch = "wasm32"))]
+pub type SurfaceSource = Box<dyn Fn() -> wgpu::SurfaceTarget<'static> + Send + Sync>;
+/// The surface-source callback (see [`Renderer::new`]), wasm variant.
+#[cfg(target_arch = "wasm32")]
+pub type SurfaceSource = Box<dyn Fn() -> wgpu::SurfaceTarget<'static>>;
+
+/// A surface source over a browser canvas (phase-7-plan.md §9.9): "the
+/// platform shell creates or receives browser-specific canvas/surface
+/// handles and passes them into renderer initialization." Cloning the
+/// handle per call keeps surface recreation possible, exactly like the
+/// native window closure.
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+pub fn canvas_surface_source(canvas: web_sys::HtmlCanvasElement) -> SurfaceSource {
+    Box::new(move || wgpu::SurfaceTarget::Canvas(canvas.clone()))
+}
 
 /// Owns the GPU objects needed to present frames to a single surface.
 pub struct Renderer {
@@ -353,23 +372,23 @@ impl Renderer {
     /// Bring up the renderer for a window of the given pixel size.
     ///
     /// `source` must return a fresh surface target for the same window each
-    /// time it is called — e.g. `move || window.clone().into()` for an
-    /// `Arc<winit::window::Window>` — so the surface can be recreated if the
-    /// platform loses it. This is async because adapter and device acquisition
-    /// are async on WebGPU; native callers can drive it with
-    /// `pollster::block_on`.
+    /// time it is called — e.g. `Box::new(move || window.clone().into())` for
+    /// an `Arc<winit::window::Window>`, or a canvas-cloning closure in the
+    /// browser — so the surface can be recreated if the platform loses it.
+    /// This is async because adapter and device acquisition are async on
+    /// WebGPU; native callers can drive it with `pollster::block_on`, the
+    /// browser shell with `wasm_bindgen_futures`.
     ///
     /// Backend selection honors the standard wgpu environment variables
     /// (`WGPU_BACKEND=vulkan|gl|dx12|metal`, `WGPU_POWER_PREF`, ...), which is
     /// the escape hatch for platforms with a flaky default driver.
     pub async fn new(
-        source: impl Fn() -> wgpu::SurfaceTarget<'static> + Send + Sync + 'static,
+        surface_source: SurfaceSource,
         width: u32,
         height: u32,
     ) -> Result<Self, RendererError> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let surface_source: SurfaceSource = Box::new(source);
 
         let surface = instance
             .create_surface(surface_source())

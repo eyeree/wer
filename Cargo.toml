@@ -10,6 +10,7 @@ members = [
     "crates/world-core",
     "crates/world-runtime",
     "crates/renderer",
+    "crates/pov-host",
     "crates/platform-native",
     "crates/platform-web",
     "crates/tools",
@@ -53,6 +54,7 @@ font8x8 = { version = "0.3", default-features = false }
 
 # Web-only.
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 wasm-bindgen-test = "=0.3.76"
 web-sys = "0.3"
 console_error_panic_hook = "0.1"
