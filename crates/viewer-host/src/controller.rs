@@ -1502,6 +1502,13 @@ mod tests {
         }
     }
 
+    fn sloped_ground(_map: &RegionMap, position: (f64, f64)) -> GroundSample {
+        GroundSample {
+            height: 10.0 + position.0 * 0.01 + position.1 * 0.02,
+            mesh_resident: true,
+        }
+    }
+
     fn tracker_snapshot(ids: &[u64]) -> RouteTrackerSnapshot {
         RouteTrackerSnapshot {
             legs: ids
@@ -1525,6 +1532,109 @@ mod tests {
             &mut NoopWorldTickHook,
             &flat_ground,
         )
+    }
+
+    #[test]
+    fn map_pov_and_split_mode_focus_reduction_follows_one_transition_table() {
+        let cases = [
+            (
+                ViewLayout::default(),
+                ViewerAction::SetPresentation(PresentationMode::Split),
+                PresentationMode::Split,
+                ViewKind::Map,
+            ),
+            (
+                ViewLayout {
+                    mode: PresentationMode::Pov,
+                    focused: ViewKind::Pov,
+                    split_ratio: 0.5,
+                },
+                ViewerAction::SetPresentation(PresentationMode::Split),
+                PresentationMode::Split,
+                ViewKind::Pov,
+            ),
+            (
+                ViewLayout {
+                    mode: PresentationMode::Split,
+                    focused: ViewKind::Map,
+                    split_ratio: 0.5,
+                },
+                ViewerAction::TogglePrimaryView,
+                PresentationMode::Split,
+                ViewKind::Pov,
+            ),
+            (
+                ViewLayout {
+                    mode: PresentationMode::Split,
+                    focused: ViewKind::Pov,
+                    split_ratio: 0.5,
+                },
+                ViewerAction::TogglePrimaryView,
+                PresentationMode::Split,
+                ViewKind::Map,
+            ),
+            (
+                ViewLayout {
+                    mode: PresentationMode::Split,
+                    focused: ViewKind::Map,
+                    split_ratio: 0.5,
+                },
+                ViewerAction::FocusView(ViewKind::Pov),
+                PresentationMode::Split,
+                ViewKind::Pov,
+            ),
+            (
+                ViewLayout {
+                    mode: PresentationMode::Split,
+                    focused: ViewKind::Pov,
+                    split_ratio: 0.5,
+                },
+                ViewerAction::SetPresentation(PresentationMode::Map),
+                PresentationMode::Map,
+                ViewKind::Map,
+            ),
+            (
+                ViewLayout {
+                    mode: PresentationMode::Split,
+                    focused: ViewKind::Map,
+                    split_ratio: 0.5,
+                },
+                ViewerAction::SetPresentation(PresentationMode::Pov),
+                PresentationMode::Pov,
+                ViewKind::Pov,
+            ),
+            (
+                ViewLayout::default(),
+                ViewerAction::FocusView(ViewKind::Pov),
+                PresentationMode::Map,
+                ViewKind::Map,
+            ),
+            (
+                ViewLayout::default(),
+                ViewerAction::TogglePrimaryView,
+                PresentationMode::Pov,
+                ViewKind::Pov,
+            ),
+            (
+                ViewLayout {
+                    mode: PresentationMode::Pov,
+                    focused: ViewKind::Pov,
+                    split_ratio: 0.5,
+                },
+                ViewerAction::TogglePrimaryView,
+                PresentationMode::Map,
+                ViewKind::Map,
+            ),
+        ];
+
+        for (mut layout, action, mode, focused) in cases {
+            let ratio = layout.split_ratio;
+            let reduction = reduce_layout_action(&mut layout, true, action)
+                .expect("table contains only layout actions");
+            assert!(!reduction.unsupported_pov);
+            assert_eq!((layout.mode, layout.focused), (mode, focused));
+            assert_eq!(layout.split_ratio, ratio);
+        }
     }
 
     #[test]
@@ -1615,26 +1725,113 @@ mod tests {
     }
 
     #[test]
-    fn split_map_movement_translates_camera_without_resetting_orientation() {
+    fn pov_focused_split_has_one_travel_value_and_one_world_update() {
+        let mut controller = controller();
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
+        controller.enqueue_action(ViewerAction::FocusView(ViewKind::Pov));
+        let mut hook = CountingHook::default();
+        let output = controller.tick(
+            TickInput {
+                dt_seconds: 0.1,
+                input: InputFrame {
+                    pov_axis: [0, 1, 0],
+                    ..InputFrame::default()
+                },
+                platform: PlatformTelemetry::default(),
+            },
+            &InlineExecutor,
+            &mut hook,
+            &flat_ground,
+        );
+
+        assert_eq!(
+            (output.mode, output.focused),
+            (PresentationMode::Split, ViewKind::Pov)
+        );
+        assert_eq!((hook.before, hook.after), (1, 1));
+        assert_eq!(output.update_serial, 1);
+        assert_eq!(hook.positions, vec![output.traveler]);
+        assert_eq!(
+            output.traveler,
+            (output.pov.position[0], output.pov.position[1])
+        );
+        assert!((output.travel - 4.0).abs() < 1.0e-5);
+        assert!((output.traveler.1 - 4.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn map_focused_split_translates_fly_camera_and_updates_world_once() {
         let mut controller = controller();
         controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
         let initialized = tick(&mut controller, InputFrame::default(), 0.0);
-        let yaw = initialized.pov.yaw;
+        controller.pov.camera.yaw = 0.37;
+        controller.pov.camera.pitch = -0.21;
         let z = initialized.pov.position[2];
 
-        let moved = tick(
-            &mut controller,
-            InputFrame {
-                map_axis: [1, 0],
-                ..InputFrame::default()
+        let mut hook = CountingHook::default();
+        let moved = controller.tick(
+            TickInput {
+                dt_seconds: 0.1,
+                input: InputFrame {
+                    map_axis: [1, 0],
+                    ..InputFrame::default()
+                },
+                platform: PlatformTelemetry::default(),
             },
-            0.1,
+            &InlineExecutor,
+            &mut hook,
+            &flat_ground,
         );
+        assert_eq!((hook.before, hook.after), (1, 1));
+        assert_eq!(hook.positions, vec![moved.traveler]);
         assert_eq!(moved.traveler, (50.0, 0.0));
+        assert_eq!(moved.travel, 50.0);
         assert_eq!(moved.pov.position[0], 50.0);
         assert_eq!(moved.pov.position[1], 0.0);
         assert_eq!(moved.pov.position[2], z);
-        assert_eq!(moved.pov.yaw, yaw);
+        assert_eq!(moved.pov.yaw, 0.37);
+        assert_eq!(moved.pov.pitch, -0.21);
+    }
+
+    #[test]
+    fn map_focused_split_regrounds_walk_camera_after_translation() {
+        let mut controller = controller();
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
+        controller.enqueue_action(ViewerAction::ToggleWalk);
+        let initial = controller.tick(
+            TickInput {
+                dt_seconds: 0.0,
+                input: InputFrame::default(),
+                platform: PlatformTelemetry::default(),
+            },
+            &InlineExecutor,
+            &mut NoopWorldTickHook,
+            &sloped_ground,
+        );
+        controller.pov.camera.yaw = 0.41;
+        controller.pov.camera.pitch = -0.17;
+
+        let moved = controller.tick(
+            TickInput {
+                dt_seconds: 0.1,
+                input: InputFrame {
+                    map_axis: [1, 0],
+                    ..InputFrame::default()
+                },
+                platform: PlatformTelemetry::default(),
+            },
+            &InlineExecutor,
+            &mut NoopWorldTickHook,
+            &sloped_ground,
+        );
+        let target = sloped_ground(controller.world().map(), moved.traveler).height + EYE_HEIGHT;
+        assert!(initial.pov.walk);
+        assert_eq!(moved.traveler, (50.0, 0.0));
+        assert_eq!(moved.pov.position[0], moved.traveler.0);
+        assert_eq!(moved.pov.position[1], moved.traveler.1);
+        assert!((moved.pov.position[2] - target).abs() < 1.0e-9);
+        assert_eq!(moved.pov.yaw, 0.41);
+        assert_eq!(moved.pov.pitch, -0.17);
     }
 
     #[test]
@@ -1671,6 +1868,51 @@ mod tests {
         let frame = mapper.take_frame();
         assert_eq!(frame.map_axis, [0, 0]);
         assert_eq!(frame.pov_axis, [0, 1, 0]);
+    }
+
+    #[test]
+    fn split_pointer_focus_is_previewed_before_a_same_batch_collision_key() {
+        let mut controller = controller();
+        let mut mapper = crate::input::InputMapper::default();
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
+        let map_context = controller.input_context(true);
+        assert_eq!(
+            (map_context.mode, map_context.focused),
+            (PresentationMode::Split, ViewKind::Map)
+        );
+
+        mapper.handle_event(
+            NormalizedInputEvent::PointerButton {
+                pointer: 1,
+                button: crate::input::PointerButton::Primary,
+                phase: ButtonPhase::Pressed,
+                position: [75.0, 20.0],
+                view: ViewKind::Pov,
+            },
+            map_context,
+        );
+        for action in mapper.drain_actions() {
+            controller.enqueue_action(action);
+        }
+        let pov_context = controller.input_context(true);
+        assert_eq!(
+            (pov_context.mode, pov_context.focused),
+            (PresentationMode::Split, ViewKind::Pov)
+        );
+
+        mapper.handle_event(
+            NormalizedInputEvent::Key {
+                key: PhysicalKey::KeyV,
+                phase: ButtonPhase::Pressed,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            },
+            pov_context,
+        );
+        assert_eq!(
+            mapper.drain_actions().collect::<Vec<_>>(),
+            vec![ViewerAction::TogglePovWater]
+        );
     }
 
     #[test]
@@ -2029,13 +2271,120 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_pov_falls_back_without_moving_world() {
-        let mut controller = controller_without_pov();
-        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Pov));
-        let output = tick(&mut controller, InputFrame::default(), 0.1);
-        assert_eq!(output.mode, PresentationMode::Map);
-        assert_eq!(output.focused, ViewKind::Map);
-        assert_eq!(output.traveler, (0.0, 0.0));
+    fn unsupported_pov_and_split_fall_back_without_moving_world() {
+        for requested in [PresentationMode::Pov, PresentationMode::Split] {
+            let mut controller = controller_without_pov();
+            controller.enqueue_action(ViewerAction::SetPresentation(requested));
+            let output = tick(&mut controller, InputFrame::default(), 0.1);
+            assert_eq!(output.mode, PresentationMode::Map);
+            assert_eq!(output.focused, ViewKind::Map);
+            assert_eq!(output.traveler, (0.0, 0.0));
+            assert!(output.effects.iter().any(|effect| matches!(
+                effect,
+                ViewerEffect::ReportWarning(ViewerWarning {
+                    id: "pov-unsupported",
+                    ..
+                })
+            )));
+        }
+    }
+
+    #[test]
+    fn capability_loss_from_split_preserves_world_and_camera_then_focuses_map() {
+        let mut controller = controller();
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
+        controller.enqueue_action(ViewerAction::NudgePossibility {
+            domain: PossibilityDomain::Climate,
+            direction: NudgeDirection::Up,
+        });
+        let before = tick(
+            &mut controller,
+            InputFrame {
+                map_axis: [1, 0],
+                ..InputFrame::default()
+            },
+            0.1,
+        );
+        let bias = *controller.world().bias();
+        let camera = before.pov;
+
+        controller.enqueue_service_notification(ServiceNotification::PovAvailability {
+            sequence: ServiceResponseSequence(1),
+            supported: false,
+            reason: Some(ViewerWarning {
+                id: "renderer-device-loss",
+                message: String::from("test device loss"),
+                severity: Severity::Warning,
+            }),
+        });
+        let preview = controller.input_context(true);
+        assert_eq!(
+            (preview.mode, preview.focused),
+            (PresentationMode::Map, ViewKind::Map)
+        );
+        let output = tick(&mut controller, InputFrame::default(), 0.0);
+
+        assert_eq!(
+            (output.mode, output.focused),
+            (PresentationMode::Map, ViewKind::Map)
+        );
+        assert!(!output.pov.supported);
+        assert_eq!(output.traveler, before.traveler);
+        assert_eq!(output.pov.position, camera.position);
+        assert_eq!(
+            (output.pov.yaw, output.pov.pitch),
+            (camera.yaw, camera.pitch)
+        );
+        assert_eq!(controller.world().bias(), &bias);
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            ViewerEffect::ReportWarning(ViewerWarning {
+                id: "renderer-device-loss",
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn loss_tick_rejects_queued_split_before_later_capability_recovery() {
+        let mut controller = controller();
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
+        let entered = tick(&mut controller, InputFrame::default(), 0.0);
+        assert_eq!(entered.mode, PresentationMode::Split);
+
+        controller.enqueue_service_notification(ServiceNotification::PovAvailability {
+            sequence: ServiceResponseSequence(1),
+            supported: false,
+            reason: None,
+        });
+        // Models a presentation action already queued when the platform
+        // observes device loss. Service inputs run first, so this loss tick
+        // must reject it and produce Map/Map.
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
+        let lost = tick(&mut controller, InputFrame::default(), 0.0);
+        assert_eq!(
+            (lost.mode, lost.focused),
+            (PresentationMode::Map, ViewKind::Map)
+        );
+        assert!(!lost.pov.supported);
+
+        // Native advertises a successfully rebuilt device only after the
+        // fallback tick. Capability recovery alone never changes presentation.
+        controller.enqueue_service_notification(ServiceNotification::PovAvailability {
+            sequence: ServiceResponseSequence(2),
+            supported: true,
+            reason: None,
+        });
+        let recovered = tick(&mut controller, InputFrame::default(), 0.0);
+        assert_eq!(
+            (recovered.mode, recovered.focused),
+            (PresentationMode::Map, ViewKind::Map)
+        );
+        assert!(recovered.pov.supported);
+
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Split));
+        let reentered = tick(&mut controller, InputFrame::default(), 0.0);
+        assert_eq!(reentered.mode, PresentationMode::Split);
     }
 
     #[test]

@@ -647,6 +647,15 @@ impl BrowserHostState {
         resolve_view_layout(self.surface, self.controller.layout())
     }
 
+    /// Resolve one physical surface point to the visible pane that owns it.
+    ///
+    /// The shared half-open pane rectangles are the sole hit-test authority;
+    /// browser pointer capture may preserve the returned view for the rest of
+    /// a gesture, but JavaScript never reconstructs the split boundary.
+    fn view_at(&self, x: f64, y: f64) -> Option<ViewKind> {
+        self.resolved_layout().hit_view([x, y])
+    }
+
     fn map_projection(&self) -> Option<MapViewportProjection> {
         let destination = self.resolved_layout().map_content?;
         let world = self.controller.world();
@@ -668,10 +677,15 @@ impl BrowserHostState {
         }
 
         let layout = self.resolved_layout();
+        let focused = match layout.focused {
+            ViewKind::Map => "map",
+            ViewKind::Pov => "pov",
+        };
         format!(
             concat!(
                 "{{\"content\":{},\"map_pane\":{},\"map_content\":{},",
-                "\"pov_pane\":{},\"pov_aspect\":{}}}"
+                "\"pov_pane\":{},\"pov_aspect\":{},\"focused\":\"{}\",",
+                "\"split_ratio\":{:.9},\"focus_border\":{},\"divider\":{}}}"
             ),
             rect(Some(layout.content)),
             rect(layout.map_pane),
@@ -680,6 +694,10 @@ impl BrowserHostState {
             layout
                 .pov_aspect
                 .map_or_else(|| String::from("null"), |aspect| format!("{aspect:.9}")),
+            focused,
+            layout.split_ratio,
+            rect(layout.focus_border(layout.focused)),
+            rect(layout.divider),
         )
     }
 
@@ -916,6 +934,13 @@ impl BrowserHostState {
         self.prepared_cpu_key = None;
         self.force_cpu_map_redraw = true;
         self.gpu_map_retry_scheduled = false;
+        // A replacement Renderer starts with empty GPU terrain/organism
+        // buffers. Reset the CPU-side publication managers as well so their
+        // next POV/Split sync emits complete uploads instead of assuming the
+        // lost device still owns the resident resources.
+        self.pov_chunks = pov_host::PovChunkManager::new();
+        self.pov_organisms = pov_host::PovOrganismManager::new();
+        self.pov_hover = PovHoverCache::new();
         if device_lost {
             self.device_losses = self.device_losses.saturating_add(1);
         }
@@ -1418,7 +1443,7 @@ mod wasm {
 
     use wasm_bindgen::prelude::*;
 
-    /// The native shell's clear/fog color, mirrored (main.rs `CLEAR_COLOR`).
+    /// The native shell's presentation-surface clear color, mirrored.
     const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
 
     thread_local! {
@@ -1594,6 +1619,25 @@ mod wasm {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
+            // Device-loss callbacks are asynchronous. Fold the capability
+            // transition before sampling input or advancing the one logical
+            // world frame, then drop the slot so later polls cannot count the
+            // same callback twice.
+            let device_lost = VIEWER_RENDERER.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.device_losses() > 0)
+                {
+                    *slot = None;
+                    true
+                } else {
+                    false
+                }
+            });
+            if device_lost {
+                self.renderer_lost();
+            }
             let input = self.driver.take_frame(&mut self.state);
             let time = time_seconds.rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
             let frame = self.state.frame_at(dt_ms, input, time);
@@ -1602,20 +1646,26 @@ mod wasm {
             }
             self.driver.synchronize_context(&self.state);
 
-            let pov_active = frame.output.mode == super::PresentationMode::Pov;
-            let map_active = frame.output.mode == super::PresentationMode::Map;
-            // M8 keeps the live modes exclusive while routing both through
-            // the same multi-view entry point. M9 widens these selectors to
-            // include Split only after focus and one-traveler routing land.
+            let split_active = frame.output.mode == super::PresentationMode::Split;
+            let pov_active = matches!(
+                frame.output.mode,
+                super::PresentationMode::Pov | super::PresentationMode::Split
+            );
+            let map_active = matches!(
+                frame.output.mode,
+                super::PresentationMode::Map | super::PresentationMode::Split
+            );
             let layout = self.state.resolved_layout();
             let map_projection = map_active.then(|| self.state.map_projection()).flatten();
             let (
                 prepared_map_backend,
                 prepared_map_fallback,
-                gpu_map_rendered,
+                map_drawn,
                 map_upload_bytes,
                 schedule_map_retry,
                 pov_rendered,
+                renderer_attempted,
+                surface_presented,
             ) = VIEWER_RENDERER.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let gpu_available = self.state.renderer_ready && slot.is_some();
@@ -1632,9 +1682,9 @@ mod wasm {
                     ..
                 } = &mut self.state;
 
-                // Prepare Map data first. A CPU packet remains owned by the
-                // separate 2D fallback canvas and therefore requests no GPU
-                // pane or surface acquisition.
+                // Prepare Map data first. Map and POV borrow the same
+                // post-update world/controller state and are submitted below
+                // through one surface frame.
                 let map_packet = if map_active {
                     let world = controller.world();
                     let traveler = world.traveler().position;
@@ -1690,30 +1740,52 @@ mod wasm {
                 }
 
                 let mut gpu_overlay_hashes = None;
+                let mut cpu_map_upload_bytes = 0u64;
                 let map_pane = map_packet.as_ref().and_then(|packet| {
-                    let super::PreparedMapSource::GpuAtlas(gpu) = &packet.source else {
-                        return None;
-                    };
-                    gpu_overlay_hashes = Some([gpu.pre_grid_hash, gpu.post_grid_hash]);
                     let destination = packet.viewport.destination;
-                    Some(renderer::MapFramePane {
-                        source: renderer::MapFrameSource::Gpu {
-                            params: &gpu.params,
-                            slots: &gpu.slots,
-                            uploads: &gpu.uploads,
-                            pre_grid_overlay: (overlay_hashes[0] != Some(gpu.pre_grid_hash))
-                                .then_some(gpu.pre_grid_rgba),
-                            post_grid_overlay: (overlay_hashes[1] != Some(gpu.post_grid_hash))
-                                .then_some(gpu.post_grid_rgba),
-                        },
-                        viewport: renderer::SurfaceViewport::new(
-                            destination.x,
-                            destination.y,
-                            destination.width,
-                            destination.height,
-                        ),
-                        information: None,
-                    })
+                    let viewport = renderer::SurfaceViewport::new(
+                        destination.x,
+                        destination.y,
+                        destination.width,
+                        destination.height,
+                    );
+                    match &packet.source {
+                        // A Map-only CPU frame remains on the dedicated 2D
+                        // fallback canvas. Split must upload that exact same
+                        // canonical bitmap into the unified GPU frame so both
+                        // panes share one acquire/submit/present.
+                        super::PreparedMapSource::Cpu(cpu) if split_active && gpu_available => {
+                            cpu_map_upload_bytes = cpu.rgba.len() as u64;
+                            Some(renderer::MapFramePane {
+                                source: renderer::MapFrameSource::Cpu {
+                                    rgba: cpu.rgba,
+                                    width: packet.projection.side,
+                                    height: packet.projection.side,
+                                },
+                                viewport,
+                                information: None,
+                            })
+                        }
+                        super::PreparedMapSource::Cpu(_) => None,
+                        super::PreparedMapSource::GpuAtlas(gpu) => {
+                            gpu_overlay_hashes = Some([gpu.pre_grid_hash, gpu.post_grid_hash]);
+                            Some(renderer::MapFramePane {
+                                source: renderer::MapFrameSource::Gpu {
+                                    params: &gpu.params,
+                                    slots: &gpu.slots,
+                                    uploads: &gpu.uploads,
+                                    pre_grid_overlay: (overlay_hashes[0]
+                                        != Some(gpu.pre_grid_hash))
+                                    .then_some(gpu.pre_grid_rgba),
+                                    post_grid_overlay: (overlay_hashes[1]
+                                        != Some(gpu.post_grid_hash))
+                                    .then_some(gpu.post_grid_rgba),
+                                },
+                                viewport,
+                                information: None,
+                            })
+                        }
+                    }
                 });
 
                 // The exact shared POV rectangle drives both projection and
@@ -1759,9 +1831,24 @@ mod wasm {
                     }
                 });
 
+                let focus = split_active
+                    .then(|| layout.focus_border(frame.output.focused))
+                    .flatten()
+                    .map(|destination| renderer::FocusDecoration {
+                        viewport: renderer::SurfaceViewport::new(
+                            destination.x,
+                            destination.y,
+                            destination.width,
+                            destination.height,
+                        ),
+                        thickness: 2,
+                    });
+
                 // One call site owns the one acquire/submit/present attempt.
                 // A CPU-only Map frame skips it so the hidden GPU stage does
                 // not compete with the truthful 2D fallback presentation.
+                let renderer_attempted =
+                    slot.is_some() && (map_pane.is_some() || pov_pane.is_some());
                 let render_result = if map_pane.is_some() || pov_pane.is_some() {
                     slot.as_mut()
                         .map_or_else(renderer::MultiViewFrameResult::default, |renderer| {
@@ -1769,16 +1856,16 @@ mod wasm {
                                 clear: CLEAR_COLOR,
                                 map: map_pane,
                                 pov: pov_pane,
-                                focus: None,
+                                focus,
                             })
                         })
                 } else {
                     renderer::MultiViewFrameResult::default()
                 };
 
-                let gpu_map_rendered = render_result.map_drawn;
+                let map_drawn = render_result.map_drawn;
                 let schedule_map_retry = if let Some(hashes) = gpu_overlay_hashes {
-                    if gpu_map_rendered {
+                    if map_drawn {
                         *overlay_hashes = hashes.map(Some);
                         *gpu_map_retry_scheduled = false;
                         false
@@ -1795,14 +1882,18 @@ mod wasm {
                 (
                     prepared_map_backend,
                     prepared_map_fallback,
-                    gpu_map_rendered,
-                    if gpu_map_rendered {
-                        render_result.map_upload_bytes
+                    map_drawn,
+                    if map_drawn {
+                        render_result
+                            .map_upload_bytes
+                            .saturating_add(cpu_map_upload_bytes)
                     } else {
                         0
                     },
                     schedule_map_retry,
                     render_result.pov_drawn,
+                    renderer_attempted,
+                    render_result.presented,
                 )
             });
             if schedule_map_retry {
@@ -1811,26 +1902,31 @@ mod wasm {
                 // turning persistent Timeout/Occluded into a busy loop.
                 self.driver.dirty = true;
             }
-            let (map_path, map_backend_changed) = if gpu_map_rendered {
-                (
-                    "gpu-atlas",
-                    self.state
-                        .record_map_result(super::MapBackend::GpuAtlas, None),
-                )
+            let map_path = if split_active {
+                match prepared_map_backend {
+                    super::MapBackend::Cpu => "gpu-cpu",
+                    super::MapBackend::GpuAtlas => "gpu-atlas",
+                }
+            } else if map_drawn && prepared_map_backend == super::MapBackend::GpuAtlas {
+                "gpu-atlas"
             } else {
-                let fallback = prepared_map_fallback.or_else(|| {
-                    (map_active
-                        && self.state.controller.map_preferences().backend
-                            == super::MapBackend::GpuAtlas)
-                        .then_some(super::MapBackendFallback::GpuUnavailable)
-                });
-                (
-                    "cpu",
-                    map_active
-                        && self
-                            .state
-                            .record_map_result(super::MapBackend::Cpu, fallback),
-                )
+                "cpu"
+            };
+            let map_backend_changed = if !map_active {
+                false
+            } else {
+                match prepared_map_backend {
+                    super::MapBackend::Cpu => self
+                        .state
+                        .record_map_result(super::MapBackend::Cpu, prepared_map_fallback),
+                    super::MapBackend::GpuAtlas if map_drawn => self
+                        .state
+                        .record_map_result(super::MapBackend::GpuAtlas, None),
+                    super::MapBackend::GpuAtlas => self.state.record_map_result(
+                        super::MapBackend::Cpu,
+                        Some(super::MapBackendFallback::GpuUnavailable),
+                    ),
+                }
             };
             let force_cpu_map_redraw = std::mem::take(&mut self.state.force_cpu_map_redraw);
             let map_dirty = frame.output.dirty.map
@@ -1839,7 +1935,8 @@ mod wasm {
                 || force_cpu_map_redraw
                 || (map_active
                     && prepared_map_backend == super::MapBackend::GpuAtlas
-                    && !gpu_map_rendered);
+                    && !map_drawn)
+                || (split_active && !map_drawn);
             let surface_losses = VIEWER_RENDERER.with(|slot| {
                 slot.borrow()
                     .as_ref()
@@ -1860,7 +1957,8 @@ mod wasm {
                 concat!(
                     "{{\"presentation\":{},\"layout\":{},\"map_dirty\":{},\"hover_changed\":{},\"needs_frame\":{},",
                     "\"update_serial\":{},\"travel\":{:.6},",
-                    "\"map\":{{\"active\":{},\"path\":\"{}\",\"gpu_submitted\":{},\"upload_bytes\":{}}},",
+                    "\"renderer_frame\":{{\"attempted\":{},\"presented\":{}}},",
+                    "\"map\":{{\"active\":{},\"path\":\"{}\",\"gpu_submitted\":{},\"drawn\":{},\"upload_bytes\":{}}},",
                     "\"pov\":{{\"active\":{},\"rendered\":{},",
                     "\"camera\":[{:.1},{:.1},{:.1}],",
                     "\"chunks\":{},\"meshed\":{},\"uploads\":{},\"hover_queries\":{},",
@@ -1874,9 +1972,12 @@ mod wasm {
                 needs_frame,
                 frame.output.update_serial,
                 frame.output.travel,
+                renderer_attempted,
+                surface_presented,
                 map_active,
                 map_path,
-                gpu_map_rendered,
+                map_drawn && prepared_map_backend == super::MapBackend::GpuAtlas,
+                map_drawn,
                 map_upload_bytes,
                 pov_active,
                 pov_rendered,
@@ -1963,6 +2064,19 @@ mod wasm {
                 },
             };
             self.driver.handle(&mut self.state, event)
+        }
+
+        /// Return the visible pane at one physical surface point.
+        ///
+        /// JavaScript uses this shared-layout answer for uncaptured pointer
+        /// and wheel events. A primary pointer capture preserves the press
+        /// view until release so crossing the Split seam cannot retarget an
+        /// in-progress POV drag.
+        pub fn view_at(&self, x: f64, y: f64) -> Option<String> {
+            self.state.view_at(x, y).map(|view| match view {
+                super::ViewKind::Map => String::from("map"),
+                super::ViewKind::Pov => String::from("pov"),
+            })
         }
 
         /// Translate one pointer position in physical canvas pixels.
@@ -2405,6 +2519,60 @@ mod wasm_input_tests {
         assert!(loss.contains("\"gpu_submitted\":false"));
         assert!(loss.contains("\"map_dirty\":true"));
     }
+
+    #[wasm_bindgen_test]
+    fn split_facade_exposes_both_panes_and_routes_shared_hits() {
+        let mut app = WebApp::new(JsValue::from_str("{}")).expect("web app");
+        app.resize_surface(800, 600).expect("surface resize");
+        // Node has no live renderer slot. The capability notification is
+        // enough to exercise reducer/layout/input behavior while status stays
+        // truthful about the absent surface attempt.
+        app.renderer_available();
+        app.action(
+            String::from("set-presentation"),
+            Some(String::from("split")),
+        )
+        .expect("Split action");
+        app.surface_focus(true);
+
+        let first: serde_json::Value = serde_json::from_str(
+            &app.frame(0.0, 0.0)
+                .expect("Split frame")
+                .as_string()
+                .expect("frame JSON"),
+        )
+        .expect("typed frame JSON");
+        assert_eq!(first["presentation"]["view"]["mode"], "split");
+        assert_eq!(first["presentation"]["view"]["focused"], "map");
+        assert_eq!(first["map"]["active"], true);
+        assert_eq!(first["pov"]["active"], true);
+        assert_eq!(first["renderer_frame"]["attempted"], false);
+        assert_eq!(first["renderer_frame"]["presented"], false);
+        assert_eq!(first["map"]["path"], "gpu-cpu");
+        assert_eq!(app.view_at(399.999, 300.0).as_deref(), Some("map"));
+        assert_eq!(app.view_at(400.0, 300.0).as_deref(), Some("pov"));
+        assert_eq!(app.view_at(800.0, 300.0), None);
+
+        let view = app.view_at(600.0, 300.0).expect("POV pane hit");
+        assert!(app
+            .pointer_button(7, 0, true, 600.0, 300.0, view.clone())
+            .expect("POV press"));
+        assert!(app.wheel(1.0, true, view).expect("focused POV wheel"));
+        let focused: serde_json::Value = serde_json::from_str(
+            &app.frame(0.0, 0.1)
+                .expect("focused Split frame")
+                .as_string()
+                .expect("frame JSON"),
+        )
+        .expect("typed focused frame JSON");
+        assert_eq!(focused["presentation"]["view"]["mode"], "split");
+        assert_eq!(focused["presentation"]["view"]["focused"], "pov");
+        assert_eq!(focused["layout"]["focused"], "pov");
+        assert_eq!(
+            focused["layout"]["focus_border"],
+            focused["layout"]["pov_pane"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2610,6 +2778,81 @@ mod tests {
         assert!(state
             .layout_json()
             .contains("\"map_content\":[100, 0, 701, 701]"));
+    }
+
+    #[test]
+    fn browser_split_hit_routing_uses_the_shared_physical_layout() {
+        let mut state = small_controller_app();
+        state.resize_surface(901, 701);
+        state.set_renderer_webgpu();
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Split,
+        ));
+        let frame = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(frame.output.mode, viewer_host::PresentationMode::Split);
+        assert_eq!(frame.output.focused, viewer_host::ViewKind::Map);
+
+        let layout = state.resolved_layout();
+        let map = layout.map_pane.expect("Split Map pane");
+        let pov = layout.pov_pane.expect("Split POV pane");
+        assert_eq!(map.right(), pov.x);
+        assert_eq!(
+            state.view_at(f64::from(map.right()) - 0.001, 1.0),
+            Some(viewer_host::ViewKind::Map)
+        );
+        assert_eq!(
+            state.view_at(f64::from(pov.x), 1.0),
+            Some(viewer_host::ViewKind::Pov)
+        );
+        assert_eq!(state.view_at(f64::from(layout.content.right()), 1.0), None);
+        let json = state.layout_json();
+        assert!(json.contains("\"focused\":\"map\""));
+        assert!(json.contains("\"split_ratio\":0.500000000"));
+        assert!(json.contains("\"focus_border\":[0, 0, 451, 701]"));
+    }
+
+    #[test]
+    fn split_pointer_focus_previews_scoped_wheel_before_the_frame() {
+        use viewer_host::input::{ButtonPhase, NormalizedInputEvent, PointerButton, WheelDelta};
+
+        let mut state = small_controller_app();
+        state.resize_surface(800, 600);
+        state.set_renderer_webgpu();
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Split,
+        ));
+        let _ = state.frame(0.0, viewer_host::input::InputFrame::default());
+        let mut driver = super::BrowserViewerDriver::default();
+        driver.set_surface_focus(&state, true);
+        let position = [600.0, 300.0];
+        let view = state.view_at(position[0], position[1]).expect("POV hit");
+
+        assert!(driver.handle(
+            &mut state,
+            NormalizedInputEvent::PointerButton {
+                pointer: 9,
+                button: PointerButton::Primary,
+                phase: ButtonPhase::Pressed,
+                position,
+                view,
+            },
+        ));
+        assert!(driver.handle(
+            &mut state,
+            NormalizedInputEvent::Wheel {
+                delta: WheelDelta::Lines(1.0),
+                view,
+            },
+        ));
+        let input = driver.take_frame(&mut state);
+        assert_eq!(
+            input.wheel_steps, 1,
+            "same-batch wheel uses previewed POV focus"
+        );
+        let frame = state.frame(0.0, input);
+        assert_eq!(frame.output.mode, viewer_host::PresentationMode::Split);
+        assert_eq!(frame.output.focused, viewer_host::ViewKind::Pov);
+        assert_eq!(state.controller.world().update_serial(), 2);
     }
 
     #[test]
@@ -3140,7 +3383,7 @@ mod tests {
         let mut state = small_controller_app();
         assert!(!state.controller.pov_state().supported);
         state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
-            viewer_host::PresentationMode::Pov,
+            viewer_host::PresentationMode::Split,
         ));
         let unavailable = state.frame(0.0, viewer_host::input::InputFrame::default());
         assert_eq!(unavailable.output.mode, viewer_host::PresentationMode::Map);
@@ -3152,20 +3395,25 @@ mod tests {
 
         state.set_renderer_webgpu();
         state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
-            viewer_host::PresentationMode::Pov,
+            viewer_host::PresentationMode::Split,
         ));
         let available = state.frame(0.0, viewer_host::input::InputFrame::default());
-        assert_eq!(available.output.mode, viewer_host::PresentationMode::Pov);
+        assert_eq!(available.output.mode, viewer_host::PresentationMode::Split);
+        assert!(!state.pov_chunks.is_empty());
+        assert!(state.pov_organisms.visual_generation() > 0);
         let serial = state.controller.world().update_serial();
+        let traveler = state.controller.world().traveler().position;
 
         state.renderer_lost();
+        assert!(state.pov_chunks.is_empty());
+        assert_eq!(state.pov_organisms.visual_generation(), 0);
         assert!(
             state.force_cpu_map_redraw,
             "GPU loss must invalidate an otherwise clean CPU fallback frame"
         );
         assert_eq!(
             state.controller.layout().mode,
-            viewer_host::PresentationMode::Pov,
+            viewer_host::PresentationMode::Split,
             "a platform callback cannot mutate the controller between ticks"
         );
         assert_eq!(state.controller.world().update_serial(), serial);
@@ -3175,6 +3423,11 @@ mod tests {
             state.controller.layout().mode,
             viewer_host::PresentationMode::Map
         );
+        assert_eq!(
+            state.controller.layout().focused,
+            viewer_host::ViewKind::Map
+        );
+        assert_eq!(state.controller.world().traveler().position, traveler);
         assert!(!state.controller.pov_state().supported);
         assert!(fallback.output.effects.iter().any(|effect| matches!(
             effect,
@@ -3183,6 +3436,23 @@ mod tests {
         )));
         assert_eq!(state.renderer, "cpu-fallback");
         assert_eq!(state.device_losses, 1);
+
+        state.set_renderer_webgpu();
+        let recovered = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(recovered.output.mode, viewer_host::PresentationMode::Map);
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Split,
+        ));
+        let reentered = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(reentered.output.mode, viewer_host::PresentationMode::Split);
+        assert!(
+            !state.pov_chunks.is_empty(),
+            "replacement renderer must receive a complete terrain publication"
+        );
+        assert!(
+            state.pov_organisms.visual_generation() > 0,
+            "replacement renderer must receive a complete organism publication"
+        );
 
         let mut unavailable = small_controller_app();
         unavailable.renderer_unavailable();

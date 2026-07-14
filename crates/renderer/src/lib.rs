@@ -12,6 +12,10 @@
 //! Vulkan/Metal/DX and to WebGPU in the browser) and uses only WGSL shaders.
 
 use core::fmt;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
 pub mod gpumap;
 pub mod pov;
@@ -383,7 +387,7 @@ pub struct FocusDecoration {
 /// Everything recorded and presented through one live surface frame.
 #[derive(Debug, Clone, Copy)]
 pub struct MultiViewFrame<'a> {
-    /// Linear clear color for the presentation surface and POV sky.
+    /// Linear clear color for the presentation surface and POV underlay.
     pub clear: [f64; 4],
     /// Optional Map pane.
     pub map: Option<MapFramePane<'a>>,
@@ -755,6 +759,12 @@ pub struct Renderer {
     /// timeouts, occlusion, and resize races do not increment this diagnostic
     /// counter.
     surface_losses: u32,
+    /// Device-loss callbacks can arrive asynchronously (including from the
+    /// browser WebGPU implementation), so hosts poll this shared counter at
+    /// the start of a logical frame and reduce capability loss before the one
+    /// world update. Unlike surface loss, a lost device cannot be repaired by
+    /// recreating only the swapchain.
+    device_losses: Arc<AtomicU32>,
     debug_map: DebugMapPipeline,
     /// Second blit pipeline for the HUD panel strip in the GPU-map path.
     panel_blit: DebugMapPipeline,
@@ -776,8 +786,20 @@ impl fmt::Debug for Renderer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Renderer")
             .field("config", &self.config)
+            .field("surface_losses", &self.surface_losses)
+            .field("device_losses", &self.device_losses())
             .finish_non_exhaustive()
     }
+}
+
+fn record_device_loss(counter: &AtomicU32) {
+    // A renderer normally observes at most one loss because wgpu installs a
+    // one-shot callback per device. Saturation still keeps this cumulative
+    // diagnostic well-defined if a backend invokes it repeatedly or a test
+    // seeds the counter near its limit.
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |losses| {
+        Some(losses.saturating_add(1))
+    });
 }
 
 fn valid_rgba_upload(rgba: &[u8], width: u32, height: u32) -> bool {
@@ -903,6 +925,12 @@ impl Renderer {
         self.surface_losses
     }
 
+    /// Number of asynchronous GPU device-loss callbacks observed.
+    #[must_use]
+    pub fn device_losses(&self) -> u32 {
+        self.device_losses.load(Ordering::Relaxed)
+    }
+
     /// Bring up the renderer for a window of the given pixel size.
     ///
     /// `source` must return a fresh surface target for the same window each
@@ -960,6 +988,18 @@ impl Renderer {
         device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
             log::error!("wgpu uncaptured error: {error}");
         }));
+        let device_losses = Arc::new(AtomicU32::new(0));
+        // Keep the callback independent of `Renderer`'s lifetime. In
+        // particular, wgpu's browser backend retains a JS `device.lost`
+        // continuation; a weak reference prevents that continuation from
+        // keeping renderer diagnostics alive after an ordinary shutdown.
+        let callback_losses = Arc::downgrade(&device_losses);
+        device.set_device_lost_callback(move |reason, message| {
+            if let Some(losses) = callback_losses.upgrade() {
+                record_device_loss(&losses);
+                log::error!("wgpu device lost ({reason:?}): {message}");
+            }
+        });
 
         let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
@@ -1013,6 +1053,7 @@ impl Renderer {
             config,
             render_format,
             surface_losses: 0,
+            device_losses,
             debug_map,
             panel_blit,
             pov_hud_blit,
@@ -1979,5 +2020,21 @@ mod viewport_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod device_loss_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::record_device_loss;
+
+    #[test]
+    fn asynchronous_loss_diagnostic_saturates_instead_of_wrapping() {
+        let losses = AtomicU32::new(u32::MAX - 1);
+        record_device_loss(&losses);
+        assert_eq!(losses.load(Ordering::Relaxed), u32::MAX);
+        record_device_loss(&losses);
+        assert_eq!(losses.load(Ordering::Relaxed), u32::MAX);
     }
 }

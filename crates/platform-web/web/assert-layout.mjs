@@ -12,6 +12,7 @@ const cases = [
   { width: 700, height: 700, dpr: 1, contract: "stacked-scroll" },
   { width: 900, height: 700, dpr: 2, contract: "bounded-desktop" },
   { width: 901, height: 701, dpr: 1.25, contract: "bounded-desktop" },
+  { width: 901, height: 701, dpr: 1, contract: "bounded-desktop" },
 ];
 
 const agent = (args, capture = false) =>
@@ -276,6 +277,234 @@ try {
       povMount?.telemetry.present === "0.00 ms" &&
       povMount?.telemetry.upload === "0 KiB/f",
     `POV performance telemetry retained stale CPU-map values: ${JSON.stringify(modeMount)}`,
+  );
+
+  const splitAcceptance = evaluate(`(async () => {
+    const app = window.__werApp;
+    const panel = document.querySelector("[data-panel-document]");
+    const stableField = document.querySelector("[data-panel-field]");
+    const frame = (dt = 0) => JSON.parse(app.frame(dt, performance.now() / 1000));
+    const nextPresentedCpuMap = async (minimumSerial) => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { code: "F24" }));
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        if (
+          window.__mapStatus?.update_serial >= minimumSerial &&
+          window.__mapStatus?.path === "cpu" &&
+          window.__mapStatus?.presented === true
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // Headless Chrome has no adapter. This explicit production hook opens
+    // only the typed capability gate; frame status must remain truthful that
+    // no renderer slot was attempted or presented.
+    app.renderer_available();
+    app.action("set-presentation", "split");
+    const split = frame();
+    const layout = split.layout;
+    const map = layout.map_pane;
+    const pov = layout.pov_pane;
+    const mapPoint = [map[0] + map[2] / 2, map[1] + map[3] / 2];
+    const povPoint = [pov[0] + pov[2] / 2, pov[1] + pov[3] / 2];
+    const hitRouting = {
+      map: app.view_at(mapPoint[0], mapPoint[1]),
+      beforeSeam: app.view_at(pov[0] - 0.001, povPoint[1]),
+      seam: app.view_at(pov[0], povPoint[1]),
+      outside: app.view_at(layout.content[0] + layout.content[2], povPoint[1]),
+    };
+
+    app.surface_focus(true);
+    const povPress = app.pointer_button(91, 0, true, povPoint[0], povPoint[1], hitRouting.seam);
+    const povRelease = app.pointer_button(91, 0, false, povPoint[0], povPoint[1], hitRouting.seam);
+    const clicked = frame();
+
+    app.surface_focus(false);
+    const toolbarTabHandled = app.key_event("Tab", true, false, false, false, false, false);
+    const toolbarTab = frame();
+    app.key_event("Tab", false, false, false, false, false, false);
+
+    app.surface_focus(true);
+    const surfaceTabHandled = app.key_event("Tab", true, false, false, false, false, false);
+    const surfaceTab = frame();
+    app.key_event("Tab", false, false, false, false, false, false);
+
+    const cameraBeforeTravel = surfaceTab.pov.camera;
+    const movementHandled = app.key_event("KeyW", true, false, false, false, false, false);
+    const traveled = frame(100);
+    app.key_event("KeyW", false, false, false, false, false, false);
+
+    const cameraBeforeLoss = traveled.pov.camera;
+    app.renderer_lost();
+    const lost = frame();
+
+    // Direct facade frames intentionally do not mutate canvases or DOM. Mark
+    // the production Map path dirty, then let the ordinary RAF adapter draw
+    // and bind the post-loss panel once.
+    app.action("zoom-in");
+    app.action("zoom-out");
+    const cpuPresented = await nextPresentedCpuMap(lost.update_serial + 1);
+    window.__refreshPanelForTest();
+    const characterization = window.__viewerCharacterization();
+    const traveler = [
+      document.querySelector('[data-panel-field="traveler.x"]')?.textContent,
+      document.querySelector('[data-panel-field="traveler.y"]')?.textContent,
+    ];
+
+    return {
+      split,
+      layout,
+      hitRouting,
+      focus: {
+        povPress,
+        povRelease,
+        clicked,
+        toolbarTabHandled,
+        toolbarTab,
+        surfaceTabHandled,
+        surfaceTab,
+      },
+      travel: {
+        movementHandled,
+        cameraBeforeTravel,
+        traveled,
+      },
+      fallback: {
+        cameraBeforeLoss,
+        lost,
+        cpuPresented,
+        mapStatus: window.__mapStatus,
+        rendererStatus: window.__rendererFrameStatus,
+        characterization,
+        panelMode: document.querySelector('[data-panel-field="view.mode"]')?.textContent,
+        panelFocus: document.querySelector('[data-panel-field="view.focus"]')?.textContent,
+        traveler,
+        warning: document.querySelector('[data-panel-field="warnings.renderer-device-loss"]')?.textContent,
+        panelStable:
+          panel === document.querySelector("[data-panel-document]") &&
+          stableField === document.querySelector("[data-panel-field]") &&
+          panel.isConnected &&
+          !panel.hidden,
+      },
+    };
+  })()`);
+
+  const { split, layout, hitRouting, focus, travel, fallback } = splitAcceptance;
+  const [contentX, contentY, contentWidth, contentHeight] = layout.content;
+  const [mapX, mapY, mapWidth, mapHeight] = layout.map_pane;
+  const [povX, povY, povWidth, povHeight] = layout.pov_pane;
+  const rectIsContained = ([x, y, width, height]) =>
+    x >= contentX &&
+    y >= contentY &&
+    x + width <= contentX + contentWidth &&
+    y + height <= contentY + contentHeight;
+  assert(
+    split.presentation.view.mode === "split" &&
+      split.presentation.view.focused === "map" &&
+      split.map.active === true &&
+      split.pov.active === true,
+    `Split did not expose both panes from one shared state: ${JSON.stringify(splitAcceptance)}`,
+  );
+  assert(
+    closeEnough(layout.split_ratio, 0.5, 1e-9) &&
+      mapX === contentX &&
+      mapY === contentY &&
+      mapHeight === contentHeight &&
+      povX === mapX + mapWidth &&
+      povY === contentY &&
+      povHeight === contentHeight &&
+      mapWidth + povWidth === contentWidth &&
+      mapWidth === Math.round(contentWidth * 0.5) &&
+      rectIsContained(layout.map_pane) &&
+      rectIsContained(layout.pov_pane) &&
+      rectIsContained(layout.map_content) &&
+      layout.map_content[2] === layout.map_content[3],
+    `Split geometry is not an exact contained 50/50 partition: ${JSON.stringify(layout)}`,
+  );
+  assert(
+    hitRouting.map === "map" &&
+      hitRouting.beforeSeam === "map" &&
+      hitRouting.seam === "pov" &&
+      hitRouting.outside === undefined,
+    `shared half-open Split hit routing failed: ${JSON.stringify(hitRouting)}`,
+  );
+  assert(
+    split.renderer_frame.attempted === false &&
+      split.renderer_frame.presented === false &&
+      split.map.path === "gpu-cpu" &&
+      split.map.drawn === false,
+    `headless Split renderer status was not truthful: ${JSON.stringify(split.renderer_frame)}`,
+  );
+
+  assert(
+    focus.povPress &&
+      focus.povRelease &&
+      focus.clicked.presentation.view.focused === "pov" &&
+      focus.clicked.layout.focused === "pov" &&
+      JSON.stringify(focus.clicked.layout.focus_border) ===
+        JSON.stringify(focus.clicked.layout.pov_pane),
+    `POV pane click did not focus before scoped input: ${JSON.stringify(focus)}`,
+  );
+  assert(
+    focus.clicked.update_serial === split.update_serial + 1 &&
+      focus.toolbarTabHandled === false &&
+      focus.toolbarTab.update_serial === focus.clicked.update_serial + 1 &&
+      focus.toolbarTab.presentation.view.focused === "pov" &&
+      focus.surfaceTabHandled === true &&
+      focus.surfaceTab.update_serial === focus.toolbarTab.update_serial + 1 &&
+      focus.surfaceTab.presentation.view.focused === "map" &&
+      JSON.stringify(focus.surfaceTab.layout.focus_border) ===
+        JSON.stringify(focus.surfaceTab.layout.map_pane),
+    `Tab did not respect surface focus or swap only Split focus: ${JSON.stringify(focus)}`,
+  );
+
+  assert(
+    travel.movementHandled === true &&
+      travel.traveled.update_serial === focus.surfaceTab.update_serial + 1 &&
+      closeEnough(travel.traveled.travel, 50, 1e-6) &&
+      closeEnough(
+        travel.traveled.pov.camera[1] - travel.cameraBeforeTravel[1],
+        travel.traveled.travel,
+        1e-6,
+      ) &&
+      travel.traveled.presentation.view.mode === "split" &&
+      travel.traveled.map.active === true &&
+      travel.traveled.pov.active === true,
+    `one Split frame did not produce one serial/travel/camera update: ${JSON.stringify(travel)}`,
+  );
+
+  assert(
+    fallback.lost.update_serial === travel.traveled.update_serial + 1 &&
+      fallback.lost.travel === 0 &&
+      fallback.lost.presentation.view.mode === "map" &&
+      fallback.lost.presentation.view.focused === "map" &&
+      fallback.lost.presentation.view.pov_supported === false &&
+      fallback.lost.map.active === true &&
+      fallback.lost.map.path === "cpu" &&
+      fallback.lost.pov.active === false &&
+      fallback.lost.renderer_frame.attempted === false &&
+      fallback.lost.renderer_frame.presented === false &&
+      JSON.stringify(fallback.lost.pov.camera) === JSON.stringify(fallback.cameraBeforeLoss),
+    `renderer loss did not atomically preserve world and reduce to Map focus: ${JSON.stringify(fallback)}`,
+  );
+  assert(
+    fallback.cpuPresented &&
+      fallback.mapStatus.path === "cpu" &&
+      fallback.mapStatus.presented === true &&
+      fallback.rendererStatus.attempted === false &&
+      fallback.rendererStatus.presented === false &&
+      fallback.characterization.renderer.viewMode === "map" &&
+      fallback.characterization.renderer.focusedView === "map" &&
+      fallback.panelMode === "map" &&
+      fallback.panelFocus === "map" &&
+      fallback.panelStable &&
+      closeEnough(Number(fallback.traveler[0]), fallback.cameraBeforeLoss[0], 0.001) &&
+      closeEnough(Number(fallback.traveler[1]), fallback.cameraBeforeLoss[1], 0.001) &&
+      fallback.warning?.includes("device lost"),
+    `post-loss CPU Map/panel state did not survive: ${JSON.stringify(fallback)}`,
   );
 } finally {
   try {

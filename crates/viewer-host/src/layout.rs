@@ -266,6 +266,30 @@ impl ResolvedViewLayout {
             ViewKind::Pov => self.pov_focus_border,
         }
     }
+
+    /// Visible pane containing a continuous physical-surface point.
+    ///
+    /// The full Map pane participates, including letterbox pixels outside
+    /// [`Self::map_content`], because a pane press changes keyboard focus even
+    /// when it does not select a world cell. Panes are half-open, so their
+    /// shared Split seam belongs deterministically to the POV pane. The
+    /// optional divider hit area remains separate for a future resize gesture.
+    #[must_use]
+    pub fn hit_view(self, point: [f64; 2]) -> Option<ViewKind> {
+        if self
+            .map_pane
+            .is_some_and(|pane| pane.contains_f64(point[0], point[1]))
+        {
+            Some(ViewKind::Map)
+        } else if self
+            .pov_pane
+            .is_some_and(|pane| pane.contains_f64(point[0], point[1]))
+        {
+            Some(ViewKind::Pov)
+        } else {
+            None
+        }
+    }
 }
 
 /// Resolve visibility, focus, fitted Map content, POV aspect, and split hit
@@ -770,6 +794,90 @@ mod tests {
             assert!((1..content.width).contains(&map.width));
             assert_eq!(map.width + pov.width, content.width);
         }
+    }
+
+    #[test]
+    fn pane_hit_routing_uses_half_open_seams_and_full_letterbox_area() {
+        let content = PixelRect::new(13, 17, 101, 55);
+        let resolved = resolve_view_layout(
+            content,
+            ViewLayout {
+                mode: PresentationMode::Split,
+                focused: ViewKind::Map,
+                split_ratio: 0.5,
+            },
+        );
+        let map = resolved.map_pane.unwrap();
+        let pov = resolved.pov_pane.unwrap();
+        let map_content = resolved.map_content.unwrap();
+
+        assert_eq!(map.width, 51, "odd widths round once before partitioning");
+        assert_eq!(pov.x, map.right());
+        assert_eq!(resolved.hit_view([13.0, 17.0]), Some(ViewKind::Map));
+        assert_eq!(
+            resolved.hit_view([f64::from(map.right()) - 0.001, 20.0]),
+            Some(ViewKind::Map)
+        );
+        assert_eq!(
+            resolved.hit_view([f64::from(map.right()), 20.0]),
+            Some(ViewKind::Pov),
+            "the exact half-open seam belongs to POV"
+        );
+        assert_eq!(
+            resolved.hit_view([f64::from(content.right()) - 0.001, 20.0]),
+            Some(ViewKind::Pov)
+        );
+
+        assert!(map.y < map_content.y, "fixture must have Map letterbox");
+        assert_eq!(
+            resolved.hit_view([f64::from(map.x) + 0.5, f64::from(map.y) + 0.5]),
+            Some(ViewKind::Map),
+            "letterbox still focuses the Map pane"
+        );
+        for outside in [
+            [f64::from(content.x) - 0.001, 20.0],
+            [f64::from(content.right()), 20.0],
+            [20.0, f64::from(content.bottom())],
+            [f64::NAN, 20.0],
+            [20.0, f64::INFINITY],
+        ] {
+            assert_eq!(
+                resolved.hit_view(outside),
+                None,
+                "outside point {outside:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_hit_routing_respects_single_views_and_degenerate_odd_splits() {
+        let content = PixelRect::new(7, 11, 3, 2);
+        for (mode, expected) in [
+            (PresentationMode::Map, ViewKind::Map),
+            (PresentationMode::Pov, ViewKind::Pov),
+        ] {
+            let resolved = resolve_view_layout(
+                content,
+                ViewLayout {
+                    mode,
+                    focused: expected,
+                    split_ratio: 0.5,
+                },
+            );
+            assert_eq!(resolved.hit_view([7.5, 11.5]), Some(expected));
+            assert_eq!(resolved.hit_view([10.0, 11.5]), None);
+        }
+
+        let split = resolve_view_layout(
+            PixelRect::new(7, 11, 1, 2),
+            ViewLayout {
+                mode: PresentationMode::Split,
+                focused: ViewKind::Pov,
+                split_ratio: 0.1,
+            },
+        );
+        assert_eq!(split.map_pane.unwrap().width, 0);
+        assert_eq!(split.hit_view([7.0, 11.0]), Some(ViewKind::Pov));
     }
 
     #[test]

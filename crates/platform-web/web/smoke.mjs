@@ -127,8 +127,15 @@ for (const generated of ["map-channels", "map-overlays"]) {
 if (app.includes("MAP_CHANNELS") || app.includes("paint_region") || app.includes("compose_map")) {
   throw new Error("browser assets contain a second map implementation or channel registry");
 }
-if (!app.includes("gpu_submitted") || !app.includes("presented: mapPresented")) {
-  throw new Error("browser map status does not distinguish GPU submission from presentation");
+if (!app.includes("frame.map.drawn") || !app.includes("presented: mapPresented")) {
+  throw new Error("browser map status does not distinguish unified drawing from presentation");
+}
+if (
+  !app.includes("app.view_at") ||
+  !app.includes("capturedPointerViews") ||
+  !app.includes("frame.renderer_frame.presented")
+) {
+  throw new Error("browser input/status does not use shared Split hit routing and unified frames");
 }
 if (!app.includes("renderer_available")) {
   throw new Error("app.js does not report WebGPU renderer availability");

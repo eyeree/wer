@@ -23,6 +23,11 @@ pub(crate) struct WinitInputAdapter {
     modifiers: Modifiers,
     cursor: Option<[f64; 2]>,
     surface_focused: bool,
+    /// Native has one mouse pointer. Once a primary press starts in POV,
+    /// keep transporting that gesture as POV until release/cancel even if
+    /// the cursor crosses the Split seam. The shared mapper still owns the
+    /// actual drag/look gate.
+    primary_pov_drag: bool,
 }
 
 impl Default for WinitInputAdapter {
@@ -31,6 +36,7 @@ impl Default for WinitInputAdapter {
             modifiers: Modifiers::default(),
             cursor: None,
             surface_focused: true,
+            primary_pov_drag: false,
         }
     }
 }
@@ -68,37 +74,71 @@ impl WinitInputAdapter {
     pub(crate) fn cursor_moved(
         &mut self,
         position: PhysicalPosition<f64>,
-        view: ViewKind,
+        hit_view: Option<ViewKind>,
     ) -> NormalizedInputEvent {
         let position = [position.x, position.y];
         self.cursor = Some(position);
-        NormalizedInputEvent::PointerMoved {
-            pointer: MOUSE_POINTER_ID,
-            position,
-            view,
+        if let Some(view) = self.primary_pov_drag.then_some(ViewKind::Pov).or(hit_view) {
+            NormalizedInputEvent::PointerMoved {
+                pointer: MOUSE_POINTER_ID,
+                position,
+                view,
+            }
+        } else {
+            NormalizedInputEvent::PointerCancelled {
+                pointer: MOUSE_POINTER_ID,
+            }
         }
     }
 
     pub(crate) fn cursor_left(&mut self) -> NormalizedInputEvent {
         self.cursor = None;
+        self.primary_pov_drag = false;
         NormalizedInputEvent::PointerCancelled {
             pointer: MOUSE_POINTER_ID,
         }
     }
 
+    /// Cancel adapter-only pointer capture after the renderer loses every
+    /// presentation pane. The shared mapper clears the semantic drag and held
+    /// inputs separately; this keeps later Map motion from being transported
+    /// through the old POV press view while waiting for a physical release.
+    pub(crate) fn cancel_pointer_gesture(&mut self) {
+        self.primary_pov_drag = false;
+    }
+
     pub(crate) fn mouse_input(
-        &self,
+        &mut self,
         state: ElementState,
         button: MouseButton,
-        view: ViewKind,
+        hit_view: Option<ViewKind>,
     ) -> Option<NormalizedInputEvent> {
+        let position = self.cursor?;
+        let button = pointer_button(button);
+        let phase = button_phase(state);
+        let view = match (button, phase) {
+            (PointerButton::Primary, ButtonPhase::Pressed) => {
+                let view = hit_view?;
+                self.primary_pov_drag = view == ViewKind::Pov;
+                view
+            }
+            (PointerButton::Primary, ButtonPhase::Released) => {
+                // The captured view owns moves, but release should leave the
+                // pointer in the pane physically under it. Falling back to
+                // POV only keeps an outside-pane release able to end a drag.
+                let view = hit_view.or(self.primary_pov_drag.then_some(ViewKind::Pov))?;
+                self.primary_pov_drag = false;
+                view
+            }
+            (_, _) => hit_view?,
+        };
         Some(NormalizedInputEvent::PointerButton {
             pointer: MOUSE_POINTER_ID,
-            button: pointer_button(button),
-            phase: button_phase(state),
+            button,
+            phase,
             // Match the previous native gesture: a press received before any
             // cursor position does not arm a drag from a fabricated origin.
-            position: self.cursor?,
+            position,
             view,
         })
     }
@@ -116,6 +156,7 @@ impl WinitInputAdapter {
         if !focused {
             self.modifiers = Modifiers::default();
             self.cursor = None;
+            self.primary_pov_drag = false;
         }
         NormalizedInputEvent::FocusChanged { focused }
     }
@@ -386,7 +427,7 @@ mod tests {
                 view: ViewKind::Pov
             }
         );
-        let moved = adapter.cursor_moved(PhysicalPosition::new(12.0, 9.0), ViewKind::Pov);
+        let moved = adapter.cursor_moved(PhysicalPosition::new(12.0, 9.0), Some(ViewKind::Pov));
         assert_eq!(
             moved,
             NormalizedInputEvent::PointerMoved {
@@ -396,7 +437,11 @@ mod tests {
             }
         );
         assert_eq!(
-            adapter.mouse_input(ElementState::Pressed, MouseButton::Left, ViewKind::Pov),
+            adapter.mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                Some(ViewKind::Pov)
+            ),
             Some(NormalizedInputEvent::PointerButton {
                 pointer: MOUSE_POINTER_ID,
                 button: PointerButton::Primary,
@@ -412,6 +457,126 @@ mod tests {
             NormalizedInputEvent::PointerCancelled {
                 pointer: MOUSE_POINTER_ID
             }
+        );
+    }
+
+    #[test]
+    fn primary_pov_drag_keeps_its_press_view_until_release() {
+        let mut adapter = WinitInputAdapter::default();
+        let _ = adapter.cursor_moved(PhysicalPosition::new(20.0, 30.0), Some(ViewKind::Pov));
+        let pressed = adapter
+            .mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                Some(ViewKind::Pov),
+            )
+            .unwrap();
+        assert!(matches!(
+            pressed,
+            NormalizedInputEvent::PointerButton {
+                view: ViewKind::Pov,
+                phase: ButtonPhase::Pressed,
+                ..
+            }
+        ));
+
+        let crossed = adapter.cursor_moved(PhysicalPosition::new(220.0, 30.0), Some(ViewKind::Map));
+        assert!(matches!(
+            crossed,
+            NormalizedInputEvent::PointerMoved {
+                view: ViewKind::Pov,
+                ..
+            }
+        ));
+        let released = adapter
+            .mouse_input(ElementState::Released, MouseButton::Left, None)
+            .unwrap();
+        assert!(matches!(
+            released,
+            NormalizedInputEvent::PointerButton {
+                view: ViewKind::Pov,
+                phase: ButtonPhase::Released,
+                ..
+            }
+        ));
+        let after = adapter.cursor_moved(PhysicalPosition::new(220.0, 30.0), None);
+        assert!(matches!(
+            after,
+            NormalizedInputEvent::PointerCancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn primary_pov_release_prefers_the_current_hit_pane() {
+        let mut adapter = WinitInputAdapter::default();
+        let _ = adapter.cursor_moved(PhysicalPosition::new(20.0, 30.0), Some(ViewKind::Pov));
+        let _ = adapter.mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            Some(ViewKind::Pov),
+        );
+        let _ = adapter.cursor_moved(PhysicalPosition::new(220.0, 30.0), Some(ViewKind::Map));
+        let released = adapter
+            .mouse_input(
+                ElementState::Released,
+                MouseButton::Left,
+                Some(ViewKind::Map),
+            )
+            .unwrap();
+        assert!(matches!(
+            released,
+            NormalizedInputEvent::PointerButton {
+                view: ViewKind::Map,
+                phase: ButtonPhase::Released,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn split_pov_press_focuses_before_followup_input_and_panel_press_is_inert() {
+        let mut adapter = WinitInputAdapter::default();
+        let mut mapper = InputMapper::default();
+        let map_focus = InputContext {
+            mode: PresentationMode::Split,
+            focused: ViewKind::Map,
+            surface_focused: true,
+        };
+        let moved = adapter.cursor_moved(PhysicalPosition::new(20.0, 30.0), Some(ViewKind::Pov));
+        assert!(mapper.handle_event(moved, map_focus));
+        let pressed = adapter
+            .mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                Some(ViewKind::Pov),
+            )
+            .unwrap();
+        assert!(mapper.handle_event(pressed, map_focus));
+        assert_eq!(
+            mapper.drain_actions().collect::<Vec<_>>(),
+            vec![ViewerAction::FocusView(ViewKind::Pov)]
+        );
+        mapper.set_context(InputContext {
+            focused: ViewKind::Pov,
+            ..map_focus
+        });
+        assert!(mapper.take_frame().primary_drag);
+
+        let released = adapter
+            .mouse_input(ElementState::Released, MouseButton::Left, None)
+            .unwrap();
+        assert!(mapper.handle_event(
+            released,
+            InputContext {
+                focused: ViewKind::Pov,
+                ..map_focus
+            }
+        ));
+        let _ = adapter.cursor_moved(PhysicalPosition::new(900.0, 30.0), None);
+        assert_eq!(
+            adapter.mouse_input(ElementState::Pressed, MouseButton::Left, None),
+            None,
+            "the information panel is not a focusable view pane"
         );
     }
 

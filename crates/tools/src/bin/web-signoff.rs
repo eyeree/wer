@@ -7,8 +7,11 @@
 //! to additionally launch the built artifact and capture the Milestone 0
 //! viewport characterization with `agent-browser`. The fixed destination keeps
 //! the artifact exercised by the smoke gate identical to the file just written.
-//! Pass `--assert-layout` to run the current bounded-layout/DPR acceptance
-//! matrix without changing that immutable pre-alignment evidence.
+//! Pass `--assert-layout` to run the current bounded-layout/DPR matrix plus
+//! functional Split geometry, focus routing, one-tick status, unified-frame,
+//! and renderer-loss fallback gates without changing that immutable
+//! pre-alignment evidence. The headless route asserts state and explicit
+//! capability/loss hooks; it never treats unavailable GPU pixels as evidence.
 //! The default sign-off remains browserless so CI does not require that local
 //! debugging tool.
 
