@@ -22,6 +22,7 @@ let wasmMod;
 // Exact physical fitted rectangle returned by viewer_host::layout. JS uses it
 // only to blit/characterize; Rust owns inverse projection and picking.
 let mapViewport;
+let sharedLayout;
 let mapScratch;
 let mapScratchContext;
 let mapImageData;
@@ -142,6 +143,7 @@ const drawCpuMap = (header, pixels) => {
 };
 
 const applySharedLayout = (layout) => {
+  sharedLayout = layout ?? undefined;
   const rect = layout?.map_content;
   if (!rect) {
     mapViewport = undefined;
@@ -237,6 +239,7 @@ const resizeViewerSurface = () => {
     if (canvas.height !== height) canvas.height = height;
   }
   mapViewport = undefined;
+  sharedLayout = undefined;
   surfaceResizeDirty = true;
   const app = window.__werApp;
   if (app) applySharedLayout(JSON.parse(app.resize_surface(width, height)));
@@ -401,56 +404,52 @@ const dispatchAction = (id, value = "") => {
 // The browser adapter forwards primitive DOM facts only. Binding selection,
 // held state, repeat suppression, wheel accumulation, and drag-look gating all
 // live in viewer_host::InputMapper on the wasm side.
-let povActive = false;
-let povEntering = false;
-let povRendererReady = false;
-let povFailures = 0;
+let gpuStageActive = false;
+let rendererEntering = false;
+let viewerRendererReady = false;
+let rendererFailures = 0;
 let viewerFrameHandle = 0;
 let lastViewerTime = 0;
 
-const povCanvas = () => document.getElementById("pov-canvas");
+const gpuStage = () => document.getElementById("pov-canvas");
 
-const initializePovRenderer = async () => {
-  if (povRendererReady || povEntering || !wasmMod) return;
-  povEntering = true;
+const initializeViewerRenderer = async () => {
+  if (viewerRendererReady || rendererEntering || !wasmMod) return;
+  rendererEntering = true;
   try {
-    const canvas = povCanvas();
+    const canvas = gpuStage();
     await wasmMod.viewer_renderer_init(canvas, canvas.width, canvas.height);
+    // ResizeObserver may have updated the backing while async adapter/device
+    // creation was in flight. Replay the current dimensions after the slot is
+    // installed so renderer resources and the already-updated shared layout
+    // cannot start their first frame with different physical sizes.
+    const app = window.__werApp;
+    if (app) applySharedLayout(JSON.parse(app.resize_surface(canvas.width, canvas.height)));
   } catch (error) {
-    povEntering = false;
-    appendDiagnostic(`pov init failed: ${String(error)}`);
+    rendererEntering = false;
+    appendDiagnostic(`viewer renderer init failed: ${String(error)}`);
     // Initialization failure is distinct from losing a device that had
     // rendered successfully; both return to the CPU map without losing state.
     window.__werApp?.renderer_unavailable();
     scheduleFrame();
     return;
   }
-  povEntering = false;
-  povRendererReady = true;
+  rendererEntering = false;
+  viewerRendererReady = true;
   // Only successful adapter/device initialization opens the shared POV gate.
   window.__werApp?.renderer_available();
-  appendDiagnostic("pov: shared WebGPU renderer ready");
+  appendDiagnostic("viewer: shared WebGPU renderer ready");
   scheduleFrame();
 };
 
-const enterPov = () => {
-  if (povActive || !povRendererReady) return;
-  povActive = true;
-  povFailures = 0;
-  document.getElementById("world-canvas").hidden = true;
-  povCanvas().hidden = false;
-  povCanvas().focus();
+const setGpuStageActive = (active) => {
+  if (gpuStageActive === active) return;
+  gpuStageActive = active;
+  rendererFailures = 0;
   lastViewerTime = 0;
   perf.frames = 0;
   perf.lastRoll = 0;
-  appendDiagnostic("pov: shared 3D renderer active (hold primary button to look)");
-};
-
-const exitPov = () => {
-  if (!povActive) return;
-  povActive = false;
-  povCanvas().hidden = true;
-  document.getElementById("world-canvas").hidden = false;
+  appendDiagnostic(`viewer: ${active ? "shared GPU stage active" : "CPU Map stage active"}`);
 };
 
 const handleEffects = () => {
@@ -477,15 +476,16 @@ const viewerFrame = (now) => {
   const frame = JSON.parse(app.frame(dt, now / 1000));
   const presentation = frame.presentation;
   applySharedLayout(frame.layout);
-  window.__povStatus = frame.pov;
-  if (frame.pov.active) {
-    if (frame.pov.rendered) {
-      povFailures = 0;
+  window.__rendererFrameStatus = frame.renderer_frame;
+  window.__povStatus = { ...frame.pov, surface_presented: frame.renderer_frame.presented };
+  if (frame.renderer_frame.attempted) {
+    if (frame.renderer_frame.presented) {
+      rendererFailures = 0;
     } else {
-      povFailures += 1;
-      if (povFailures > 30) {
-        appendDiagnostic("pov: renderer failing; returning to map mode");
-        povRendererReady = false;
+      rendererFailures += 1;
+      if (rendererFailures > 30) {
+        appendDiagnostic("viewer: renderer failing; returning to CPU Map mode");
+        viewerRendererReady = false;
         app.renderer_lost();
       }
     }
@@ -504,8 +504,8 @@ const viewerFrame = (now) => {
   const redrawsResize = surfaceResizeDirty;
   if (frame.map.active && frame.map.path === "cpu") {
     mapPresented = frame.map_dirty || surfaceResizeDirty ? renderMap() : mapViewport !== undefined;
-  } else if (frame.map.active && frame.map.path === "gpu-atlas") {
-    mapPresented = frame.map.gpu_submitted;
+  } else if (frame.map.active) {
+    mapPresented = frame.map.drawn;
   }
   if (mapPresented) {
     if (redrawsResize) resizeRedrawGeneration = surfaceResizeGeneration;
@@ -519,7 +519,7 @@ const viewerFrame = (now) => {
     resize_generation: surfaceResizeGeneration,
     resize_redraw_generation: resizeRedrawGeneration,
   };
-  if (frame.map.active && frame.map.path === "gpu-atlas") {
+  if (frame.map.active && frame.map.path !== "cpu") {
     perf.uploadKib = frame.map.upload_bytes / 1024;
   }
   handleEffects();
@@ -540,16 +540,37 @@ const scheduleFrame = () => {
 // Keep the canvas swap and frame loop in lockstep with the facade's view
 // mode, whatever changed it (button, Tab key, device loss).
 const syncViewMode = (presentation, mapPath = "cpu") => {
-  const wantPov = presentation.view.mode === "pov";
-  if (wantPov && !povActive) {
-    enterPov();
-  } else if (!wantPov && povActive) {
-    exitPov();
-  }
-  if (!wantPov) {
-    const gpuMap = mapPath === "gpu-atlas";
-    document.getElementById("world-canvas").hidden = gpuMap;
-    povCanvas().hidden = !gpuMap;
+  const mode = presentation.view.mode;
+  const focused = presentation.view.focused;
+  const cpuCanvas = document.getElementById("world-canvas");
+  const stage = gpuStage();
+  const surfaceHadFocus = document.activeElement === cpuCanvas || document.activeElement === stage;
+  const useGpuStage =
+    mode === "pov" || mode === "split" || (mode === "map" && mapPath === "gpu-atlas");
+
+  cpuCanvas.hidden = useGpuStage;
+  stage.hidden = !useGpuStage;
+  setGpuStageActive(useGpuStage);
+
+  const focusedLabel = focused === "pov" ? "POV" : "Map";
+  const host = document.querySelector(".canvas-host");
+  host.dataset.presentationMode = mode;
+  host.dataset.focusedView = focused;
+  stage.dataset.presentationMode = mode;
+  stage.dataset.focusedView = focused;
+  stage.setAttribute(
+    "aria-label",
+    mode === "split"
+      ? `Split world view; ${focusedLabel} pane focused`
+      : mode === "pov"
+        ? "Point-of-view world view"
+        : "GPU world map",
+  );
+  cpuCanvas.setAttribute("aria-label", "World map; Map pane focused");
+
+  const visibleSurface = useGpuStage ? stage : cpuCanvas;
+  if (surfaceHadFocus && document.activeElement !== visibleSurface) {
+    visibleSurface.focus({ preventScroll: true });
   }
 };
 
@@ -799,7 +820,10 @@ document.querySelector(".toolbar")?.addEventListener("change", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
-  if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
+  if (
+    event.target instanceof Element &&
+    event.target.closest("button,input,select,textarea,[contenteditable='true']")
+  ) {
     return;
   }
   const app = window.__werApp;
@@ -849,12 +873,10 @@ const canvasPoint = (canvas, event) => {
 };
 
 const expectedCaptureLosses = new Set();
+const capturedPointerViews = new Map();
 
 for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
-  const routedView = () =>
-    canvas === povCanvas() && lastPresentation?.view.mode !== "pov"
-      ? "map"
-      : canvas.dataset.viewKind;
+  const hitView = (app, x, y) => app.view_at(x, y) ?? null;
   canvas.addEventListener("focus", () => window.__werApp?.surface_focus(true));
   canvas.addEventListener("blur", () => window.__werApp?.surface_focus(false));
   canvas.addEventListener("pointerdown", (event) => {
@@ -863,8 +885,13 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     expectedCaptureLosses.delete(event.pointerId);
     canvas.focus();
     const [x, y] = canvasPoint(canvas, event);
-    const handled = app.pointer_button(event.pointerId, event.button, true, x, y, routedView());
-    if (event.button === 0) canvas.setPointerCapture(event.pointerId);
+    const view = hitView(app, x, y);
+    if (!view) return;
+    const handled = app.pointer_button(event.pointerId, event.button, true, x, y, view);
+    if (event.button === 0 && handled) {
+      capturedPointerViews.set(event.pointerId, view);
+      canvas.setPointerCapture(event.pointerId);
+    }
     if (handled) event.preventDefault();
     scheduleFrame();
   });
@@ -872,13 +899,21 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     const app = window.__werApp;
     if (!app) return;
     const [x, y] = canvasPoint(canvas, event);
-    if (app.pointer_move(event.pointerId, x, y, routedView())) scheduleFrame();
+    const view = capturedPointerViews.get(event.pointerId) ?? hitView(app, x, y);
+    if (view && app.pointer_move(event.pointerId, x, y, view)) scheduleFrame();
   });
   canvas.addEventListener("pointerup", (event) => {
     const app = window.__werApp;
     if (!app) return;
     const [x, y] = canvasPoint(canvas, event);
-    const handled = app.pointer_button(event.pointerId, event.button, false, x, y, routedView());
+    // Captured POV owns motion across the seam, but release records the pane
+    // physically under the pointer. The captured view remains the fallback
+    // outside both panes so drag state always clears.
+    const view = hitView(app, x, y) ?? capturedPointerViews.get(event.pointerId);
+    const handled = view
+      ? app.pointer_button(event.pointerId, event.button, false, x, y, view)
+      : false;
+    capturedPointerViews.delete(event.pointerId);
     if (canvas.hasPointerCapture(event.pointerId)) {
       expectedCaptureLosses.add(event.pointerId);
       canvas.releasePointerCapture(event.pointerId);
@@ -887,6 +922,7 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     scheduleFrame();
   });
   canvas.addEventListener("pointercancel", (event) => {
+    capturedPointerViews.delete(event.pointerId);
     if (canvas.hasPointerCapture(event.pointerId)) {
       expectedCaptureLosses.add(event.pointerId);
       canvas.releasePointerCapture(event.pointerId);
@@ -900,6 +936,7 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     scheduleFrame();
   });
   canvas.addEventListener("lostpointercapture", (event) => {
+    capturedPointerViews.delete(event.pointerId);
     if (expectedCaptureLosses.delete(event.pointerId)) return;
     window.__werApp?.pointer_cancel(event.pointerId);
     scheduleFrame();
@@ -914,7 +951,9 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
         event.deltaMode === WheelEvent.DOM_DELTA_PAGE
           ? -event.deltaY * canvas.height
           : -event.deltaY;
-      if (app.wheel(delta, lines, routedView())) event.preventDefault();
+      const [x, y] = canvasPoint(canvas, event);
+      const view = hitView(app, x, y);
+      if (view && app.wheel(delta, lines, view)) event.preventDefault();
       scheduleFrame();
     },
     { passive: false },
@@ -1037,6 +1076,7 @@ window.__viewerCharacterization = () => {
       map: canvas("#world-canvas"),
       pov: canvas("#pov-canvas"),
       observedBacking: surfaceBacking,
+      sharedLayout: sharedLayout ?? null,
       mapViewport:
         mapViewport === undefined
           ? null
@@ -1053,10 +1093,12 @@ window.__viewerCharacterization = () => {
           compose: lastPresentation.map.backend,
           refinement: lastPresentation.map.refinement,
           viewMode: lastPresentation.view.mode,
+          focusedView: lastPresentation.view.focused,
           povSupported: lastPresentation.view.pov_supported,
           domStatus:
             document.querySelector('[data-status-field="webgpu-status"]')?.textContent ?? null,
           povStatus: window.__povStatus ?? null,
+          frameStatus: window.__rendererFrameStatus ?? null,
         }
       : null,
   };
@@ -1068,7 +1110,7 @@ const webgpuAvailable = probeWebGpu();
 initWorkerProbe();
 await initWasm();
 if (webgpuAvailable) {
-  await initializePovRenderer();
+  await initializeViewerRenderer();
 }
 await initStorage();
 initBenchmark();

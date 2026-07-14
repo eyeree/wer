@@ -606,7 +606,7 @@ pub const BINDING_DESCRIPTORS: &[BindingDescriptor] = &[
     ),
     key_binding!(
         "map-key-o",
-        Map,
+        Global,
         KeyO,
         Any,
         ViewerAction::SaveSession,
@@ -1124,7 +1124,7 @@ impl InputMapper {
         if !presentation_contains(self.context.mode, view) {
             return false;
         }
-        self.pointer_positions[view_index(view)] = Some((pointer, position));
+        self.remember_pointer(pointer, position, view);
         let Some(drag) = self.drag.as_mut() else {
             return true;
         };
@@ -1148,7 +1148,7 @@ impl InputMapper {
         if button != PointerButton::Primary {
             return false;
         }
-        self.pointer_positions[view_index(view)] = Some((pointer, position));
+        self.remember_pointer(pointer, position, view);
         match phase {
             ButtonPhase::Pressed => {
                 if self.context.mode == PresentationMode::Split && self.context.focused != view {
@@ -1168,6 +1168,22 @@ impl InputMapper {
             }
         }
         true
+    }
+
+    /// Keep one physical pointer in at most one pane. Without clearing its
+    /// previous slot, crossing the Split seam leaves a stale Map or POV hover
+    /// alive even though both adapters correctly route the new position.
+    /// Different pointer identities may still occupy the two panes at once.
+    fn remember_pointer(&mut self, pointer: u64, position: [f64; 2], view: ViewKind) {
+        let active = view_index(view);
+        for (index, stored) in self.pointer_positions.iter_mut().enumerate() {
+            if index != active
+                && stored.is_some_and(|(stored_pointer, _)| stored_pointer == pointer)
+            {
+                *stored = None;
+            }
+        }
+        self.pointer_positions[active] = Some((pointer, position));
     }
 
     fn handle_wheel(&mut self, delta: WheelDelta, view: ViewKind) -> bool {
@@ -1339,28 +1355,49 @@ mod tests {
     }
 
     #[test]
-    fn context_collisions_resolve_to_one_action() {
-        let mut mapper = InputMapper::default();
-        mapper.handle_event(
-            key(PhysicalKey::KeyV, ButtonPhase::Pressed, false, false),
-            context(PresentationMode::Map, ViewKind::Map),
-        );
-        assert_eq!(
-            mapper.drain_actions().collect::<Vec<_>>(),
-            vec![ViewerAction::CycleMapChannel]
-        );
-        mapper.handle_event(
-            key(PhysicalKey::KeyV, ButtonPhase::Released, false, false),
-            context(PresentationMode::Map, ViewKind::Map),
-        );
-        mapper.handle_event(
-            key(PhysicalKey::KeyV, ButtonPhase::Pressed, false, false),
-            context(PresentationMode::Pov, ViewKind::Pov),
-        );
-        assert_eq!(
-            mapper.drain_actions().collect::<Vec<_>>(),
-            vec![ViewerAction::TogglePovWater]
-        );
+    fn context_collisions_follow_the_focused_split_pane() {
+        let collisions = [
+            (
+                PhysicalKey::KeyF,
+                ViewerAction::ToggleOverlay(MapOverlay::Discovered),
+                ViewerAction::ToggleWalk,
+            ),
+            (
+                PhysicalKey::KeyB,
+                ViewerAction::RecordLastAnchor,
+                ViewerAction::TogglePovShadowAo,
+            ),
+            (
+                PhysicalKey::KeyN,
+                ViewerAction::ToggleOverlay(MapOverlay::Rings),
+                ViewerAction::TogglePovDetailNormals,
+            ),
+            (
+                PhysicalKey::KeyV,
+                ViewerAction::CycleMapChannel,
+                ViewerAction::TogglePovWater,
+            ),
+        ];
+        let contexts = [
+            (context(PresentationMode::Map, ViewKind::Map), false),
+            (context(PresentationMode::Pov, ViewKind::Pov), true),
+            (context(PresentationMode::Split, ViewKind::Map), false),
+            (context(PresentationMode::Split, ViewKind::Pov), true),
+        ];
+
+        for (key_code, map_action, pov_action) in collisions {
+            for (ctx, pov_focused) in contexts {
+                let mut mapper = InputMapper::default();
+                assert!(
+                    mapper.handle_event(key(key_code, ButtonPhase::Pressed, false, false), ctx,)
+                );
+                assert_eq!(
+                    mapper.drain_actions().collect::<Vec<_>>(),
+                    vec![if pov_focused { pov_action } else { map_action }],
+                    "wrong action for {key_code:?} in {ctx:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1534,6 +1571,52 @@ mod tests {
     }
 
     #[test]
+    fn split_wheel_is_consumed_only_by_the_focused_pane() {
+        let map = context(PresentationMode::Split, ViewKind::Map);
+        let pov = context(PresentationMode::Split, ViewKind::Pov);
+        let mut mapper = InputMapper::default();
+
+        assert!(!mapper.handle_event(
+            NormalizedInputEvent::Wheel {
+                delta: WheelDelta::Lines(1.0),
+                view: ViewKind::Pov,
+            },
+            map,
+        ));
+        assert!(mapper.drain_actions().next().is_none());
+        assert_eq!(mapper.take_frame().wheel_steps, 0);
+        assert!(mapper.handle_event(
+            NormalizedInputEvent::Wheel {
+                delta: WheelDelta::Lines(1.0),
+                view: ViewKind::Map,
+            },
+            map,
+        ));
+        assert_eq!(
+            mapper.drain_actions().collect::<Vec<_>>(),
+            vec![ViewerAction::ZoomIn]
+        );
+
+        assert!(!mapper.handle_event(
+            NormalizedInputEvent::Wheel {
+                delta: WheelDelta::Lines(-1.0),
+                view: ViewKind::Map,
+            },
+            pov,
+        ));
+        assert!(mapper.drain_actions().next().is_none());
+        assert!(mapper.handle_event(
+            NormalizedInputEvent::Wheel {
+                delta: WheelDelta::Lines(1.0),
+                view: ViewKind::Pov,
+            },
+            pov,
+        ));
+        assert!(mapper.drain_actions().next().is_none());
+        assert_eq!(mapper.take_frame().wheel_steps, 1);
+    }
+
+    #[test]
     fn pointer_look_requires_matching_primary_hold_and_cancels() {
         let ctx = context(PresentationMode::Pov, ViewKind::Pov);
         let mut mapper = InputMapper::default();
@@ -1577,6 +1660,95 @@ mod tests {
             ctx,
         );
         assert_eq!(mapper.take_frame().look_delta, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn split_primary_press_focuses_each_hit_pane_before_pov_drag_input() {
+        let map = context(PresentationMode::Split, ViewKind::Map);
+        let pov = context(PresentationMode::Split, ViewKind::Pov);
+        let mut mapper = InputMapper::default();
+
+        assert!(mapper.handle_event(
+            NormalizedInputEvent::PointerButton {
+                pointer: 7,
+                button: PointerButton::Primary,
+                phase: ButtonPhase::Pressed,
+                position: [80.0, 40.0],
+                view: ViewKind::Pov,
+            },
+            map,
+        ));
+        assert_eq!(
+            mapper.drain_actions().collect::<Vec<_>>(),
+            vec![ViewerAction::FocusView(ViewKind::Pov)]
+        );
+        assert!(mapper.handle_event(
+            NormalizedInputEvent::PointerMoved {
+                pointer: 7,
+                position: [86.0, 37.0],
+                view: ViewKind::Pov,
+            },
+            pov,
+        ));
+        let frame = mapper.take_frame();
+        assert!(frame.primary_drag);
+        assert_eq!(frame.look_delta, [6.0, -3.0]);
+
+        mapper.handle_event(
+            NormalizedInputEvent::PointerButton {
+                pointer: 7,
+                button: PointerButton::Primary,
+                phase: ButtonPhase::Released,
+                position: [86.0, 37.0],
+                view: ViewKind::Pov,
+            },
+            pov,
+        );
+        assert!(mapper.handle_event(
+            NormalizedInputEvent::PointerButton {
+                pointer: 7,
+                button: PointerButton::Primary,
+                phase: ButtonPhase::Pressed,
+                position: [20.0, 40.0],
+                view: ViewKind::Map,
+            },
+            pov,
+        ));
+        assert_eq!(
+            mapper.drain_actions().collect::<Vec<_>>(),
+            vec![ViewerAction::FocusView(ViewKind::Map)]
+        );
+        mapper.set_context(map);
+        assert!(!mapper.take_frame().primary_drag);
+    }
+
+    #[test]
+    fn one_pointer_crossing_split_clears_its_previous_pane_hover() {
+        let split = context(PresentationMode::Split, ViewKind::Map);
+        let mut mapper = InputMapper::default();
+        assert!(mapper.handle_event(
+            NormalizedInputEvent::PointerMoved {
+                pointer: 11,
+                position: [20.0, 40.0],
+                view: ViewKind::Map,
+            },
+            split,
+        ));
+        let frame = mapper.take_frame();
+        assert_eq!(frame.map_pointer, Some([20.0, 40.0]));
+        assert_eq!(frame.pov_pointer, None);
+
+        assert!(mapper.handle_event(
+            NormalizedInputEvent::PointerMoved {
+                pointer: 11,
+                position: [80.0, 40.0],
+                view: ViewKind::Pov,
+            },
+            split,
+        ));
+        let frame = mapper.take_frame();
+        assert_eq!(frame.map_pointer, None);
+        assert_eq!(frame.pov_pointer, Some([80.0, 40.0]));
     }
 
     #[test]
@@ -1674,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_is_surface_scoped_and_split_moves_focus() {
+    fn tab_is_surface_scoped_toggles_single_views_and_swaps_split_focus() {
         let mut mapper = InputMapper::default();
         let toolbar = InputContext {
             mode: PresentationMode::Map,
@@ -1687,6 +1859,21 @@ mod tests {
         ));
         assert!(mapper.drain_actions().next().is_none());
         mapper.clear_held_state();
+
+        let single = context(PresentationMode::Map, ViewKind::Map);
+        mapper.handle_event(
+            key(PhysicalKey::Tab, ButtonPhase::Pressed, false, false),
+            single,
+        );
+        assert_eq!(
+            mapper.drain_actions().collect::<Vec<_>>(),
+            vec![ViewerAction::TogglePrimaryView]
+        );
+        mapper.handle_event(
+            key(PhysicalKey::Tab, ButtonPhase::Released, false, false),
+            single,
+        );
+
         let split = context(PresentationMode::Split, ViewKind::Map);
         mapper.handle_event(
             key(PhysicalKey::Tab, ButtonPhase::Pressed, false, false),
@@ -1696,5 +1883,36 @@ mod tests {
             mapper.drain_actions().collect::<Vec<_>>(),
             vec![ViewerAction::FocusView(ViewKind::Pov)]
         );
+        mapper.handle_event(
+            key(PhysicalKey::Tab, ButtonPhase::Released, false, false),
+            split,
+        );
+        let split = context(PresentationMode::Split, ViewKind::Pov);
+        mapper.handle_event(
+            key(PhysicalKey::Tab, ButtonPhase::Pressed, false, false),
+            split,
+        );
+        assert_eq!(
+            mapper.drain_actions().collect::<Vec<_>>(),
+            vec![ViewerAction::FocusView(ViewKind::Map)]
+        );
+    }
+
+    #[test]
+    fn global_keys_remain_global_for_both_split_focuses() {
+        for focused in [ViewKind::Map, ViewKind::Pov] {
+            for (key_code, expected) in [
+                (PhysicalKey::KeyO, ViewerAction::SaveSession),
+                (PhysicalKey::F12, ViewerAction::RequestDebugDump),
+                (PhysicalKey::Escape, ViewerAction::RequestExit),
+            ] {
+                let mut mapper = InputMapper::default();
+                let ctx = context(PresentationMode::Split, focused);
+                assert!(
+                    mapper.handle_event(key(key_code, ButtonPhase::Pressed, false, false), ctx,)
+                );
+                assert_eq!(mapper.drain_actions().collect::<Vec<_>>(), vec![expected]);
+            }
+        }
     }
 }

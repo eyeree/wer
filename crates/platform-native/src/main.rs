@@ -83,11 +83,11 @@ mod pov;
 mod viz;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use renderer::{
-    InformationSurface, InformationUpload, MapFramePane, MapFrameSource, MultiViewFrame,
-    PovFramePane, Renderer, SurfaceViewport,
+    FocusDecoration, InformationSurface, InformationUpload, MapFramePane, MapFrameSource,
+    MultiViewFrame, PovFramePane, Renderer, SurfaceViewport,
 };
 use viewer_host::action::{
     PreserveMutation, ServiceRequestId, ViewerAction, ViewerEffect, WorkerBackend,
@@ -101,7 +101,10 @@ use viewer_host::controller::{
 use viewer_host::input::InputFrame;
 use viewer_host::input::{InputContext, InputMapper, NormalizedInputEvent};
 use viewer_host::inspect::{HoverInfo, PovHoverCache};
-use viewer_host::layout::{MapViewportProjection, PixelRect, PresentationMode, ViewKind};
+use viewer_host::layout::{
+    resolve_view_layout, MapViewportProjection, PixelRect, PresentationMode, ResolvedViewLayout,
+    ViewKind, ViewLayout,
+};
 use viewer_host::map::{MapBackend, MapRenderRequest, PreparedMapSource};
 use viewer_host::panel::{
     build_panel_document, PanelBuildInput, PanelDocument, PanelDocumentCache, PanelDocumentKey,
@@ -140,6 +143,41 @@ use viz::{Channel, MapComposer, MapDecor, Overlays};
 /// Letterbox color around the square map (linear RGBA).
 const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
 
+/// Resolve the native startup compatibility knobs without letting the legacy
+/// boolean override the explicit three-mode selector.
+fn initial_presentation(
+    requested: Option<&str>,
+    legacy_pov: bool,
+) -> Result<Option<PresentationMode>, &str> {
+    match requested {
+        Some(id) => PresentationMode::parse(id).map(Some).ok_or(id),
+        None if legacy_pov => Ok(Some(PresentationMode::Pov)),
+        None => Ok(None),
+    }
+}
+
+/// Build a fresh device/surface renderer for an existing native window.
+/// Device-loss recovery uses the same path as initial resume so a successful
+/// fallback can actually present the surviving Map world and panel.
+fn build_window_renderer(window: &Arc<Window>) -> Result<Renderer, renderer::RendererError> {
+    let size = window.inner_size();
+    let surface_window = Arc::clone(window);
+    pollster::block_on(Renderer::new(
+        Box::new(move || surface_window.clone().into()),
+        size.width,
+        size.height,
+    ))
+}
+
+/// A capability loss changes the focused input context from POV to Map before
+/// the next tick. Clear held navigation at that boundary so a key/controller
+/// axis pressed for POV cannot be reinterpreted as Map travel on the fallback
+/// frame; queued one-shot actions retain their reducer order.
+fn clear_renderer_loss_input(mapper: &mut InputMapper, adapter: &mut input::WinitInputAdapter) {
+    mapper.clear_held_state();
+    adapter.cancel_pointer_gesture();
+}
+
 /// Exact physical rectangles for the native map plus its temporary bitmap
 /// information strip. The combined rectangle preserves the source HUD aspect,
 /// while the square left edge remains the single draw/pick destination used by
@@ -149,6 +187,102 @@ struct NativeMapRects {
     combined: PixelRect,
     map: PixelRect,
     panel: PixelRect,
+}
+
+/// Live native presentation geometry: one aspect-fitted view deck followed
+/// by the bitmap information panel. A single view contributes one square
+/// source column; Split contributes two, so each 50/50 pane remains square
+/// instead of squeezing both panes into the legacy one-column map slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeFrameRects {
+    combined: PixelRect,
+    view_deck: PixelRect,
+    panel: PixelRect,
+    views: ResolvedViewLayout,
+}
+
+impl NativeFrameRects {
+    fn resolve(
+        surface: PixelRect,
+        map_side: u32,
+        panel_width: u32,
+        layout: ViewLayout,
+    ) -> Option<Self> {
+        let view_columns = if layout.mode == PresentationMode::Split {
+            2
+        } else {
+            1
+        };
+        let view_source_width = map_side.checked_mul(view_columns)?;
+        let source_width = view_source_width.checked_add(panel_width)?;
+        let combined = surface.fitted_aspect(source_width, map_side)?;
+        if combined.width < 2 || combined.height == 0 {
+            return None;
+        }
+        // Split the already-fitted destination at one shared source-space
+        // seam. Rounding the deck width and panel origin separately can
+        // overlap or leave a one-pixel hole on odd surfaces.
+        let deck_width = ((u64::from(combined.width) * u64::from(view_source_width)
+            + u64::from(source_width) / 2)
+            / u64::from(source_width)) as u32;
+        let deck_width = deck_width.clamp(1, combined.width - 1);
+        let view_deck = PixelRect::new(combined.x, combined.y, deck_width, combined.height);
+        let panel = PixelRect::new(
+            view_deck.right(),
+            combined.y,
+            combined.width - deck_width,
+            combined.height,
+        );
+        let views = resolve_view_layout(view_deck, layout);
+        if panel.width == 0
+            || panel.height == 0
+            || views
+                .map_pane
+                .is_some_and(|pane| pane.width == 0 || pane.height == 0)
+            || views
+                .pov_pane
+                .is_some_and(|pane| pane.width == 0 || pane.height == 0)
+        {
+            return None;
+        }
+        Some(Self {
+            combined,
+            view_deck,
+            panel,
+            views,
+        })
+    }
+
+    const fn panel_viewport(self) -> SurfaceViewport {
+        SurfaceViewport::new(
+            self.panel.x,
+            self.panel.y,
+            self.panel.width,
+            self.panel.height,
+        )
+    }
+
+    fn map_viewport(self) -> Option<SurfaceViewport> {
+        self.views.map_content.map(surface_viewport)
+    }
+
+    fn pov_viewport(self) -> Option<SurfaceViewport> {
+        self.views.pov_pane.map(surface_viewport)
+    }
+
+    fn focus_decoration(self) -> Option<FocusDecoration> {
+        (self.views.mode == PresentationMode::Split)
+            .then(|| self.views.focus_border(self.views.focused))
+            .flatten()
+            .map(|viewport| FocusDecoration {
+                viewport: surface_viewport(viewport),
+                thickness: 3,
+            })
+    }
+}
+
+const fn surface_viewport(rect: PixelRect) -> SurfaceViewport {
+    SurfaceViewport::new(rect.x, rect.y, rect.width, rect.height)
 }
 
 impl NativeMapRects {
@@ -174,48 +308,31 @@ impl NativeMapRects {
             panel,
         })
     }
-
-    const fn map_viewport(self) -> SurfaceViewport {
-        SurfaceViewport::new(self.map.x, self.map.y, self.map.width, self.map.height)
-    }
-
-    const fn panel_viewport(self) -> Option<SurfaceViewport> {
-        if self.panel.width == 0 || self.panel.height == 0 {
-            None
-        } else {
-            Some(SurfaceViewport::new(
-                self.panel.x,
-                self.panel.y,
-                self.panel.width,
-                self.panel.height,
-            ))
-        }
-    }
-}
-
-/// Gate POV gestures through the same half-open rectangle used by rendering
-/// and picking. The temporary native information strip is not a view surface;
-/// routing it as Map makes POV presses/wheels inert in single-POV mode while
-/// still letting a release clear an already-held drag by pointer identity.
-fn routed_native_pointer_view(
-    focused: ViewKind,
-    pov_pane: Option<PixelRect>,
-    pointer: Option<[f64; 2]>,
-) -> ViewKind {
-    if focused == ViewKind::Pov
-        && !pointer
-            .zip(pov_pane)
-            .is_some_and(|(point, pane)| pane.contains_f64(point[0], point[1]))
-    {
-        ViewKind::Map
-    } else {
-        focused
-    }
 }
 
 #[cfg(test)]
 mod native_map_rect_tests {
     use super::*;
+
+    #[test]
+    fn explicit_start_view_covers_all_modes_and_overrides_legacy_pov() {
+        assert_eq!(initial_presentation(None, false), Ok(None));
+        assert_eq!(
+            initial_presentation(None, true),
+            Ok(Some(PresentationMode::Pov))
+        );
+        for mode in [
+            PresentationMode::Map,
+            PresentationMode::Pov,
+            PresentationMode::Split,
+        ] {
+            assert_eq!(
+                initial_presentation(Some(mode.as_str()), true),
+                Ok(Some(mode))
+            );
+        }
+        assert_eq!(initial_presentation(Some("POV"), true), Err("POV"));
+    }
 
     #[test]
     fn native_map_and_panel_partition_one_aspect_fitted_rectangle() {
@@ -259,32 +376,125 @@ mod native_map_rect_tests {
     }
 
     #[test]
-    fn pov_gestures_route_only_inside_the_exact_render_pane() {
+    fn live_view_hit_routing_uses_exact_panes_and_ignores_panel() {
         let surface = PixelRect::new(0, 0, 1280, 720);
-        let rects = NativeMapRects::resolve(surface, 600, 300).unwrap();
+        let rects = NativeFrameRects::resolve(
+            surface,
+            600,
+            300,
+            ViewLayout {
+                mode: PresentationMode::Split,
+                focused: ViewKind::Map,
+                split_ratio: 0.5,
+            },
+        )
+        .unwrap();
+        let map = rects.views.map_pane.unwrap();
+        let pov = rects.views.pov_pane.unwrap();
         assert_eq!(
-            routed_native_pointer_view(
-                ViewKind::Pov,
-                Some(rects.map),
-                Some([f64::from(rects.map.x) + 0.5, f64::from(rects.map.y) + 0.5,]),
-            ),
-            ViewKind::Pov
+            rects
+                .views
+                .hit_view([f64::from(map.x) + 0.5, f64::from(map.y) + 0.5]),
+            Some(ViewKind::Map)
         );
         assert_eq!(
-            routed_native_pointer_view(
-                ViewKind::Pov,
-                Some(rects.map),
-                Some([f64::from(rects.panel.x) + 0.5, f64::from(rects.panel.y)]),
-            ),
-            ViewKind::Map
+            rects
+                .views
+                .hit_view([f64::from(pov.x) + 0.5, f64::from(pov.y) + 0.5]),
+            Some(ViewKind::Pov)
         );
         assert_eq!(
-            routed_native_pointer_view(ViewKind::Pov, Some(rects.map), None),
-            ViewKind::Map
+            rects.views.hit_view([
+                f64::from(rects.panel.x) + 0.5,
+                f64::from(rects.panel.y) + 0.5,
+            ]),
+            None
         );
+    }
+
+    #[test]
+    fn live_modes_fit_one_deck_and_split_keeps_two_square_columns() {
+        for (width, height) in [(1280, 720), (901, 701), (509, 701), (127, 511)] {
+            let surface = PixelRect::new(0, 0, width, height);
+            for mode in [
+                PresentationMode::Map,
+                PresentationMode::Pov,
+                PresentationMode::Split,
+            ] {
+                let focused = if mode == PresentationMode::Pov {
+                    ViewKind::Pov
+                } else {
+                    ViewKind::Map
+                };
+                let rects = NativeFrameRects::resolve(
+                    surface,
+                    600,
+                    300,
+                    ViewLayout {
+                        mode,
+                        focused,
+                        split_ratio: 0.5,
+                    },
+                )
+                .expect("visible deck and panel");
+                assert!(surface.contains_rect(rects.combined));
+                assert!(rects.combined.contains_rect(rects.view_deck));
+                assert!(rects.combined.contains_rect(rects.panel));
+                assert_eq!(rects.view_deck.right(), rects.panel.x);
+                assert_eq!(rects.panel.right(), rects.combined.right());
+                assert!(!rects.view_deck.overlaps(rects.panel));
+                for pane in [rects.views.map_pane, rects.views.pov_pane]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert!(rects.view_deck.contains_rect(pane));
+                    assert!(pane.width.abs_diff(pane.height) <= 1);
+                }
+                if mode == PresentationMode::Split {
+                    let map = rects.views.map_pane.unwrap();
+                    let pov = rects.views.pov_pane.unwrap();
+                    assert_eq!(map.right(), pov.x);
+                    assert!(!map.overlaps(pov));
+                    assert!(rects.focus_decoration().is_some());
+                } else {
+                    assert!(rects.focus_decoration().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_frame_geometry_plans_one_surface_lifecycle() {
+        let rects = NativeFrameRects::resolve(
+            PixelRect::new(0, 0, 1280, 720),
+            600,
+            300,
+            ViewLayout {
+                mode: PresentationMode::Split,
+                focused: ViewKind::Pov,
+                split_ratio: 0.5,
+            },
+        )
+        .unwrap();
+        let plan = renderer::FramePassPlan::new(renderer::FramePlanRequest {
+            surface: (1280, 720),
+            map: rects.map_viewport(),
+            pov: rects.pov_viewport(),
+            map_information: Some(rects.panel_viewport()),
+            pov_information: None,
+            pov_shadows: true,
+            focus: rects.focus_decoration().map(|focus| focus.viewport),
+        })
+        .expect("native Split rectangles form one valid renderer frame");
         assert_eq!(
-            routed_native_pointer_view(ViewKind::Map, Some(rects.map), None),
-            ViewKind::Map
+            plan.successful_surface_lifecycle(),
+            renderer::FrameLifecycleCounters {
+                acquire_attempts: 1,
+                acquired: 1,
+                surface_clears: 1,
+                submissions: 1,
+                presents: 1,
+            }
         );
     }
 
@@ -325,20 +535,27 @@ mod native_map_rect_tests {
     #[test]
     fn pov_camera_center_and_aspect_come_from_the_uncovered_pane() {
         for (width, height) in [(1280, 720), (901, 701), (509, 701)] {
-            let rects = NativeMapRects::resolve(
+            let rects = NativeFrameRects::resolve(
                 PixelRect::new(0, 0, width, height),
                 800,
                 panel::PANEL_WIDTH as u32,
+                ViewLayout {
+                    mode: PresentationMode::Pov,
+                    focused: ViewKind::Pov,
+                    split_ratio: 0.5,
+                },
             )
             .expect("visible POV and panel panes");
-            let center = (
-                rects.map.x + rects.map.width / 2,
-                rects.map.y + rects.map.height / 2,
-            );
-            assert!(rects.map.contains(center.0, center.1));
+            let pov = rects.views.pov_pane.unwrap();
+            let center = (pov.x + pov.width / 2, pov.y + pov.height / 2);
+            assert!(pov.contains(center.0, center.1));
             assert!(!rects.panel.contains(center.0, center.1));
             assert_eq!(
-                rects.map.width as f32 / rects.map.height as f32,
+                rects.views.pov_aspect,
+                Some(pov.width as f32 / pov.height as f32),
+            );
+            assert_eq!(
+                pov.width as f32 / pov.height as f32,
                 1.0,
                 "POV projection uses the square physical pane"
             );
@@ -428,11 +645,19 @@ impl NativeWorldServices {
     }
 
     fn pov_availability(&mut self, supported: bool) -> ServiceNotification {
+        self.pov_availability_with_reason(supported, None)
+    }
+
+    fn pov_availability_with_reason(
+        &mut self,
+        supported: bool,
+        reason: Option<ViewerWarning>,
+    ) -> ServiceNotification {
         self.response_sequence = self.response_sequence.saturating_add(1);
         ServiceNotification::PovAvailability {
             sequence: ServiceResponseSequence(self.response_sequence),
             supported,
-            reason: None,
+            reason,
         }
     }
 }
@@ -736,6 +961,20 @@ struct App {
     /// Mean atlas/overlay/panel upload KB per frame over the last second
     /// (GPU path; phase-6-plan.md §12).
     upload_kb: f64,
+    /// Device losses survive dropping the failed renderer so the shared
+    /// information panel keeps reporting the reason for Map fallback.
+    device_losses: u32,
+    /// A replacement device is ready, but capability restoration is queued
+    /// only after the loss tick has irrevocably produced Map/Map output.
+    pov_recovery_ready: bool,
+    /// Device recreation can fail transiently. Keep retrying at a bounded
+    /// cadence while the world continues ticking in unsupported Map mode.
+    renderer_recovery_pending: bool,
+    renderer_retry_at: Option<Instant>,
+    /// Keep the device-loss warning visible for the fallback/recovery frame,
+    /// then remove its stale "returned to Map" claim. The cumulative device
+    /// loss field remains in renderer diagnostics.
+    clear_recovered_renderer_warning: bool,
 }
 
 impl App {
@@ -769,8 +1008,19 @@ impl App {
         if std::env::var_os("WER_CPU_MAP").is_some() {
             controller.enqueue_action(ViewerAction::SetMapBackend(MapBackend::Cpu));
         }
-        if std::env::var_os("WER_POV").is_some_and(|value| value != "0") {
-            controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Pov));
+        let requested_view = std::env::var("WER_VIEW").ok();
+        let legacy_pov = std::env::var_os("WER_POV").is_some_and(|value| value != "0");
+        match initial_presentation(requested_view.as_deref(), legacy_pov) {
+            Ok(Some(mode)) => {
+                controller.enqueue_action(ViewerAction::SetPresentation(mode));
+            }
+            Ok(None) => {}
+            Err(id) => {
+                log::warn!("ignoring invalid WER_VIEW={id:?}; expected map, pov, or split");
+                if legacy_pov {
+                    controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Pov));
+                }
+            }
         }
         controller.set_pov_render_scale(
             std::env::var("WER_POV_SCALE")
@@ -828,6 +1078,11 @@ impl App {
             pass_ms: [0.0; world_runtime::PASS_COUNT],
             upload_accum: 0,
             upload_kb: 0.0,
+            device_losses: 0,
+            pov_recovery_ready: false,
+            renderer_recovery_pending: false,
+            renderer_retry_at: None,
+            clear_recovered_renderer_warning: false,
         }
     }
 
@@ -1340,13 +1595,18 @@ impl App {
 
     fn debug_panel_document(&mut self) -> PanelDocument {
         let preferences = self.controller.map_preferences();
-        let hover = match self.controller.layout().mode {
-            PresentationMode::Map | PresentationMode::Split => viewer_host::map_hover(
-                self.controller.world().map(),
-                Some(self.controller.world().traveler().position),
-                preferences.zoom,
-            ),
-            PresentationMode::Pov => self.pov_hover.hover().clone(),
+        let layout = self.controller.layout();
+        let hover = match (layout.mode, layout.focused) {
+            (PresentationMode::Map, _) | (PresentationMode::Split, ViewKind::Map) => {
+                viewer_host::map_hover(
+                    self.controller.world().map(),
+                    Some(self.controller.world().traveler().position),
+                    preferences.zoom,
+                )
+            }
+            (PresentationMode::Pov, _) | (PresentationMode::Split, ViewKind::Pov) => {
+                self.pov_hover.hover().clone()
+            }
         };
         let surface_format = self
             .renderer
@@ -1413,21 +1673,42 @@ impl App {
         }
     }
 
-    /// Resolve this frame's native HUD rectangles and exact map projection.
-    /// Rendering and pointer inversion both consume this value; neither path
-    /// reconstructs letterboxing or reads the composer's previous zoom.
+    /// Resolve one live view deck and the native information panel. Rendering,
+    /// pointer routing, map inversion, and POV picking all consume the same
+    /// shared pane rectangles.
+    fn native_frame_layout(&self, layout: ViewLayout) -> Option<NativeFrameRects> {
+        let (width, height) = self.renderer.as_ref()?.size();
+        let map_side = self.composer.side();
+        let panel_width = self.hud.size().0.checked_sub(map_side)?;
+        NativeFrameRects::resolve(
+            PixelRect::new(0, 0, width, height),
+            map_side,
+            panel_width,
+            layout,
+        )
+    }
+
+    /// Pending mode/focus actions already influence raw-event routing before
+    /// the next logical frame. Split ratio has no native live control yet, so
+    /// its committed shared value is sufficient for this first fixed layout.
+    fn pointer_frame_layout(&self) -> Option<NativeFrameRects> {
+        let context = self.input_context();
+        let mut layout = self.controller.layout();
+        layout.mode = context.mode;
+        layout.focused = context.focused;
+        self.native_frame_layout(layout)
+    }
+
+    /// Resolve this frame's exact map projection without reconstructing the
+    /// map fit separately from the shared view layout.
     fn map_frame_layout(
         &self,
         player: (f64, f64),
         zoom: u32,
-    ) -> Option<(NativeMapRects, MapViewportProjection)> {
-        let (width, height) = self.renderer.as_ref()?.size();
-        let map_side = self.composer.side();
-        let panel_width = self.hud.size().0.checked_sub(map_side)?;
-        let rects =
-            NativeMapRects::resolve(PixelRect::new(0, 0, width, height), map_side, panel_width)?;
+    ) -> Option<(NativeFrameRects, MapViewportProjection)> {
+        let rects = self.native_frame_layout(self.controller.layout())?;
         let projection = MapViewportProjection::new(
-            rects.map,
+            rects.views.map_content?,
             player,
             self.composer.half_regions(),
             self.controller.world().map().config().field_resolution,
@@ -1436,26 +1717,15 @@ impl App {
         Some((rects, projection))
     }
 
-    /// Resolve the exact native POV/panel fit before either picking or panel
-    /// construction. The returned square `map` rectangle is the live POV pane;
-    /// both the camera ray and renderer viewport consume it unchanged.
-    fn pov_frame_layout(&self) -> Option<NativeMapRects> {
-        let (width, height) = self.renderer.as_ref()?.size();
-        let (source_width, source_height) = self.hud.size();
-        let panel_width = source_width.checked_sub(source_height)?;
-        NativeMapRects::resolve(
-            PixelRect::new(0, 0, width, height),
-            source_height,
-            panel_width,
-        )
+    fn pointer_hit_view(&self) -> Option<ViewKind> {
+        self.winit_input
+            .cursor_position()
+            .and_then(|point| self.pointer_hit_at(point))
     }
 
-    fn pointer_gesture_view(&self) -> ViewKind {
-        let focused = self.input_context().focused;
-        let pov_pane = (focused == ViewKind::Pov)
-            .then(|| self.pov_frame_layout().map(|rects| rects.map))
-            .flatten();
-        routed_native_pointer_view(focused, pov_pane, self.winit_input.cursor_position())
+    fn pointer_hit_at(&self, point: [f64; 2]) -> Option<ViewKind> {
+        self.pointer_frame_layout()
+            .and_then(|layout| layout.views.hit_view(point))
     }
 
     /// Map the mouse in physical surface pixels through the exact destination
@@ -1529,7 +1799,76 @@ impl App {
         }
     }
 
+    /// Convert an asynchronous wgpu device loss into the shared typed
+    /// capability transition before this frame's action/input reduction.
+    /// Only renderer-side caches are discarded; the controller, world, panel
+    /// document cache, traveler, and persisted state remain intact.
+    fn recover_lost_renderer(&mut self) {
+        let losses = self
+            .renderer
+            .as_ref()
+            .map_or(0, renderer::Renderer::device_losses);
+        if losses > 0 {
+            self.device_losses = self.device_losses.saturating_add(losses);
+            clear_renderer_loss_input(&mut self.input, &mut self.winit_input);
+            self.renderer = None;
+            self.atlas = AtlasManager::default();
+            self.overlay_hashes = [0; 2];
+            self.panel_revision = None;
+            self.pov_panel_revision = None;
+            self.pov_chunks = PovChunkManager::new();
+            self.pov_organisms = PovOrganismManager::new();
+            self.pov_hover = PovHoverCache::new();
+            self.pov_recovery_ready = false;
+            self.renderer_recovery_pending = true;
+            self.renderer_retry_at = None;
+            let notification = self.services.pov_availability_with_reason(
+                false,
+                Some(ViewerWarning {
+                    id: "renderer-device-loss",
+                    message: String::from("GPU device lost; presentation returned to Map"),
+                    severity: Severity::Warning,
+                }),
+            );
+            self.controller.enqueue_service_notification(notification);
+        }
+        if !self.renderer_recovery_pending {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .renderer_retry_at
+            .is_some_and(|retry_at| now < retry_at)
+        {
+            return;
+        }
+
+        let replacement = self
+            .window
+            .as_ref()
+            .ok_or_else(|| String::from("native window is unavailable"))
+            .and_then(|window| build_window_renderer(window).map_err(|error| error.to_string()));
+        match replacement {
+            Ok(renderer) => {
+                self.renderer = Some(renderer);
+                // Do not advertise the replacement before the loss tick:
+                // queued presentation actions run after service inputs and
+                // could otherwise re-enter POV/Split immediately.
+                self.pov_recovery_ready = true;
+                self.renderer_recovery_pending = false;
+                self.renderer_retry_at = None;
+                self.clear_recovered_renderer_warning = true;
+                log::info!("GPU device recovered; Map presentation resumed");
+            }
+            Err(error) => {
+                self.renderer_retry_at = Some(now + Duration::from_secs(1));
+                log::error!("GPU device recovery failed; world remains alive in Map mode: {error}");
+            }
+        }
+    }
+
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
+        self.recover_lost_renderer();
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f64();
         self.last_frame = now;
@@ -1556,10 +1895,14 @@ impl App {
             &mut self.services,
             &ground,
         );
+        if std::mem::take(&mut self.pov_recovery_ready) {
+            let notification = self.services.pov_availability(true);
+            self.controller.enqueue_service_notification(notification);
+        }
         let update_seconds = update_start.elapsed().as_secs_f64();
         self.composer
             .update_for_tick(output.update_serial, self.controller.world().map());
-        let stats = output.stats;
+        let mut stats = output.stats;
         self.last_stats = stats;
         for (total, &count) in self
             .regen_totals
@@ -1581,9 +1924,8 @@ impl App {
         }
         let effects = std::mem::take(&mut output.effects);
         // A POV debug capture must observe the geometry/hover prepared for
-        // this same tick. Other effects keep their ordinary pre-presentation
-        // handling; only F12 capture is deferred until frame_pov has synced,
-        // picked, built the panel, and submitted the matching view.
+        // this same tick. Split retains the pre-M9 Map-capture behavior until
+        // the aligned multi-view dump lands in M10.
         let (deferred_captures, effects): (Vec<_>, Vec<_>) = if output.mode == PresentationMode::Pov
         {
             effects
@@ -1595,38 +1937,146 @@ impl App {
         self.last_tick_output = Some(output.clone());
         self.handle_effects(effects, event_loop);
 
-        if output.mode == PresentationMode::Pov {
-            self.frame_pov(&output, update_seconds);
+        let Some(frame_rects) = self.native_frame_layout(self.controller.layout()) else {
             self.handle_effects(deferred_captures, event_loop);
             return;
-        }
-
-        let Some((frame_rects, map_projection)) =
-            self.map_frame_layout(output.traveler, output.map.zoom)
-        else {
-            return;
         };
-        let cursor_world = self.cursor_world_in(map_projection);
-        let hover =
-            viewer_host::map_hover(self.controller.world().map(), cursor_world, output.map.zoom);
+        let map_visible = output.mode != PresentationMode::Pov;
+        let pov_visible = output.mode != PresentationMode::Map;
+        let map_projection = map_visible
+            .then(|| {
+                MapViewportProjection::new(
+                    frame_rects
+                        .views
+                        .map_content
+                        .expect("visible Map has fitted content"),
+                    output.traveler,
+                    self.composer.half_regions(),
+                    self.controller.world().map().config().field_resolution,
+                    output.map.zoom,
+                )
+            })
+            .flatten();
+        let map_hover = map_projection.map_or(HoverInfo::None, |projection| {
+            viewer_host::map_hover(
+                self.controller.world().map(),
+                self.cursor_world_in(projection),
+                output.map.zoom,
+            )
+        });
 
-        let decor = self.build_decor();
-        self.composer.set_zoom(output.map.zoom);
+        let mut pov_uploads = Vec::new();
+        let mut pov_removes = Vec::new();
+        let mut organisms_changed = false;
+        let mut pov_params = None;
+        let mut upload_bytes = 0u64;
+        if pov_visible {
+            // POV presentation is lazy: entering POV or Split starts its
+            // resident ring, but Map remains available in the same frame.
+            let camera_xy = {
+                let camera = self.controller.pov_camera();
+                (camera.pos.x, camera.pos.y)
+            };
+            let fog_end = f64::from(pov::pov_fog_end(self.pov_radius) as f32);
+            let mesh_start = Instant::now();
+            (pov_uploads, pov_removes) = self.pov_chunks.sync(
+                self.controller.world().map(),
+                camera_xy,
+                self.pov_radius,
+                self.executor.as_ref(),
+            );
+            organisms_changed = self.pov_organisms.sync(
+                self.controller.world().map(),
+                &self.pov_chunks,
+                camera_xy,
+                fog_end,
+            );
+            upload_bytes = (pov_uploads.len()
+                * renderer::pov::VERTS_PER_CHUNK
+                * core::mem::size_of::<renderer::PovVertex>()
+                + pov_uploads
+                    .iter()
+                    .map(|upload| upload.river_indices.len() * 4)
+                    .sum::<usize>()) as u64;
+            stats.pass_ms[world_runtime::Pass::Mesh.index()] +=
+                mesh_start.elapsed().as_secs_f32() * 1000.0;
+            self.last_stats = stats;
+
+            let time = self
+                .start
+                .elapsed()
+                .as_secs_f64()
+                .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
+            let resolution = pov::shadow_resolution(self.tier);
+            let shadow = pov::shadow_frame(
+                self.controller.pov_camera(),
+                &self.pov_chunks,
+                self.pov_organisms.shadow_bounds(),
+                resolution,
+            );
+            let params = pov::frame_params(
+                self.controller.pov_camera(),
+                frame_rects
+                    .views
+                    .pov_aspect
+                    .expect("visible POV has an aspect"),
+                self.pov_radius,
+                CLEAR_COLOR,
+                time,
+                self.controller.pov_toggles(),
+                shadow,
+            );
+            debug_assert_eq!(f64::from(params.fog_end), fog_end);
+            self.pov_hover.update(
+                self.controller.world().map(),
+                self.controller.pov_camera(),
+                &self.pov_chunks,
+                &self.pov_organisms,
+                self.pov_pointer,
+                frame_rects.views.pov_pane,
+                f64::from(params.fog_end),
+                params.time,
+            );
+            pov_params = Some(params);
+        }
+        let pov_hover = if pov_visible {
+            self.pov_hover.hover().clone()
+        } else {
+            HoverInfo::None
+        };
+        let hover = match output.focused {
+            ViewKind::Map => map_hover,
+            ViewKind::Pov => pov_hover,
+        };
+
+        output.stats = stats;
+        self.last_tick_output = Some(output.clone());
+        let decor = if map_visible {
+            self.build_decor()
+        } else {
+            MapDecor::default()
+        };
+        if map_visible {
+            self.composer.set_zoom(output.map.zoom);
+        }
         let capture = self.controller.capture_preferences();
-        let pinned_violations = self.composer.pinned_violations;
         let performance = self.panel_performance();
-        let streaming = self.streaming_supplement(pinned_violations);
+        let streaming = self.streaming_supplement(self.composer.pinned_violations);
         let persistence = self.persistence_info();
         let split_ratio = self.controller.layout().split_ratio;
+        let surface_losses = self
+            .renderer
+            .as_ref()
+            .map_or(0, renderer::Renderer::surface_losses);
         let compose_start = Instant::now();
-        let packet = {
+        let map_packet = map_projection.map(|projection| {
             let world = self.controller.world();
             self.composer.prepare_render(
                 &mut self.atlas,
                 MapRenderRequest {
                     map: world.map(),
                     player: output.traveler,
-                    destination: map_projection.destination,
+                    destination: projection.destination,
                     channel: output.map.channel,
                     overlays: output.map.overlays,
                     anchors: world.anchors(),
@@ -1640,20 +2090,26 @@ impl App {
                     dirty_key: output.update_serial,
                 },
             )
-        };
-        let prepared_pixel_hash = packet.pixel_hash;
-        let map_side = packet.projection.side;
-        let renderer_info = RendererInfo {
-            requested_map_backend: packet.requested_backend,
-            effective_map_backend: packet.backend,
-            map_fallback: packet.fallback,
-            surface_format: output.platform.surface_format.clone(),
-            device_losses: 0,
-            surface_losses: self
-                .renderer
-                .as_ref()
-                .map_or(0, renderer::Renderer::surface_losses),
-        };
+        });
+        let renderer_info = map_packet.as_ref().map_or_else(
+            || {
+                let mut info = self.panel_state.renderer_for_pov(
+                    output.map.backend,
+                    output.platform.surface_format.clone(),
+                    surface_losses,
+                );
+                info.device_losses = self.device_losses;
+                info
+            },
+            |packet| RendererInfo {
+                requested_map_backend: packet.requested_backend,
+                effective_map_backend: packet.backend,
+                map_fallback: packet.fallback,
+                surface_format: output.platform.surface_format.clone(),
+                device_losses: self.device_losses,
+                surface_losses,
+            },
+        );
         let document = self.panel_state.document(
             &output,
             self.controller.world(),
@@ -1665,278 +2121,126 @@ impl App {
             capture,
             split_ratio,
         );
-        let mut upload_bytes = 0u64;
-        let (compose_seconds, render_seconds) = match packet.source {
-            PreparedMapSource::GpuAtlas(gpu) => {
-                // Delta uploads: only regions whose dependency-hash key
-                // changed, plus overlay strips or a shared panel document
-                // whose semantic revision changed.
-                let (_, panel_width, panel_height, _) = self
-                    .hud
-                    .panel_image_for(document.revision, &document.sections);
-                let panel_w = (self.panel_revision != Some(document.revision))
-                    .then_some((panel_width, panel_height));
-                debug_assert_eq!(prepared_pixel_hash, gpu.overlay_hash);
-                let pre_grid_changed = gpu.pre_grid_hash != self.overlay_hashes[0];
-                let post_grid_changed = gpu.post_grid_hash != self.overlay_hashes[1];
-
-                let compose_seconds = compose_start.elapsed().as_secs_f64();
-                let render_start = Instant::now();
-                if let Some(renderer) = self.renderer.as_mut() {
-                    let pre_grid = pre_grid_changed.then_some(gpu.pre_grid_rgba);
-                    let post_grid = post_grid_changed.then_some(gpu.post_grid_rgba);
-                    let panel =
-                        panel_w.map(|(width, height)| (self.hud.panel_pixels(), width, height));
-                    let information =
-                        frame_rects
-                            .panel_viewport()
-                            .map(|viewport| InformationSurface {
-                                upload: panel.map(|(rgba, width, height)| InformationUpload {
-                                    rgba,
-                                    width,
-                                    height,
-                                }),
-                                viewport,
-                            });
-                    let result = renderer.render_frame(MultiViewFrame {
-                        clear: CLEAR_COLOR,
-                        map: Some(MapFramePane {
-                            source: MapFrameSource::Gpu {
-                                params: &gpu.params,
-                                slots: &gpu.slots,
-                                uploads: &gpu.uploads,
-                                pre_grid_overlay: pre_grid,
-                                post_grid_overlay: post_grid,
-                            },
-                            viewport: frame_rects.map_viewport(),
-                            information,
-                        }),
-                        pov: None,
-                        focus: None,
-                    });
-                    if result.presented {
-                        debug_assert!(result.map_drawn);
-                        self.panel_revision = Some(document.revision);
-                        self.overlay_hashes = [gpu.pre_grid_hash, gpu.post_grid_hash];
-                        upload_bytes = result.map_upload_bytes;
-                    } else {
-                        // Atlas keys were consumed while preparing this packet;
-                        // retry a complete upload after surface recovery.
-                        self.atlas = AtlasManager::default();
-                        self.panel_revision = None;
-                        self.overlay_hashes = [0; 2];
-                    }
-                }
-                (compose_seconds, render_start.elapsed().as_secs_f64())
-            }
-            PreparedMapSource::Cpu(cpu) => {
-                let (panel, panel_width, panel_height) = self.hud.panel_image(&document.sections);
-                let compose_seconds = compose_start.elapsed().as_secs_f64();
-                let render_start = Instant::now();
-                if let Some(renderer) = self.renderer.as_mut() {
-                    let information = InformationSurface {
-                        upload: Some(InformationUpload {
-                            rgba: panel,
-                            width: panel_width,
-                            height: panel_height,
-                        }),
-                        viewport: frame_rects
-                            .panel_viewport()
-                            .expect("native bitmap panel has a visible viewport"),
-                    };
-                    let _ = renderer.render_frame(MultiViewFrame {
-                        clear: CLEAR_COLOR,
-                        map: Some(MapFramePane {
-                            source: MapFrameSource::Cpu {
-                                rgba: cpu.rgba,
-                                width: map_side,
-                                height: map_side,
-                            },
-                            viewport: frame_rects.map_viewport(),
-                            information: Some(information),
-                        }),
-                        pov: None,
-                        focus: None,
-                    });
-                }
-                (compose_seconds, render_start.elapsed().as_secs_f64())
-            }
-        };
-
-        self.update_telemetry(
-            update_seconds,
-            compose_seconds,
-            render_seconds,
-            &stats.pass_ms,
-            upload_bytes,
-        );
-    }
-
-    /// The POV half of [`Self::frame`] (3d-phase-1-plan.md §8.1): sync the
-    /// chunk lifecycle, build the frame parameters with glam, and present
-    /// through [`Renderer::render_frame`]. The complete shared panel document
-    /// is built once and mounted as the POV information rail; M8 changes only
-    /// how the already-shared passes are planned.
-    fn frame_pov(&mut self, output: &TickOutput, update_seconds: f64) {
-        let mut stats = output.stats;
-        let camera = self.controller.pov_camera();
-        let fog_end = f64::from(pov::pov_fog_end(self.pov_radius) as f32);
-        // Ordering contract for native hover: the controller tick has already
-        // applied primary-drag look and the single world update. Synchronize
-        // the geometry those values select next, then pick, then build the
-        // panel and draw. Hover alone never contributes a look delta.
-        // The frame-side POV work (scheduling + amortized integration) fills
-        // the Mesh pass, following the Flush precedent (plan §8.1); the
-        // worker-side mesh milliseconds ride the manager's counters instead.
-        let mesh_start = Instant::now();
-        let (uploads, removes) = self.pov_chunks.sync(
-            self.controller.world().map(),
-            (camera.pos.x, camera.pos.y),
-            self.pov_radius,
-            self.executor.as_ref(),
-        );
-        let organisms_changed = self.pov_organisms.sync(
-            self.controller.world().map(),
-            &self.pov_chunks,
-            (camera.pos.x, camera.pos.y),
-            fog_end,
-        );
-        let organism_upload = organisms_changed.then(|| self.pov_organisms.upload());
-        let mut upload_bytes = (uploads.len()
-            * renderer::pov::VERTS_PER_CHUNK
-            * core::mem::size_of::<renderer::PovVertex>()
-            + uploads
-                .iter()
-                .map(|u| u.river_indices.len() * 4)
-                .sum::<usize>()) as u64;
-        stats.pass_ms[world_runtime::Pass::Mesh.index()] +=
-            mesh_start.elapsed().as_secs_f32() * 1000.0;
-        self.last_stats = stats;
-
-        let Some(frame_rects) = self.pov_frame_layout() else {
-            return;
-        };
-        let pov_viewport = frame_rects.map_viewport();
-        let panel_viewport = frame_rects
-            .panel_viewport()
-            .expect("resolved native POV panel has a visible viewport");
-        // The water-wobble clock (3d-phase-3-plan.md §7.1): wrapped at the
-        // shader's period so f32 never loses phase precision. This exact value
-        // also drives animated-organism picking.
-        let time = self
-            .start
-            .elapsed()
-            .as_secs_f64()
-            .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
-        let resolution = pov::shadow_resolution(self.tier);
-        let shadow = pov::shadow_frame(
-            self.controller.pov_camera(),
-            &self.pov_chunks,
-            self.pov_organisms.shadow_bounds(),
-            resolution,
-        );
-        let params = pov::frame_params(
-            self.controller.pov_camera(),
-            pov_viewport.width as f32 / pov_viewport.height.max(1) as f32,
-            self.pov_radius,
-            CLEAR_COLOR,
-            time,
-            self.controller.pov_toggles(),
-            shadow,
-        );
-        debug_assert_eq!(f64::from(params.fog_end), fog_end);
-        self.pov_hover.update(
-            self.controller.world().map(),
-            self.controller.pov_camera(),
-            &self.pov_chunks,
-            &self.pov_organisms,
-            self.pov_pointer,
-            Some(frame_rects.map),
-            f64::from(params.fog_end),
-            params.time,
-        );
-        let hover = self.pov_hover.hover().clone();
-
-        let mut panel_tick = output.clone();
-        panel_tick.stats = stats;
-        self.last_tick_output = Some(panel_tick.clone());
-        let surface_format = self
-            .renderer
+        let map_is_cpu = map_packet
             .as_ref()
-            .map(renderer::Renderer::surface_format_name);
-        let surface_losses = self
-            .renderer
-            .as_ref()
-            .map_or(0, renderer::Renderer::surface_losses);
-        let renderer_info =
-            self.panel_state
-                .renderer_for_pov(output.map.backend, surface_format, surface_losses);
-        let performance = self.panel_performance();
-        let streaming = self.streaming_supplement(self.composer.pinned_violations);
-        let persistence = self.persistence_info();
-        let capture = self.controller.capture_preferences();
-        let split_ratio = self.controller.layout().split_ratio;
-        let document = self.panel_state.document(
-            &panel_tick,
-            self.controller.world(),
-            hover,
-            performance,
-            streaming,
-            persistence,
-            renderer_info,
-            capture,
-            split_ratio,
-        );
-
-        let render_start = Instant::now();
-        let mut organism_buffer_stats = None;
-        if let Some(renderer) = self.renderer.as_mut() {
-            let (panel_rgba, panel_width, panel_height, _) = self
+            .is_some_and(|packet| matches!(&packet.source, PreparedMapSource::Cpu(_)));
+        let (panel_width, panel_height) = if map_is_cpu {
+            let (_, width, height) = self.hud.panel_image(&document.sections);
+            (width, height)
+        } else {
+            let (_, width, height, _) = self
                 .hud
                 .panel_image_for(document.revision, &document.sections);
-            let panel_changed = self.pov_panel_revision != Some(document.revision);
-            // Keep the complete shared information surface mounted beside a
-            // projection-correct POV pane. Unchanged panel pixels retain the
-            // renderer texture and incur no upload.
-            let information = Some(InformationSurface {
-                upload: panel_changed.then_some(InformationUpload {
-                    rgba: panel_rgba,
-                    width: panel_width,
-                    height: panel_height,
-                }),
-                viewport: panel_viewport,
-            });
-            let result = renderer.render_frame(MultiViewFrame {
-                clear: CLEAR_COLOR,
-                map: None,
-                pov: Some(PovFramePane {
-                    frame: &params,
-                    uploads: &uploads,
-                    removes: &removes,
-                    organisms: organism_upload,
-                    viewport: pov_viewport,
-                    information,
-                    render_scale: output.pov.render_scale,
-                }),
-                focus: None,
-            });
-            debug_assert!(!result.presented || result.pov_drawn);
-            upload_bytes += commit_pov_panel_upload(
+            (width, height)
+        };
+        let panel_rgba = self.hud.panel_pixels();
+        let panel_on_map = map_visible;
+        let panel_changed = map_is_cpu
+            || if panel_on_map {
+                self.panel_revision != Some(document.revision)
+            } else {
+                self.pov_panel_revision != Some(document.revision)
+            };
+        let information = InformationSurface {
+            upload: panel_changed.then_some(InformationUpload {
+                rgba: panel_rgba,
+                width: panel_width,
+                height: panel_height,
+            }),
+            viewport: frame_rects.panel_viewport(),
+        };
+        let map_pane = map_packet.as_ref().map(|packet| {
+            let source = match &packet.source {
+                PreparedMapSource::Cpu(cpu) => MapFrameSource::Cpu {
+                    rgba: cpu.rgba,
+                    width: packet.projection.side,
+                    height: packet.projection.side,
+                },
+                PreparedMapSource::GpuAtlas(gpu) => {
+                    debug_assert_eq!(packet.pixel_hash, gpu.overlay_hash);
+                    MapFrameSource::Gpu {
+                        params: &gpu.params,
+                        slots: &gpu.slots,
+                        uploads: &gpu.uploads,
+                        pre_grid_overlay: (gpu.pre_grid_hash != self.overlay_hashes[0])
+                            .then_some(gpu.pre_grid_rgba),
+                        post_grid_overlay: (gpu.post_grid_hash != self.overlay_hashes[1])
+                            .then_some(gpu.post_grid_rgba),
+                    }
+                }
+            };
+            MapFramePane {
+                source,
+                viewport: frame_rects
+                    .map_viewport()
+                    .expect("visible Map has a viewport"),
+                information: panel_on_map.then_some(information),
+            }
+        });
+        let organism_upload = organisms_changed.then(|| self.pov_organisms.upload());
+        let pov_pane = pov_params.as_ref().map(|params| PovFramePane {
+            frame: params,
+            uploads: &pov_uploads,
+            removes: &pov_removes,
+            organisms: organism_upload,
+            viewport: frame_rects
+                .pov_viewport()
+                .expect("visible POV has a viewport"),
+            information: (!panel_on_map).then_some(information),
+            render_scale: output.pov.render_scale,
+        });
+        let compose_seconds = compose_start.elapsed().as_secs_f64();
+        let render_start = Instant::now();
+        let result = self.renderer.as_mut().map_or_else(
+            renderer::MultiViewFrameResult::default,
+            |renderer| {
+                renderer.render_frame(MultiViewFrame {
+                    clear: CLEAR_COLOR,
+                    map: map_pane,
+                    pov: pov_pane,
+                    focus: frame_rects.focus_decoration(),
+                })
+            },
+        );
+        let render_seconds = render_start.elapsed().as_secs_f64();
+        debug_assert!(!result.presented || !map_visible || result.map_drawn);
+        debug_assert!(!result.presented || !pov_visible || result.pov_drawn);
+        upload_bytes = upload_bytes.saturating_add(result.map_upload_bytes);
+
+        if let Some(packet) = map_packet.as_ref() {
+            if result.presented {
+                self.panel_revision = Some(document.revision);
+                if let PreparedMapSource::GpuAtlas(gpu) = &packet.source {
+                    self.overlay_hashes = [gpu.pre_grid_hash, gpu.post_grid_hash];
+                }
+            } else {
+                self.panel_revision = None;
+                if matches!(&packet.source, PreparedMapSource::GpuAtlas(_)) {
+                    // Atlas keys were consumed while preparing this packet;
+                    // retry a complete upload after surface recovery.
+                    self.atlas = AtlasManager::default();
+                    self.overlay_hashes = [0; 2];
+                }
+            }
+        } else {
+            upload_bytes = upload_bytes.saturating_add(commit_pov_panel_upload(
                 &mut self.pov_panel_revision,
                 document.revision,
                 (panel_width, panel_height),
                 result.presented,
-            );
-            organism_buffer_stats = renderer.pov_organism_stats();
-            if let Some(buffers) = organism_buffer_stats {
-                upload_bytes += buffers.replacement_bytes;
-            }
+            ));
         }
-        let render_seconds = render_start.elapsed().as_secs_f64();
+        let organism_buffer_stats = self
+            .renderer
+            .as_ref()
+            .and_then(renderer::Renderer::pov_organism_stats);
+        if let Some(buffers) = organism_buffer_stats {
+            upload_bytes = upload_bytes.saturating_add(buffers.replacement_bytes);
+        }
 
         // The once-per-second POV log line (plan §7.5): the steady-state
         // exit criterion reads these — travel stopped ⇒ remeshed stays flat.
-        if self.last_telemetry.elapsed().as_secs_f64() >= 1.0 {
+        if pov_visible && self.last_telemetry.elapsed().as_secs_f64() >= 1.0 {
             let c = self.pov_chunks.counters();
             let last = self.pov_counters_last;
             let organisms = self.pov_organisms.counters();
@@ -1992,11 +2296,15 @@ impl App {
         }
         self.update_telemetry(
             update_seconds,
-            0.0,
+            compose_seconds,
             render_seconds,
             &stats.pass_ms,
             upload_bytes,
         );
+        self.handle_effects(deferred_captures, event_loop);
+        if std::mem::take(&mut self.clear_recovered_renderer_warning) {
+            self.panel_state.warnings.remove("renderer-device-loss");
+        }
     }
 }
 
@@ -2023,17 +2331,10 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        let size = window.inner_size();
         // The renderer gets a source of fresh surface targets (not a single
         // surface) so it can rebuild the swapchain if the platform loses it —
         // which WSLg does routinely.
-        let surface_window = window.clone();
-        let renderer = pollster::block_on(Renderer::new(
-            Box::new(move || surface_window.clone().into()),
-            size.width,
-            size.height,
-        ))
-        .expect("failed to initialize renderer");
+        let renderer = build_window_renderer(&window).expect("failed to initialize renderer");
 
         log::info!(
             "world algorithm version {} | streaming {:?}",
@@ -2082,8 +2383,8 @@ impl ApplicationHandler for App {
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let focused = self.input_context().focused;
-                let event = self.winit_input.cursor_moved(position, focused);
+                let hit = self.pointer_hit_at([position.x, position.y]);
+                let event = self.winit_input.cursor_moved(position, hit);
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::CursorLeft { .. } => {
@@ -2091,15 +2392,16 @@ impl ApplicationHandler for App {
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let view = self.pointer_gesture_view();
-                if let Some(event) = self.winit_input.mouse_input(state, button, view) {
+                let hit = self.pointer_hit_view();
+                if let Some(event) = self.winit_input.mouse_input(state, button, hit) {
                     self.handle_input_event(event, event_loop);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let view = self.pointer_gesture_view();
-                let event = self.winit_input.wheel(delta, view);
-                self.handle_input_event(event, event_loop);
+                if let Some(view) = self.pointer_hit_view() {
+                    let event = self.winit_input.wheel(delta, view);
+                    self.handle_input_event(event, event_loop);
+                }
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -3421,6 +3723,71 @@ mod alignment_characterization_tests {
     }
 
     #[test]
+    fn native_renderer_loss_does_not_reinterpret_held_pov_navigation_as_map_travel() {
+        let mut adapter = input::WinitInputAdapter::default();
+        let mut mapper = InputMapper::default();
+        let pov = context(PresentationMode::Pov);
+        mapper.set_context(pov);
+        let pressed = adapter
+            .key_event(KeyCode::KeyW, ElementState::Pressed, false)
+            .expect("W is supported");
+        assert!(mapper.handle_event(pressed, pov));
+        assert!(mapper.has_continuous_input());
+
+        let position = PhysicalPosition::new(80.0, 40.0);
+        let moved = adapter.cursor_moved(position, Some(ViewKind::Pov));
+        assert!(mapper.handle_event(moved, pov));
+        let press = adapter
+            .mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                Some(ViewKind::Pov),
+            )
+            .expect("POV primary press");
+        assert!(mapper.handle_event(press, pov));
+
+        clear_renderer_loss_input(&mut mapper, &mut adapter);
+        let map = context(PresentationMode::Map);
+        mapper.set_context(map);
+        assert!(!mapper.has_continuous_input());
+        assert!(matches!(
+            adapter.cursor_moved(position, Some(ViewKind::Map)),
+            NormalizedInputEvent::PointerMoved {
+                view: ViewKind::Map,
+                ..
+            }
+        ));
+        let input = mapper.take_frame();
+        assert_eq!(input.map_axis, [0, 0]);
+        assert_eq!(input.pov_axis, [0, 0, 0]);
+
+        let mut controller = ViewerController::new(ExplorationWorld::with_runtime(
+            StreamConfig {
+                near_radius: 0.0,
+                far_radius: 0.0,
+                load_radius: 0.0,
+                unload_radius: 1.0,
+                ..StreamConfig::default()
+            },
+            Budget::unlimited(),
+            ResourceTier::Low,
+        ));
+        let mut hook = viewer_host::world::NoopWorldTickHook;
+        let output = controller.tick(
+            TickInput {
+                dt_seconds: 0.1,
+                input,
+                platform: PlatformTelemetry::default(),
+            },
+            &InlineExecutor,
+            &mut hook,
+            &viewer_host::controller::AnalyticGroundSampler,
+        );
+        assert_eq!(output.travel, 0.0);
+        assert_eq!(output.traveler, (0.0, 0.0));
+    }
+
+    #[test]
     fn shared_map_movement_preserves_legacy_evaluation_order() {
         let controls = [
             KeyCode::KeyW,
@@ -3822,15 +4189,19 @@ mod alignment_characterization_tests {
         )
         .unwrap();
 
-        let event = adapter.cursor_moved(PhysicalPosition::new(100.0, 100.0), ViewKind::Pov);
+        let event = adapter.cursor_moved(PhysicalPosition::new(100.0, 100.0), Some(ViewKind::Pov));
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
         let unheld = mapper.take_frame().look_delta != [0.0, 0.0];
         writeln!(&mut actual, "pov move-unheld look={unheld}").unwrap();
         let event = adapter
-            .mouse_input(ElementState::Pressed, MouseButton::Left, ViewKind::Pov)
+            .mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                Some(ViewKind::Pov),
+            )
             .expect("cursor position arms the drag");
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
-        let event = adapter.cursor_moved(PhysicalPosition::new(112.0, 92.0), ViewKind::Pov);
+        let event = adapter.cursor_moved(PhysicalPosition::new(112.0, 92.0), Some(ViewKind::Pov));
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
         let drag = mapper.take_frame().look_delta;
         tick_controller(
@@ -3850,10 +4221,14 @@ mod alignment_characterization_tests {
         )
         .unwrap();
         let event = adapter
-            .mouse_input(ElementState::Released, MouseButton::Left, ViewKind::Pov)
+            .mouse_input(
+                ElementState::Released,
+                MouseButton::Left,
+                Some(ViewKind::Pov),
+            )
             .expect("release retains the cursor position");
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
-        let event = adapter.cursor_moved(PhysicalPosition::new(140.0, 140.0), ViewKind::Pov);
+        let event = adapter.cursor_moved(PhysicalPosition::new(140.0, 140.0), Some(ViewKind::Pov));
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
         let after_release = mapper.take_frame().look_delta != [0.0, 0.0];
         writeln!(
@@ -3865,12 +4240,16 @@ mod alignment_characterization_tests {
         )
         .unwrap();
         let event = adapter
-            .mouse_input(ElementState::Pressed, MouseButton::Left, ViewKind::Pov)
+            .mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                Some(ViewKind::Pov),
+            )
             .expect("second press retains the cursor position");
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
         let event = adapter.cursor_left();
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
-        let event = adapter.cursor_moved(PhysicalPosition::new(150.0, 150.0), ViewKind::Pov);
+        let event = adapter.cursor_moved(PhysicalPosition::new(150.0, 150.0), Some(ViewKind::Pov));
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
         let after_cancel = mapper.take_frame().look_delta != [0.0, 0.0];
         writeln!(&mut actual, "pov move-cancelled look={after_cancel}").unwrap();
