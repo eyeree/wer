@@ -807,22 +807,22 @@ impl<B> ChunkTable<B> {
     }
 }
 
-/// The scaled offscreen color target for `WER_POV_SCALE < 1.0`: the POV
-/// pass rasterizes into this smaller texture and a linear-filtered blit
-/// stretches it onto the surface. On a software rasterizer fragment cost is
-/// CPU cost and scales with pixel count, so half resolution cuts the raster
-/// bill ~4× — the practical llvmpipe knob the shading toggles are not.
+/// Pane-local offscreen color target for the live POV pass.
+///
+/// Rendering through this target even at scale 1 keeps a POV color clear from
+/// touching a neighboring Map pane. At a lower `WER_POV_SCALE`, the same
+/// target also provides the existing reduced-resolution path.
 #[derive(Debug)]
-pub(crate) struct ScaledTarget {
+pub(crate) struct ColorTarget {
     pub(crate) view: wgpu::TextureView,
     pub(crate) bind_group: wgpu::BindGroup,
     pub(crate) width: u32,
     pub(crate) height: u32,
 }
 
-/// The upscale blit for [`ScaledTarget`]: the debug-map fullscreen-triangle
-/// shader over a **linear** sampler (the debug-map path samples nearest;
-/// an upscale wants smoothing).
+/// The pane-composite blit for [`ColorTarget`]: the debug-map
+/// fullscreen-triangle shader over a **linear** sampler (the debug-map path
+/// samples nearest; a scaled POV wants smoothing).
 #[derive(Debug)]
 pub(crate) struct UpscaleBlit {
     pipeline: wgpu::RenderPipeline,
@@ -983,14 +983,13 @@ pub(crate) struct Pov {
     box_instances: InstanceBuffer,
     sphere_instances: InstanceBuffer,
     organism_stats: PovOrganismBufferStats,
-    /// `(view, width, height)`; recreated when the surface size changes.
+    /// `(view, width, height)`; recreated when the pane render size changes.
     depth: Option<(wgpu::TextureView, u32, u32)>,
-    /// The linear-filtered upscale blit for reduced-resolution rendering.
+    /// The linear-filtered pane composite.
     upscale: UpscaleBlit,
-    /// The scaled offscreen color target (`WER_POV_SCALE < 1.0`); `None`
-    /// at full resolution. Recreated when the target size changes.
-    scaled: Option<ScaledTarget>,
-    /// Surface format, for recreating the scaled target.
+    /// Pane-local offscreen color, recreated only when its render size changes.
+    color: Option<ColorTarget>,
+    /// Surface format, for recreating the color target.
     format: wgpu::TextureFormat,
 }
 
@@ -1703,14 +1702,13 @@ impl Pov {
             organism_stats: PovOrganismBufferStats::default(),
             depth: None,
             upscale: UpscaleBlit::new(device, format),
-            scaled: None,
+            color: None,
             format,
         }
     }
 
-    /// The POV pass's render size for a surface of `width`×`height` at
-    /// `scale` (clamped by the shell): the scaled offscreen size, or the
-    /// surface itself at scale 1.
+    /// The POV pass's render size for a pane of `width`×`height` at
+    /// `scale` (clamped by the shell).
     pub(crate) fn render_size(width: u32, height: u32, scale: f32) -> (u32, u32) {
         if scale >= 1.0 {
             (width, height)
@@ -1722,15 +1720,23 @@ impl Pov {
         }
     }
 
-    /// (Re)create the scaled offscreen target when reduced-resolution
-    /// rendering is active and the size changed. Returns whether the scaled
-    /// path is active.
-    pub(crate) fn ensure_scaled(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        if matches!(&self.scaled, Some(t) if t.width == width && t.height == height) {
+    fn target_size_changed(current: Option<(u32, u32)>, width: u32, height: u32) -> bool {
+        current != Some((width.max(1), height.max(1)))
+    }
+
+    /// (Re)create the pane-local offscreen color target when its render size
+    /// changes.
+    pub(crate) fn ensure_color(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let (width, height) = (width.max(1), height.max(1));
+        let current = self
+            .color
+            .as_ref()
+            .map(|target| (target.width, target.height));
+        if !Self::target_size_changed(current, width, height) {
             return;
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("pov-scaled-color"),
+            label: Some("pov-pane-color"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -1745,7 +1751,7 @@ impl Pov {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pov-scaled-bind-group"),
+            label: Some("pov-pane-bind-group"),
             layout: &self.upscale.layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1758,7 +1764,7 @@ impl Pov {
                 },
             ],
         });
-        self.scaled = Some(ScaledTarget {
+        self.color = Some(ColorTarget {
             view,
             bind_group,
             width,
@@ -1766,16 +1772,20 @@ impl Pov {
         });
     }
 
-    /// The scaled offscreen target's view, when reduced-resolution rendering
-    /// is active ([`Self::ensure_scaled`] ran this frame).
-    pub(crate) fn scaled_view(&self) -> Option<&wgpu::TextureView> {
-        self.scaled.as_ref().map(|t| &t.view)
+    /// The pane-local offscreen target's view after [`Self::ensure_color`].
+    pub(crate) fn color_view(&self) -> Option<&wgpu::TextureView> {
+        self.color.as_ref().map(|t| &t.view)
     }
 
-    /// Record the upscale blit: stretch the scaled offscreen target over the
-    /// full surface with linear filtering.
-    pub(crate) fn blit_scaled(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
-        let scaled = self.scaled.as_ref().expect("ensure_scaled ran");
+    /// Record the pane composite: stretch the offscreen color target into the
+    /// exact destination rectangle with linear filtering.
+    pub(crate) fn blit_color(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        destination: crate::SurfaceViewport,
+    ) {
+        let color = self.color.as_ref().expect("ensure_color ran");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("pov-upscale"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1793,8 +1803,9 @@ impl Pov {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        destination.set(&mut pass);
         pass.set_pipeline(&self.upscale.pipeline);
-        pass.set_bind_group(0, &scaled.bind_group, &[]);
+        pass.set_bind_group(0, &color.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
 
@@ -1824,11 +1835,15 @@ impl Pov {
         (buffer, bind_group)
     }
 
-    /// (Re)create the depth target when the surface size changed
-    /// (plan §5.1). The 2D passes never touch it.
+    /// (Re)create the depth target when the pane render size changes. The 2D
+    /// passes never touch it.
     pub(crate) fn ensure_depth(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let (width, height) = (width.max(1), height.max(1));
-        if matches!(&self.depth, Some((_, w, h)) if *w == width && *h == height) {
+        let current = self
+            .depth
+            .as_ref()
+            .map(|(_, width, height)| (*width, *height));
+        if !Self::target_size_changed(current, width, height) {
             return;
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -2393,7 +2408,7 @@ impl PovCapture {
         self.pov
             .ensure_shadow(&self.device, frame.shadow_resolution);
         if scaled_active {
-            self.pov.ensure_scaled(&self.device, rw, rh);
+            self.pov.ensure_color(&self.device, rw, rh);
         }
         let draws = self.pov.write_frame(&self.device, &self.queue, frame);
         let view = self
@@ -2405,7 +2420,7 @@ impl PovCapture {
                 label: Some("pov-capture-frame"),
             });
         if scaled_active {
-            let target = self.pov.scaled_view().expect("ensure_scaled ran");
+            let target = self.pov.color_view().expect("ensure_color ran");
             self.pov.draw(
                 &mut encoder,
                 target,
@@ -2415,7 +2430,11 @@ impl PovCapture {
                 frame.water,
                 frame.shadow_ao && frame.shadow_resolution > 0,
             );
-            self.pov.blit_scaled(&mut encoder, &view);
+            self.pov.blit_color(
+                &mut encoder,
+                &view,
+                crate::SurfaceViewport::new(0, 0, self.width, self.height),
+            );
         } else {
             self.pov.draw(
                 &mut encoder,
@@ -2483,6 +2502,23 @@ impl PovCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_render_targets_key_only_on_pane_and_scale() {
+        let full = Pov::render_size(641, 359, 1.0);
+        let half = Pov::render_size(641, 359, 0.5);
+        assert_eq!(full, (641, 359));
+        assert_eq!(half, (321, 180));
+        assert!(Pov::target_size_changed(None, full.0, full.1));
+        assert!(!Pov::target_size_changed(Some(full), full.0, full.1));
+        // A presentation-surface resize is deliberately absent from the key.
+        // Keeping this pane at 641x359 therefore retains both color and depth.
+        let resized_surface = (1920, 1080);
+        assert_ne!(resized_surface, full);
+        assert!(!Pov::target_size_changed(Some(full), full.0, full.1));
+        assert!(Pov::target_size_changed(Some(full), half.0, half.1));
+        assert!(Pov::target_size_changed(Some(half), 640, 359));
+    }
 
     fn assert_outward(vertices: &[PovPrimitiveVertex], indices: &[u16]) {
         for tri in indices.chunks_exact(3) {

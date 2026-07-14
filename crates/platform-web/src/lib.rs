@@ -1604,6 +1604,10 @@ mod wasm {
 
             let pov_active = frame.output.mode == super::PresentationMode::Pov;
             let map_active = frame.output.mode == super::PresentationMode::Map;
+            // M8 keeps the live modes exclusive while routing both through
+            // the same multi-view entry point. M9 widens these selectors to
+            // include Split only after focus and one-traveler routing land.
+            let layout = self.state.resolved_layout();
             let map_projection = map_active.then(|| self.state.map_projection()).flatten();
             let (
                 prepared_map_backend,
@@ -1611,50 +1615,64 @@ mod wasm {
                 gpu_map_rendered,
                 map_upload_bytes,
                 schedule_map_retry,
-            ) = if map_active {
-                VIEWER_RENDERER.with(|slot| {
-                    let mut slot = slot.borrow_mut();
-                    let gpu_available = self.state.renderer_ready && slot.is_some();
-                    let super::BrowserHostState {
-                        controller,
-                        composer,
-                        atlas,
-                        overlay_hashes,
-                        prepared_cpu_key,
-                        gpu_map_retry_scheduled,
-                        ..
-                    } = &mut self.state;
+                pov_rendered,
+            ) = VIEWER_RENDERER.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let gpu_available = self.state.renderer_ready && slot.is_some();
+                let super::BrowserHostState {
+                    controller,
+                    composer,
+                    atlas,
+                    overlay_hashes,
+                    prepared_cpu_key,
+                    gpu_map_retry_scheduled,
+                    pov_chunks,
+                    pov_organisms,
+                    pov_radius,
+                    ..
+                } = &mut self.state;
+
+                // Prepare Map data first. A CPU packet remains owned by the
+                // separate 2D fallback canvas and therefore requests no GPU
+                // pane or surface acquisition.
+                let map_packet = if map_active {
                     let world = controller.world();
                     let traveler = world.traveler().position;
                     let preferences = controller.map_preferences();
                     composer.set_zoom(preferences.zoom);
                     let decor = super::MapDecor::default();
-                    let packet = composer.prepare_render(
-                        atlas,
-                        super::MapRenderRequest {
-                            map: world.map(),
-                            player: traveler,
-                            destination: map_projection
-                                .expect("active Map mode has a resolved destination")
-                                .destination,
-                            channel: preferences.channel,
-                            overlays: preferences.overlays,
-                            anchors: world.anchors(),
-                            decor: &decor,
-                            requested_backend: preferences.backend,
-                            gpu_available,
-                            refinement: super::RefinementRequest {
-                                enabled: preferences.refinement,
-                                octave_count: 3,
+                    Some(
+                        composer.prepare_render(
+                            atlas,
+                            super::MapRenderRequest {
+                                map: world.map(),
+                                player: traveler,
+                                destination: map_projection
+                                    .expect("active Map mode has a resolved destination")
+                                    .destination,
+                                channel: preferences.channel,
+                                overlays: preferences.overlays,
+                                anchors: world.anchors(),
+                                decor: &decor,
+                                requested_backend: preferences.backend,
+                                gpu_available,
+                                refinement: super::RefinementRequest {
+                                    enabled: preferences.refinement,
+                                    octave_count: 3,
+                                },
+                                dirty_key: frame.output.update_serial,
                             },
-                            dirty_key: frame.output.update_serial,
-                        },
-                    );
-                    let backend = packet.backend;
-                    let fallback = packet.fallback;
-                    let dirty_key = packet.dirty_key;
-                    let destination = packet.viewport.destination;
-                    match packet.source {
+                        ),
+                    )
+                } else {
+                    None
+                };
+                let prepared_map_backend = map_packet
+                    .as_ref()
+                    .map_or(super::MapBackend::Cpu, |packet| packet.backend);
+                let prepared_map_fallback = map_packet.as_ref().and_then(|packet| packet.fallback);
+                if let Some(packet) = map_packet.as_ref() {
+                    match &packet.source {
                         super::PreparedMapSource::Cpu(cpu) => {
                             debug_assert_eq!(
                                 cpu.rgba.len(),
@@ -1662,54 +1680,131 @@ mod wasm {
                                     * packet.projection.side as usize
                                     * 4
                             );
-                            *prepared_cpu_key = Some(dirty_key);
+                            *prepared_cpu_key = Some(packet.dirty_key);
                             *gpu_map_retry_scheduled = false;
-                            (backend, fallback, false, 0, false)
                         }
-                        super::PreparedMapSource::GpuAtlas(gpu) => {
+                        super::PreparedMapSource::GpuAtlas(_) => {
                             *prepared_cpu_key = None;
-                            let pre_grid_changed = overlay_hashes[0] != Some(gpu.pre_grid_hash);
-                            let post_grid_changed = overlay_hashes[1] != Some(gpu.post_grid_hash);
-                            let renderer = slot
-                                .as_mut()
-                                .expect("a prepared GPU packet requires an initialized renderer");
-                            let result = renderer.render_map_gpu_in(
-                                &gpu.params,
-                                &gpu.slots,
-                                &gpu.uploads,
-                                pre_grid_changed.then_some(gpu.pre_grid_rgba),
-                                post_grid_changed.then_some(gpu.post_grid_rgba),
-                                None,
-                                renderer::SurfaceViewport::new(
-                                    destination.x,
-                                    destination.y,
-                                    destination.width,
-                                    destination.height,
-                                ),
-                                None,
-                                CLEAR_COLOR,
-                            );
-                            if let Some(bytes) = result {
-                                *overlay_hashes =
-                                    [Some(gpu.pre_grid_hash), Some(gpu.post_grid_hash)];
-                                *gpu_map_retry_scheduled = false;
-                                (backend, fallback, true, bytes, false)
-                            } else {
-                                // The manager may have consumed delta keys
-                                // before a failed surface submission. Reset it
-                                // so a recovered renderer receives full tiles.
-                                *atlas = super::AtlasManager::default();
-                                *overlay_hashes = [None; 2];
-                                let schedule_retry =
-                                    super::claim_gpu_map_retry(gpu_map_retry_scheduled);
-                                (backend, fallback, false, 0, schedule_retry)
-                            }
                         }
                     }
-                })
-            } else {
-                (super::MapBackend::Cpu, None, false, 0, false)
-            };
+                }
+
+                let mut gpu_overlay_hashes = None;
+                let map_pane = map_packet.as_ref().and_then(|packet| {
+                    let super::PreparedMapSource::GpuAtlas(gpu) = &packet.source else {
+                        return None;
+                    };
+                    gpu_overlay_hashes = Some([gpu.pre_grid_hash, gpu.post_grid_hash]);
+                    let destination = packet.viewport.destination;
+                    Some(renderer::MapFramePane {
+                        source: renderer::MapFrameSource::Gpu {
+                            params: &gpu.params,
+                            slots: &gpu.slots,
+                            uploads: &gpu.uploads,
+                            pre_grid_overlay: (overlay_hashes[0] != Some(gpu.pre_grid_hash))
+                                .then_some(gpu.pre_grid_rgba),
+                            post_grid_overlay: (overlay_hashes[1] != Some(gpu.post_grid_hash))
+                                .then_some(gpu.post_grid_rgba),
+                        },
+                        viewport: renderer::SurfaceViewport::new(
+                            destination.x,
+                            destination.y,
+                            destination.width,
+                            destination.height,
+                        ),
+                        information: None,
+                    })
+                });
+
+                // The exact shared POV rectangle drives both projection and
+                // pane-local color/depth sizing. Full-surface dimensions are
+                // deliberately irrelevant here.
+                let pov_params = pov_active.then(|| {
+                    let camera = controller.pov_camera();
+                    let shadow = pov_host::shadow_frame(
+                        camera,
+                        pov_chunks,
+                        pov_organisms.shadow_bounds(),
+                        pov_host::shadow_resolution(controller.world().tier()),
+                    );
+                    pov_host::frame_params(
+                        camera,
+                        layout
+                            .pov_aspect
+                            .expect("active POV mode has a resolved aspect"),
+                        *pov_radius,
+                        time,
+                        controller.pov_toggles(),
+                        shadow,
+                    )
+                });
+                let organism_upload = frame.organisms_changed.then(|| pov_organisms.upload());
+                let pov_pane = pov_params.as_ref().map(|params| {
+                    let destination = layout
+                        .pov_pane
+                        .expect("active POV mode has a resolved pane");
+                    renderer::PovFramePane {
+                        frame: params,
+                        uploads: &frame.uploads,
+                        removes: &frame.removes,
+                        organisms: organism_upload,
+                        viewport: renderer::SurfaceViewport::new(
+                            destination.x,
+                            destination.y,
+                            destination.width,
+                            destination.height,
+                        ),
+                        information: None,
+                        render_scale: frame.output.pov.render_scale,
+                    }
+                });
+
+                // One call site owns the one acquire/submit/present attempt.
+                // A CPU-only Map frame skips it so the hidden GPU stage does
+                // not compete with the truthful 2D fallback presentation.
+                let render_result = if map_pane.is_some() || pov_pane.is_some() {
+                    slot.as_mut()
+                        .map_or_else(renderer::MultiViewFrameResult::default, |renderer| {
+                            renderer.render_frame(renderer::MultiViewFrame {
+                                clear: CLEAR_COLOR,
+                                map: map_pane,
+                                pov: pov_pane,
+                                focus: None,
+                            })
+                        })
+                } else {
+                    renderer::MultiViewFrameResult::default()
+                };
+
+                let gpu_map_rendered = render_result.map_drawn;
+                let schedule_map_retry = if let Some(hashes) = gpu_overlay_hashes {
+                    if gpu_map_rendered {
+                        *overlay_hashes = hashes.map(Some);
+                        *gpu_map_retry_scheduled = false;
+                        false
+                    } else {
+                        // Atlas keys were consumed before the failed unified
+                        // presentation. Force complete tiles after recovery.
+                        *atlas = super::AtlasManager::default();
+                        *overlay_hashes = [None; 2];
+                        super::claim_gpu_map_retry(gpu_map_retry_scheduled)
+                    }
+                } else {
+                    false
+                };
+                (
+                    prepared_map_backend,
+                    prepared_map_fallback,
+                    gpu_map_rendered,
+                    if gpu_map_rendered {
+                        render_result.map_upload_bytes
+                    } else {
+                        0
+                    },
+                    schedule_map_retry,
+                    render_result.pov_drawn,
+                )
+            });
             if schedule_map_retry {
                 // Surface Outdated/Lost is repaired by the failed acquire;
                 // request one bounded follow-up frame to present it without
@@ -1745,42 +1840,6 @@ mod wasm {
                 || (map_active
                     && prepared_map_backend == super::MapBackend::GpuAtlas
                     && !gpu_map_rendered);
-            let organism_upload = frame
-                .organisms_changed
-                .then(|| self.state.pov_organisms.upload());
-            let pov_rendered = pov_active
-                && VIEWER_RENDERER.with(|slot| {
-                    let mut slot = slot.borrow_mut();
-                    let Some(renderer) = slot.as_mut() else {
-                        return false;
-                    };
-                    let (width, height) = renderer.size();
-                    let camera = self.state.controller.pov_camera();
-                    let shadow = pov_host::shadow_frame(
-                        camera,
-                        &self.state.pov_chunks,
-                        self.state.pov_organisms.shadow_bounds(),
-                        pov_host::shadow_resolution(self.state.controller.world().tier()),
-                    );
-                    let params = pov_host::frame_params(
-                        camera,
-                        width as f32 / height.max(1) as f32,
-                        self.state.pov_radius,
-                        time,
-                        self.state.controller.pov_toggles(),
-                        shadow,
-                    );
-                    renderer.render_pov(
-                        &params,
-                        &frame.uploads,
-                        &frame.removes,
-                        organism_upload,
-                        CLEAR_COLOR,
-                        renderer::SurfaceViewport::new(0, 0, width, height),
-                        None,
-                        frame.output.pov.render_scale,
-                    )
-                });
             let surface_losses = VIEWER_RENDERER.with(|slot| {
                 slot.borrow()
                     .as_ref()

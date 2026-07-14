@@ -40,6 +40,22 @@ pub fn letterbox_viewport(surface: (u32, u32), image: (u32, u32)) -> (f32, f32, 
     ((sw - w) * 0.5, (sh - h) * 0.5, w, h)
 }
 
+/// Fit an image without distortion inside an arbitrary parent rectangle.
+///
+/// This is the rectangle form of [`letterbox_viewport`]. Keeping the parent
+/// origin in the result lets Map use the same helper in a full surface or one
+/// half of a multi-view frame.
+#[must_use]
+pub fn letterbox_viewport_in(parent: SurfaceViewport, image: (u32, u32)) -> SurfaceViewport {
+    let (x, y, width, height) = letterbox_viewport((parent.width, parent.height), image);
+    SurfaceViewport::new(
+        parent.x.saturating_add(x.round() as u32),
+        parent.y.saturating_add(y.round() as u32),
+        width.round() as u32,
+        height.round() as u32,
+    )
+}
+
 /// An exact physical-pixel viewport on the presentation surface.
 ///
 /// Layout ownership stays in `viewer-host`; this renderer-side transport type
@@ -57,9 +73,9 @@ pub struct SurfaceViewport {
     pub height: u32,
 }
 
-/// Optional new pixels for the shell-owned POV information texture.
+/// Optional new pixels for a shell-owned information texture.
 #[derive(Debug, Clone, Copy)]
-pub struct PovInformationUpload<'a> {
+pub struct InformationUpload<'a> {
     /// sRGB-encoded RGBA8 pixels in row-major order.
     pub rgba: &'a [u8],
     /// Source texture width.
@@ -68,11 +84,11 @@ pub struct PovInformationUpload<'a> {
     pub height: u32,
 }
 
-/// One shell-owned information surface composed after the POV pass.
+/// One shell-owned information surface composed after the view passes.
 #[derive(Debug, Clone, Copy)]
-pub struct PovInformationSurface<'a> {
+pub struct InformationSurface<'a> {
     /// Replacement pixels, or `None` to retain the existing texture.
-    pub upload: Option<PovInformationUpload<'a>>,
+    pub upload: Option<InformationUpload<'a>>,
     /// Exact destination on the presentation surface.
     pub viewport: SurfaceViewport,
 }
@@ -100,7 +116,17 @@ impl SurfaceViewport {
             && self.height <= surface_height - self.y
     }
 
-    fn set(self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Whether this rectangle shares at least one physical pixel with
+    /// `other`. Touching half-open edges do not overlap.
+    #[must_use]
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.x < other.x.saturating_add(other.width)
+            && other.x < self.x.saturating_add(self.width)
+            && self.y < other.y.saturating_add(other.height)
+            && other.y < self.y.saturating_add(self.height)
+    }
+
+    pub(crate) fn set(self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_viewport(
             self.x as f32,
             self.y as f32,
@@ -109,9 +135,278 @@ impl SurfaceViewport {
             0.0,
             1.0,
         );
+        pass.set_scissor_rect(self.x, self.y, self.width, self.height);
     }
 }
 
+/// Logical passes recorded for one live surface frame.
+///
+/// The list is device-free test evidence for the ordering contract; POV's
+/// offscreen color/depth clear is distinct from the single surface clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramePassKind {
+    /// Clear the presentation surface once.
+    SurfaceClear,
+    /// Compose the CPU or atlas Map pane, loading the cleared surface.
+    Map,
+    /// Populate the independent directional shadow target.
+    PovShadow,
+    /// Render POV color/depth into its pane-sized offscreen target.
+    PovOffscreen,
+    /// Composite the POV offscreen color into its destination pane.
+    PovComposite,
+    /// Draw the Map-associated bitmap information surface.
+    MapInformation,
+    /// Draw the POV-associated bitmap information surface.
+    PovInformation,
+    /// Draw focus decoration last.
+    Focus,
+}
+
+/// Names the non-overlapping surface regions in a frame-plan error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameRegion {
+    /// Map destination.
+    Map,
+    /// POV destination.
+    Pov,
+    /// Map information/HUD destination.
+    MapInformation,
+    /// POV information/HUD destination.
+    PovInformation,
+    /// Focus decoration bounds.
+    Focus,
+}
+
+/// A device-free request for the passes and rectangles in one frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FramePlanRequest {
+    /// Surface dimensions in physical pixels.
+    pub surface: (u32, u32),
+    /// Optional Map destination.
+    pub map: Option<SurfaceViewport>,
+    /// Optional POV destination.
+    pub pov: Option<SurfaceViewport>,
+    /// Optional Map information destination.
+    pub map_information: Option<SurfaceViewport>,
+    /// Optional POV information destination.
+    pub pov_information: Option<SurfaceViewport>,
+    /// Whether the POV pass records its independent shadow pass.
+    pub pov_shadows: bool,
+    /// Optional focus decoration bounds. It may overlap the focused pane.
+    pub focus: Option<SurfaceViewport>,
+}
+
+/// Why a multi-view frame layout cannot be recorded safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramePlanError {
+    /// A non-empty region escaped the surface.
+    OutsideSurface(FrameRegion, SurfaceViewport),
+    /// Two independently owned color regions overlap.
+    Overlap(FrameRegion, FrameRegion),
+}
+
+/// Ordered, validated recording plan for one live frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramePassPlan {
+    passes: [FramePassKind; 8],
+    len: u8,
+}
+
+impl FramePassPlan {
+    /// Validate rectangles and construct the fixed recording order.
+    pub fn new(request: FramePlanRequest) -> Result<Self, FramePlanError> {
+        let regions = [
+            (FrameRegion::Map, request.map),
+            (FrameRegion::Pov, request.pov),
+            (FrameRegion::MapInformation, request.map_information),
+            (FrameRegion::PovInformation, request.pov_information),
+        ];
+        for (region, viewport) in regions
+            .into_iter()
+            .filter_map(|(kind, rect)| rect.map(|r| (kind, r)))
+        {
+            if !viewport.is_contained_by(request.surface.0, request.surface.1) {
+                return Err(FramePlanError::OutsideSurface(region, viewport));
+            }
+        }
+        if let Some(focus) = request.focus {
+            if !focus.is_contained_by(request.surface.0, request.surface.1) {
+                return Err(FramePlanError::OutsideSurface(FrameRegion::Focus, focus));
+            }
+        }
+        for first in 0..regions.len() {
+            let Some(first_rect) = regions[first].1 else {
+                continue;
+            };
+            for second in first + 1..regions.len() {
+                let Some(second_rect) = regions[second].1 else {
+                    continue;
+                };
+                if first_rect.overlaps(second_rect) {
+                    return Err(FramePlanError::Overlap(regions[first].0, regions[second].0));
+                }
+            }
+        }
+
+        let mut passes = [FramePassKind::SurfaceClear; 8];
+        let mut len = 1usize;
+        let mut push = |pass| {
+            passes[len] = pass;
+            len += 1;
+        };
+        if request.map.is_some() {
+            push(FramePassKind::Map);
+        }
+        if request.pov.is_some() {
+            if request.pov_shadows {
+                push(FramePassKind::PovShadow);
+            }
+            push(FramePassKind::PovOffscreen);
+            push(FramePassKind::PovComposite);
+        }
+        if request.map_information.is_some() {
+            push(FramePassKind::MapInformation);
+        }
+        if request.pov_information.is_some() {
+            push(FramePassKind::PovInformation);
+        }
+        if request.focus.is_some() {
+            push(FramePassKind::Focus);
+        }
+        Ok(Self {
+            passes,
+            len: len as u8,
+        })
+    }
+
+    /// Fixed pass order used by the renderer.
+    #[must_use]
+    pub fn passes(&self) -> &[FramePassKind] {
+        &self.passes[..usize::from(self.len)]
+    }
+
+    /// Successful surface lifecycle for any plan: exactly one of each.
+    #[must_use]
+    pub const fn successful_surface_lifecycle(&self) -> FrameLifecycleCounters {
+        FrameLifecycleCounters {
+            acquire_attempts: 1,
+            acquired: 1,
+            surface_clears: 1,
+            submissions: 1,
+            presents: 1,
+        }
+    }
+}
+
+/// Cumulative (or plan-local) surface-frame lifecycle counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FrameLifecycleCounters {
+    /// Calls that attempted to acquire a swapchain image.
+    pub acquire_attempts: u64,
+    /// Swapchain images successfully acquired.
+    pub acquired: u64,
+    /// Clears recorded against the presentation surface.
+    pub surface_clears: u64,
+    /// Command-buffer submissions.
+    pub submissions: u64,
+    /// Presented swapchain images.
+    pub presents: u64,
+}
+
+/// A CPU or atlas-composed Map source for [`MultiViewFrame`].
+#[derive(Debug, Clone, Copy)]
+pub enum MapFrameSource<'a> {
+    /// CPU-composed sRGB RGBA8 pixels.
+    Cpu {
+        /// Pixel bytes.
+        rgba: &'a [u8],
+        /// Image width.
+        width: u32,
+        /// Image height.
+        height: u32,
+    },
+    /// GPU atlas inputs and delta uploads.
+    Gpu {
+        /// Per-frame composition uniforms.
+        params: &'a GpuMapParams,
+        /// Atlas slot table.
+        slots: &'a [i32],
+        /// Changed tile uploads.
+        uploads: &'a [MapTileUpload],
+        /// Changed pre-grid overlay, if any.
+        pre_grid_overlay: Option<&'a [u8]>,
+        /// Changed post-grid overlay, if any.
+        post_grid_overlay: Option<&'a [u8]>,
+    },
+}
+
+/// One optional Map pane in a multi-view frame.
+#[derive(Debug, Clone, Copy)]
+pub struct MapFramePane<'a> {
+    /// CPU or GPU source.
+    pub source: MapFrameSource<'a>,
+    /// Exact destination rectangle.
+    pub viewport: SurfaceViewport,
+    /// Optional final bitmap panel/HUD associated with Map.
+    pub information: Option<InformationSurface<'a>>,
+}
+
+/// One optional POV pane in a multi-view frame.
+#[derive(Debug, Clone, Copy)]
+pub struct PovFramePane<'a> {
+    /// Camera/light/fog uniforms.
+    pub frame: &'a PovFrameParams,
+    /// Changed terrain chunks.
+    pub uploads: &'a [TerrainChunkUpload],
+    /// Evicted chunk handles.
+    pub removes: &'a [u64],
+    /// Organism replacement tri-state.
+    pub organisms: Option<&'a PovOrganismUpload>,
+    /// Exact destination rectangle.
+    pub viewport: SurfaceViewport,
+    /// Optional final bitmap panel/HUD associated with POV.
+    pub information: Option<InformationSurface<'a>>,
+    /// Pane-relative render scale.
+    pub render_scale: f32,
+}
+
+/// Optional final focus-border decoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusDecoration {
+    /// Bounds of the focused pane.
+    pub viewport: SurfaceViewport,
+    /// Border thickness in physical pixels.
+    pub thickness: u32,
+}
+
+/// Everything recorded and presented through one live surface frame.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiViewFrame<'a> {
+    /// Linear clear color for the presentation surface and POV sky.
+    pub clear: [f64; 4],
+    /// Optional Map pane.
+    pub map: Option<MapFramePane<'a>>,
+    /// Optional POV pane.
+    pub pov: Option<PovFramePane<'a>>,
+    /// Optional focus border, drawn last.
+    pub focus: Option<FocusDecoration>,
+}
+
+/// Outcome of one multi-view surface attempt.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MultiViewFrameResult {
+    /// Whether a surface image was submitted and presented.
+    pub presented: bool,
+    /// Atlas/overlay/information bytes uploaded while preparing Map.
+    pub map_upload_bytes: u64,
+    /// Whether a requested Map pane reached the presented frame.
+    pub map_drawn: bool,
+    /// Whether a requested POV pane reached the presented frame.
+    pub pov_drawn: bool,
+}
+
+#[cfg(test)]
 fn scale_viewport(
     viewport: SurfaceViewport,
     source: (u32, u32),
@@ -465,12 +760,16 @@ pub struct Renderer {
     panel_blit: DebugMapPipeline,
     /// Third blit pipeline for the shell-owned POV information surface.
     pov_hud_blit: DebugMapPipeline,
+    /// Opaque one-pixel source used to draw final focus-border strips.
+    focus_blit: DebugMapPipeline,
     /// The Phase 6 atlas-composed map path (phase-6-plan.md §6.5), built
     /// lazily on the first GPU-mode frame.
     gpu_map: Option<GpuMap>,
     /// The POV terrain path (3d-phase-1-plan.md §5), built lazily on the
     /// first POV frame. Owns the renderer's only depth target.
     pov: Option<pov::Pov>,
+    /// Observable proof that all live wrappers share one surface lifecycle.
+    frame_lifecycle: FrameLifecycleCounters,
 }
 
 impl fmt::Debug for Renderer {
@@ -479,6 +778,114 @@ impl fmt::Debug for Renderer {
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
+}
+
+fn valid_rgba_upload(rgba: &[u8], width: u32, height: u32) -> bool {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4));
+    width > 0 && height > 0 && u64::try_from(rgba.len()).ok() == expected
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InformationPreflightError {
+    InvalidUpload,
+    MissingRetainedTexture,
+}
+
+fn preflight_information(
+    information: Option<InformationSurface<'_>>,
+    retained_texture_exists: bool,
+) -> Result<(), InformationPreflightError> {
+    let Some(information) = information else {
+        return Ok(());
+    };
+    match information.upload {
+        Some(upload) if valid_rgba_upload(upload.rgba, upload.width, upload.height) => Ok(()),
+        Some(_) => Err(InformationPreflightError::InvalidUpload),
+        None if retained_texture_exists => Ok(()),
+        None => Err(InformationPreflightError::MissingRetainedTexture),
+    }
+}
+
+fn horizontal_split(
+    combined: SurfaceViewport,
+    left_units: u32,
+    total_units: u32,
+) -> (SurfaceViewport, SurfaceViewport) {
+    debug_assert!(total_units > 0 && left_units <= total_units);
+    let left_width = ((u64::from(combined.width) * u64::from(left_units)
+        + u64::from(total_units) / 2)
+        / u64::from(total_units)) as u32;
+    let left = SurfaceViewport::new(combined.x, combined.y, left_width, combined.height);
+    let right = SurfaceViewport::new(
+        left.x.saturating_add(left.width),
+        combined.y,
+        combined.width.saturating_sub(left.width),
+        combined.height,
+    );
+    (left, right)
+}
+
+fn record_bitmap_surface(
+    encoder: &mut wgpu::CommandEncoder,
+    surface: &wgpu::TextureView,
+    pipeline: &DebugMapPipeline,
+    viewport: SurfaceViewport,
+    label: &'static str,
+) {
+    let Some((_, bind_group, _, _)) = pipeline.texture.as_ref() else {
+        return;
+    };
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: surface,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    viewport.set(&mut pass);
+    pass.set_pipeline(&pipeline.pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+fn focus_border_rects(focus: FocusDecoration) -> [Option<SurfaceViewport>; 4] {
+    let rect = focus.viewport;
+    let thickness = focus.thickness.min(rect.width).min(rect.height);
+    if thickness == 0 {
+        return [None; 4];
+    }
+    let bottom_y = rect.y.saturating_add(rect.height.saturating_sub(thickness));
+    let inner_height = rect.height.saturating_sub(thickness.saturating_mul(2));
+    let right_x = rect.x.saturating_add(rect.width.saturating_sub(thickness));
+    [
+        Some(SurfaceViewport::new(rect.x, rect.y, rect.width, thickness)),
+        (bottom_y != rect.y).then_some(SurfaceViewport::new(
+            rect.x, bottom_y, rect.width, thickness,
+        )),
+        (inner_height > 0).then_some(SurfaceViewport::new(
+            rect.x,
+            rect.y.saturating_add(thickness),
+            thickness,
+            inner_height,
+        )),
+        (inner_height > 0 && right_x != rect.x).then_some(SurfaceViewport::new(
+            right_x,
+            rect.y.saturating_add(thickness),
+            thickness,
+            inner_height,
+        )),
+    ]
 }
 
 impl Renderer {
@@ -594,6 +1001,8 @@ impl Renderer {
         let debug_map = DebugMapPipeline::new(&device, render_format);
         let panel_blit = DebugMapPipeline::new(&device, render_format);
         let pov_hud_blit = DebugMapPipeline::new(&device, render_format);
+        let mut focus_blit = DebugMapPipeline::new(&device, render_format);
+        focus_blit.upload(&device, &queue, &[72, 190, 255, 255], 1, 1);
 
         Ok(Self {
             instance,
@@ -607,8 +1016,10 @@ impl Renderer {
             debug_map,
             panel_blit,
             pov_hud_blit,
+            focus_blit,
             gpu_map: None,
             pov: None,
+            frame_lifecycle: FrameLifecycleCounters::default(),
         })
     }
 
@@ -656,11 +1067,9 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        // The POV depth target tracks the surface size (3d-phase-1-plan.md
-        // §5.1); the 2D passes keep no depth attachment and are untouched.
-        if let Some(pov) = self.pov.as_mut() {
-            pov.ensure_depth(&self.device, width, height);
-        }
+        // Pane-local POV color/depth resources are resized lazily from the
+        // next frame's POV rectangle. A surface-only resize need not churn
+        // them when the pane's physical render size is unchanged.
     }
 
     /// Acquire the next surface frame, handling transient states
@@ -668,11 +1077,17 @@ impl Renderer {
     /// rather than propagating. `None` means "draw nothing this frame".
     fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
         use wgpu::CurrentSurfaceTexture as Cst;
+        self.frame_lifecycle.acquire_attempts =
+            self.frame_lifecycle.acquire_attempts.saturating_add(1);
         match self.surface.get_current_texture() {
-            Cst::Success(frame) => Some(frame),
+            Cst::Success(frame) => {
+                self.frame_lifecycle.acquired = self.frame_lifecycle.acquired.saturating_add(1);
+                Some(frame)
+            }
             Cst::Suboptimal(frame) => {
                 // Usable this frame; reconfigure for the next.
                 self.surface.configure(&self.device, &self.config);
+                self.frame_lifecycle.acquired = self.frame_lifecycle.acquired.saturating_add(1);
                 Some(frame)
             }
             Cst::Outdated => {
@@ -697,33 +1112,216 @@ impl Renderer {
         }
     }
 
-    /// Acquire the next frame and clear it to `color` (linear RGBA, 0..=1).
-    /// Returns `false` when no frame was drawn.
-    pub fn render_clear(&mut self, color: [f64; 4]) -> bool {
-        let Some(frame) = self.acquire_frame() else {
-            return false;
+    /// Cumulative surface lifecycle counters for live multi-view attempts.
+    #[must_use]
+    pub const fn frame_lifecycle(&self) -> FrameLifecycleCounters {
+        self.frame_lifecycle
+    }
+
+    /// Prepare every requested view, then acquire, encode, submit, and present
+    /// exactly one live surface frame.
+    ///
+    /// Queue writes and pane-local resource growth happen before acquisition.
+    /// The presentation surface is cleared once; Map, POV composite,
+    /// information, and focus passes load that result. Live rendering exposes
+    /// no readback (ADR 0017).
+    #[must_use]
+    pub fn render_frame(&mut self, frame: MultiViewFrame<'_>) -> MultiViewFrameResult {
+        // Validate every borrowed bitmap before mutating any retained GPU
+        // resource. Callers may already have consumed dirty keys while
+        // assembling the packet, so a late failure must not apply only the
+        // earlier half of a multi-view update.
+        if let Some(MapFramePane {
+            source:
+                MapFrameSource::Cpu {
+                    rgba,
+                    width,
+                    height,
+                },
+            ..
+        }) = frame.map
+        {
+            if !valid_rgba_upload(rgba, width, height) {
+                log::error!(
+                    "map upload with inconsistent dimensions ({width}x{height}, {} bytes)",
+                    rgba.len()
+                );
+                return MultiViewFrameResult::default();
+            }
+        }
+        if let Err(error) = preflight_information(
+            frame.map.and_then(|map| map.information),
+            self.panel_blit.texture.is_some(),
+        ) {
+            log::error!("map information preflight failed: {error:?}");
+            return MultiViewFrameResult::default();
+        }
+        if let Err(error) = preflight_information(
+            frame.pov.and_then(|pov| pov.information),
+            self.pov_hud_blit.texture.is_some(),
+        ) {
+            log::error!("POV information preflight failed: {error:?}");
+            return MultiViewFrameResult::default();
+        }
+
+        let surface = (self.config.width, self.config.height);
+        let focus = frame.focus.filter(|focus| focus.thickness > 0);
+        let plan_request = FramePlanRequest {
+            surface,
+            map: frame.map.map(|map| map.viewport),
+            pov: frame.pov.map(|pov| pov.viewport),
+            map_information: frame
+                .map
+                .and_then(|map| map.information.map(|information| information.viewport)),
+            pov_information: frame
+                .pov
+                .and_then(|pov| pov.information.map(|information| information.viewport)),
+            pov_shadows: frame
+                .pov
+                .is_some_and(|pov| pov.frame.shadow_ao && pov.frame.shadow_resolution > 0),
+            focus: focus.map(|focus| focus.viewport),
+        };
+        let Ok(_plan) = FramePassPlan::new(plan_request) else {
+            log::error!("invalid multi-view frame layout: {plan_request:?}");
+            return MultiViewFrameResult::default();
         };
 
-        let view = self.surface_view(&frame);
+        // Resource preparation: no surface image exists yet.
+        let mut map_upload_bytes = 0u64;
+        if let Some(map) = frame.map {
+            match map.source {
+                MapFrameSource::Cpu {
+                    rgba,
+                    width,
+                    height,
+                } => {
+                    self.debug_map
+                        .upload(&self.device, &self.queue, rgba, width, height);
+                }
+                MapFrameSource::Gpu {
+                    params,
+                    slots,
+                    uploads,
+                    pre_grid_overlay,
+                    post_grid_overlay,
+                } => {
+                    let span = (2 * params.half_regions + 1) as u32;
+                    let side = span * params.resolution;
+                    let rebuild = !matches!(
+                        &self.gpu_map,
+                        Some(existing)
+                            if existing.capacity == span * span
+                                && existing.resolution == params.resolution
+                                && existing.side == side
+                    );
+                    if rebuild {
+                        self.gpu_map = Some(GpuMap::new(
+                            &self.device,
+                            self.render_format,
+                            span * span,
+                            params.resolution,
+                            side,
+                        ));
+                        log::info!(
+                            "gpu map atlas built: {span}x{span} slots at {}²",
+                            params.resolution
+                        );
+                    }
+                    let gpu_map = self.gpu_map.as_ref().expect("GPU map just ensured");
+                    map_upload_bytes = gpu_map.upload_tiles(&self.queue, uploads);
+                    if let Some(rgba) = pre_grid_overlay {
+                        map_upload_bytes += gpu_map.upload_pre_grid_overlay(&self.queue, rgba);
+                    }
+                    if let Some(rgba) = post_grid_overlay {
+                        map_upload_bytes += gpu_map.upload_post_grid_overlay(&self.queue, rgba);
+                    }
+                    gpu_map.write_frame(&self.queue, params, slots);
+                }
+            }
+            if let Some(information) = map.information {
+                if let Some(upload) = information.upload {
+                    self.panel_blit.upload(
+                        &self.device,
+                        &self.queue,
+                        upload.rgba,
+                        upload.width,
+                        upload.height,
+                    );
+                    map_upload_bytes += u64::from(upload.width) * u64::from(upload.height) * 4;
+                }
+            }
+        }
+
+        let mut pov_draws = Vec::new();
+        let mut pov_render_size = None;
+        if let Some(pov_frame) = frame.pov {
+            if self.pov.is_none() {
+                self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.render_format));
+                log::info!(
+                    "pov pipeline built: {} verts/chunk, {} indices shared",
+                    pov::VERTS_PER_CHUNK,
+                    pov::INDICES_PER_CHUNK
+                );
+            }
+            let scale = if pov_frame.render_scale.is_finite() {
+                pov_frame.render_scale.clamp(0.25, 1.0)
+            } else {
+                1.0
+            };
+            let (width, height) =
+                pov::Pov::render_size(pov_frame.viewport.width, pov_frame.viewport.height, scale);
+            let pov = self.pov.as_mut().expect("POV just ensured");
+            pov.ensure_color(&self.device, width, height);
+            pov.ensure_depth(&self.device, width, height);
+            pov.ensure_shadow(&self.device, pov_frame.frame.shadow_resolution);
+            pov.apply(
+                &self.device,
+                &self.queue,
+                pov_frame.uploads,
+                pov_frame.removes,
+            );
+            pov.apply_organisms(&self.device, &self.queue, pov_frame.organisms);
+            pov_draws = pov.write_frame(&self.device, &self.queue, pov_frame.frame);
+            pov_render_size = Some((width, height));
+            if let Some(information) = pov_frame.information {
+                if let Some(upload) = information.upload {
+                    self.pov_hud_blit.upload(
+                        &self.device,
+                        &self.queue,
+                        upload.rgba,
+                        upload.width,
+                        upload.height,
+                    );
+                }
+            }
+        }
+
+        let Some(surface_frame) = self.acquire_frame() else {
+            return MultiViewFrameResult {
+                map_upload_bytes,
+                ..MultiViewFrameResult::default()
+            };
+        };
+        let surface_view = self.surface_view(&surface_frame);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wer-frame"),
+                label: Some("wer-multi-view-frame"),
             });
 
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear"),
+                label: Some("frame-surface-clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &surface_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: color[0],
-                            g: color[1],
-                            b: color[2],
-                            a: color[3],
+                            r: frame.clear[0],
+                            g: frame.clear[1],
+                            b: frame.clear[2],
+                            a: frame.clear[3],
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -734,10 +1332,127 @@ impl Renderer {
                 multiview_mask: None,
             });
         }
+        self.frame_lifecycle.surface_clears = self.frame_lifecycle.surface_clears.saturating_add(1);
+
+        if let Some(map) = frame.map {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frame-map"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            map.viewport.set(&mut pass);
+            match map.source {
+                MapFrameSource::Cpu { .. } => {
+                    let (_, bind_group, _, _) = self
+                        .debug_map
+                        .texture
+                        .as_ref()
+                        .expect("validated CPU map upload");
+                    pass.set_pipeline(&self.debug_map.pipeline);
+                    pass.set_bind_group(0, bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                MapFrameSource::Gpu { .. } => {
+                    self.gpu_map
+                        .as_ref()
+                        .expect("GPU map ensured")
+                        .draw(&mut pass);
+                }
+            }
+        }
+
+        if let Some(pov_frame) = frame.pov {
+            let (width, height) = pov_render_size.expect("POV render size prepared");
+            let pov = self.pov.as_ref().expect("POV prepared");
+            pov.draw(
+                &mut encoder,
+                pov.color_view().expect("POV color target prepared"),
+                SurfaceViewport::new(0, 0, width, height),
+                &pov_draws,
+                frame.clear,
+                pov_frame.frame.water,
+                pov_frame.frame.shadow_ao && pov_frame.frame.shadow_resolution > 0,
+            );
+            pov.blit_color(&mut encoder, &surface_view, pov_frame.viewport);
+        }
+
+        if let Some(information) = frame.map.and_then(|map| map.information) {
+            record_bitmap_surface(
+                &mut encoder,
+                &surface_view,
+                &self.panel_blit,
+                information.viewport,
+                "frame-map-information",
+            );
+        }
+        if let Some(information) = frame.pov.and_then(|pov| pov.information) {
+            record_bitmap_surface(
+                &mut encoder,
+                &surface_view,
+                &self.pov_hud_blit,
+                information.viewport,
+                "frame-pov-information",
+            );
+        }
+        if let Some(focus) = focus {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frame-focus"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let (_, bind_group, _, _) = self.focus_blit.texture.as_ref().expect("initialized");
+            pass.set_pipeline(&self.focus_blit.pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            for viewport in focus_border_rects(focus).into_iter().flatten() {
+                viewport.set(&mut pass);
+                pass.draw(0..3, 0..1);
+            }
+        }
 
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        true
+        self.frame_lifecycle.submissions = self.frame_lifecycle.submissions.saturating_add(1);
+        surface_frame.present();
+        self.frame_lifecycle.presents = self.frame_lifecycle.presents.saturating_add(1);
+        MultiViewFrameResult {
+            presented: true,
+            map_upload_bytes,
+            map_drawn: frame.map.is_some(),
+            pov_drawn: frame.pov.is_some(),
+        }
+    }
+
+    /// Acquire the next frame and clear it to `color` (linear RGBA, 0..=1).
+    /// Returns `false` when no frame was drawn.
+    pub fn render_clear(&mut self, color: [f64; 4]) -> bool {
+        self.render_frame(MultiViewFrame {
+            clear: color,
+            map: None,
+            pov: None,
+            focus: None,
+        })
+        .presented
     }
 
     /// Upload a CPU-composed RGBA8 image (`width`×`height`, row-major) and
@@ -771,62 +1486,21 @@ impl Renderer {
         viewport: SurfaceViewport,
         clear: [f64; 4],
     ) -> bool {
-        self.debug_map
-            .upload(&self.device, &self.queue, rgba, width, height);
-        if self.debug_map.texture.is_none()
-            || !viewport.is_contained_by(self.config.width, self.config.height)
-        {
-            if self.debug_map.texture.is_some() {
-                log::error!(
-                    "map viewport {viewport:?} escapes surface {:?}",
-                    self.size()
-                );
-            }
-            return false;
-        }
-
-        let Some(frame) = self.acquire_frame() else {
-            return false;
-        };
-        let (_, bind_group, _, _) = self.debug_map.texture.as_ref().expect("uploaded above");
-        let view = self.surface_view(&frame);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wer-frame"),
-            });
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("debug-map"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear[0],
-                            g: clear[1],
-                            b: clear[2],
-                            a: clear[3],
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            viewport.set(&mut pass);
-            pass.set_pipeline(&self.debug_map.pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        true
+        self.render_frame(MultiViewFrame {
+            clear,
+            map: Some(MapFramePane {
+                source: MapFrameSource::Cpu {
+                    rgba,
+                    width,
+                    height,
+                },
+                viewport,
+                information: None,
+            }),
+            pov: None,
+            focus: None,
+        })
+        .presented
     }
 
     /// Upload a CPU-composed square map and bitmap panel separately, then
@@ -846,77 +1520,28 @@ impl Renderer {
         panel_viewport: SurfaceViewport,
         clear: [f64; 4],
     ) -> bool {
-        self.debug_map
-            .upload(&self.device, &self.queue, map_rgba, map_width, map_height);
-        self.panel_blit.upload(
-            &self.device,
-            &self.queue,
-            panel_rgba,
-            panel_width,
-            panel_height,
-        );
-        if self.debug_map.texture.is_none()
-            || self.panel_blit.texture.is_none()
-            || !map_viewport.is_contained_by(self.config.width, self.config.height)
-            || !panel_viewport.is_contained_by(self.config.width, self.config.height)
-        {
-            if self.debug_map.texture.is_some() && self.panel_blit.texture.is_some() {
-                log::error!(
-                    "map/panel viewports {map_viewport:?}/{panel_viewport:?} escape surface {:?}",
-                    self.size()
-                );
-            }
-            return false;
-        }
-
-        let Some(frame) = self.acquire_frame() else {
-            return false;
-        };
-        let (_, map_bind_group, _, _) = self.debug_map.texture.as_ref().expect("uploaded above");
-        let (_, panel_bind_group, _, _) = self.panel_blit.texture.as_ref().expect("uploaded above");
-        let view = self.surface_view(&frame);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wer-frame-map-panel"),
-            });
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("debug-map-panel"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear[0],
-                            g: clear[1],
-                            b: clear[2],
-                            a: clear[3],
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            map_viewport.set(&mut pass);
-            pass.set_pipeline(&self.debug_map.pipeline);
-            pass.set_bind_group(0, map_bind_group, &[]);
-            pass.draw(0..3, 0..1);
-
-            panel_viewport.set(&mut pass);
-            pass.set_pipeline(&self.panel_blit.pipeline);
-            pass.set_bind_group(0, panel_bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        true
+        self.render_frame(MultiViewFrame {
+            clear,
+            map: Some(MapFramePane {
+                source: MapFrameSource::Cpu {
+                    rgba: map_rgba,
+                    width: map_width,
+                    height: map_height,
+                },
+                viewport: map_viewport,
+                information: Some(InformationSurface {
+                    upload: Some(InformationUpload {
+                        rgba: panel_rgba,
+                        width: panel_width,
+                        height: panel_height,
+                    }),
+                    viewport: panel_viewport,
+                }),
+            }),
+            pov: None,
+            focus: None,
+        })
+        .presented
     }
 
     /// Present one frame through the Phase 6 GPU-composed map path
@@ -948,24 +1573,15 @@ impl Renderer {
             },
             |(_, width, _)| width,
         );
-        let (x, y, width, height) = letterbox_viewport(
-            (self.config.width, self.config.height),
-            (side + panel_width, side),
+        let source_width = side + panel_width;
+        let combined = letterbox_viewport_in(
+            SurfaceViewport::new(0, 0, self.config.width, self.config.height),
+            (source_width, side),
         );
-        let scale = width / (side + panel_width) as f32;
-        let map_width = side as f32 * scale;
-        let map_viewport = SurfaceViewport::new(
-            x.round() as u32,
-            y.round() as u32,
-            map_width.round() as u32,
-            height.round() as u32,
-        );
-        let panel_viewport = (panel_width > 0).then_some(SurfaceViewport::new(
-            (x + map_width).round() as u32,
-            y.round() as u32,
-            (panel_width as f32 * scale).round() as u32,
-            height.round() as u32,
-        ));
+        // Resolve the shared seam once. Rounding map width and panel origin
+        // independently can overlap by one physical pixel on odd fits.
+        let (map_viewport, fitted_panel) = horizontal_split(combined, side, source_width);
+        let panel_viewport = (panel_width > 0).then_some(fitted_panel);
         self.render_map_gpu_in(
             params,
             slots,
@@ -981,9 +1597,10 @@ impl Renderer {
 
     /// Present a GPU-composed map in exact shared-layout rectangles.
     ///
-    /// `panel_viewport` is used only when a panel upload is supplied. Browser
-    /// Map mode passes the fitted square and no panel; the temporary native
-    /// single-view wrapper above retains its existing map-plus-panel layout.
+    /// `panel_viewport` requests the information surface; `panel` optionally
+    /// replaces its retained pixels. Browser Map mode passes the fitted square
+    /// and no panel viewport; the temporary single-view wrapper above retains
+    /// its existing map-plus-panel layout.
     #[allow(clippy::too_many_arguments)]
     pub fn render_map_gpu_in(
         &mut self,
@@ -997,97 +1614,31 @@ impl Renderer {
         panel_viewport: Option<SurfaceViewport>,
         clear: [f64; 4],
     ) -> Option<u64> {
-        let span = (2 * params.half_regions + 1) as u32;
-        let side = span * params.resolution;
-        let rebuild = !matches!(
-            &self.gpu_map,
-            Some(m) if m.capacity == span * span && m.resolution == params.resolution && m.side == side
-        );
-        if rebuild {
-            self.gpu_map = Some(GpuMap::new(
-                &self.device,
-                self.render_format,
-                span * span,
-                params.resolution,
-                side,
-            ));
-            log::info!(
-                "gpu map atlas built: {span}x{span} slots at {}²",
-                params.resolution
-            );
-        }
-        let gpu_map = self.gpu_map.as_ref().expect("just ensured");
-
-        let mut bytes = gpu_map.upload_tiles(&self.queue, uploads);
-        if let Some(rgba) = pre_grid_overlay {
-            bytes += gpu_map.upload_pre_grid_overlay(&self.queue, rgba);
-        }
-        if let Some(rgba) = post_grid_overlay {
-            bytes += gpu_map.upload_post_grid_overlay(&self.queue, rgba);
-        }
-        gpu_map.write_frame(&self.queue, params, slots);
-        if let Some((rgba, w, h)) = panel {
-            self.panel_blit
-                .upload(&self.device, &self.queue, rgba, w, h);
-            bytes += u64::from(w) * u64::from(h) * 4;
-        }
-
-        if !map_viewport.is_contained_by(self.config.width, self.config.height)
-            || panel_viewport.is_some_and(|viewport| {
-                !viewport.is_contained_by(self.config.width, self.config.height)
-            })
-        {
-            log::error!(
-                "GPU map/panel viewports {map_viewport:?}/{panel_viewport:?} escape surface {:?}",
-                self.size()
-            );
-            return None;
-        }
-
-        let frame = self.acquire_frame()?;
-        let view = self.surface_view(&frame);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wer-frame-gpu-map"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("compose-map"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear[0],
-                            g: clear[1],
-                            b: clear[2],
-                            a: clear[3],
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            map_viewport.set(&mut pass);
-            let gpu_map = self.gpu_map.as_ref().expect("ensured above");
-            gpu_map.draw(&mut pass);
-            if let (Some(viewport), Some((_, bind_group, _, _))) =
-                (panel_viewport, self.panel_blit.texture.as_ref())
-            {
-                viewport.set(&mut pass);
-                pass.set_pipeline(&self.panel_blit.pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-        }
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        Some(bytes)
+        let information = panel_viewport.map(|viewport| InformationSurface {
+            upload: panel.map(|(rgba, width, height)| InformationUpload {
+                rgba,
+                width,
+                height,
+            }),
+            viewport,
+        });
+        let result = self.render_frame(MultiViewFrame {
+            clear,
+            map: Some(MapFramePane {
+                source: MapFrameSource::Gpu {
+                    params,
+                    slots,
+                    uploads,
+                    pre_grid_overlay,
+                    post_grid_overlay,
+                },
+                viewport: map_viewport,
+                information,
+            }),
+            pov: None,
+            focus: None,
+        });
+        result.presented.then_some(result.map_upload_bytes)
     }
 
     /// Present one POV frame (3d-phase-4-plan.md §6), mirroring
@@ -1111,8 +1662,8 @@ impl Renderer {
     /// and redraws the existing texture, and the outer `None` draws no panel.
     ///
     /// `pov_scale` (already clamped by the shell, `WER_POV_SCALE`) renders
-    /// the POV pass at a fraction of the surface resolution and stretches it
-    /// up with a linear blit — on a software rasterizer fragment cost is CPU
+    /// the POV pass at a fraction of the pane resolution and stretches it up
+    /// with a linear blit — on a software rasterizer fragment cost is CPU
     /// cost, so 0.5 cuts the raster bill ~4×. The information surface is
     /// composed at the destination viewport's full resolution.
     #[allow(clippy::too_many_arguments)] // Upload tri-state stays explicit at the renderer boundary.
@@ -1124,125 +1675,24 @@ impl Renderer {
         organisms: Option<&PovOrganismUpload>,
         clear: [f64; 4],
         pov_viewport: SurfaceViewport,
-        information: Option<PovInformationSurface<'_>>,
+        information: Option<InformationSurface<'_>>,
         pov_scale: f32,
     ) -> bool {
-        let surface_size = (self.config.width, self.config.height);
-        if !pov_viewport.is_contained_by(surface_size.0, surface_size.1)
-            || information.is_some_and(|information| {
-                !information
-                    .viewport
-                    .is_contained_by(surface_size.0, surface_size.1)
-            })
-        {
-            log::error!(
-                "POV/information viewports {pov_viewport:?}/{:?} escape surface {surface_size:?}",
-                information.map(|information| information.viewport)
-            );
-            return false;
-        }
-        if self.pov.is_none() {
-            self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.render_format));
-            log::info!(
-                "pov pipeline built: {} verts/chunk, {} indices shared",
-                pov::VERTS_PER_CHUNK,
-                pov::INDICES_PER_CHUNK
-            );
-        }
-        let scaled_active = pov_scale < 1.0;
-        let (rw, rh) = pov::Pov::render_size(self.config.width, self.config.height, pov_scale);
-        let draw_viewport = if scaled_active {
-            scale_viewport(pov_viewport, surface_size, (rw, rh))
-        } else {
-            pov_viewport
-        };
-        let pov = self.pov.as_mut().expect("just ensured");
-        pov.ensure_depth(&self.device, rw, rh);
-        pov.ensure_shadow(&self.device, frame.shadow_resolution);
-        if scaled_active {
-            pov.ensure_scaled(&self.device, rw, rh);
-        }
-        pov.apply(&self.device, &self.queue, uploads, removes);
-        pov.apply_organisms(&self.device, &self.queue, organisms);
-        let draws = pov.write_frame(&self.device, &self.queue, frame);
-
-        let Some(surface_frame) = self.acquire_frame() else {
-            return false;
-        };
-        let view = self.surface_view(&surface_frame);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wer-frame-pov"),
-            });
-        {
-            let pov = self.pov.as_ref().expect("ensured above");
-            if scaled_active {
-                let target = pov.scaled_view().expect("ensure_scaled ran");
-                pov.draw(
-                    &mut encoder,
-                    target,
-                    draw_viewport,
-                    &draws,
-                    clear,
-                    frame.water,
-                    frame.shadow_ao && frame.shadow_resolution > 0,
-                );
-                pov.blit_scaled(&mut encoder, &view);
-            } else {
-                pov.draw(
-                    &mut encoder,
-                    &view,
-                    draw_viewport,
-                    &draws,
-                    clear,
-                    frame.water,
-                    frame.shadow_ao && frame.shadow_resolution > 0,
-                );
-            }
-        }
-        // The information surface: a second pass loading the POV result and
-        // blitting the shell-owned bitmap into its exact shared viewport.
-        if let Some(information) = information {
-            if let Some(upload) = information.upload {
-                self.pov_hud_blit.upload(
-                    &self.device,
-                    &self.queue,
-                    upload.rgba,
-                    upload.width,
-                    upload.height,
-                );
-            }
-            if let Some((_, bind_group, _, _)) = self.pov_hud_blit.texture.as_ref() {
-                let (sw, sh) = (self.config.width, self.config.height);
-                let viewport = information.viewport;
-                if viewport.is_contained_by(sw, sh) {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("pov-information-surface"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    viewport.set(&mut pass);
-                    pass.set_pipeline(&self.pov_hud_blit.pipeline);
-                    pass.set_bind_group(0, bind_group, &[]);
-                    pass.draw(0..3, 0..1);
-                }
-            }
-        }
-        self.queue.submit(Some(encoder.finish()));
-        surface_frame.present();
-        true
+        self.render_frame(MultiViewFrame {
+            clear,
+            map: None,
+            pov: Some(PovFramePane {
+                frame,
+                uploads,
+                removes,
+                organisms,
+                viewport: pov_viewport,
+                information,
+                render_scale: pov_scale,
+            }),
+            focus: None,
+        })
+        .presented
     }
 
     /// Packed live/capacity counts for the lazily built POV organism buffers.
@@ -1254,7 +1704,12 @@ impl Renderer {
 
 #[cfg(test)]
 mod viewport_tests {
-    use super::{scale_viewport, SurfaceViewport};
+    use super::{
+        focus_border_rects, horizontal_split, letterbox_viewport_in, preflight_information,
+        scale_viewport, FocusDecoration, FrameLifecycleCounters, FramePassKind, FramePassPlan,
+        FramePlanError, FramePlanRequest, FrameRegion, InformationPreflightError,
+        InformationSurface, InformationUpload, SurfaceViewport,
+    };
 
     #[test]
     fn physical_viewport_containment_handles_edges_odds_and_overflow() {
@@ -1263,6 +1718,220 @@ mod viewport_tests {
         assert!(!SurfaceViewport::new(0, 0, 0, 10).is_contained_by(901, 701));
         assert!(!SurfaceViewport::new(900, 700, 2, 1).is_contained_by(901, 701));
         assert!(!SurfaceViewport::new(u32::MAX, 0, 2, 1).is_contained_by(901, 701));
+    }
+
+    #[test]
+    fn arbitrary_parent_letterbox_preserves_origin_and_aspect() {
+        assert_eq!(
+            letterbox_viewport_in(SurfaceViewport::new(10, 20, 100, 100), (16, 9)),
+            SurfaceViewport::new(10, 42, 100, 56)
+        );
+        assert_eq!(
+            letterbox_viewport_in(SurfaceViewport::new(301, 17, 99, 61), (1, 1)),
+            SurfaceViewport::new(320, 17, 61, 61)
+        );
+        for parent_width in 1..=100 {
+            for parent_height in 1..=100 {
+                let parent = SurfaceViewport::new(13, 17, parent_width, parent_height);
+                for image_width in 1..=16 {
+                    for image_height in 1..=16 {
+                        let fitted = letterbox_viewport_in(parent, (image_width, image_height));
+                        assert!(
+                            fitted.x >= parent.x
+                                && fitted.y >= parent.y
+                                && fitted.x + fitted.width <= parent.x + parent.width
+                                && fitted.y + fitted.height <= parent.y + parent.height,
+                            "{parent:?} fitting {image_width}x{image_height} produced {fitted:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_map_panel_seam_is_exact_for_odd_sizes() {
+        for width in 1..=101 {
+            let combined = SurfaceViewport::new(7, 11, width, 63);
+            let (map, panel) = horizontal_split(combined, 73, 104);
+            assert_eq!(map.x, combined.x);
+            assert_eq!(map.x + map.width, panel.x);
+            assert_eq!(panel.x + panel.width, combined.x + combined.width);
+            assert!(!map.overlaps(panel));
+        }
+    }
+
+    #[test]
+    fn information_preflight_requires_valid_pixels_or_a_retained_texture() {
+        let viewport = SurfaceViewport::new(0, 0, 2, 2);
+        assert_eq!(
+            preflight_information(
+                Some(InformationSurface {
+                    upload: None,
+                    viewport,
+                }),
+                false,
+            ),
+            Err(InformationPreflightError::MissingRetainedTexture)
+        );
+        assert!(preflight_information(
+            Some(InformationSurface {
+                upload: None,
+                viewport,
+            }),
+            true,
+        )
+        .is_ok());
+        assert_eq!(
+            preflight_information(
+                Some(InformationSurface {
+                    upload: Some(InformationUpload {
+                        rgba: &[0; 15],
+                        width: 2,
+                        height: 2,
+                    }),
+                    viewport,
+                }),
+                false,
+            ),
+            Err(InformationPreflightError::InvalidUpload)
+        );
+        assert!(preflight_information(
+            Some(InformationSurface {
+                upload: Some(InformationUpload {
+                    rgba: &[0; 16],
+                    width: 2,
+                    height: 2,
+                }),
+                viewport,
+            }),
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn focus_border_strips_stay_inside_the_focused_pane() {
+        for viewport in [
+            SurfaceViewport::new(3, 5, 100, 80),
+            SurfaceViewport::new(3, 5, 1, 1),
+            SurfaceViewport::new(3, 5, 2, 7),
+        ] {
+            let strips = focus_border_rects(FocusDecoration {
+                viewport,
+                thickness: 3,
+            });
+            for strip in strips.into_iter().flatten() {
+                assert!(strip
+                    .is_contained_by(viewport.x + viewport.width, viewport.y + viewport.height));
+                assert!(strip.x >= viewport.x && strip.y >= viewport.y);
+            }
+        }
+    }
+
+    #[test]
+    fn multi_view_plan_is_disjoint_ordered_and_single_present() {
+        let map = SurfaceViewport::new(0, 0, 400, 600);
+        let pov = SurfaceViewport::new(400, 0, 400, 600);
+        let information = SurfaceViewport::new(800, 0, 200, 600);
+        let plan = FramePassPlan::new(FramePlanRequest {
+            surface: (1000, 600),
+            map: Some(map),
+            pov: Some(pov),
+            map_information: Some(information),
+            pov_information: None,
+            pov_shadows: true,
+            focus: Some(pov),
+        })
+        .expect("adjacent panes are valid");
+        assert_eq!(
+            plan.passes(),
+            &[
+                FramePassKind::SurfaceClear,
+                FramePassKind::Map,
+                FramePassKind::PovShadow,
+                FramePassKind::PovOffscreen,
+                FramePassKind::PovComposite,
+                FramePassKind::MapInformation,
+                FramePassKind::Focus,
+            ]
+        );
+        assert_eq!(
+            plan.successful_surface_lifecycle(),
+            FrameLifecycleCounters {
+                acquire_attempts: 1,
+                acquired: 1,
+                surface_clears: 1,
+                submissions: 1,
+                presents: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn map_only_and_pov_only_keep_the_same_upload_passes() {
+        let map = FramePassPlan::new(FramePlanRequest {
+            surface: (900, 700),
+            map: Some(SurfaceViewport::new(100, 0, 700, 700)),
+            ..FramePlanRequest::default()
+        })
+        .unwrap();
+        assert_eq!(
+            map.passes(),
+            &[FramePassKind::SurfaceClear, FramePassKind::Map]
+        );
+
+        let pov = FramePassPlan::new(FramePlanRequest {
+            surface: (900, 700),
+            pov: Some(SurfaceViewport::new(0, 0, 700, 700)),
+            pov_information: Some(SurfaceViewport::new(700, 0, 200, 700)),
+            ..FramePlanRequest::default()
+        })
+        .unwrap();
+        assert_eq!(
+            pov.passes(),
+            &[
+                FramePassKind::SurfaceClear,
+                FramePassKind::PovOffscreen,
+                FramePassKind::PovComposite,
+                FramePassKind::PovInformation,
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_plan_rejects_escape_and_color_overlap_but_allows_focus_overlay() {
+        let outside = FramePassPlan::new(FramePlanRequest {
+            surface: (100, 80),
+            map: Some(SurfaceViewport::new(99, 0, 2, 1)),
+            ..FramePlanRequest::default()
+        });
+        assert_eq!(
+            outside,
+            Err(FramePlanError::OutsideSurface(
+                FrameRegion::Map,
+                SurfaceViewport::new(99, 0, 2, 1)
+            ))
+        );
+
+        let overlap = FramePassPlan::new(FramePlanRequest {
+            surface: (100, 80),
+            map: Some(SurfaceViewport::new(0, 0, 60, 80)),
+            pov: Some(SurfaceViewport::new(59, 0, 41, 80)),
+            ..FramePlanRequest::default()
+        });
+        assert_eq!(
+            overlap,
+            Err(FramePlanError::Overlap(FrameRegion::Map, FrameRegion::Pov))
+        );
+
+        assert!(FramePassPlan::new(FramePlanRequest {
+            surface: (100, 80),
+            map: Some(SurfaceViewport::new(0, 0, 100, 80)),
+            focus: Some(SurfaceViewport::new(0, 0, 100, 80)),
+            ..FramePlanRequest::default()
+        })
+        .is_ok());
     }
 
     #[test]

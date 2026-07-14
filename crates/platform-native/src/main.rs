@@ -85,7 +85,10 @@ mod viz;
 use std::sync::Arc;
 use std::time::Instant;
 
-use renderer::{PovInformationSurface, PovInformationUpload, Renderer, SurfaceViewport};
+use renderer::{
+    InformationSurface, InformationUpload, MapFramePane, MapFrameSource, MultiViewFrame,
+    PovFramePane, Renderer, SurfaceViewport,
+};
 use viewer_host::action::{
     PreserveMutation, ServiceRequestId, ViewerAction, ViewerEffect, WorkerBackend,
 };
@@ -1684,20 +1687,38 @@ impl App {
                     let post_grid = post_grid_changed.then_some(gpu.post_grid_rgba);
                     let panel =
                         panel_w.map(|(width, height)| (self.hud.panel_pixels(), width, height));
-                    if let Some(bytes) = renderer.render_map_gpu_in(
-                        &gpu.params,
-                        &gpu.slots,
-                        &gpu.uploads,
-                        pre_grid,
-                        post_grid,
-                        panel,
-                        frame_rects.map_viewport(),
-                        frame_rects.panel_viewport(),
-                        CLEAR_COLOR,
-                    ) {
+                    let information =
+                        frame_rects
+                            .panel_viewport()
+                            .map(|viewport| InformationSurface {
+                                upload: panel.map(|(rgba, width, height)| InformationUpload {
+                                    rgba,
+                                    width,
+                                    height,
+                                }),
+                                viewport,
+                            });
+                    let result = renderer.render_frame(MultiViewFrame {
+                        clear: CLEAR_COLOR,
+                        map: Some(MapFramePane {
+                            source: MapFrameSource::Gpu {
+                                params: &gpu.params,
+                                slots: &gpu.slots,
+                                uploads: &gpu.uploads,
+                                pre_grid_overlay: pre_grid,
+                                post_grid_overlay: post_grid,
+                            },
+                            viewport: frame_rects.map_viewport(),
+                            information,
+                        }),
+                        pov: None,
+                        focus: None,
+                    });
+                    if result.presented {
+                        debug_assert!(result.map_drawn);
                         self.panel_revision = Some(document.revision);
                         self.overlay_hashes = [gpu.pre_grid_hash, gpu.post_grid_hash];
-                        upload_bytes = bytes;
+                        upload_bytes = result.map_upload_bytes;
                     } else {
                         // Atlas keys were consumed while preparing this packet;
                         // retry a complete upload after surface recovery.
@@ -1713,19 +1734,30 @@ impl App {
                 let compose_seconds = compose_start.elapsed().as_secs_f64();
                 let render_start = Instant::now();
                 if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.render_map_and_panel_in(
-                        cpu.rgba,
-                        map_side,
-                        map_side,
-                        panel,
-                        panel_width,
-                        panel_height,
-                        frame_rects.map_viewport(),
-                        frame_rects
+                    let information = InformationSurface {
+                        upload: Some(InformationUpload {
+                            rgba: panel,
+                            width: panel_width,
+                            height: panel_height,
+                        }),
+                        viewport: frame_rects
                             .panel_viewport()
                             .expect("native bitmap panel has a visible viewport"),
-                        CLEAR_COLOR,
-                    );
+                    };
+                    let _ = renderer.render_frame(MultiViewFrame {
+                        clear: CLEAR_COLOR,
+                        map: Some(MapFramePane {
+                            source: MapFrameSource::Cpu {
+                                rgba: cpu.rgba,
+                                width: map_side,
+                                height: map_side,
+                            },
+                            viewport: frame_rects.map_viewport(),
+                            information: Some(information),
+                        }),
+                        pov: None,
+                        focus: None,
+                    });
                 }
                 (compose_seconds, render_start.elapsed().as_secs_f64())
             }
@@ -1742,9 +1774,9 @@ impl App {
 
     /// The POV half of [`Self::frame`] (3d-phase-1-plan.md §8.1): sync the
     /// chunk lifecycle, build the frame parameters with glam, and present
-    /// through [`Renderer::render_pov`]. The complete shared panel document is
-    /// built once and mounted as the POV information rail; M8 only changes how
-    /// the already-shared passes are planned.
+    /// through [`Renderer::render_frame`]. The complete shared panel document
+    /// is built once and mounted as the POV information rail; M8 changes only
+    /// how the already-shared passes are planned.
     fn frame_pov(&mut self, output: &TickOutput, update_seconds: f64) {
         let mut stats = output.stats;
         let camera = self.controller.pov_camera();
@@ -1865,29 +1897,34 @@ impl App {
             // Keep the complete shared information surface mounted beside a
             // projection-correct POV pane. Unchanged panel pixels retain the
             // renderer texture and incur no upload.
-            let information = Some(PovInformationSurface {
-                upload: panel_changed.then_some(PovInformationUpload {
+            let information = Some(InformationSurface {
+                upload: panel_changed.then_some(InformationUpload {
                     rgba: panel_rgba,
                     width: panel_width,
                     height: panel_height,
                 }),
                 viewport: panel_viewport,
             });
-            let rendered = renderer.render_pov(
-                &params,
-                &uploads,
-                &removes,
-                organism_upload,
-                CLEAR_COLOR,
-                pov_viewport,
-                information,
-                output.pov.render_scale,
-            );
+            let result = renderer.render_frame(MultiViewFrame {
+                clear: CLEAR_COLOR,
+                map: None,
+                pov: Some(PovFramePane {
+                    frame: &params,
+                    uploads: &uploads,
+                    removes: &removes,
+                    organisms: organism_upload,
+                    viewport: pov_viewport,
+                    information,
+                    render_scale: output.pov.render_scale,
+                }),
+                focus: None,
+            });
+            debug_assert!(!result.presented || result.pov_drawn);
             upload_bytes += commit_pov_panel_upload(
                 &mut self.pov_panel_revision,
                 document.revision,
                 (panel_width, panel_height),
-                rendered,
+                result.presented,
             );
             organism_buffer_stats = renderer.pov_organism_stats();
             if let Some(buffers) = organism_buffer_stats {
