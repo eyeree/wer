@@ -1,9 +1,6 @@
-// Vertex-lit POV terrain (3d-phase-1-plan.md §5.6): Lambert sun + hemisphere
-// ambient + distance fog, over per-vertex material color. Shadows and
-// ambient occlusion arrive pre-baked in the vertex `light` bytes — the
-// mesher marches the heightfield toward the fixed sun and measures
-// concavity, so this shader stays single-pass (no shadow map, no extra
-// render targets). Per-fragment **detail normals** continue the terrain
+// POV terrain (3d-phase-4-plan.md §6): Lambert sun + GPU directional shadow,
+// CPU-baked low-frequency ambient occlusion, and distance fog. Per-fragment
+// **detail normals** continue the terrain
 // gradient-noise spectrum above its authoritative top octave (the same
 // integer-hash scheme `compose_map.wgsl` ports), bending the shading normal
 // only — vertices are never displaced, so the CPU heightfield stays the
@@ -16,6 +13,8 @@ struct PovParams {
     // Camera-relative view-projection (the view translation is applied on the
     // CPU in f64 through the per-chunk offsets, §4 of the plan).
     view_proj: mat4x4<f32>,
+    // Camera-relative stabilized directional-light projection.
+    light_view_proj: mat4x4<f32>,
     // Normalized, pointing from the sun toward the ground.
     sun_dir: vec3<f32>,
     fog_start: f32,
@@ -36,7 +35,9 @@ struct PovParams {
     // Water frame state (3d-phase-3-plan.md §4.3), consumed by
     // pov_water.wgsl; declared here so both modules share one uniform layout.
     water: vec4<f32>,
-    // Live diagnostic toggles (1.0/0.0): x = baked sun-visibility/AO,
+    // (inverse map size, enabled, constant bias, slope bias).
+    shadow: vec4<f32>,
+    // Live diagnostic toggles (1.0/0.0): x = directional shadow/AO,
     // y = per-fragment detail normals, z/w reserved.
     toggles: vec4<f32>,
 }
@@ -55,6 +56,8 @@ struct ChunkOffset {
 }
 
 @group(0) @binding(0) var<uniform> params: PovParams;
+@group(0) @binding(1) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(1) @binding(0) var<uniform> chunk: ChunkOffset;
 
 struct VsIn {
@@ -63,8 +66,8 @@ struct VsIn {
     @location(1) normal: vec3<f32>,
     // sRGB bytes, Unorm8x4 -> 0..1 here.
     @location(2) color: vec4<f32>,
-    // Baked lighting, Unorm8x4 -> 0..1: x = sun visibility (heightfield
-    // horizon shadow), y = ambient occlusion, z/w reserved.
+    // Presentation bytes, Unorm8x4 -> 0..1: x = reserved neutral,
+    // y = ambient occlusion, z = river, w = wetness.
     @location(3) light: vec4<f32>,
 }
 
@@ -73,18 +76,22 @@ struct VsOut {
     @location(0) normal: vec3<f32>,
     @location(1) color: vec4<f32>,
     @location(2) dist: f32,
-    // Baked sun visibility, ambient occlusion, river, wetness (the last two
-    // drive the 3D-3 wet specular; 3d-phase-3-plan.md §5).
+    // Reserved, ambient occlusion, river, wetness.
     @location(3) light: vec4<f32>,
     // Chunk-local x, y for the detail-noise lattice.
     @location(4) local: vec2<f32>,
     // Camera-relative position, for the wet-specular view direction.
     @location(5) pos: vec3<f32>,
+    @location(6) light_clip: vec4<f32>,
+}
+
+fn terrain_position(in: VsIn) -> vec3<f32> {
+    return in.position + chunk.offset;
 }
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let pos = in.position + chunk.offset; // camera-relative world space
+    let pos = terrain_position(in); // camera-relative world space
     var out: VsOut;
     out.clip = params.view_proj * vec4<f32>(pos, 1.0);
     out.normal = in.normal;
@@ -93,7 +100,13 @@ fn vs_main(in: VsIn) -> VsOut {
     out.light = in.light;
     out.local = in.position.xy;
     out.pos = pos;
+    out.light_clip = params.light_view_proj * vec4<f32>(pos, 1.0);
     return out;
+}
+
+@vertex
+fn vs_shadow(in: VsIn) -> @builtin(position) vec4<f32> {
+    return params.light_view_proj * vec4<f32>(terrain_position(in), 1.0);
 }
 
 // --- 64-bit integer hashing over u32 pairs (lo, hi) ------------------------
@@ -241,6 +254,36 @@ const SUN_STRENGTH: f32 = 1.2;
 const WET_GLINT_POWER: f32 = 40.0;
 const WET_GLINT_STRENGTH: f32 = 0.5;
 
+// Manual 3x3 PCF with a normal-dependent receiver bias. Outside the fitted
+// volume is fully lit; the one-texel fade prevents a clamped-edge stripe.
+fn shadow_visibility(light_clip: vec4<f32>, normal: vec3<f32>) -> f32 {
+    if (params.shadow.y < 0.5 || abs(light_clip.w) < 1e-6) {
+        return 1.0;
+    }
+    let ndc = light_clip.xyz / light_clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (ndc.z <= 0.0 || ndc.z >= 1.0 || any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0))) {
+        return 1.0;
+    }
+    let texel = params.shadow.x;
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    let edge_fade = smoothstep(texel, 2.0 * texel, edge);
+    let slope = 1.0 - max(dot(normalize(normal), -params.sun_dir), 0.0);
+    let reference = ndc.z - (params.shadow.z + params.shadow.w * slope);
+    var visible = 0.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            visible = visible + textureSampleCompareLevel(
+                shadow_map,
+                shadow_sampler,
+                uv + vec2<f32>(f32(x), f32(y)) * texel,
+                reference,
+            );
+        }
+    }
+    return mix(1.0, visible / 9.0, edge_fade);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Cheap sRGB decode (pow 2.2, noted in plan §5.6): the vertex bytes are
@@ -265,16 +308,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
         n = normalize(vec3<f32>(n.x - dgrad.x * n.z, n.y - dgrad.y * n.z, n.z));
     }
-    // Baked terms: sun visibility gates the direct term (terrain shadows);
-    // ambient occlusion dims the hemisphere fill in gullies and hollows.
-    // The `B` toggle neutralizes both (their cost is mesh-time, not
-    // per-frame — the toggle answers "how does it look", instantly).
-    let sunvis = mix(1.0, in.light.x, params.toggles.x);
+    // GPU visibility gates direct light; retained CPU AO only attenuates the
+    // hemisphere fill. The `B` diagnostic neutralizes both.
+    let sunvis = shadow_visibility(in.light_clip, n);
     let ao = mix(1.0, in.light.y, params.toggles.x);
     let sun = SUN_STRENGTH * max(dot(n, -params.sun_dir), 0.0) * sunvis;
     let ambient = mix(params.ground_ambient, params.sky_ambient, n.z * 0.5 + 0.5) * ao;
     // The 3D-3 wet response (3d-phase-3-plan.md §5.2): a specular sun glint
-    // gated by wetness and the baked sun visibility. Rivers dominate;
+    // gated by wetness and GPU directional visibility. Rivers dominate;
     // wetlands get a weaker version. Albedo is untouched — the color half of
     // the response already rides composite_cell_color, and doubling it here
     // would desynchronize the 3D ground from the 2D map.

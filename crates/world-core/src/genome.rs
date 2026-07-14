@@ -185,6 +185,7 @@ impl Genome {
             size,
             activity,
             aggression,
+            form: self.appearance.form,
         }
     }
 }
@@ -246,6 +247,9 @@ pub struct Expressed {
     pub activity: f32,
     /// Expressed aggression in `[0, 1]`.
     pub aggression: f32,
+    /// Morphology archetype copied from [`AppearanceGenes::form`] (`0..=15`).
+    /// Presentation only; never identity or persistence.
+    pub form: u8,
 }
 
 #[cfg(test)]
@@ -277,7 +281,83 @@ mod tests {
             assert!((e.luminance - f32::from(g.appearance.luminance) / 255.0).abs() < 1e-6);
             assert!((e.size - g.base_size()).abs() < 1e-6);
             assert!((e.activity - f32::from(g.behavior.activity) / 255.0).abs() < 1e-6);
+            assert!((e.aggression - f32::from(g.behavior.aggression) / 255.0).abs() < 1e-6);
+            assert_eq!(e.form, g.appearance.form);
         }
+    }
+
+    /// The five original expression fields, evaluated with the formula that
+    /// predates the presentation-only `form` passthrough. Comparing bits makes
+    /// this a guard against accidentally perturbing existing presentation
+    /// values while extending [`Expressed`].
+    fn legacy_expression_bits(genome: &Genome, bias: GenomeBias) -> [u32; 5] {
+        let aes = 0.5 + bias.aesthetics;
+        let morph = 0.5 + bias.morphology;
+        let beh = 0.5 + bias.behavior;
+        let base_hue = f32::from(genome.appearance.hue) / 255.0;
+
+        [
+            (base_hue + (bias.aesthetics - 0.5) * HUE_SHIFT)
+                .rem_euclid(1.0)
+                .to_bits(),
+            (f32::from(genome.appearance.luminance) / 255.0 * aes)
+                .clamp(0.0, 1.0)
+                .to_bits(),
+            (genome.base_size() * morph).max(0.0).to_bits(),
+            (f32::from(genome.behavior.activity) / 255.0 * beh)
+                .clamp(0.0, 1.0)
+                .to_bits(),
+            (f32::from(genome.behavior.aggression) / 255.0 * beh)
+                .clamp(0.0, 1.0)
+                .to_bits(),
+        ]
+    }
+
+    #[test]
+    fn form_passthrough_preserves_every_legacy_field_for_bias_range() {
+        const BUCKETS: [f32; 3] = [0.0, 0.5, 1.0];
+
+        for form in 0..=15 {
+            let mut genome = Genome::from_seed(0xA11C_E55E_D15C_0A57);
+            genome.appearance.form = form;
+            for morphology in BUCKETS {
+                for behavior in BUCKETS {
+                    for aesthetics in BUCKETS {
+                        let bias = GenomeBias {
+                            morphology,
+                            behavior,
+                            aesthetics,
+                        };
+                        let expected = legacy_expression_bits(&genome, bias);
+                        let expressed = genome.express(bias);
+
+                        assert_eq!(expressed.form, form, "bias {bias:?}");
+                        assert_eq!(
+                            [
+                                expressed.hue.to_bits(),
+                                expressed.luminance.to_bits(),
+                                expressed.size.to_bits(),
+                                expressed.activity.to_bits(),
+                                expressed.aggression.to_bits(),
+                            ],
+                            expected,
+                            "form {form}, bias {bias:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_forms_cover_exact_declared_range() {
+        let mut seen = 0u16;
+        for seed in 0..=u16::MAX {
+            let form = Genome::from_seed(u64::from(seed)).appearance.form;
+            assert!(form <= 15, "seed {seed} generated out-of-range form {form}");
+            seen |= 1 << form;
+        }
+        assert_eq!(seen, u16::MAX, "the seed sweep should exercise all forms");
     }
 
     #[test]
@@ -314,6 +394,12 @@ mod tests {
         let g = Genome::from_seed(100);
         let mut other = g;
         other.appearance.hue ^= 1;
+        assert_ne!(g.fingerprint(), other.fingerprint());
+
+        // `form` was already folded into the stable identity fingerprint;
+        // copying it to `Expressed` must not add or reorder any hash input.
+        let mut other = g;
+        other.appearance.form ^= 1;
         assert_ne!(g.fingerprint(), other.fingerprint());
     }
 }

@@ -17,8 +17,9 @@ pub mod gpumap;
 pub mod pov;
 pub use gpumap::{GpuMap, GpuMapParams, MapTileUpload, RefineOctaveParams};
 pub use pov::{
-    PovFrameParams, PovVertex, TerrainChunkUpload, DETAIL_OCTAVES, SHADER_POV_TERRAIN,
-    SHADER_POV_WATER,
+    PovFrameParams, PovOrganismBufferStats, PovOrganismInstance, PovOrganismUpload, PovVertex,
+    TerrainChunkUpload, DETAIL_OCTAVES, POV_ORGANISM_INSTANCE_BYTES, SHADER_POV_ORGANISM,
+    SHADER_POV_TERRAIN, SHADER_POV_WATER,
 };
 
 /// The debug-map presentation shader (fullscreen textured triangle).
@@ -780,12 +781,14 @@ impl Renderer {
         Some(bytes)
     }
 
-    /// Present one POV terrain frame (3d-phase-1-plan.md §5.4), mirroring
+    /// Present one POV frame (3d-phase-4-plan.md §6), mirroring
     /// [`Self::render_map_gpu`]'s shape: lazily build the POV state on first
     /// call, apply `removes` (vertex buffers return to the pool) and
     /// `uploads` (a re-upload to a live handle swaps contents in place),
-    /// write the frame uniform, then one depth-tested pass that clears color
-    /// + depth and draws every resident chunk with the shared index buffer.
+    /// write the frame uniforms, then record the optional directional caster
+    /// pass followed by terrain, organism, river, and sea color draws.
+    /// `organisms` is tri-state: `None` retains the grow-only buffers,
+    /// `Some(non-empty)` replaces both batches, and `Some(empty)` clears them.
     ///
     /// Returns `false` when no frame was drawn (surface loss), like the
     /// other entry points. No readback, no API that could ever produce one
@@ -800,11 +803,13 @@ impl Renderer {
     /// the POV pass at a fraction of the surface resolution and stretches it
     /// up with a linear blit — on a software rasterizer fragment cost is CPU
     /// cost, so 0.5 cuts the raster bill ~4×. The HUD chip stays full-res.
+    #[allow(clippy::too_many_arguments)] // Upload tri-state stays explicit at the renderer boundary.
     pub fn render_pov(
         &mut self,
         frame: &PovFrameParams,
         uploads: &[TerrainChunkUpload],
         removes: &[u64],
+        organisms: Option<&PovOrganismUpload>,
         clear: [f64; 4],
         hud: Option<(&[u8], u32, u32)>,
         pov_scale: f32,
@@ -821,10 +826,12 @@ impl Renderer {
         let (rw, rh) = pov::Pov::render_size(self.config.width, self.config.height, pov_scale);
         let pov = self.pov.as_mut().expect("just ensured");
         pov.ensure_depth(&self.device, rw, rh);
+        pov.ensure_shadow(&self.device, frame.shadow_resolution);
         if scaled_active {
             pov.ensure_scaled(&self.device, rw, rh);
         }
         pov.apply(&self.device, &self.queue, uploads, removes);
+        pov.apply_organisms(&self.device, &self.queue, organisms);
         let draws = pov.write_frame(&self.device, &self.queue, frame);
 
         let Some(surface_frame) = self.acquire_frame() else {
@@ -840,10 +847,24 @@ impl Renderer {
             let pov = self.pov.as_ref().expect("ensured above");
             if scaled_active {
                 let target = pov.scaled_view().expect("ensure_scaled ran");
-                pov.draw(&mut encoder, target, &draws, clear, frame.water);
+                pov.draw(
+                    &mut encoder,
+                    target,
+                    &draws,
+                    clear,
+                    frame.water,
+                    frame.shadow_ao && frame.shadow_resolution > 0,
+                );
                 pov.blit_scaled(&mut encoder, &view);
             } else {
-                pov.draw(&mut encoder, &view, &draws, clear, frame.water);
+                pov.draw(
+                    &mut encoder,
+                    &view,
+                    &draws,
+                    clear,
+                    frame.water,
+                    frame.shadow_ao && frame.shadow_resolution > 0,
+                );
             }
         }
         // The HUD chip: a second tiny pass loading the POV result and
@@ -888,5 +909,11 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         surface_frame.present();
         true
+    }
+
+    /// Packed live/capacity counts for the lazily built POV organism buffers.
+    #[must_use]
+    pub fn pov_organism_stats(&self) -> Option<PovOrganismBufferStats> {
+        self.pov.as_ref().map(pov::Pov::organism_stats)
     }
 }

@@ -2,17 +2,19 @@
 //! and the chunk lifecycle manager — plus the 3D-2 walk camera
 //! (3d-phase-2-plan.md): [`PovChunkManager::ground_height`] rides the same
 //! CPU-side height lattices the drawn chunks carry, with
-//! [`analytic_ground`] as the loading-frontier fallback.
+//! [`analytic_ground`] as the loading-frontier fallback. Phase 3D-4 adds
+//! GPU-shadow frame fitting and the upload-only organism presentation path;
+//! both remain derived presentation and share the resident terrain lattice.
 //!
 //! **Derived presentation only (ADR 0017).** Every height the mesher emits is
 //! the authoritative Terrain P/G halo through the same SIMD relief row and
 //! scalar scaling tail as field generation (ADRs 0016 and 0027); every color is
 //! the 2D Composite per-cell logic
 //! ([`world_runtime::mapcolor::composite_cell_color`]) over the settled field tiles. The
-//! baked per-vertex light (sun visibility from a heightfield horizon march,
-//! ambient occlusion from multi-scale concavity) is float presentation math
-//! over the same halo evaluator, edge-extended for distant probes, and the
-//! fixed [`SUN_DIR`]. Nothing here feeds back into world state, hashing, or
+//! baked ambient occlusion is float presentation math over the same halo
+//! evaluator, edge-extended for distant probes. Direct-sun visibility is a
+//! renderer-owned directional shadow map fitted here from camera-relative
+//! resident bounds. Nothing here feeds back into world state, hashing, or
 //! persistence.
 //!
 //! The mesher is a pure function of value snapshots (plan §6.1): no
@@ -29,25 +31,28 @@ use std::sync::{mpsc, Arc};
 use renderer::pov::{
     skirt_core_index, CORE_VERTS, DETAIL_OCTAVES, POV_GRID, POV_MESH_RES, VERTS_PER_CHUNK,
 };
-use renderer::{PovFrameParams, PovVertex, TerrainChunkUpload};
+use renderer::{
+    PovFrameParams, PovOrganismInstance, PovOrganismUpload, PovVertex, TerrainChunkUpload,
+};
 use world_core::{mix, simd, Biome, FieldTile, PossibilityVector, RegionCoord, REGION_SIZE};
-use world_runtime::mapcolor::{composite_cell_color, pov_sediment_color};
+use world_runtime::mapcolor::{composite_cell_color, expressed_color, pov_sediment_color};
 use world_runtime::{
-    RegionMap, TaskExecutor, TaskPriority, TerrainPossibilityHalo, CHANNEL_RIVER, CHANNEL_WETNESS,
+    Organism, RegionMap, ResourceTier, TaskExecutor, TaskPriority, TerrainPossibilityHalo,
+    CHANNEL_RIVER, CHANNEL_WETNESS,
 };
 
 /// Vertex spacing in world units (`REGION_SIZE / POV_MESH_RES` = 4.0).
 const SPACING: f64 = REGION_SIZE / POV_MESH_RES as f64;
 
 /// The fixed sun direction (normalized, pointing from the sun toward the
-/// ground), shared by [`frame_params`] and the mesher's baked shadow march —
-/// the shading and the baked shadows must agree on one sun. Same azimuth as
+/// ground), shared by [`frame_params`] and [`shadow_frame`] — the shading and
+/// directional shadow projection must agree on one sun. Same azimuth as
 /// plan §4's original sun, elevation lowered to 20° (permanent late
 /// afternoon): this world's heightfield is smooth below ~100-unit
 /// wavelengths and its steepest flanks sit near 20°, so only a sun at or
 /// below that angle lets ridges cast real shadows or slope shading develop
 /// contrast — the definition the near-noon sun washed out entirely.
-const SUN_DIR: [f32; 3] = [0.840_446, 0.420_223, -0.342_020_14];
+pub const SUN_DIR: [f32; 3] = [0.840_446, 0.420_223, -0.342_020_14];
 
 /// Extra sample ring around the 65×65 vertex lattice for the
 /// central-difference normals (plan §6.3).
@@ -55,25 +60,6 @@ const GRID_MARGIN: usize = 1;
 
 /// Sample-grid edge length: the vertex lattice plus the margin rings.
 const SAMPLE_GRID: usize = POV_GRID + 2 * GRID_MARGIN;
-
-/// Baked-shadow march: horizon samples along the horizontal toward-sun
-/// direction at exponentially spaced distances `BASE · GROWTH^k` — 8, 14.4,
-/// …, ≈490 world units, so nearby banks and distant ridgelines both cast
-/// while the per-chunk cost stays bounded (8 row-kernel calls per vertex
-/// row). Features beyond ~490 units (≈2 regions) cannot cast onto this
-/// chunk; at that range fog has mostly eaten the contrast anyway.
-const SHADOW_STEPS: usize = 8;
-const SHADOW_STEP_BASE: f64 = 2.0 * SPACING;
-const SHADOW_STEP_GROWTH: f64 = 1.8;
-
-/// Self-shadow bias in world units, subtracted from every horizon sample so
-/// a surface does not speckle-shadow itself right at the terminator.
-const SHADOW_BIAS: f32 = 0.5;
-
-/// Penumbra half-width in horizon-tangent space: the shadow edge fades over
-/// `sun_tan ± SOFTNESS` instead of cutting hard, hiding the 4-unit lattice
-/// stepping along shadow borders.
-const SHADOW_SOFTNESS: f32 = 0.15;
 
 /// Valley-scale AO lattice. The elevation field is smooth below ~100-unit
 /// wavelengths (pure low-octave fBm — measured, and visible in any
@@ -316,16 +302,15 @@ impl Default for PovCamera {
 
 /// Live POV feature toggles — presentation-only diagnostic switches for
 /// chasing llvmpipe (software rasterizer) CPU cost, flipped by POV-mode keys
-/// and defaulted all-on. `baked_light` and `detail_normals` gate shader
-/// terms; `water` skips the sea/overlay draws entirely. Note the baked
-/// terms cost CPU at *mesh* time (the shadow march), so their toggle mostly
-/// answers "how does it look", while `detail_normals` (per-fragment 64-bit
-/// hashing) and `water` (a blended near-fullscreen pass) are the per-frame
-/// suspects on a software rasterizer.
+/// and defaulted all-on. `shadow_ao` and `detail_normals` gate shader
+/// terms; `water` skips the sea/overlay draws entirely. `shadow_ao` skips the
+/// continuous GPU depth pass and neutralizes retained AO without remeshing;
+/// `detail_normals` (per-fragment 64-bit hashing) and `water` (a blended
+/// near-fullscreen pass) remain independent per-frame diagnostics.
 #[derive(Debug, Clone, Copy)]
 pub struct PovToggles {
-    /// `B`: baked sun-visibility shadows and ambient occlusion.
-    pub baked_light: bool,
+    /// `B`: GPU directional shadows and CPU-baked ambient occlusion.
+    pub shadow_ao: bool,
     /// `N`: per-fragment detail normals (the continued terrain spectrum).
     pub detail_normals: bool,
     /// `V`: the sea plane and river overlays.
@@ -335,11 +320,217 @@ pub struct PovToggles {
 impl Default for PovToggles {
     fn default() -> Self {
         Self {
-            baked_light: true,
+            shadow_ao: true,
             detail_normals: true,
             water: true,
         }
     }
+}
+
+/// The full fog reach shared by shader parameters and organism distance
+/// culling (3d-phase-4-plan.md §7.3).
+#[inline]
+#[must_use]
+pub fn pov_fog_end(radius: i32) -> f64 {
+    0.95 * (f64::from(radius) + 0.5) * REGION_SIZE
+}
+
+/// Initial directional-shadow map edge selected by the resource tier.
+#[inline]
+#[must_use]
+pub const fn shadow_resolution(tier: ResourceTier) -> u32 {
+    match tier {
+        ResourceTier::Low => 1024,
+        ResourceTier::Mid | ResourceTier::High => 2048,
+    }
+}
+
+/// World-space axis-aligned bounds used only to conservatively fit the
+/// camera-relative directional shadow map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PovShadowBounds {
+    /// Inclusive minimum world coordinate.
+    pub min: [f64; 3],
+    /// Inclusive maximum world coordinate.
+    pub max: [f64; 3],
+}
+
+impl PovShadowBounds {
+    /// One finite point, useful when incrementally accumulating a bound.
+    #[must_use]
+    pub const fn point(point: [f64; 3]) -> Self {
+        Self {
+            min: point,
+            max: point,
+        }
+    }
+
+    /// Union two bounds. Callers construct bounds only from finite terrain
+    /// and organism presentation values.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        let mut out = self;
+        for axis in 0..3 {
+            out.min[axis] = out.min[axis].min(other.min[axis]);
+            out.max[axis] = out.max[axis].max(other.max[axis]);
+        }
+        out
+    }
+
+    fn corners(self) -> impl Iterator<Item = [f64; 3]> {
+        (0u8..8).map(move |mask| {
+            [
+                if mask & 1 == 0 {
+                    self.min[0]
+                } else {
+                    self.max[0]
+                },
+                if mask & 2 == 0 {
+                    self.min[1]
+                } else {
+                    self.max[1]
+                },
+                if mask & 4 == 0 {
+                    self.min[2]
+                } else {
+                    self.max[2]
+                },
+            ]
+        })
+    }
+}
+
+/// Stabilized directional-shadow inputs for one POV frame. An empty resident
+/// bound yields `resolution == 0` and an identity matrix, a safe disabled
+/// state understood by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PovShadowFrame {
+    /// Column-major projection consuming camera-relative positions.
+    pub light_view_proj: [[f32; 4]; 4],
+    /// Depth-map edge length; zero safely disables the shadow path.
+    pub resolution: u32,
+}
+
+impl PovShadowFrame {
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            resolution: 0,
+        }
+    }
+}
+
+/// Padding around projected casters/receivers. X/Y padding gives PCF and a
+/// newly integrated edge chunk room; depth padding is deliberately fixed so
+/// near/far behavior does not depend on local relief amplitude.
+const SHADOW_XY_PADDING: f64 = REGION_SIZE * 0.25;
+const SHADOW_DEPTH_PADDING: f64 = REGION_SIZE;
+
+/// Fit one camera-relative directional shadow matrix to the resident terrain
+/// and current organism bounds. The same helper is used by live POV, F12,
+/// scripted capture, and the browser host; only callers decide whether they
+/// actually submit organisms.
+#[must_use]
+pub fn shadow_frame(
+    camera: &PovCamera,
+    chunks: &PovChunkManager,
+    organism_bounds: Option<PovShadowBounds>,
+    resolution: u32,
+) -> PovShadowFrame {
+    if resolution == 0 {
+        return PovShadowFrame::disabled();
+    }
+    let bounds = match (chunks.shadow_bounds(), organism_bounds) {
+        (Some(terrain), Some(organisms)) => Some(terrain.union(organisms)),
+        (terrain @ Some(_), None) => terrain,
+        (None, organisms @ Some(_)) => organisms,
+        (None, None) => None,
+    };
+    let Some(bounds) = bounds else {
+        return PovShadowFrame::disabled();
+    };
+    PovShadowFrame {
+        light_view_proj: fit_shadow_matrix(camera.pos, bounds, resolution),
+        resolution,
+    }
+}
+
+fn fit_shadow_matrix(
+    camera: glam::DVec3,
+    bounds: PovShadowBounds,
+    resolution: u32,
+) -> [[f32; 4]; 4] {
+    let forward = glam::DVec3::new(
+        f64::from(SUN_DIR[0]),
+        f64::from(SUN_DIR[1]),
+        f64::from(SUN_DIR[2]),
+    )
+    .normalize();
+    let right = glam::DVec3::Z.cross(forward).normalize();
+    // The screen basis must face back toward the sun: `right × up =
+    // -forward`. Terrain's CCW +z-facing triangles then remain CCW from the
+    // light, matching the shadow pipelines' back-face culling. Using
+    // `forward × right` here mirrors projected winding and culls the
+    // sun-facing terrain core instead.
+    let up = right.cross(forward).normalize();
+
+    let mut min = glam::DVec3::splat(f64::INFINITY);
+    let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
+    for corner in bounds.corners() {
+        let relative = glam::DVec3::from_array(corner) - camera;
+        let light = glam::DVec3::new(relative.dot(right), relative.dot(up), relative.dot(forward));
+        min = min.min(light);
+        max = max.max(light);
+    }
+
+    let rounded_extent = |span: f64| {
+        ((span + 2.0 * SHADOW_XY_PADDING) / REGION_SIZE)
+            .ceil()
+            .max(1.0)
+            * REGION_SIZE
+    };
+    let extent_x = rounded_extent(max.x - min.x);
+    let extent_y = rounded_extent(max.y - min.y);
+    let texel_x = extent_x / f64::from(resolution);
+    let texel_y = extent_y / f64::from(resolution);
+    let center_x = (((min.x + max.x) * 0.5) / texel_x).round() * texel_x;
+    let center_y = (((min.y + max.y) * 0.5) / texel_y).round() * texel_y;
+    let near = min.z - SHADOW_DEPTH_PADDING;
+    let far = max.z + SHADOW_DEPTH_PADDING;
+    let depth = (far - near).max(1.0);
+
+    // Column-major matrix. Input positions are already camera-relative in
+    // every POV shader; no large absolute f32 coordinate enters this fit.
+    let sx = 2.0 / extent_x;
+    let sy = 2.0 / extent_y;
+    let sz = 1.0 / depth;
+    [
+        [
+            (right.x * sx) as f32,
+            (up.x * sy) as f32,
+            (forward.x * sz) as f32,
+            0.0,
+        ],
+        [
+            (right.y * sx) as f32,
+            (up.y * sy) as f32,
+            (forward.y * sz) as f32,
+            0.0,
+        ],
+        [
+            (right.z * sx) as f32,
+            (up.z * sy) as f32,
+            (forward.z * sz) as f32,
+            0.0,
+        ],
+        [
+            (-center_x * sx) as f32,
+            (-center_y * sy) as f32,
+            (-near * sz) as f32,
+            1.0,
+        ],
+    ]
 }
 
 /// The per-frame renderer parameters for the camera at `radius` regions
@@ -361,22 +552,25 @@ pub fn frame_params(
     clear: [f64; 4],
     time: f32,
     toggles: PovToggles,
+    shadow: PovShadowFrame,
 ) -> PovFrameParams {
     let reach = (f64::from(radius) + 0.5) * REGION_SIZE;
     let sun = glam::Vec3::from_array(SUN_DIR);
     PovFrameParams {
         view_proj: camera.view_proj(aspect),
+        light_view_proj: shadow.light_view_proj,
         camera_pos: [camera.pos.x, camera.pos.y, camera.pos.z],
         sun_dir: [sun.x, sun.y, sun.z],
         detail: detail_octaves(),
         time,
         water_z: (f64::from(world_core::SEA_LEVEL) - camera.pos.z) as f32,
-        baked_light: toggles.baked_light,
+        shadow_resolution: shadow.resolution,
+        shadow_ao: toggles.shadow_ao,
         detail_normals: toggles.detail_normals,
         water: toggles.water,
         fog_color: [clear[0] as f32, clear[1] as f32, clear[2] as f32],
         fog_start: (0.55 * reach) as f32,
-        fog_end: (0.95 * reach) as f32,
+        fog_end: pov_fog_end(radius) as f32,
         // Near the 3D-1 fill values: flat ground now sits at ~0.75 of full
         // exposure (sun 0.41 + sky fill) instead of the old ~1.05 — the
         // original tuning overexposed flat ground, clipping every
@@ -482,6 +676,348 @@ pub fn walk_ground(chunks: &PovChunkManager, map: &RegionMap, world: (f64, f64))
 }
 
 // ---------------------------------------------------------------------------
+// Organism presentation (3d-phase-4-plan.md §5, §7)
+// ---------------------------------------------------------------------------
+
+/// The two canonical instanced primitive batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PovOrganismPrimitive {
+    /// Flat-shaded unit cube.
+    Box,
+    /// Smooth two-subdivision unit icosphere.
+    Sphere,
+}
+
+/// Pure renderer-ready organism mapping before it is partitioned into an
+/// upload batch. No map, chunk, or GPU reference crosses this boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PovOrganismVisual {
+    /// Canonical mesh batch.
+    pub primitive: PovOrganismPrimitive,
+    /// Absolute body center in world space.
+    pub position: [f64; 3],
+    /// Non-uniform world-space scale.
+    pub scale: [f32; 3],
+    /// Static rotation around world +z.
+    pub yaw: f32,
+    /// Shared expressed RGB plus producer flag.
+    pub color: [u8; 4],
+    /// AO sampled under the body's center.
+    pub ambient_occlusion: u8,
+    /// Optional activity amplitude/phase; static Phase 3D-4 uses zero.
+    pub bob: [f32; 2],
+}
+
+impl PovOrganismVisual {
+    fn instance(self) -> PovOrganismInstance {
+        PovOrganismInstance {
+            position: self.position,
+            scale: self.scale,
+            yaw: self.yaw,
+            color: self.color,
+            ambient_occlusion: self.ambient_occlusion,
+            bob: self.bob,
+        }
+    }
+
+    fn bounding_radius(self) -> f64 {
+        let [x, y, z] = self.scale.map(f64::from);
+        0.5 * (x * x + y * y + z * z).sqrt()
+    }
+
+    fn shadow_bounds(self) -> PovShadowBounds {
+        let radius = self.bounding_radius();
+        let half_z = 0.5 * f64::from(self.scale[2]);
+        PovShadowBounds {
+            min: [
+                self.position[0] - radius,
+                self.position[1] - radius,
+                self.position[2] - half_z,
+            ],
+            max: [
+                self.position[0] + radius,
+                self.position[1] + radius,
+                self.position[2] + half_z,
+            ],
+        }
+    }
+}
+
+/// Fixed, approximately volume-preserving form proportions. Form bit zero
+/// selects the primitive; bits 1–3 index this table.
+const ORGANISM_PROPORTIONS: [[f32; 2]; 8] = [
+    [1.42, 0.50],
+    [1.26, 0.63],
+    [1.13, 0.79],
+    [1.00, 1.00],
+    [0.89, 1.25],
+    [0.82, 1.48],
+    [0.76, 1.74],
+    [0.69, 2.08],
+];
+
+/// Packed renderer instance size pinned by the renderer's layout tests.
+pub const POV_ORGANISM_INSTANCE_BYTES: u64 = 64;
+
+fn organism_scale(organism: &Organism) -> [f32; 3] {
+    let shape = usize::from((organism.expressed.form >> 1) & 7);
+    let [xy, z] = ORGANISM_PROPORTIONS[shape];
+    let size = organism.expressed.size;
+    [size * xy, size * xy, size * z]
+}
+
+/// Map one realized organism and its resident ground sample to renderer-ready
+/// geometry. This is table-driven and has no random or time-varying input.
+#[must_use]
+pub fn organism_visual(organism: &Organism, ground: GroundSurface) -> PovOrganismVisual {
+    let scale = organism_scale(organism);
+    let rgb = expressed_color(&organism.expressed);
+    PovOrganismVisual {
+        primitive: if organism.expressed.form & 1 == 0 {
+            PovOrganismPrimitive::Box
+        } else {
+            PovOrganismPrimitive::Sphere
+        },
+        position: [
+            organism.world_pos.0,
+            organism.world_pos.1,
+            f64::from(ground.height) + 0.5 * f64::from(scale[2]),
+        ],
+        scale,
+        yaw: core::f32::consts::TAU * ((organism.id & 0xffff) as f32 / 65_536.0),
+        color: [
+            rgb[0],
+            rgb[1],
+            rgb[2],
+            u8::from(organism.trophic == world_core::Trophic::Producer),
+        ],
+        ambient_occlusion: ground.ambient_occlusion,
+        bob: [0.0; 2],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrganismVisualKey {
+    id: u64,
+    slot: u16,
+    expressed: [u32; 5],
+    form: u8,
+    position: [u64; 3],
+    scale: [u32; 3],
+    yaw: u32,
+    color: [u8; 4],
+    ambient_occlusion: u8,
+    bob: [u32; 2],
+}
+
+impl OrganismVisualKey {
+    fn new(organism: &Organism, visual: PovOrganismVisual) -> Self {
+        Self {
+            id: organism.id,
+            slot: organism.slot,
+            expressed: [
+                organism.expressed.hue.to_bits(),
+                organism.expressed.luminance.to_bits(),
+                organism.expressed.size.to_bits(),
+                organism.expressed.activity.to_bits(),
+                organism.expressed.aggression.to_bits(),
+            ],
+            form: organism.expressed.form,
+            position: visual.position.map(f64::to_bits),
+            scale: visual.scale.map(f32::to_bits),
+            yaw: visual.yaw.to_bits(),
+            color: visual.color,
+            ambient_occlusion: visual.ambient_occlusion,
+            bob: visual.bob.map(f32::to_bits),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrganismScratch {
+    key: OrganismVisualKey,
+    visual: PovOrganismVisual,
+}
+
+/// Shell-side organism presentation telemetry. Counts describe the latest
+/// scan; rebuild/upload totals are cumulative and observational only.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PovOrganismCounters {
+    /// Organisms published by the runtime before presentation filters.
+    pub published: usize,
+    /// Eligible box instances.
+    pub boxes: usize,
+    /// Eligible sphere instances.
+    pub spheres: usize,
+    /// In-range organisms omitted until their terrain chunk is resident.
+    pub waiting_for_ground: usize,
+    /// Organisms wholly beyond fog plus their conservative body radius.
+    pub distance_culled: usize,
+    /// Exact-list replacements since manager creation.
+    pub rebuilds: u64,
+    /// Instances included in all replacement uploads.
+    pub uploaded_instances: u64,
+    /// Packed 64-byte instance traffic across all replacements.
+    pub uploaded_bytes: u64,
+}
+
+impl PovOrganismCounters {
+    #[must_use]
+    pub const fn drawn(self) -> usize {
+        self.boxes + self.spheres
+    }
+}
+
+/// Exact, reusable CPU lifecycle for POV organism replacement uploads.
+/// Camera rotation is deliberately absent; translation only matters when an
+/// organism crosses the fog/body-radius membership boundary.
+#[derive(Debug, Default)]
+pub struct PovOrganismManager {
+    upload: PovOrganismUpload,
+    box_keys: Vec<OrganismVisualKey>,
+    sphere_keys: Vec<OrganismVisualKey>,
+    box_scratch: Vec<OrganismScratch>,
+    sphere_scratch: Vec<OrganismScratch>,
+    counters: PovOrganismCounters,
+    shadow_bounds: Option<PovShadowBounds>,
+    initialized: bool,
+}
+
+impl PovOrganismManager {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> PovOrganismCounters {
+        self.counters
+    }
+
+    /// Current complete replacement lists. Call only when [`Self::sync`]
+    /// returned true; otherwise the renderer should retain its buffers.
+    #[must_use]
+    pub const fn upload(&self) -> &PovOrganismUpload {
+        &self.upload
+    }
+
+    /// Bounds of the organisms selected by the latest scan.
+    #[must_use]
+    pub const fn shadow_bounds(&self) -> Option<PovShadowBounds> {
+        self.shadow_bounds
+    }
+
+    /// Scan the published realization, distance/ground filter it, build exact
+    /// visual keys in stable `(id, slot)` order, and return whether the
+    /// renderer needs a full replacement upload.
+    pub fn sync(
+        &mut self,
+        map: &RegionMap,
+        chunks: &PovChunkManager,
+        camera: (f64, f64),
+        fog_end: f64,
+    ) -> bool {
+        self.sync_organisms(map.organisms(), chunks, camera, fog_end)
+    }
+
+    fn sync_organisms<'a>(
+        &mut self,
+        organisms: impl Iterator<Item = &'a Organism>,
+        chunks: &PovChunkManager,
+        camera: (f64, f64),
+        fog_end: f64,
+    ) -> bool {
+        self.box_scratch.clear();
+        self.sphere_scratch.clear();
+        self.shadow_bounds = None;
+        self.counters.published = 0;
+        self.counters.boxes = 0;
+        self.counters.spheres = 0;
+        self.counters.waiting_for_ground = 0;
+        self.counters.distance_culled = 0;
+
+        for organism in organisms {
+            self.counters.published += 1;
+            let scale = organism_scale(organism);
+            let [x, y, z] = scale.map(f64::from);
+            let body_radius = 0.5 * (x * x + y * y + z * z).sqrt();
+            let reach = fog_end + body_radius;
+            let dx = organism.world_pos.0 - camera.0;
+            let dy = organism.world_pos.1 - camera.1;
+            if dx * dx + dy * dy > reach * reach {
+                self.counters.distance_culled += 1;
+                continue;
+            }
+            let Some(ground) = chunks.ground_surface(organism.world_pos.0, organism.world_pos.1)
+            else {
+                self.counters.waiting_for_ground += 1;
+                continue;
+            };
+            let visual = organism_visual(organism, ground);
+            let entry = OrganismScratch {
+                key: OrganismVisualKey::new(organism, visual),
+                visual,
+            };
+            match visual.primitive {
+                PovOrganismPrimitive::Box => self.box_scratch.push(entry),
+                PovOrganismPrimitive::Sphere => self.sphere_scratch.push(entry),
+            }
+            let bounds = visual.shadow_bounds();
+            self.shadow_bounds = Some(
+                self.shadow_bounds
+                    .map_or(bounds, |current| current.union(bounds)),
+            );
+        }
+
+        let order = |entry: &OrganismScratch| (entry.key.id, entry.key.slot);
+        self.box_scratch.sort_unstable_by_key(order);
+        self.sphere_scratch.sort_unstable_by_key(order);
+        self.counters.boxes = self.box_scratch.len();
+        self.counters.spheres = self.sphere_scratch.len();
+
+        let boxes_same = self.box_keys.len() == self.box_scratch.len()
+            && self
+                .box_keys
+                .iter()
+                .zip(&self.box_scratch)
+                .all(|(key, entry)| *key == entry.key);
+        let spheres_same = self.sphere_keys.len() == self.sphere_scratch.len()
+            && self
+                .sphere_keys
+                .iter()
+                .zip(&self.sphere_scratch)
+                .all(|(key, entry)| *key == entry.key);
+        let changed = !self.initialized || !boxes_same || !spheres_same;
+        self.initialized = true;
+        if !changed {
+            return false;
+        }
+
+        self.box_keys.clear();
+        self.box_keys
+            .extend(self.box_scratch.iter().map(|entry| entry.key));
+        self.sphere_keys.clear();
+        self.sphere_keys
+            .extend(self.sphere_scratch.iter().map(|entry| entry.key));
+        self.upload.boxes.clear();
+        self.upload
+            .boxes
+            .extend(self.box_scratch.iter().map(|entry| entry.visual.instance()));
+        self.upload.spheres.clear();
+        self.upload.spheres.extend(
+            self.sphere_scratch
+                .iter()
+                .map(|entry| entry.visual.instance()),
+        );
+        let count = self.counters.drawn() as u64;
+        self.counters.rebuilds += 1;
+        self.counters.uploaded_instances += count;
+        self.counters.uploaded_bytes += count * POV_ORGANISM_INSTANCE_BYTES;
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The mesher (plan §6): pure function of value snapshots
 // ---------------------------------------------------------------------------
 
@@ -506,14 +1042,22 @@ pub struct ChunkMeshInputs<'a> {
     pub dominant_ids: &'a [u64],
 }
 
-/// A meshed chunk: the GPU vertices plus the CPU-side core heights 3D-2's
-/// `ground_height` will start from (plan §1.2).
+/// A meshed chunk: GPU vertices plus the compact CPU-side height/AO lattice
+/// and extrema used by grounding and directional-shadow fitting.
 #[derive(Debug)]
 pub struct ChunkMesh {
     /// Exactly [`VERTS_PER_CHUNK`] vertices in the shared topology's order.
     pub vertices: Vec<PovVertex>,
     /// 65×65 core vertex heights, row-major (`j * POV_GRID + i`).
     pub heights: Vec<f32>,
+    /// Ambient-occlusion bytes for the same 65×65 core lattice. Keeping the
+    /// quantized attribute beside [`Self::heights`] lets organism grounding
+    /// sample exactly the presentation field drawn by the terrain shader.
+    pub ambient_occlusion: Vec<u8>,
+    /// Minimum core height, retained for directional-shadow fitting.
+    pub min_height: f32,
+    /// Maximum core height, retained for directional-shadow fitting.
+    pub max_height: f32,
     /// River-overlay triangles (3d-phase-3-plan.md §6.1): index triples into
     /// `vertices`, a subset of the shared core topology (same order, same
     /// diagonal split, same winding) selected where any corner's river
@@ -537,7 +1081,7 @@ pub fn mesh_region_chunk(inputs: &ChunkMeshInputs<'_>) -> ChunkMesh {
 
 /// Evaluate a presentation height row from an owned Terrain halo. Relief is
 /// always sampled at the requested world position. Only the P/G lookup is
-/// clamped to the outer region-center rectangle when a shadow or AO probe
+/// clamped to the outer region-center rectangle when an AO probe
 /// reaches beyond Terrain's authoritative 3×3 simulation halo; this
 /// constant edge extension keeps distant presentation work bounded by the
 /// same provenance key without changing core or ghost samples (ADR 0027).
@@ -583,10 +1127,7 @@ pub fn mesh_region_chunk_cancellable(
         return None;
     }
 
-    // Baked sun visibility (the shadow half of the vertex `light` bytes).
-    let sunvis = bake_sun_visibility(&h, (ox, oy), &inputs.terrain_halo, cancel)?;
-
-    // Coarse height lattice for valley-scale AO (the other half): 25×25 at
+    // Coarse height lattice for valley-scale AO: 25×25 at
     // 32-unit spacing spanning [origin − 256, origin + 512].
     let xsc: Vec<f64> = (0..COARSE_GRID)
         .map(|g| ox + (g as f64 - COARSE_MARGIN as f64) * COARSE_SPACING)
@@ -616,7 +1157,10 @@ pub fn mesh_region_chunk_cancellable(
 
     let mut vertices = Vec::with_capacity(VERTS_PER_CHUNK);
     let mut heights = Vec::with_capacity(CORE_VERTS);
+    let mut ambient_occlusion = Vec::with_capacity(CORE_VERTS);
     let mut rivers = Vec::with_capacity(CORE_VERTS);
+    let mut min_height = f32::INFINITY;
+    let mut max_height = f32::NEG_INFINITY;
     for j in 0..POV_GRID {
         for i in 0..POV_GRID {
             // Sample-grid index of vertex (i, j) is (i + MARGIN, j + MARGIN).
@@ -635,6 +1179,7 @@ pub fn mesh_region_chunk_cancellable(
             let biome = Biome::from_id(inputs.biome.get(cx, cy));
             let id = inputs.dominant_ids[usize::from(cy) * usize::from(res) + usize::from(cx)];
             let submerged = e < world_core::SEA_LEVEL;
+            let ao = quantize_light(vertex_ao(&occlusion, lx, ly));
             // Land matches the 2D Composite exactly (3d-phase-1-plan.md
             // §6.4); the sea floor gets a real sediment ramp instead of the
             // map's blue depth legend, so the ocean reads as water over sand
@@ -653,8 +1198,8 @@ pub fn mesh_region_chunk_cancellable(
                 normal,
                 color: [rgb[0], rgb[1], rgb[2], 255],
                 light: [
-                    quantize_light(sunvis[j * POV_GRID + i]),
-                    quantize_light(vertex_ao(&occlusion, lx, ly)),
+                    255, // reserved/neutral: direct visibility is GPU-shadowed
+                    ao,
                     if submerged { 0 } else { quantize_light(river) },
                     if submerged {
                         0
@@ -664,12 +1209,16 @@ pub fn mesh_region_chunk_cancellable(
                 ],
             });
             heights.push(e);
+            ambient_occlusion.push(ao);
             rivers.push(river);
+            min_height = min_height.min(e);
+            max_height = max_height.max(e);
         }
     }
     // The skirt bottom ring (plan §6.5): same (x, y), normal, color, and
-    // baked light as the perimeter vertex above — the skirt reads as the
-    // terrain continuing, not as a wall — z lowered by one grid step.
+    // packed material/AO attributes as the perimeter vertex above — the skirt
+    // reads as the terrain continuing, not as a wall — z lowered by one grid
+    // step.
     for edge in 0..4 {
         for k in 0..POV_GRID {
             let mut v = vertices[skirt_core_index(edge, k)];
@@ -682,6 +1231,9 @@ pub fn mesh_region_chunk_cancellable(
     Some(ChunkMesh {
         vertices,
         heights,
+        ambient_occlusion,
+        min_height,
+        max_height,
         river_indices,
     })
 }
@@ -710,79 +1262,6 @@ fn river_overlay_indices(rivers: &[f32], heights: &[f32]) -> Vec<u32> {
         }
     }
     out
-}
-
-/// Baked sun visibility per core vertex — the terrain self-shadow term of
-/// the vertex `light` bytes. From each vertex, march the heightfield along
-/// the horizontal toward-sun direction at the [`SHADOW_STEPS`] exponential
-/// distances (one batched halo-elevation row call per vertex row per step),
-/// track the highest horizon tangent seen, and soft-threshold it against the
-/// sun's elevation tangent.
-///
-/// Derived presentation only (ADR 0017): deterministic float math over the
-/// owned Terrain halo, never an identity. Probes beyond the halo's outer
-/// center rectangle use [`halo_elevation_row`]'s constant P/G edge extension.
-fn bake_sun_visibility(
-    h: &[f32],
-    origin: (f64, f64),
-    halo: &TerrainPossibilityHalo,
-    cancel: &AtomicBool,
-) -> Option<Vec<f32>> {
-    // Horizontal unit vector pointing toward the sun, and the tangent of the
-    // sun's elevation above the horizon (1.0 at the 45° SUN_DIR).
-    let horiz = f64::hypot(f64::from(SUN_DIR[0]), f64::from(SUN_DIR[1]));
-    let toward = (
-        -f64::from(SUN_DIR[0]) / horiz,
-        -f64::from(SUN_DIR[1]) / horiz,
-    );
-    let sun_tan = (-f64::from(SUN_DIR[2]) / horiz) as f32;
-
-    // March distances, and each step's vertex-row x positions — x depends
-    // only on the column and the step, so each row is built once and reused
-    // by all 65 vertex rows.
-    let mut dists = [0f64; SHADOW_STEPS];
-    let mut d = SHADOW_STEP_BASE;
-    for slot in &mut dists {
-        *slot = d;
-        d *= SHADOW_STEP_GROWTH;
-    }
-    let step_xs: Vec<Vec<f64>> = dists
-        .iter()
-        .map(|d| {
-            (0..POV_GRID)
-                .map(|i| origin.0 + i as f64 * SPACING + toward.0 * d)
-                .collect()
-        })
-        .collect();
-
-    let mut vis = vec![0f32; CORE_VERTS];
-    let mut row = vec![0f32; POV_GRID];
-    let mut horizon = vec![0f32; POV_GRID];
-    for j in 0..POV_GRID {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-        let y = origin.1 + j as f64 * SPACING;
-        horizon.fill(f32::NEG_INFINITY);
-        for (k, &dist) in dists.iter().enumerate() {
-            halo_elevation_row(&step_xs[k], y + toward.1 * dist, halo, &mut row);
-            let inv_d = (1.0 / dist) as f32;
-            for i in 0..POV_GRID {
-                let e = h[(j + GRID_MARGIN) * SAMPLE_GRID + i + GRID_MARGIN];
-                horizon[i] = horizon[i].max((row[i] - e - SHADOW_BIAS) * inv_d);
-            }
-        }
-        for i in 0..POV_GRID {
-            let lit = 1.0
-                - smoothstep(
-                    sun_tan - SHADOW_SOFTNESS,
-                    sun_tan + SHADOW_SOFTNESS,
-                    horizon[i],
-                );
-            vis[j * POV_GRID + i] = lit;
-        }
-    }
-    Some(vis)
 }
 
 /// Valley-scale occlusion over the region's own coarse nodes (a 9×9 patch):
@@ -830,12 +1309,6 @@ fn vertex_ao(occlusion: &[f32], lx: f64, ly: f64) -> f32 {
     let bottom = v01 + (v11 - v01) * tx;
     let occl = top + (bottom - top) * ty;
     1.0 - (AO_STRENGTH * occl).min(AO_MAX)
-}
-
-/// The GLSL/WGSL `smoothstep`, for the baked shadow's soft threshold.
-fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 /// A `[0, 1]` light factor to its `Unorm8` vertex byte (round to nearest).
@@ -955,13 +1428,27 @@ struct MeshResult {
     mesh: ChunkMesh,
 }
 
-/// A resident chunk: its key, its renderer handle, and the CPU-side core
-/// heights ([`PovChunkManager::ground_height`]'s lattice, plan §1.2).
+/// A resident chunk: provenance, renderer handle, and the CPU-side attributes
+/// that mirror the drawn core lattice (3d-phase-4-plan.md §7.1).
 #[derive(Debug)]
 struct ChunkEntry {
     key: u64,
     handle: u64,
     heights: Vec<f32>,
+    ambient_occlusion: Vec<u8>,
+    min_height: f32,
+    max_height: f32,
+}
+
+/// Interpolated attributes of the resident terrain triangle below a world
+/// position. Both fields use the exact v00→v11 split drawn by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundSurface {
+    /// Height of the rendered triangle at the query point.
+    pub height: f32,
+    /// Ambient-occlusion attribute interpolated from the triangle's vertex
+    /// bytes and requantized once for an organism instance.
+    pub ambient_occlusion: u8,
 }
 
 /// An in-flight mesh job: the key it will produce and its cancellation token.
@@ -1035,6 +1522,25 @@ impl PovChunkManager {
         self.chunks.is_empty()
     }
 
+    /// Conservative world-space union of resident chunk cores for
+    /// directional-shadow fitting. The skirt drop expands depth coverage but
+    /// skirts themselves remain excluded from the renderer's caster draw.
+    #[must_use]
+    pub fn shadow_bounds(&self) -> Option<PovShadowBounds> {
+        self.chunks.iter().fold(None, |bounds, (coord, entry)| {
+            let (ox, oy) = coord.origin();
+            let chunk = PovShadowBounds {
+                min: [ox, oy, f64::from(entry.min_height - POV_SKIRT_DROP)],
+                max: [
+                    ox + REGION_SIZE,
+                    oy + REGION_SIZE,
+                    f64::from(entry.max_height),
+                ],
+            };
+            Some(bounds.map_or(chunk, |bounds: PovShadowBounds| bounds.union(chunk)))
+        })
+    }
+
     /// Whether nothing is in flight or awaiting integration — with an inline
     /// executor, repeated `sync` calls until `idle` fully settle the ring
     /// (the `--pov-script` snapshot path).
@@ -1043,12 +1549,11 @@ impl PovChunkManager {
         self.pending.is_empty() && self.in_flight.is_empty()
     }
 
-    /// Height of the rendered terrain surface under a world position, from
-    /// the resident chunk's CPU-side height lattice (the drawn mesh's twin —
-    /// [`ChunkEntry::heights`] is swapped in atomically with the GPU upload,
-    /// so this is at every moment exactly the vertices on screen, including
-    /// mid-drift staleness; 3d-phase-2-plan.md §4.1). `None` when the
-    /// covering region has no chunk yet (loading frontier).
+    /// Height and ambient occlusion of the rendered terrain surface under a
+    /// world position. The resident height/AO lattices are swapped atomically
+    /// with the matching GPU upload, so an organism cannot observe attributes
+    /// from two terrain revisions. `None` means the covering chunk is not yet
+    /// resident and callers must omit the organism rather than float it.
     ///
     /// Barycentric interpolation over the 65×65 core lattice, splitting each
     /// cell along the v00→v11 diagonal exactly as
@@ -1057,7 +1562,7 @@ impl PovChunkManager {
     /// the diagonal, cell edges, and (in steady state, ADR 0027) region
     /// borders. O(1), no allocation, pure over `&self`.
     #[must_use]
-    pub fn ground_height(&self, wx: f64, wy: f64) -> Option<f32> {
+    pub fn ground_surface(&self, wx: f64, wy: f64) -> Option<GroundSurface> {
         // Floor semantics put a border position in exactly one region, whose
         // chunk owns that border column.
         let coord = RegionCoord::from_world(wx, wy);
@@ -1070,18 +1575,33 @@ impl PovChunkManager {
         let cy = gy.floor().clamp(0.0, max_cell);
         let (i, j) = (cx as usize, cy as usize);
         let (fx, fy) = ((gx - cx) as f32, (gy - cy) as f32);
-        let h = &entry.heights;
-        let h00 = h[j * POV_GRID + i];
-        let h10 = h[j * POV_GRID + i + 1];
-        let h01 = h[(j + 1) * POV_GRID + i];
-        let h11 = h[(j + 1) * POV_GRID + i + 1];
-        Some(if fx >= fy {
-            // South-east triangle [v00, v10, v11].
-            h00 + fx * (h10 - h00) + fy * (h11 - h10)
-        } else {
-            // North-west triangle [v00, v11, v01].
-            h00 + fy * (h01 - h00) + fx * (h11 - h01)
+        let samples = |values: &[f32]| {
+            [
+                values[j * POV_GRID + i],
+                values[j * POV_GRID + i + 1],
+                values[(j + 1) * POV_GRID + i],
+                values[(j + 1) * POV_GRID + i + 1],
+            ]
+        };
+        let ao_samples = [
+            entry.ambient_occlusion[j * POV_GRID + i],
+            entry.ambient_occlusion[j * POV_GRID + i + 1],
+            entry.ambient_occlusion[(j + 1) * POV_GRID + i],
+            entry.ambient_occlusion[(j + 1) * POV_GRID + i + 1],
+        ]
+        .map(|value| f32::from(value) / 255.0);
+        Some(GroundSurface {
+            height: triangle_interpolate(samples(&entry.heights), fx, fy),
+            ambient_occlusion: quantize_light(triangle_interpolate(ao_samples, fx, fy)),
         })
+    }
+
+    /// Height-only compatibility query used by walk mode. Delegating to
+    /// [`Self::ground_surface`] prevents organism footing and collision from
+    /// ever acquiring different triangle math.
+    #[must_use]
+    pub fn ground_height(&self, wx: f64, wy: f64) -> Option<f32> {
+        self.ground_surface(wx, wy).map(|surface| surface.height)
     }
 
     /// Per-frame sync (plan §7.2–§7.4): drain finished meshes, schedule
@@ -1180,12 +1700,23 @@ impl PovChunkManager {
                     handle
                 }
             };
+            let ChunkMesh {
+                vertices,
+                heights,
+                ambient_occlusion,
+                min_height,
+                max_height,
+                river_indices,
+            } = result.mesh;
             self.chunks.insert(
                 result.coord,
                 ChunkEntry {
                     key: result.key,
                     handle,
-                    heights: result.mesh.heights,
+                    heights,
+                    ambient_occlusion,
+                    min_height,
+                    max_height,
                 },
             );
             let (ox, oy) = result.coord.origin();
@@ -1193,8 +1724,8 @@ impl PovChunkManager {
                 handle,
                 origin: [ox, oy],
                 detail_base: detail_base(result.coord),
-                vertices: result.mesh.vertices,
-                river_indices: result.mesh.river_indices,
+                vertices,
+                river_indices,
             });
         }
         self.counters.uploads_deferred += self.pending.len() as u64;
@@ -1303,6 +1834,16 @@ impl PovChunkManager {
                 let _ = tx.send(MeshResult { coord, key, mesh });
             }),
         );
+    }
+}
+
+/// Interpolate one four-corner attribute over the renderer's fixed cell
+/// diagonal. `v = [v00, v10, v01, v11]`.
+fn triangle_interpolate(v: [f32; 4], fx: f32, fy: f32) -> f32 {
+    if fx >= fy {
+        v[0] + fx * (v[1] - v[0]) + fy * (v[3] - v[1])
+    } else {
+        v[0] + fy * (v[2] - v[0]) + fx * (v[3] - v[2])
     }
 }
 
@@ -1513,8 +2054,8 @@ mod tests {
     use renderer::pov::chunk_indices;
     use world_core::terrain::elevation;
     use world_core::{
-        PossibilityDomain, PossibilityField, PossibilitySignature, POSSIBILITY_DIMS,
-        POSSIBILITY_QUANT,
+        Expressed, LocalPos, PossibilityDomain, PossibilityField, PossibilitySignature, Trophic,
+        POSSIBILITY_DIMS, POSSIBILITY_QUANT,
     };
     use world_runtime::{Budget, InlineExecutor, StreamConfig, CHANNEL_ELEVATION};
 
@@ -1589,6 +2130,403 @@ mod tests {
                 dominant_ids: &self.dominant_ids,
             }
         }
+    }
+
+    fn test_organism(id: u64, slot: u16, form: u8, size: f32) -> Organism {
+        Organism {
+            id,
+            species: 9,
+            trophic: Trophic::Herbivore,
+            slot,
+            cell: LocalPos::new(0, 0),
+            world_pos: (32.0, 48.0),
+            expressed: Expressed {
+                hue: 0.37,
+                luminance: 0.62,
+                size,
+                activity: 0.4,
+                aggression: 0.2,
+                form,
+            },
+        }
+    }
+
+    fn flat_chunk_manager(ao: u8) -> PovChunkManager {
+        let mut chunks = PovChunkManager::new();
+        chunks.chunks.insert(
+            RegionCoord::new(0, 0),
+            ChunkEntry {
+                key: 1,
+                handle: 1,
+                heights: vec![10.0; CORE_VERTS],
+                ambient_occlusion: vec![ao; CORE_VERTS],
+                min_height: 10.0,
+                max_height: 10.0,
+            },
+        );
+        chunks
+    }
+
+    #[test]
+    fn organism_forms_exhaust_primitive_and_proportion_mapping() {
+        let ground = GroundSurface {
+            height: 10.0,
+            ambient_occlusion: 137,
+        };
+        // Keep the acceptance table independent of the production constant:
+        // a reordered or mistyped pair must fail even if box and sphere still
+        // happen to agree with one another.
+        let expected_proportions = [
+            [1.42, 0.50],
+            [1.26, 0.63],
+            [1.13, 0.79],
+            [1.00, 1.00],
+            [0.89, 1.25],
+            [0.82, 1.48],
+            [0.76, 1.74],
+            [0.69, 2.08],
+        ];
+        let mut ratios = [0.0f32; 8];
+        for shape in 0u8..8 {
+            let box_visual = organism_visual(&test_organism(7, 0, shape << 1, 2.0), ground);
+            let sphere_visual =
+                organism_visual(&test_organism(7, 0, (shape << 1) | 1, 2.0), ground);
+            assert_eq!(box_visual.primitive, PovOrganismPrimitive::Box);
+            assert_eq!(sphere_visual.primitive, PovOrganismPrimitive::Sphere);
+            assert_eq!(box_visual.scale, sphere_visual.scale);
+            let [xy, z] = expected_proportions[usize::from(shape)];
+            assert_eq!(box_visual.scale, [2.0 * xy, 2.0 * xy, 2.0 * z]);
+            ratios[usize::from(shape)] = box_visual.scale[2] / box_visual.scale[0];
+            assert_eq!(box_visual.ambient_occlusion, 137);
+        }
+        assert!(ratios.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn organism_size_grounding_yaw_and_color_are_exact_presentation_inputs() {
+        let ground = GroundSurface {
+            height: -12.5,
+            ambient_occlusion: 201,
+        };
+        let organism = test_organism(0xabcd, 3, 12, 0.1);
+        let small = organism_visual(&organism, ground);
+        let large = organism_visual(&test_organism(0xabcd, 3, 12, 12.8), ground);
+        for axis in 0..3 {
+            assert!((large.scale[axis] / small.scale[axis] - 128.0).abs() < 1e-4);
+            assert!(small.scale[axis].is_finite() && large.scale[axis].is_finite());
+        }
+        assert_eq!(
+            small.position[2] - 0.5 * f64::from(small.scale[2]),
+            f64::from(ground.height)
+        );
+        assert_eq!(small.yaw, organism_visual(&organism, ground).yaw);
+        assert_eq!(
+            small.yaw,
+            core::f32::consts::TAU * (f32::from(0xabcdu16) / 65_536.0)
+        );
+        assert!((0.0..core::f32::consts::TAU).contains(&small.yaw));
+        let other_yaw = organism_visual(&test_organism(0xffff, 3, 12, 0.1), ground);
+        assert!(other_yaw.yaw < core::f32::consts::TAU);
+        assert_eq!(other_yaw.scale, small.scale);
+        assert_eq!(other_yaw.color, small.color);
+        let rgb = expressed_color(&organism.expressed);
+        assert_eq!(&small.color[..3], &rgb);
+        assert_eq!(small.color[3], 0);
+        let mut producer = organism;
+        producer.trophic = Trophic::Producer;
+        let producer = organism_visual(&producer, ground);
+        assert_eq!(
+            &producer.color[..3],
+            &rgb,
+            "producer cue cannot alter base RGB"
+        );
+        assert_eq!(producer.color[3], 1);
+        assert_eq!(producer.scale, small.scale);
+    }
+
+    #[test]
+    fn ground_surface_interpolates_height_and_ao_on_one_triangle_topology() {
+        let mut chunks = flat_chunk_manager(255);
+        let entry = chunks.chunks.get_mut(&RegionCoord::new(0, 0)).unwrap();
+        entry.heights[..].fill(0.0);
+        entry.ambient_occlusion[..].fill(0);
+        // First cell: distinct corners make the selected diagonal observable.
+        entry.heights[0] = 10.0;
+        entry.heights[1] = 20.0;
+        entry.heights[POV_GRID] = 30.0;
+        entry.heights[POV_GRID + 1] = 50.0;
+        entry.ambient_occlusion[0] = 10;
+        entry.ambient_occlusion[1] = 60;
+        entry.ambient_occlusion[POV_GRID] = 110;
+        entry.ambient_occlusion[POV_GRID + 1] = 210;
+
+        for &(fx, fy) in &[(0.75, 0.25), (0.25, 0.75), (0.5, 0.5)] {
+            let surface = chunks
+                .ground_surface(fx * SPACING, fy * SPACING)
+                .expect("resident");
+            let expected_h = triangle_interpolate([10.0, 20.0, 30.0, 50.0], fx as f32, fy as f32);
+            let expected_ao = quantize_light(triangle_interpolate(
+                [10.0 / 255.0, 60.0 / 255.0, 110.0 / 255.0, 210.0 / 255.0],
+                fx as f32,
+                fy as f32,
+            ));
+            assert_eq!(surface.height.to_bits(), expected_h.to_bits());
+            assert_eq!(surface.ambient_occlusion, expected_ao);
+            assert_eq!(
+                chunks
+                    .ground_height(fx * SPACING, fy * SPACING)
+                    .unwrap()
+                    .to_bits(),
+                surface.height.to_bits()
+            );
+        }
+        let all_zero = flat_chunk_manager(0).ground_surface(1.0, 1.0).unwrap();
+        let all_full = flat_chunk_manager(255).ground_surface(1.0, 1.0).unwrap();
+        assert_eq!(all_zero.ambient_occlusion, 0);
+        assert_eq!(all_full.ambient_occlusion, 255);
+    }
+
+    #[test]
+    fn organism_manager_has_exact_delta_empty_and_unbounded_count_semantics() {
+        let chunks = flat_chunk_manager(190);
+        let mut initially_empty = PovOrganismManager::new();
+        assert!(initially_empty.sync_organisms(core::iter::empty(), &chunks, (0.0, 0.0), 1_000.0));
+        assert!(!initially_empty.sync_organisms(core::iter::empty(), &chunks, (0.0, 0.0), 1_000.0));
+        let mut organisms = (0..1_701u64)
+            .map(|id| {
+                let mut organism = test_organism(id, (id % 4) as u16, (id % 16) as u8, 1.0);
+                organism.world_pos = (32.0 + (id % 8) as f64, 48.0);
+                organism
+            })
+            .collect::<Vec<_>>();
+        let mut manager = PovOrganismManager::new();
+        assert!(manager.sync_organisms(organisms.iter(), &chunks, (0.0, 0.0), 1_000.0));
+        assert_eq!(manager.counters().drawn(), 1_701, "no fixed upload cap");
+        assert_eq!(
+            manager.upload().boxes.len() + manager.upload().spheres.len(),
+            1_701
+        );
+        assert_eq!(
+            manager.counters().uploaded_bytes,
+            1_701 * POV_ORGANISM_INSTANCE_BYTES
+        );
+        let capacities = (
+            manager.upload().boxes.capacity(),
+            manager.upload().spheres.capacity(),
+            manager.box_scratch.capacity(),
+            manager.sphere_scratch.capacity(),
+        );
+        assert!(!manager.sync_organisms(organisms.iter(), &chunks, (0.1, 0.1), 1_000.0));
+        assert_eq!(manager.counters().rebuilds, 1);
+        assert_eq!(
+            capacities,
+            (
+                manager.upload().boxes.capacity(),
+                manager.upload().spheres.capacity(),
+                manager.box_scratch.capacity(),
+                manager.sphere_scratch.capacity(),
+            ),
+            "steady scan reuses every instance vector"
+        );
+        organisms[0].expressed.size = 2.0;
+        assert!(manager.sync_organisms(organisms.iter(), &chunks, (0.1, 0.1), 1_000.0));
+        assert_eq!(manager.counters().rebuilds, 2);
+        let mut added_slot = test_organism(9_999, 7, 3, 1.0);
+        added_slot.world_pos = (40.0, 40.0);
+        organisms.push(added_slot);
+        assert!(manager.sync_organisms(organisms.iter(), &chunks, (0.1, 0.1), 1_000.0));
+        assert_eq!(manager.counters().drawn(), 1_702);
+        assert!(manager.sync_organisms(organisms.iter(), &chunks, (1.0e6, 1.0e6), 1.0));
+        assert_eq!(manager.counters().drawn(), 0);
+        assert!(manager.upload().boxes.is_empty() && manager.upload().spheres.is_empty());
+        assert!(!manager.sync_organisms(organisms.iter(), &chunks, (1.0e6, 1.0e6), 1.0));
+    }
+
+    #[test]
+    fn organism_manager_waits_for_ground_then_places_and_sorts_stably() {
+        let mut organisms = [
+            test_organism(30, 2, 1, 1.0),
+            test_organism(10, 3, 1, 1.0),
+            test_organism(10, 1, 1, 1.0),
+        ];
+        let mut manager = PovOrganismManager::new();
+        assert!(manager.sync_organisms(
+            organisms.iter(),
+            &PovChunkManager::new(),
+            (0.0, 0.0),
+            1_000.0
+        ));
+        assert_eq!(manager.counters().waiting_for_ground, 3);
+        assert_eq!(manager.counters().drawn(), 0);
+
+        let mut chunks = flat_chunk_manager(77);
+        assert!(manager.sync_organisms(organisms.iter(), &chunks, (0.0, 0.0), 1_000.0));
+        assert_eq!(manager.counters().waiting_for_ground, 0);
+        assert_eq!(manager.counters().spheres, 3);
+        assert_eq!(
+            manager
+                .sphere_keys
+                .iter()
+                .map(|key| (key.id, key.slot))
+                .collect::<Vec<_>>(),
+            vec![(10, 1), (10, 3), (30, 2)]
+        );
+        for instance in &manager.upload().spheres {
+            assert_eq!(instance.ambient_occlusion, 77);
+            assert_eq!(
+                instance.position[2] - 0.5 * f64::from(instance.scale[2]),
+                10.0
+            );
+        }
+        organisms.reverse();
+        assert!(!manager.sync_organisms(organisms.iter(), &chunks, (0.0, 0.0), 1_000.0));
+        let chunk = chunks.chunks.get_mut(&RegionCoord::new(0, 0)).unwrap();
+        chunk.heights.fill(20.0);
+        chunk.ambient_occlusion.fill(88);
+        assert!(manager.sync_organisms(organisms.iter(), &chunks, (0.0, 0.0), 1_000.0));
+        assert!(manager
+            .upload()
+            .spheres
+            .iter()
+            .all(|instance| instance.ambient_occlusion == 88
+                && instance.position[2] - 0.5 * f64::from(instance.scale[2]) == 20.0));
+    }
+
+    #[test]
+    fn organism_distance_cull_keeps_a_body_intersecting_fog() {
+        let chunks = flat_chunk_manager(255);
+        let mut organism = test_organism(1, 0, 14, 12.8);
+        organism.world_pos = (20.0, 0.0);
+        let mut manager = PovOrganismManager::new();
+        assert!(manager.sync_organisms(core::iter::once(&organism), &chunks, (0.0, 0.0), 10.0));
+        assert_eq!(manager.counters().drawn(), 1, "body radius overlaps fog");
+        organism.world_pos = (200.0, 0.0);
+        assert!(manager.sync_organisms(core::iter::once(&organism), &chunks, (0.0, 0.0), 10.0));
+        assert_eq!(manager.counters().drawn(), 0);
+        assert_eq!(manager.counters().distance_culled, 1);
+    }
+
+    #[test]
+    fn organism_manager_matches_independently_filtered_published_map() {
+        let map = settled_map();
+        let chunks = settled_chunks(&map, (0.0, 0.0), 3);
+        let fog_end = pov_fog_end(3);
+        let mut expected = map
+            .organisms()
+            .filter_map(|organism| {
+                let scale = organism_scale(organism).map(f64::from);
+                let radius = 0.5 * (scale[0].powi(2) + scale[1].powi(2) + scale[2].powi(2)).sqrt();
+                let distance = f64::hypot(organism.world_pos.0, organism.world_pos.1);
+                (distance <= fog_end + radius
+                    && chunks
+                        .ground_surface(organism.world_pos.0, organism.world_pos.1)
+                        .is_some())
+                .then_some((organism.id, organism.slot))
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+
+        let mut manager = PovOrganismManager::new();
+        assert!(manager.sync(&map, &chunks, (0.0, 0.0), fog_end));
+        let mut actual = manager
+            .box_keys
+            .iter()
+            .chain(&manager.sphere_keys)
+            .map(|key| (key.id, key.slot))
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(manager.counters().published, map.organism_count());
+        assert_eq!(manager.counters().drawn(), expected.len());
+        assert!(!manager.sync(&map, &chunks, (0.01, -0.01), fog_end));
+    }
+
+    #[test]
+    fn shadow_fit_is_finite_contains_bounds_and_disables_when_empty() {
+        assert_eq!(shadow_resolution(ResourceTier::Low), 1024);
+        assert_eq!(shadow_resolution(ResourceTier::Mid), 2048);
+        assert_eq!(shadow_resolution(ResourceTier::High), 2048);
+        assert_eq!(
+            flat_chunk_manager(255).shadow_bounds(),
+            Some(PovShadowBounds {
+                min: [0.0, 0.0, 10.0 - f64::from(POV_SKIRT_DROP)],
+                max: [REGION_SIZE, REGION_SIZE, 10.0],
+            })
+        );
+        let camera = glam::DVec3::new(1.0e12, -1.0e12, 700.0);
+        let bounds = PovShadowBounds {
+            min: [camera.x - 300.0, camera.y - 200.0, -120.0],
+            max: [camera.x + 400.0, camera.y + 500.0, 450.0],
+        };
+        let matrix = fit_shadow_matrix(camera, bounds, 2048);
+        assert!(matrix.iter().flatten().all(|value| value.is_finite()));
+        let matrix = glam::Mat4::from_cols_array_2d(&matrix);
+        for corner in bounds.corners() {
+            let relative = (glam::DVec3::from_array(corner) - camera).as_vec3();
+            let projected = matrix.project_point3(relative);
+            assert!((-1.000_01..=1.000_01).contains(&projected.x));
+            assert!((-1.000_01..=1.000_01).contains(&projected.y));
+            assert!((-0.000_01..=1.000_01).contains(&projected.z));
+        }
+        let empty = shadow_frame(&PovCamera::new(), &PovChunkManager::new(), None, 2048);
+        assert_eq!(empty, PovShadowFrame::disabled());
+    }
+
+    #[test]
+    fn shadow_fit_preserves_sun_facing_ccw_winding() {
+        let camera = glam::DVec3::new(0.0, 0.0, 100.0);
+        let bounds = PovShadowBounds {
+            min: [-20.0, -20.0, -10.0],
+            max: [20.0, 20.0, 10.0],
+        };
+        let matrix = glam::Mat4::from_cols_array_2d(&fit_shadow_matrix(camera, bounds, 1024));
+        // A +z-facing terrain triangle is wound CCW and faces the fixed sun.
+        // Its light-space projection must stay CCW because both shadow
+        // pipelines use `FrontFace::Ccw` with back-face culling.
+        let project = |point: glam::DVec3| matrix.project_point3((point - camera).as_vec3());
+        let a = project(glam::DVec3::new(-5.0, -5.0, 0.0));
+        let b = project(glam::DVec3::new(5.0, -5.0, 0.0));
+        let c = project(glam::DVec3::new(5.0, 5.0, 0.0));
+        let signed_area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        assert!(signed_area > 0.0, "sun-facing triangle was mirrored");
+    }
+
+    #[test]
+    fn shadow_fit_snaps_center_and_rounds_extent() {
+        let bounds = PovShadowBounds {
+            min: [-100.0, -100.0, -50.0],
+            max: [100.0, 100.0, 50.0],
+        };
+        let camera = glam::DVec3::ZERO;
+        let first = fit_shadow_matrix(camera, bounds, 1024);
+        let forward = glam::DVec3::from_array(SUN_DIR.map(f64::from));
+        let right = glam::DVec3::Z.cross(forward).normalize();
+        let sub_texel = fit_shadow_matrix(camera + right * 0.01, bounds, 1024);
+        assert_eq!(first, sub_texel, "sub-texel light-x motion must be stable");
+        let crossed = fit_shadow_matrix(camera + right, bounds, 1024);
+        assert_ne!(
+            first, crossed,
+            "crossing texels advances the snapped center"
+        );
+
+        let within_same_extent = PovShadowBounds {
+            min: [-110.0, -100.0, -50.0],
+            max: [110.0, 100.0, 50.0],
+        };
+        let wider = PovShadowBounds {
+            min: [-500.0, -100.0, -50.0],
+            max: [500.0, 100.0, 50.0],
+        };
+        let same = fit_shadow_matrix(camera, within_same_extent, 1024);
+        let wider = fit_shadow_matrix(camera, wider, 1024);
+        let xy_scales = |matrix: [[f32; 4]; 4]| {
+            [
+                (matrix[0][0].powi(2) + matrix[1][0].powi(2) + matrix[2][0].powi(2)).sqrt(),
+                (matrix[0][1].powi(2) + matrix[1][1].powi(2) + matrix[2][1].powi(2)).sqrt(),
+            ]
+        };
+        assert_eq!(xy_scales(first), xy_scales(same), "same extent step");
+        assert_ne!(xy_scales(first), xy_scales(wider), "extent step crossed");
     }
 
     #[test]
@@ -1864,31 +2802,41 @@ mod tests {
     }
 
     #[test]
-    fn baked_light_quantization_and_smoothstep_are_sane() {
+    fn light_quantization_is_clamped_and_rounded() {
         assert_eq!(quantize_light(0.0), 0);
         assert_eq!(quantize_light(1.0), 255);
         assert_eq!(quantize_light(-0.5), 0, "clamped below");
         assert_eq!(quantize_light(2.0), 255, "clamped above");
-        assert_eq!(smoothstep(0.0, 1.0, -1.0), 0.0);
-        assert_eq!(smoothstep(0.0, 1.0, 2.0), 1.0);
-        assert_eq!(smoothstep(0.0, 1.0, 0.5), 0.5);
     }
 
     #[test]
-    fn open_terrain_bakes_mostly_lit_vertices() {
-        // Rolling settled terrain under the 45° sun: most vertices see the
-        // sun, every light byte pair is populated, and none exceeds full.
+    fn direct_light_byte_is_neutral_and_ao_lattice_matches_vertices() {
         let map = settled_map();
         let snap = Snapshot::of(&map, RegionCoord::new(0, 0));
         let mesh = mesh_region_chunk(&snap.inputs());
-        let lit = mesh.vertices[..CORE_VERTS]
-            .iter()
-            .filter(|v| v.light[0] == 255)
-            .count();
-        assert!(
-            lit * 2 > CORE_VERTS,
-            "most open-terrain vertices are sunlit, got {lit}/{CORE_VERTS}"
+        assert_eq!(mesh.ambient_occlusion.len(), CORE_VERTS);
+        assert_eq!(
+            mesh.min_height.to_bits(),
+            mesh.heights
+                .iter()
+                .copied()
+                .reduce(f32::min)
+                .unwrap()
+                .to_bits()
         );
+        assert_eq!(
+            mesh.max_height.to_bits(),
+            mesh.heights
+                .iter()
+                .copied()
+                .reduce(f32::max)
+                .unwrap()
+                .to_bits()
+        );
+        for (index, vertex) in mesh.vertices[..CORE_VERTS].iter().enumerate() {
+            assert_eq!(vertex.light[0], 255, "reserved direct byte {index}");
+            assert_eq!(vertex.light[1], mesh.ambient_occlusion[index]);
+        }
     }
 
     #[test]
@@ -2042,13 +2990,15 @@ mod tests {
             [0.1, 0.2, 0.3, 1.0],
             7.25,
             PovToggles::default(),
+            PovShadowFrame::disabled(),
         );
         assert_eq!(params.time, 7.25);
         assert_eq!(
             params.water_z,
             (f64::from(world_core::SEA_LEVEL) - 137.5) as f32
         );
-        assert!(params.baked_light && params.detail_normals && params.water);
+        assert!(params.shadow_ao && params.detail_normals && params.water);
+        assert_eq!(params.shadow_resolution, 0);
         let off = frame_params(
             &cam,
             1.5,
@@ -2056,13 +3006,14 @@ mod tests {
             [0.0; 4],
             0.0,
             PovToggles {
-                baked_light: false,
+                shadow_ao: false,
                 detail_normals: false,
                 water: false,
             },
+            PovShadowFrame::disabled(),
         );
         assert_eq!(off.time, 0.0);
-        assert!(!off.baked_light && !off.detail_normals && !off.water);
+        assert!(!off.shadow_ao && !off.detail_normals && !off.water);
     }
 
     #[test]
@@ -2219,6 +3170,9 @@ mod tests {
                 VERTS_PER_CHUNK
             ],
             heights: vec![0.0; CORE_VERTS],
+            ambient_occlusion: vec![255; CORE_VERTS],
+            min_height: 0.0,
+            max_height: 0.0,
             river_indices: Vec::new(),
         };
         manager
@@ -2255,6 +3209,9 @@ mod tests {
                     key: 1,
                     handle: 100 + x as u64,
                     heights: Vec::new(),
+                    ambient_occlusion: Vec::new(),
+                    min_height: 0.0,
+                    max_height: 0.0,
                 },
             );
         }

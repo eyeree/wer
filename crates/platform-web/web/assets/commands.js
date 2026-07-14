@@ -152,7 +152,7 @@ export const COMMANDS = [
   {
     id: "pov:toggle-baked",
     key: "B",
-    label: "Toggle baked lighting",
+    label: "Toggle shadows and terrain AO",
     group: "POV",
   },
   {

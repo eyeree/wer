@@ -220,7 +220,7 @@ const syncControls = (snapshot) => {
     "mode:map": snapshot.view.mode === "map",
     "mode:pov": snapshot.view.mode === "pov",
     "pov:walk": pov.motion === "walk",
-    "pov:toggle-baked": pov.baked_light,
+    "pov:toggle-baked": pov.shadow_ao,
     "pov:toggle-detail": pov.detail_normals,
     "pov:toggle-water": pov.water,
   };

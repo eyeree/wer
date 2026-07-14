@@ -405,6 +405,9 @@ struct WebAppState {
     /// facade unit tests without any GPU.
     pov_camera: pov_host::PovCamera,
     pov_chunks: pov_host::PovChunkManager,
+    /// Exact organism replacement lifecycle shared with the native POV
+    /// shell. Like chunk geometry, this is derived upload-only presentation.
+    pov_organisms: pov_host::PovOrganismManager,
     /// Meshed-chunk radius around the camera (the native `WER_POV_RADIUS`
     /// default), reduced on the Low tier — inline meshing pays the whole
     /// window on POV entry, so the small tier keeps entry snappy.
@@ -432,10 +435,10 @@ struct WebAppState {
     pov_walk: bool,
     /// The native POV diagnostic toggles (`B`/`N`/`V`), mirrored so the
     /// browser viewer drives the same presentation switches the shared 3D
-    /// renderer exposes: baked sun-visibility/AO, per-fragment detail
-    /// normals, and the water passes. Presentation-only — never part of the
-    /// settle hash.
-    pov_baked_light: bool,
+    /// renderer exposes: GPU directional shadows plus terrain AO,
+    /// per-fragment detail normals, and the water passes. Presentation-only
+    /// — never part of the settle hash.
+    pov_shadow_ao: bool,
     pov_detail_normals: bool,
     pov_water: bool,
     /// POV render scale (the native `WER_POV_SCALE`): the fraction of the
@@ -469,6 +472,7 @@ impl Default for WebAppState {
             regen_totals: [0; world_core::layer::LAYER_COUNT as usize],
             pov_camera: pov_host::PovCamera::new(),
             pov_chunks: pov_host::PovChunkManager::new(),
+            pov_organisms: pov_host::PovOrganismManager::new(),
             pov_radius: 2,
             tier: "WebLow",
             cache_ceiling_mb: 48,
@@ -489,7 +493,7 @@ impl Default for WebAppState {
             pov_supported: false,
             pointer_lock: false,
             pov_walk: false,
-            pov_baked_light: true,
+            pov_shadow_ao: true,
             pov_detail_normals: true,
             pov_water: true,
             pov_render_scale: 1.0,
@@ -592,7 +596,7 @@ impl WebAppState {
         &mut self,
         dt_ms: f64,
         input: &str,
-    ) -> (Vec<renderer::TerrainChunkUpload>, Vec<u64>) {
+    ) -> (Vec<renderer::TerrainChunkUpload>, Vec<u64>, bool) {
         self.frame_index = self.frame_index.wrapping_add(1);
         let dt = (dt_ms / 1000.0).clamp(0.0, 0.1);
         let look_dx = json_number(input, "look_dx").unwrap_or(0.0);
@@ -669,12 +673,19 @@ impl WebAppState {
             );
             self.absorb_stats(stats);
         }
-        self.pov_chunks.sync(
+        let (uploads, removes) = self.pov_chunks.sync(
             &self.map,
             (self.pov_camera.pos.x, self.pov_camera.pos.y),
             self.pov_radius,
             &InlineExecutor,
-        )
+        );
+        let organisms_changed = self.pov_organisms.sync(
+            &self.map,
+            &self.pov_chunks,
+            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            pov_host::pov_fog_end(self.pov_radius),
+        );
+        (uploads, removes, organisms_changed)
     }
 
     /// Fold one stream update's statistics into the panel's rolling state.
@@ -798,7 +809,7 @@ impl WebAppState {
             );
             self.pov_camera.set_walk(self.pov_walk, ground);
         } else if command.contains("pov:toggle-baked") {
-            self.pov_baked_light = !self.pov_baked_light;
+            self.pov_shadow_ao = !self.pov_shadow_ao;
         } else if command.contains("pov:toggle-detail") {
             self.pov_detail_normals = !self.pov_detail_normals;
         } else if command.contains("pov:toggle-water") {
@@ -918,7 +929,7 @@ impl WebAppState {
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
                 "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
                 "\"view\":{{\"mode\":\"{}\",\"pov_supported\":{},\"pointer_lock\":{},",
-                "\"pov\":{{\"motion\":\"{}\",\"baked_light\":{},\"detail_normals\":{},\"water\":{},\"render_scale\":{:.2}}}}},",
+                "\"pov\":{{\"motion\":\"{}\",\"shadow_ao\":{},\"detail_normals\":{},\"water\":{},\"render_scale\":{:.2}}}}},",
                 "\"tier\":{{\"name\":\"{}\",\"runtime\":\"{}\",\"cache_ceiling_mb\":{},\"benchmark_ms\":{:.3}}},",
                 "\"bias\":{},",
                 "\"stats\":{},",
@@ -954,7 +965,7 @@ impl WebAppState {
             self.pov_supported,
             self.pointer_lock,
             if self.pov_walk { "walk" } else { "fly" },
-            self.pov_baked_light,
+            self.pov_shadow_ao,
             self.pov_detail_normals,
             self.pov_water,
             self.pov_render_scale,
@@ -1534,7 +1545,8 @@ mod wasm {
                 return Ok(JsValue::from_str("{\"active\":false,\"rendered\":false}"));
             }
             let input = input.as_string().unwrap_or_default();
-            let (uploads, removes) = self.state.pov_step(dt_ms, &input);
+            let (uploads, removes, organisms_changed) = self.state.pov_step(dt_ms, &input);
+            let organism_upload = organisms_changed.then(|| self.state.pov_organisms.upload());
             // The water-wobble clock, wrapped at the shader period like the
             // native shell so f32 never loses phase precision.
             let time = super::json_number(&input, "time")
@@ -1546,6 +1558,12 @@ mod wasm {
                     return false;
                 };
                 let (w, h) = renderer.size();
+                let shadow = pov_host::shadow_frame(
+                    &self.state.pov_camera,
+                    &self.state.pov_chunks,
+                    self.state.pov_organisms.shadow_bounds(),
+                    pov_host::shadow_resolution(self.state.runtime_tier),
+                );
                 let params = pov_host::frame_params(
                     &self.state.pov_camera,
                     w as f32 / h.max(1) as f32,
@@ -1553,15 +1571,17 @@ mod wasm {
                     CLEAR_COLOR,
                     time,
                     pov_host::PovToggles {
-                        baked_light: self.state.pov_baked_light,
+                        shadow_ao: self.state.pov_shadow_ao,
                         detail_normals: self.state.pov_detail_normals,
                         water: self.state.pov_water,
                     },
+                    shadow,
                 );
                 renderer.render_pov(
                     &params,
                     &uploads,
                     &removes,
+                    organism_upload,
                     CLEAR_COLOR,
                     None,
                     self.state.pov_render_scale,
@@ -1569,11 +1589,13 @@ mod wasm {
             });
             let camera = &self.state.pov_camera;
             let counters = self.state.pov_chunks.counters();
+            let organism_counts = self.state.pov_organisms.counters();
             Ok(JsValue::from_str(&format!(
                 concat!(
                     "{{\"active\":true,\"rendered\":{},",
                     "\"camera\":[{:.1},{:.1},{:.1}],",
-                    "\"chunks\":{},\"meshed\":{},\"uploads\":{}}}"
+                    "\"chunks\":{},\"meshed\":{},\"uploads\":{},",
+                    "\"organisms\":{{\"published\":{},\"drawn\":{},\"waiting_for_ground\":{}}}}}"
                 ),
                 rendered,
                 camera.pos.x,
@@ -1582,6 +1604,9 @@ mod wasm {
                 self.state.pov_chunks.len(),
                 counters.meshed,
                 uploads.len(),
+                organism_counts.published,
+                organism_counts.drawn(),
+                organism_counts.waiting_for_ground,
             )))
         }
 
@@ -1814,7 +1839,7 @@ mod tests {
         assert_eq!(app.view_mode, "pov");
 
         let before = app.pov_camera.pos;
-        let (uploads, _) = app.pov_step(100.0, "{\"move_y\":1,\"time\":0}");
+        let (uploads, _, _) = app.pov_step(100.0, "{\"move_y\":1,\"time\":0}");
         assert!(
             !app.pov_chunks.is_empty(),
             "chunks meshed around the camera"
@@ -1965,7 +1990,7 @@ mod tests {
         let snapshot = app.snapshot_json();
         assert_eq!(before, app.settle_hash());
         assert!(snapshot.contains(
-            "\"pov\":{\"motion\":\"walk\",\"baked_light\":false,\"detail_normals\":false,\
+            "\"pov\":{\"motion\":\"walk\",\"shadow_ao\":false,\"detail_normals\":false,\
              \"water\":false,\"render_scale\":0.50}"
         ));
         app.apply_command("pov:walk");

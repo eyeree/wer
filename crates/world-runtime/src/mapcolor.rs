@@ -10,7 +10,39 @@
 //! of identity (ADR 0003) — and touches no platform services, keeping the
 //! module wasm-clean like the rest of this crate.
 
-use world_core::{splitmix64, Biome, SEA_LEVEL};
+use world_core::{splitmix64, Biome, Expressed, SEA_LEVEL};
+
+/// Convert HSV to RGB for presentation palettes. Hue wraps around the wheel;
+/// saturation and value are expected in `[0, 1]`.
+#[must_use]
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let h6 = h.rem_euclid(1.0) * 6.0;
+    let c = v * s;
+    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h6 as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    ]
+}
+
+/// The base RGB shared by 2D organism markers and 3D organism instances.
+///
+/// This is presentation-only and deliberately observes just the expressed hue
+/// and luminance; morphology and behavior traits must not alter marker bytes.
+#[must_use]
+pub fn expressed_color(expressed: &Expressed) -> [u8; 3] {
+    hsv_to_rgb(expressed.hue, 0.75, 0.45 + 0.55 * expressed.luminance)
+}
 
 /// Linear blend of two RGB colors.
 #[must_use]
@@ -230,5 +262,74 @@ pub fn composite_cell_color(
     match dominant {
         Some(id) if e >= SEA_LEVEL => lerp_rgb(rgb, species_color(id), 0.18),
         _ => rgb,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use world_core::{Genome, GenomeBias};
+
+    #[test]
+    fn expressed_color_keeps_marker_palette_bytes() {
+        let base = Genome::from_seed(7).express(GenomeBias::neutral());
+        let cases = [
+            (0.0, 0.0, [114, 28, 28]),
+            (1.0, 0.0, [114, 28, 28]),
+            (-1.0, 1.0, [255, 63, 63]),
+            (1.0 / 3.0, 1.0, [63, 255, 63]),
+            (2.0 / 3.0, 1.0, [63, 63, 255]),
+        ];
+
+        for (hue, luminance, expected) in cases {
+            let expressed = Expressed {
+                hue,
+                luminance,
+                ..base
+            };
+            assert_eq!(expressed_color(&expressed), expected);
+        }
+    }
+
+    #[test]
+    fn expressed_color_ignores_non_color_traits() {
+        let base = Genome::from_seed(42).express(GenomeBias::neutral());
+        let changed = Expressed {
+            size: base.size * 4.0,
+            activity: 1.0 - base.activity,
+            aggression: 1.0 - base.aggression,
+            form: base.form ^ 0x0f,
+            ..base
+        };
+
+        assert_eq!(expressed_color(&base), expressed_color(&changed));
+    }
+
+    #[test]
+    fn representative_genomes_use_the_shared_hsv_formula() {
+        let biases = [
+            GenomeBias {
+                morphology: 0.0,
+                behavior: 1.0,
+                aesthetics: 0.0,
+            },
+            GenomeBias::neutral(),
+            GenomeBias {
+                morphology: 1.0,
+                behavior: 0.0,
+                aesthetics: 1.0,
+            },
+        ];
+
+        for seed in [0, 1, 42, 0xDEAD_BEEF_CAFE_F00D] {
+            for bias in biases {
+                let expressed = Genome::from_seed(seed).express(bias);
+                eprintln!("{seed:#018x} {bias:?} {:?}", expressed_color(&expressed));
+                assert_eq!(
+                    expressed_color(&expressed),
+                    hsv_to_rgb(expressed.hue, 0.75, 0.45 + 0.55 * expressed.luminance)
+                );
+            }
+        }
     }
 }

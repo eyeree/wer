@@ -197,6 +197,52 @@ sediment ramp meets the beach; walk mode stands on the sea floor at
 `z < 0` with the surface visible from below; a `RIVER_LIFT` exaggeration A/B
 confirmed the overlay pipeline draws through the terrain vertex buffers.
 
+## 3D-4 — organisms and directional shadows (3d-phase-4-plan.md §9)
+
+Implementation evidence in this checkout is recorded separately from the
+phase's performance sign-off. The available WSL2 environment is suitable for
+pipeline creation, capture smoke tests, and invariant checks, but it is not the
+required native-Windows hardware-GPU reference. No Windows frame-time or GPU
+pass number is inferred from llvmpipe, and the unresolved cells below are
+deliberately marked **pending** rather than populated with estimates.
+
+| implemented quantity | factual value / evidence |
+|---|---|
+| CPU direct-shadow bake | The per-chunk horizon march and its scratch buffers are removed. `PovVertex.light[0]` is now neutral `255`; the existing coarse terrain AO remains in `light[1]`. The last pre-removal local number is the 3D-3 radius-1 river-basin result above (**2.66 ms/chunk**, where the shadow/AO march dominated); a same-machine post-removal ms/chunk measurement is pending. |
+| shadow target | Low: **1024² `Depth32Float` ≈ 4 MiB**. Mid/High: **2048² ≈ 16 MiB**. It is independent of `WER_POV_SCALE`; `B` off omits the shadow draw and neutralizes both directional visibility and terrain AO. |
+| shadow-pass submissions | Resident terrain core indices only (skirts excluded), followed by one instanced box batch and one instanced sphere batch. River overlays and sea do not cast. The pass is rebuilt every enabled frame; there is no unmeasured cache claim. |
+| primitive cost | Box: **24 vertices, 12 triangles**. Two-subdivision icosphere: **162 vertices, 320 triangles**. Each visible organism is submitted once in the color pass and once in the enabled shadow pass. |
+| packed instance traffic | **64 B/live instance** on an exact replacement. Buffers grow independently to powers of two and never shrink. A retained frame writes **0 B**; an explicit empty replacement clears both live counts without a write. Actual Low/Mid/High populations and high-water capacities remain scene measurements, not a 1,600-instance assumption. |
+| CPU assembly lifecycle | One exact scan of `RegionMap::organisms()`, rendered-lattice height/AO queries, stable `(id, slot)` ordering, and collision-free vector comparison. Camera look and sub-cull-boundary translation retain the lists; realization, cull membership, expression, ground height, or AO changes replace them. Device-free lifecycle tests cover the zero-steady-upload contract; wall-clock scan time remains pending on the Windows reference. |
+| optional activity bob | **Not built.** The static path was selected for this phase; every packed bob amplitude/phase is zero. A measured native-Windows animation go/no-go was unavailable, and static organisms satisfy the phase contract. |
+| captures | Live POV, F12, and `--pov-script` use the same replacement upload and stabilized light fit. Script capture first runs the existing eight-update settle, then continues polling authoritative realization up to a bound of 128 zero-travel updates total; both capture paths freeze display time at zero. |
+| local functional smoke (not a performance reference) | WSL2 llvmpipe (Mesa 25.2.8, Vulkan), dev profile, `WER_POV_RADIUS=1`, 64×64 capture at the origin: **9 chunks; 9,829 published; 1,616 drawn (769 box / 847 sphere); 324 waiting for ground; 7,889 distance-culled; 33 settle updates**. Packed instances were **101 KiB live / 128 KiB capacity / 101 KiB first replacement**. Repeating the command produced a byte-identical PPM. This proves pipeline creation/submission, frozen-time reproducibility, and telemetry on the available adapter; it supplies no native-Windows timing. |
+
+### Native-Windows measurement gate — pending
+
+The following matrix is required before 3D-4 performance sign-off. It was not
+available in this implementation environment, so the quality/performance gate
+remains open; in particular, 2048² for Mid/High is still an initial setting,
+not a measured final choice.
+
+| required measurement | result |
+|---|---|
+| CPU / GPU / adapter / driver / Windows version / Rust commit | **pending — native-Windows reference unavailable** |
+| release configuration | `WER_WINDOW` fixed, `WER_POV_RADIUS=3`, `WER_POV_SCALE=1`, `WER_PRESENT_MODE=immediate`; execution **pending** |
+| old/new cold-ring mesh total and ms/chunk | old local context recorded above; same-machine native-Windows A/B **pending** |
+| terrain-only `B` off/on warmed median and p95 | **pending** |
+| organism-dense High-tier `B` off/on warmed median and p95 | **pending** |
+| world-update CPU and organism-scan CPU | **pending** |
+| Low/Mid/High published, box, sphere, drawn, waiting counts | **pending** |
+| Low/Mid/High live/capacity instance bytes and first replacement bytes | **pending** |
+| steady-state replacement traffic | Exact lifecycle contract/test: **0 B/frame**; native-Windows telemetry confirmation **pending** |
+
+The measurement owner should record the same fixed poses with `B` off/on in
+one executable and compare 1024² with 2048². Per the implementation plan, a
+2048² tier setting that adds more than 15% warmed p95 without a visible
+contact/terrain-shadow improvement should move to 1024²; organism count must
+not be reduced to make the result pass.
+
 ## Improvement A.8 — fixed routing and halo Terrain
 
 Measured on the same local execution machine with the release Criterion

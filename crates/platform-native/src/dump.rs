@@ -24,7 +24,7 @@ use world_core::PossibilityDomain;
 use world_runtime::Pass;
 
 use crate::panel::PanelInfo;
-use crate::pov::{self, PovChunkManager};
+use crate::pov::{self, PovChunkManager, PovOrganismManager};
 use crate::{App, ViewMode, CLEAR_COLOR, ORGANISM_INFO_ZOOM};
 
 /// Encode an RGBA8 buffer as binary PPM (P6, alpha dropped) — the repo's
@@ -224,15 +224,33 @@ impl App {
                 &world_runtime::InlineExecutor,
             );
             let done = uploads.is_empty() && chunks.is_idle();
-            cap.apply(&uploads, &removes);
+            cap.apply(&uploads, &removes, None);
             if done {
                 break;
             }
         }
+        // The capture owns fresh GPU buffers, so build a fresh exact
+        // organism replacement against the same newly meshed terrain ring.
+        // This reads the live publication as-is; F12 never settles or mutates
+        // the world, including a legitimately partial tier expansion.
+        let mut organisms = PovOrganismManager::new();
+        let organisms_changed = organisms.sync(
+            &self.world.map,
+            &chunks,
+            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            pov::pov_fog_end(self.pov_radius),
+        );
+        cap.apply(&[], &[], organisms_changed.then(|| organisms.upload()));
         let aspect = width as f32 / height.max(1) as f32;
         // Time-frozen like every capture (3d-phase-3-plan.md §4.3), with the
         // live diagnostic toggles applied so the dump shows what the window
         // shows.
+        let shadow = pov::shadow_frame(
+            &self.pov_camera,
+            &chunks,
+            organisms.shadow_bounds(),
+            pov::shadow_resolution(self.tier),
+        );
         let params = pov::frame_params(
             &self.pov_camera,
             aspect,
@@ -240,12 +258,18 @@ impl App {
             CLEAR_COLOR,
             0.0,
             self.pov_toggles,
+            shadow,
         );
         let rgba = cap.snapshot_at_scale(&params, CLEAR_COLOR, self.pov_scale);
         write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
+        let counts = organisms.counters();
         Ok(format!(
-            "screenshot.ppm ({width}x{height} POV, offscreen capture, {} chunks meshed)",
-            chunks.len()
+            "screenshot.ppm ({width}x{height} POV, offscreen capture, {} chunks meshed, {} organisms drawn / {} published / {} waiting for ground; {} distance-culled)",
+            chunks.len(),
+            counts.drawn(),
+            counts.published,
+            counts.waiting_for_ground,
+            counts.distance_culled,
         ))
     }
 
@@ -397,8 +421,8 @@ impl App {
         writeln!(s, "resident_chunks   : {}", self.pov_chunks.len())?;
         writeln!(
             s,
-            "toggles           : baked_light {}, detail_normals {}, water {}",
-            self.pov_toggles.baked_light, self.pov_toggles.detail_normals, self.pov_toggles.water
+            "toggles           : shadow_ao {}, detail_normals {}, water {}",
+            self.pov_toggles.shadow_ao, self.pov_toggles.detail_normals, self.pov_toggles.water
         )?;
         writeln!(s, "render_scale      : {}", self.pov_scale)?;
         if self.view_mode == ViewMode::Map {

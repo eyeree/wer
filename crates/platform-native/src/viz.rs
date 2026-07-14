@@ -22,12 +22,12 @@ use world_runtime::{
 // (phase-7-plan.md §4.1); this module keeps the native-only composition on
 // top of them (overlays, zoom, pinned-revision detection). `composite_cell_color`
 // is re-exported for the POV mesher's per-vertex material (`crate::pov`).
-pub(crate) use world_runtime::mapcolor::composite_cell_color;
 use world_runtime::mapcolor::{
     biome_color, diversity_color, elevation_color, geology_color, herbivore_color, lerp_rgb,
     missing_color, moisture_color, predator_color, river_color, soil_color, species_color,
     temperature_color, vegetation_color, wetness_color,
 };
+pub(crate) use world_runtime::mapcolor::{composite_cell_color, expressed_color};
 
 /// Which scalar the map paints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,34 +195,6 @@ pub struct MapDecor {
     /// Route polylines: recorded node positions in travel order, plus the
     /// route's usage count (brightness — well-worn paths glow).
     pub routes: Vec<(Vec<(f64, f64)>, u32)>,
-}
-
-/// Convert an HSV triple (all `[0, 1]`) to RGB — for organism markers coloured
-/// by expressed appearance (hue, brightness from luminance).
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
-    let h6 = (h.rem_euclid(1.0)) * 6.0;
-    let c = v * s;
-    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
-    let m = v - c;
-    let (r, g, b) = match h6 as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    [
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
-    ]
-}
-
-/// The marker colour for an organism's expressed appearance (hue from the
-/// Aesthetics-biased genome, brightness from luminance).
-fn expressed_color(expressed: &world_core::Expressed) -> [u8; 3] {
-    hsv_to_rgb(expressed.hue, 0.75, 0.45 + 0.55 * expressed.luminance)
 }
 
 /// Distinct tints per possibility domain, indexed like

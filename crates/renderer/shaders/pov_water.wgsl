@@ -18,6 +18,7 @@
 
 struct PovParams {
     view_proj: mat4x4<f32>,
+    light_view_proj: mat4x4<f32>,
     sun_dir: vec3<f32>,
     fog_start: f32,
     fog_color: vec3<f32>,
@@ -31,6 +32,8 @@ struct PovParams {
     //  wobble anchor fraction x, y) — plan §4.3. Layout-identical to
     //  pov_terrain.wgsl's PovParams and the Rust PovParamsRaw.
     water: vec4<f32>,
+    // (inverse directional-map size, enabled, constant bias, slope bias).
+    shadow: vec4<f32>,
     // Live diagnostic toggles — unused here (the water toggle skips these
     // passes CPU-side), declared for uniform-layout parity with
     // pov_terrain.wgsl.
@@ -44,6 +47,8 @@ struct ChunkOffset {
 }
 
 @group(0) @binding(0) var<uniform> params: PovParams;
+@group(0) @binding(1) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(1) @binding(0) var<uniform> chunk: ChunkOffset;
 
 const TAU: f32 = 6.28318530718;
@@ -176,12 +181,12 @@ struct OverlayOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) pos: vec3<f32>,
-    // Baked river intensity (light.z) and sun visibility (light.x).
+    // Baked river intensity (light.z).
     @location(2) river: f32,
-    @location(3) sunvis: f32,
     // Chunk-local x, y: ≡ world mod WOBBLE_TILE (REGION_SIZE = 4 tiles), so
     // the overlay wobble is seamless across chunks and in phase with the sea.
-    @location(4) local: vec2<f32>,
+    @location(3) local: vec2<f32>,
+    @location(4) light_clip: vec4<f32>,
 }
 
 @vertex
@@ -192,9 +197,37 @@ fn vs_overlay(in: OverlayIn) -> OverlayOut {
     out.normal = in.normal;
     out.pos = pos;
     out.river = in.light.z;
-    out.sunvis = in.light.x;
     out.local = in.position.xy;
+    out.light_clip = params.light_view_proj * vec4<f32>(pos, 1.0);
     return out;
+}
+
+fn shadow_visibility(light_clip: vec4<f32>, normal: vec3<f32>) -> f32 {
+    if (params.shadow.y < 0.5 || abs(light_clip.w) < 1e-6) {
+        return 1.0;
+    }
+    let ndc = light_clip.xyz / light_clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (ndc.z <= 0.0 || ndc.z >= 1.0 || any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0))) {
+        return 1.0;
+    }
+    let texel = params.shadow.x;
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    let edge_fade = smoothstep(texel, 2.0 * texel, edge);
+    let slope = 1.0 - max(dot(normalize(normal), -params.sun_dir), 0.0);
+    let reference = ndc.z - (params.shadow.z + params.shadow.w * slope);
+    var visible = 0.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            visible = visible + textureSampleCompareLevel(
+                shadow_map,
+                shadow_sampler,
+                uv + vec2<f32>(f32(x), f32(y)) * texel,
+                reference,
+            );
+        }
+    }
+    return mix(1.0, visible / 9.0, edge_fade);
 }
 
 @fragment
@@ -207,9 +240,11 @@ fn fs_overlay(in: OverlayOut) -> @location(0) vec4<f32> {
     n = normalize(vec3<f32>(n.x - g.x * n.z, n.y - g.y * n.z, n.z));
     let f = fresnel(dot(view, n));
     var color = mix(RIVER_SHALLOW, params.fog_color, f);
-    // Glint gated by the baked sun visibility: shadowed water doesn't sparkle.
+    // Glint gated by the shared directional map: shadowed water doesn't sparkle.
     let glint = pow(max(dot(reflect(params.sun_dir, n), view), 0.0), RIVER_GLINT_POWER);
-    color = color + vec3<f32>(glint * RIVER_GLINT_STRENGTH * in.sunvis);
+    color = color + vec3<f32>(
+        glint * RIVER_GLINT_STRENGTH * shadow_visibility(in.light_clip, n),
+    );
     let fog = smoothstep(params.fog_start, params.fog_end, dist);
     // Feathered on the baked intensity: the ribbon edge fades to zero at the
     // mesher's selection threshold, so no hard boundary exists (plan §6.2).

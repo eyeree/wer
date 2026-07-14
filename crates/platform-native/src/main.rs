@@ -109,7 +109,9 @@ use world_runtime::{
 use executor::LaneExecutor;
 use gpumap::AtlasManager;
 use panel::{CursorInfo, EcologyInfo, Hud, OrganismInfo, PanelInfo, VaultInfo};
-use pov::{PovCamera, PovChunkManager, PovCounters, PovToggles};
+use pov::{
+    PovCamera, PovChunkManager, PovCounters, PovOrganismCounters, PovOrganismManager, PovToggles,
+};
 use tools::FileStorage;
 use viz::{Channel, MapComposer, MapDecor, Overlays};
 
@@ -772,6 +774,9 @@ struct App {
     /// POV chunk lifecycle: keying, Background-lane meshing, amortized
     /// upload, farthest-first eviction (3d-phase-1-plan.md §7).
     pov_chunks: PovChunkManager,
+    /// Exact upload-only presentation of the currently published organisms.
+    /// It scans only in POV and retains renderer replacement lists at rest.
+    pov_organisms: PovOrganismManager,
     /// Chunk draw radius in regions (`WER_POV_RADIUS`, default 3).
     pov_radius: i32,
     /// Mouse look is a left-button drag (WSLg/XWayland delivers unusable
@@ -781,8 +786,11 @@ struct App {
     pov_look_from: Option<(f64, f64)>,
     /// The previous telemetry second's POV counters, for the delta log line.
     pov_counters_last: PovCounters,
-    /// Live POV diagnostic toggles (`B` baked light, `N` detail normals,
-    /// `V` water) — presentation-only switches for chasing llvmpipe CPU.
+    /// Previous organism lifecycle totals for the POV telemetry delta line.
+    pov_organism_counters_last: PovOrganismCounters,
+    /// Live POV diagnostic toggles (`B` directional shadows + terrain AO,
+    /// `N` detail normals, `V` water) — presentation-only switches for
+    /// chasing render cost.
     pov_toggles: PovToggles,
     /// The POV HUD chip (fps + frame-budget split), rebuilt only when the
     /// displayed text changes: `(rgba, width, height, text it shows)`.
@@ -871,6 +879,7 @@ impl App {
             },
             pov_camera: PovCamera::new(),
             pov_chunks: PovChunkManager::new(),
+            pov_organisms: PovOrganismManager::new(),
             // The llvmpipe escape hatch (3d-phase-1-plan.md §8.5).
             pov_radius: std::env::var("WER_POV_RADIUS")
                 .ok()
@@ -878,6 +887,7 @@ impl App {
                 .map_or(3, |r| r.clamp(1, 8)),
             pov_look_from: None,
             pov_counters_last: PovCounters::default(),
+            pov_organism_counters_last: PovOrganismCounters::default(),
             pov_toggles: PovToggles::default(),
             pov_fps_chip: None,
             pov_scale: std::env::var("WER_POV_SCALE")
@@ -1072,10 +1082,10 @@ impl App {
                 KeyCode::Tab => self.toggle_view_mode(),
                 KeyCode::KeyF => self.toggle_walk(),
                 KeyCode::KeyB => {
-                    self.pov_toggles.baked_light = !self.pov_toggles.baked_light;
+                    self.pov_toggles.shadow_ao = !self.pov_toggles.shadow_ao;
                     log::info!(
-                        "pov: baked lighting {} (shader-side; mesh cost unchanged)",
-                        onoff(self.pov_toggles.baked_light)
+                        "pov: directional shadows and terrain AO {}",
+                        onoff(self.pov_toggles.shadow_ao)
                     );
                 }
                 KeyCode::KeyN => {
@@ -1675,7 +1685,14 @@ impl App {
             self.pov_radius,
             self.world.executor.as_ref(),
         );
-        let upload_bytes = (uploads.len()
+        let organisms_changed = self.pov_organisms.sync(
+            &self.world.map,
+            &self.pov_chunks,
+            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            pov::pov_fog_end(self.pov_radius),
+        );
+        let organism_upload = organisms_changed.then(|| self.pov_organisms.upload());
+        let mut upload_bytes = (uploads.len()
             * renderer::pov::VERTS_PER_CHUNK
             * core::mem::size_of::<renderer::PovVertex>()
             + uploads
@@ -1687,6 +1704,7 @@ impl App {
         self.last_stats = stats;
 
         let render_start = Instant::now();
+        let mut organism_buffer_stats = None;
         if let Some(renderer) = self.renderer.as_mut() {
             let (w, h) = renderer.size();
             // The water-wobble clock (3d-phase-3-plan.md §7.1): wrapped at
@@ -1696,6 +1714,13 @@ impl App {
                 .elapsed()
                 .as_secs_f64()
                 .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
+            let resolution = pov::shadow_resolution(self.tier);
+            let shadow = pov::shadow_frame(
+                &self.pov_camera,
+                &self.pov_chunks,
+                self.pov_organisms.shadow_bounds(),
+                resolution,
+            );
             let params = pov::frame_params(
                 &self.pov_camera,
                 w as f32 / h.max(1) as f32,
@@ -1703,6 +1728,7 @@ impl App {
                 CLEAR_COLOR,
                 time,
                 self.pov_toggles,
+                shadow,
             );
             // The corner HUD chip: fps plus the frame-budget split — `upd`
             // is the world update, `gpu` is the whole render+present call —
@@ -1726,10 +1752,15 @@ impl App {
                 &params,
                 &uploads,
                 &removes,
+                organism_upload,
                 CLEAR_COLOR,
                 hud,
                 self.pov_scale,
             );
+            organism_buffer_stats = renderer.pov_organism_stats();
+            if let Some(buffers) = organism_buffer_stats {
+                upload_bytes += buffers.replacement_bytes;
+            }
         }
         let render_seconds = render_start.elapsed().as_secs_f64();
 
@@ -1738,6 +1769,8 @@ impl App {
         if self.last_telemetry.elapsed().as_secs_f64() >= 1.0 {
             let c = self.pov_chunks.counters();
             let last = self.pov_counters_last;
+            let organisms = self.pov_organisms.counters();
+            let last_organisms = self.pov_organism_counters_last;
             // The mode tail: the walk form's mesh-vs-analytic tag is the
             // observable for the frontier-fallback exit criterion
             // (3d-phase-2-plan.md §6.2).
@@ -1752,8 +1785,20 @@ impl App {
             } else {
                 format!("fly {:.0}u/s", self.pov_camera.speed)
             };
+            let buffers = organism_buffer_stats.map_or_else(
+                || String::from("gpu buffers pending"),
+                |stats| {
+                    format!(
+                        "gpu {} box + {} sphere, {:.1}/{:.1} KiB live/cap",
+                        stats.box_count,
+                        stats.sphere_count,
+                        stats.live_bytes as f64 / 1024.0,
+                        stats.capacity_bytes as f64 / 1024.0,
+                    )
+                },
+            );
             log::info!(
-                "pov: {} chunks | +meshed {} +remeshed {} +cancelled {} +stale {} +deferred {} | mesh {:.1}ms worker total | {mode}",
+                "pov: {} chunks | +meshed {} +remeshed {} +cancelled {} +stale {} +deferred {} | mesh {:.1}ms worker total | organisms {}/{} (box {}, sphere {}, waiting {}, culled {}) +rebuild {} +upload {} inst/{:.1} KiB, {buffers} | {mode}",
                 self.pov_chunks.len(),
                 c.meshed - last.meshed,
                 c.remeshed - last.remeshed,
@@ -1761,8 +1806,18 @@ impl App {
                 c.dropped_stale - last.dropped_stale,
                 c.uploads_deferred - last.uploads_deferred,
                 c.mesh_ms,
+                organisms.drawn(),
+                organisms.published,
+                organisms.boxes,
+                organisms.spheres,
+                organisms.waiting_for_ground,
+                organisms.distance_culled,
+                organisms.rebuilds - last_organisms.rebuilds,
+                organisms.uploaded_instances - last_organisms.uploaded_instances,
+                (organisms.uploaded_bytes - last_organisms.uploaded_bytes) as f64 / 1024.0,
             );
             self.pov_counters_last = c;
+            self.pov_organism_counters_last = organisms;
         }
         self.update_telemetry(
             update_seconds,
@@ -2089,6 +2144,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
     let mut map = RegionMap::new(cfg);
     let mut camera = PovCamera::new();
     let mut chunks = PovChunkManager::new();
+    let mut organisms = PovOrganismManager::new();
     let radius = std::env::var("WER_POV_RADIUS")
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
@@ -2169,9 +2225,28 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                 settle_world(&mut map, (camera.pos.x, camera.pos.y), &field, &bias, n);
             }
             pov::PovInstr::Snap(path) => {
-                // Tiles under the camera, then the chunk ring, must be
-                // settled so the snapshot shows the steady state.
-                settle_world(&mut map, (camera.pos.x, camera.pos.y), &field, &bias, 8);
+                // Canonical near-field realization advances at a bounded
+                // number of regions per update. Wait for its explicit
+                // completion observation rather than assuming the old fixed
+                // eight-update terrain settle also published every organism.
+                let camera_xy = (camera.pos.x, camera.pos.y);
+                // Populate the field-active near window before consulting the
+                // completion observation; an entirely empty fresh map would
+                // otherwise be vacuously complete.
+                settle_world(&mut map, camera_xy, &field, &bias, 8);
+                let mut realization_updates = 8u32;
+                while realization_updates < 128
+                    && !map.authoritative_realization_complete(camera_xy)
+                {
+                    settle_world(&mut map, camera_xy, &field, &bias, 1);
+                    realization_updates += 1;
+                }
+                if !map.authoritative_realization_complete(camera_xy) {
+                    return Err(format!(
+                        "POV snapshot at ({:.1}, {:.1}) did not complete authoritative organism realization after 128 zero-travel updates",
+                        camera_xy.0, camera_xy.1
+                    ));
+                }
                 if capture.is_none() {
                     capture = Some(
                         renderer::pov::PovCapture::new(size.0, size.1)
@@ -2187,14 +2262,23 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                         &world_runtime::InlineExecutor,
                     );
                     let done = uploads.is_empty() && chunks.is_idle();
-                    cap.apply(&uploads, &removes);
+                    cap.apply(&uploads, &removes, None);
                     if done {
                         break;
                     }
                 }
+                let organisms_changed =
+                    organisms.sync(&map, &chunks, camera_xy, pov::pov_fog_end(radius));
+                cap.apply(&[], &[], organisms_changed.then(|| organisms.upload()));
                 let aspect = size.0 as f32 / size.1 as f32;
                 // Time-frozen captures (3d-phase-3-plan.md §4.3): two snaps
                 // of the same pose are byte-comparable; toggles all-on.
+                let shadow = pov::shadow_frame(
+                    &camera,
+                    &chunks,
+                    organisms.shadow_bounds(),
+                    pov::shadow_resolution(ResourceTier::Low),
+                );
                 let params = pov::frame_params(
                     &camera,
                     aspect,
@@ -2202,11 +2286,14 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                     CLEAR_COLOR,
                     0.0,
                     pov::PovToggles::default(),
+                    shadow,
                 );
                 let rgba = cap.snapshot_at_scale(&params, CLEAR_COLOR, scale);
                 dump::write_ppm(std::path::Path::new(&path), &rgba, size.0, size.1)?;
+                let organism_counts = organisms.counters();
+                let organism_buffers = cap.organism_stats();
                 log::info!(
-                    "pov snapshot {path}: {}x{} at ({:.1}, {:.1}, {:.1}) yaw {:.1}° pitch {:.1}° | {} chunks resident",
+                    "pov snapshot {path}: {}x{} at ({:.1}, {:.1}, {:.1}) yaw {:.1}° pitch {:.1}° | {} chunks | {}/{} organisms drawn (box {}, sphere {}, waiting {}, culled {}; realization {} updates) | instances {:.1}/{:.1} KiB live/cap, {:.1} KiB replacement",
                     size.0,
                     size.1,
                     camera.pos.x,
@@ -2215,6 +2302,16 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                     camera.yaw.to_degrees(),
                     camera.pitch.to_degrees(),
                     chunks.len(),
+                    organism_counts.drawn(),
+                    organism_counts.published,
+                    organism_counts.boxes,
+                    organism_counts.spheres,
+                    organism_counts.waiting_for_ground,
+                    organism_counts.distance_culled,
+                    realization_updates,
+                    organism_buffers.live_bytes as f64 / 1024.0,
+                    organism_buffers.capacity_bytes as f64 / 1024.0,
+                    organism_buffers.replacement_bytes as f64 / 1024.0,
                 );
             }
         }
