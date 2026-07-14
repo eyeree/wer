@@ -58,6 +58,6 @@ pub use vault::{
     apply_session_regions, budget_from_record, budget_record, compare_session_runtime,
     session_runtime_record, stream_config_from_record, stream_config_record, tier_record,
     MergeStats, PersistenceOperation, SessionCompatibility, SessionConfigError,
-    SessionSnapshotInput, Vault, VaultError, VaultFlushError, VaultIssue, VaultPersistenceError,
-    VaultSequenceError, VaultStats, MAX_VAULT_ISSUES,
+    SessionSnapshotInput, SessionSnapshotOwnedInput, Vault, VaultError, VaultFlushError,
+    VaultIssue, VaultPersistenceError, VaultSequenceError, VaultStats, MAX_VAULT_ISSUES,
 };

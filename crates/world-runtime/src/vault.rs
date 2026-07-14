@@ -65,6 +65,24 @@ pub struct SessionSnapshotInput<'a> {
     pub tracker: RouteTrackerSnapshot,
 }
 
+/// Owned, action-ordered session values captured by a shared viewer reducer.
+///
+/// Unlike [`SessionSnapshotInput`], this form does not re-read a live
+/// [`RegionMap`] when a platform processes the persistence effect later. The
+/// vault still assigns the authoritative store sequence at write time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSnapshotOwnedInput {
+    pub runtime: SessionRuntimeRecord,
+    pub player: (f64, f64),
+    pub last_player: (f64, f64),
+    pub bias: [f32; POSSIBILITY_DIMS],
+    pub transition_mode: bool,
+    pub anchors: Vec<AnchorSnapshot>,
+    pub regions: Vec<RegionSnapshotRecord>,
+    pub recorder: Option<RouteRecorderSnapshot>,
+    pub tracker: RouteTrackerSnapshot,
+}
+
 /// Session metadata comparison result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCompatibility {
@@ -955,8 +973,7 @@ impl<S: Storage> Vault<S> {
         &mut self,
         input: SessionSnapshotInput<'_>,
     ) -> Result<(), VaultSequenceError> {
-        let sequence = self.next_sequence()?;
-        let snap = SessionSnapshot {
+        self.snapshot_session_owned(SessionSnapshotOwnedInput {
             runtime: input.runtime,
             player: input.player,
             last_player: input.last_player,
@@ -978,6 +995,28 @@ impl<S: Storage> Vault<S> {
                     revision: r.revision,
                 })
                 .collect(),
+            recorder: input.recorder,
+            tracker: input.tracker,
+        })
+    }
+
+    /// Snapshot already-captured, action-ordered session values.
+    ///
+    /// The platform may process this input after the controller tick without
+    /// accidentally persisting later actions or continuous movement.
+    pub fn snapshot_session_owned(
+        &mut self,
+        input: SessionSnapshotOwnedInput,
+    ) -> Result<(), VaultSequenceError> {
+        let sequence = self.next_sequence()?;
+        let snap = SessionSnapshot {
+            runtime: input.runtime,
+            player: input.player,
+            last_player: input.last_player,
+            bias: input.bias,
+            transition_mode: input.transition_mode,
+            anchors: input.anchors,
+            regions: input.regions,
             recorder: input.recorder,
             tracker: input.tracker,
             sequence,

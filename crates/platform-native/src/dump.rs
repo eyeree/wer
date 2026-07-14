@@ -19,13 +19,15 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use viewer_host::layout::PresentationMode;
+use viewer_host::map::MapBackend;
 use world_core::layer::layer_decl;
 use world_core::PossibilityDomain;
 use world_runtime::Pass;
 
 use crate::panel::PanelInfo;
 use crate::pov::{self, PovChunkManager, PovOrganismManager};
-use crate::{App, ViewMode, CLEAR_COLOR, ORGANISM_INFO_ZOOM};
+use crate::{App, CLEAR_COLOR, ORGANISM_INFO_ZOOM};
 
 /// Encode an RGBA8 buffer as binary PPM (P6, alpha dropped) — the repo's
 /// image format everywhere (`--screenshot`, `--pov-script`, and the dump).
@@ -110,9 +112,10 @@ impl App {
     /// One-shot `F12` handler: write the dump, log where it went (or why it
     /// failed). Never panics — a diagnostics feature must not take down the
     /// session it is diagnosing.
-    pub(crate) fn debug_dump(&mut self) {
+    pub(crate) fn debug_dump(&mut self) -> Result<PathBuf, String> {
         let start = std::time::Instant::now();
-        match self.write_debug_dump() {
+        let result = self.write_debug_dump();
+        match &result {
             Ok(dir) => log::info!(
                 "debug dump written to {} ({:.2}s)",
                 dir.display(),
@@ -120,6 +123,7 @@ impl App {
             ),
             Err(err) => log::error!("debug dump failed: {err}"),
         }
+        result
     }
 
     fn write_debug_dump(&mut self) -> Result<PathBuf, String> {
@@ -128,9 +132,9 @@ impl App {
 
     fn write_debug_dump_into(&mut self, base: &Path) -> Result<PathBuf, String> {
         let dir = create_dump_dir(base, unix_seconds())?;
-        let screenshot = match self.view_mode {
-            ViewMode::Map => self.dump_map_screenshot(&dir),
-            ViewMode::Pov => self.dump_pov_screenshot(&dir),
+        let screenshot = match self.controller.layout().mode {
+            PresentationMode::Map | PresentationMode::Split => self.dump_map_screenshot(&dir),
+            PresentationMode::Pov => self.dump_pov_screenshot(&dir),
         };
         let report = self
             .dump_report(&screenshot)
@@ -149,20 +153,24 @@ impl App {
     /// panel's cursor readout is pinned at the player, like `--screenshot`.
     fn dump_map_screenshot(&mut self, dir: &Path) -> Result<String, String> {
         let decor = self.build_decor();
-        self.composer.set_zoom(self.zoom);
+        let preferences = self.controller.map_preferences();
+        let traveler = self.controller.world().traveler().position;
+        self.composer.set_zoom(preferences.zoom);
         self.composer.compose(
-            &self.world.map,
-            self.world.player,
-            self.channel,
-            self.overlays,
-            &self.world.anchors,
+            self.controller.world().map(),
+            traveler,
+            preferences.channel,
+            preferences.overlays,
+            self.controller.world().anchors(),
             &decor,
         );
-        let organism = if self.zoom >= ORGANISM_INFO_ZOOM {
-            Self::pick_organism(&self.world.map, self.world.player)
+        let organism = if preferences.zoom >= ORGANISM_INFO_ZOOM {
+            Self::pick_organism(self.controller.world().map(), traveler)
         } else {
             None
         };
+        let world = self.controller.world();
+        let capture = self.controller.capture_preferences();
         let info = PanelInfo {
             fps: self.fps,
             update_ms: self.update_ms,
@@ -171,26 +179,26 @@ impl App {
             upload_kb: self.upload_kb,
             gpu_compose: false,
             tier: self.tier.name(),
-            cache_ceiling_bytes: self.world.map.config().max_field_cache_bytes,
+            cache_ceiling_bytes: world.map().config().max_field_cache_bytes,
             pass_ms: self.pass_ms,
-            workers: self.world.executor.parallelism(),
+            workers: self.executor.parallelism(),
             stats: self.last_stats,
             regen_totals: &self.regen_totals,
-            macro_tiles: self.world.map.macro_cache().len(),
-            rosters: self.world.map.roster_cache().len(),
-            organisms: self.world.map.organism_count(),
-            jobs_in_flight: self.world.map.jobs_in_flight(),
+            macro_tiles: world.map().macro_cache().len(),
+            rosters: world.map().roster_cache().len(),
+            organisms: world.map().organism_count(),
+            jobs_in_flight: world.map().jobs_in_flight(),
             pinned_violations: self.composer.pinned_violations,
-            channel: self.channel,
-            player: self.world.player,
-            bias: &self.world.bias,
-            anchors: &self.world.anchors,
-            capture_category: self.capture_category.name(),
-            capture_polarity: self.capture_polarity,
-            transition_mode: self.world.transition_mode,
+            channel: preferences.channel,
+            player: traveler,
+            bias: world.bias(),
+            anchors: world.anchors(),
+            capture_category: capture.category.name(),
+            capture_polarity: capture.polarity,
+            transition_mode: world.transition_mode(),
             vault: self.vault_panel_info(),
-            zoom: self.zoom,
-            cursor: Some(Self::sample_cursor(&self.world.map, self.world.player)),
+            zoom: preferences.zoom,
+            cursor: Some(Self::sample_cursor(world.map(), traveler)),
             organism,
         };
         let (width, height) = self.hud.size();
@@ -198,8 +206,8 @@ impl App {
         write_ppm(&dir.join("screenshot.ppm"), pixels, width, height)?;
         Ok(format!(
             "screenshot.ppm ({width}x{height} map+panel, CPU-composed, channel {}, zoom x{})",
-            self.channel.name(),
-            self.zoom
+            preferences.channel.name(),
+            preferences.zoom
         ))
     }
 
@@ -215,11 +223,13 @@ impl App {
             .map_or((1024, 768), renderer::Renderer::size);
         let mut cap = renderer::pov::PovCapture::new(width, height)
             .map_err(|e| format!("pov capture init: {e}"))?;
+        let camera = self.controller.pov_camera();
+        let map = self.controller.world().map();
         let mut chunks = PovChunkManager::new();
         for _ in 0..256 {
             let (uploads, removes) = chunks.sync(
-                &self.world.map,
-                (self.pov_camera.pos.x, self.pov_camera.pos.y),
+                map,
+                (camera.pos.x, camera.pos.y),
                 self.pov_radius,
                 &world_runtime::InlineExecutor,
             );
@@ -235,9 +245,9 @@ impl App {
         // the world, including a legitimately partial tier expansion.
         let mut organisms = PovOrganismManager::new();
         let organisms_changed = organisms.sync(
-            &self.world.map,
+            map,
             &chunks,
-            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            (camera.pos.x, camera.pos.y),
             pov::pov_fog_end(self.pov_radius),
         );
         cap.apply(&[], &[], organisms_changed.then(|| organisms.upload()));
@@ -246,21 +256,25 @@ impl App {
         // live diagnostic toggles applied so the dump shows what the window
         // shows.
         let shadow = pov::shadow_frame(
-            &self.pov_camera,
+            camera,
             &chunks,
             organisms.shadow_bounds(),
             pov::shadow_resolution(self.tier),
         );
         let params = pov::frame_params(
-            &self.pov_camera,
+            camera,
             aspect,
             self.pov_radius,
             CLEAR_COLOR,
             0.0,
-            self.pov_toggles,
+            self.controller.pov_toggles(),
             shadow,
         );
-        let rgba = cap.snapshot_at_scale(&params, CLEAR_COLOR, self.pov_scale);
+        let rgba = cap.snapshot_at_scale(
+            &params,
+            CLEAR_COLOR,
+            self.controller.pov_state().render_scale,
+        );
         write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
         let counts = organisms.counters();
         Ok(format!(
@@ -303,10 +317,15 @@ impl App {
         writeln!(s)?;
 
         writeln!(s, "[view]")?;
-        let mode = match self.view_mode {
-            ViewMode::Map => "map",
-            ViewMode::Pov if self.pov_camera.walk => "pov (3D walk camera)",
-            ViewMode::Pov => "pov (3D fly camera)",
+        let layout = self.controller.layout();
+        let pov_state = self.controller.pov_state();
+        let preferences = self.controller.map_preferences();
+        let world = self.controller.world();
+        let mode = match layout.mode {
+            PresentationMode::Map => "map",
+            PresentationMode::Pov if pov_state.walk => "pov (3D walk camera)",
+            PresentationMode::Pov => "pov (3D fly camera)",
+            PresentationMode::Split => "split (map + POV)",
         };
         writeln!(s, "mode              : {mode}")?;
         let surface = self.renderer.as_ref().map_or_else(
@@ -318,20 +337,16 @@ impl App {
         );
         writeln!(s, "surface           : {surface}")?;
         writeln!(s, "tier              : {}", self.tier.name())?;
-        writeln!(
-            s,
-            "workers           : {}",
-            self.world.executor.parallelism()
-        )?;
+        writeln!(s, "workers           : {}", self.executor.parallelism())?;
         writeln!(
             s,
             "gpu_compose       : {} (the dump screenshot is always CPU-composed)",
-            self.gpu_compose
+            preferences.backend == MapBackend::GpuAtlas
         )?;
-        writeln!(s, "refinement        : {}", self.refinement)?;
-        writeln!(s, "channel           : {}", self.channel.name())?;
-        writeln!(s, "zoom              : x{}", self.zoom)?;
-        let o = self.overlays;
+        writeln!(s, "refinement        : {}", preferences.refinement)?;
+        writeln!(s, "channel           : {}", preferences.channel.name())?;
+        writeln!(s, "zoom              : x{}", preferences.zoom)?;
+        let o = preferences.overlays;
         writeln!(
             s,
             "overlays          : grid={} rings={} pinned_flash={} organisms={} discovered={}",
@@ -339,14 +354,15 @@ impl App {
         )?;
         writeln!(s)?;
 
-        let player = self.world.player;
+        let traveler = world.traveler();
+        let player = traveler.position;
         let (region, feature) = tools::probe_world_position(player.0, player.1);
         writeln!(s, "[position]")?;
         writeln!(s, "player_world      : ({:.3}, {:.3})", player.0, player.1)?;
         writeln!(
             s,
             "last_player       : ({:.3}, {:.3})",
-            self.world.last_player.0, self.world.last_player.1
+            traveler.previous_position.0, traveler.previous_position.1
         )?;
         writeln!(
             s,
@@ -368,7 +384,7 @@ impl App {
         // Camera state is always reported: in POV it *is* the player; in map
         // mode it is whatever the last POV session left behind.
         writeln!(s, "[pov_camera]")?;
-        let cam = &self.pov_camera;
+        let cam = self.controller.pov_camera();
         let fwd = cam.forward();
         let right = cam.right();
         writeln!(
@@ -409,7 +425,7 @@ impl App {
             // The current ground and its source (mesh vs the analytic
             // frontier fallback, 3d-phase-2-plan.md §6.3).
             let (ground, mesh) =
-                pov::walk_ground(&self.pov_chunks, &self.world.map, (cam.pos.x, cam.pos.y));
+                pov::walk_ground(&self.pov_chunks, world.map(), (cam.pos.x, cam.pos.y));
             writeln!(
                 s,
                 "ground            : {:.3} ({})",
@@ -419,13 +435,14 @@ impl App {
         }
         writeln!(s, "chunk_radius      : {} regions", self.pov_radius)?;
         writeln!(s, "resident_chunks   : {}", self.pov_chunks.len())?;
+        let toggles = self.controller.pov_toggles();
         writeln!(
             s,
             "toggles           : shadow_ao {}, detail_normals {}, water {}",
-            self.pov_toggles.shadow_ao, self.pov_toggles.detail_normals, self.pov_toggles.water
+            toggles.shadow_ao, toggles.detail_normals, toggles.water
         )?;
-        writeln!(s, "render_scale      : {}", self.pov_scale)?;
-        if self.view_mode == ViewMode::Map {
+        writeln!(s, "render_scale      : {}", pov_state.render_scale)?;
+        if layout.mode == PresentationMode::Map {
             writeln!(
                 s,
                 "note              : map mode — camera state is from the last POV session"
@@ -434,21 +451,22 @@ impl App {
         writeln!(s)?;
 
         writeln!(s, "[steering]")?;
-        writeln!(s, "bias              : {:?}", self.world.bias)?;
-        writeln!(s, "transition_mode   : {}", self.world.transition_mode)?;
+        writeln!(s, "bias              : {:?}", world.bias())?;
+        writeln!(s, "transition_mode   : {}", world.transition_mode())?;
+        let capture = self.controller.capture_preferences();
         writeln!(
             s,
             "capture           : {} / {:?}",
-            self.capture_category.name(),
-            self.capture_polarity
+            capture.category.name(),
+            capture.polarity
         )?;
         writeln!(
             s,
             "resonance         : strength {:.3}, {} nodes",
             self.last_stats.resonance_strength, self.last_stats.resonance_nodes
         )?;
-        writeln!(s, "anchors           : {}", self.world.anchors.len())?;
-        for (i, anchor) in self.world.anchors.iter().enumerate() {
+        writeln!(s, "anchors           : {}", world.anchors().len())?;
+        for (i, anchor) in world.anchors().iter().enumerate() {
             writeln!(s, "  [{i}] {anchor:?}")?;
         }
         writeln!(s)?;
@@ -473,15 +491,15 @@ impl App {
         writeln!(s)?;
 
         writeln!(s, "[cell_at_player]")?;
-        writeln!(s, "{:#?}", Self::sample_cursor(&self.world.map, player))?;
-        match Self::pick_organism(&self.world.map, player) {
+        writeln!(s, "{:#?}", Self::sample_cursor(world.map(), player))?;
+        match Self::pick_organism(world.map(), player) {
             Some(org) => writeln!(s, "organism within one cell: {org:#?}")?,
             None => writeln!(s, "organism within one cell: none")?,
         }
         writeln!(s)?;
 
         writeln!(s, "[possibility]  (player region's realized vector)")?;
-        match self.world.map.get(region) {
+        match world.map().get(region) {
             Some(state) => {
                 writeln!(
                     s,
@@ -502,7 +520,7 @@ impl App {
         writeln!(s)?;
 
         writeln!(s, "[layer_dep_hash_chain]  (player region; ADR 0008)")?;
-        match self.world.map.layer_diagnostics(region) {
+        match world.map().layer_diagnostics(region) {
             Some(layers) => {
                 for diag in &layers {
                     let decl = layer_decl(diag.layer);
@@ -528,25 +546,21 @@ impl App {
         writeln!(s)?;
 
         writeln!(s, "[world]")?;
-        writeln!(s, "stream_config     : {:?}", self.world.map.config())?;
+        writeln!(s, "stream_config     : {:?}", world.map().config())?;
         writeln!(
             s,
             "field_cache_bytes : {} (ceiling {})",
             self.last_stats.cache_bytes,
-            self.world.map.config().max_field_cache_bytes
+            world.map().config().max_field_cache_bytes
         )?;
-        writeln!(
-            s,
-            "macro_tiles       : {}",
-            self.world.map.macro_cache().len()
-        )?;
+        writeln!(s, "macro_tiles       : {}", world.map().macro_cache().len())?;
         writeln!(
             s,
             "rosters           : {}",
-            self.world.map.roster_cache().len()
+            world.map().roster_cache().len()
         )?;
-        writeln!(s, "organisms         : {}", self.world.map.organism_count())?;
-        writeln!(s, "jobs_in_flight    : {}", self.world.map.jobs_in_flight())?;
+        writeln!(s, "organisms         : {}", world.map().organism_count())?;
+        writeln!(s, "jobs_in_flight    : {}", world.map().jobs_in_flight())?;
         writeln!(s, "pinned_violations : {}", self.composer.pinned_violations)?;
         writeln!(s)?;
 
@@ -556,7 +570,7 @@ impl App {
             "dir               : {}",
             std::env::var("WER_VAULT_DIR").unwrap_or_else(|_| String::from("wer-vault"))
         )?;
-        match self.world.vault.as_ref() {
+        match self.services.vault.as_ref() {
             Some(v) => {
                 writeln!(s, "open              : true")?;
                 writeln!(s, "discoveries       : {}", v.discoveries().len())?;
@@ -576,10 +590,10 @@ impl App {
             }
             None => writeln!(s, "open              : false (store directory unusable)")?,
         }
-        writeln!(s, "last_flush_stats  : {:?}", self.world.vault_stats)?;
-        writeln!(s, "path_tracking     : {}", self.world.path_tracking)?;
-        writeln!(s, "route_attraction  : {}", self.world.route_attraction)?;
-        writeln!(s, "route_recording   : {}", self.world.recorder.is_some())?;
+        writeln!(s, "last_flush_stats  : {:?}", self.services.vault_stats)?;
+        writeln!(s, "path_tracking     : {}", world.path_tracking())?;
+        writeln!(s, "route_attraction  : {}", world.route_attraction())?;
+        writeln!(s, "route_recording   : {}", world.route_recording())?;
         writeln!(s)?;
 
         writeln!(s, "[env]")?;
@@ -652,5 +666,23 @@ mod tests {
         let shot = std::fs::read(dir.join("screenshot.ppm")).expect("screenshot.ppm");
         assert!(shot.starts_with(b"P6\n"), "screenshot must be binary PPM");
         std::fs::remove_dir_all(&tmp).expect("cleanup");
+    }
+
+    #[test]
+    fn debug_dump_propagates_directory_creation_failure() {
+        let tmp = std::env::temp_dir().join(format!("wer-dump-failure-{}", std::process::id()));
+        std::fs::write(&tmp, b"not a directory").expect("create blocking file");
+        let vault = tmp.with_extension("vault");
+        std::env::set_var("WER_VAULT_DIR", &vault);
+        let mut app = App::new(true, world_runtime::ResourceTier::Low);
+        let error = app
+            .write_debug_dump_into(&tmp)
+            .expect_err("a file cannot contain a dump directory");
+        assert!(error.contains("create"));
+        drop(app);
+        std::fs::remove_file(&tmp).expect("cleanup");
+        if vault.exists() {
+            std::fs::remove_dir_all(vault).expect("vault cleanup");
+        }
     }
 }

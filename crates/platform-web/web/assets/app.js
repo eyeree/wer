@@ -169,9 +169,10 @@ const initWasm = async () => {
     appendDiagnostic(`origin_feature_hash=${hex}`);
     document.body.dataset.originFeatureHash = hex;
     updateSnapshot(JSON.parse(app.info_snapshot()));
-    const started = performance.now();
-    renderMap();
-    appendDiagnostic(`map settle+compose ${(performance.now() - started).toFixed(0)}ms`);
+    // The first shared frame performs the first and only world update. Map
+    // presentation is read-only and waits for that frame instead of secretly
+    // settling the world from `map_pixels`.
+    scheduleFrame();
   } catch (error) {
     write("wasm-status", "wasm failed", "err");
     write("origin-hash", "origin hash unavailable", "err");
@@ -289,14 +290,15 @@ const dispatchAction = (id, value = "") => {
 // live in viewer_host::InputMapper on the wasm side.
 let povActive = false;
 let povEntering = false;
+let povRendererReady = false;
 let povFailures = 0;
 let viewerFrameHandle = 0;
 let lastViewerTime = 0;
 
 const povCanvas = () => document.getElementById("pov-canvas");
 
-const enterPov = async () => {
-  if (povActive || povEntering || !wasmMod) return;
+const initializePovRenderer = async () => {
+  if (povRendererReady || povEntering || !wasmMod) return;
   povEntering = true;
   try {
     const canvas = povCanvas();
@@ -311,6 +313,15 @@ const enterPov = async () => {
     return;
   }
   povEntering = false;
+  povRendererReady = true;
+  // Only successful adapter/device initialization opens the shared POV gate.
+  window.__werApp?.renderer_available();
+  appendDiagnostic("pov: shared WebGPU renderer ready");
+  scheduleFrame();
+};
+
+const enterPov = () => {
+  if (povActive || !povRendererReady) return;
   povActive = true;
   povFailures = 0;
   document.getElementById("world-canvas").hidden = true;
@@ -320,7 +331,6 @@ const enterPov = async () => {
   perf.frames = 0;
   perf.lastRoll = 0;
   appendDiagnostic("pov: shared 3D renderer active (hold primary button to look)");
-  scheduleFrame();
 };
 
 const exitPov = () => {
@@ -328,7 +338,6 @@ const exitPov = () => {
   povActive = false;
   povCanvas().hidden = true;
   document.getElementById("world-canvas").hidden = false;
-  renderMap();
 };
 
 const handleEffects = () => {
@@ -352,28 +361,24 @@ const viewerFrame = (now) => {
   const dt = Math.min(now - (lastViewerTime || now), 100);
   lastViewerTime = now;
   const t0 = performance.now();
-  let snapshot;
-  let renderMapFrame = false;
-  if (lastSnapshot?.view?.mode === "pov") {
-    const status = JSON.parse(app.pov_frame(dt, now / 1000));
-    window.__povStatus = status;
-    snapshot = JSON.parse(app.info_snapshot());
-    if (status.rendered) {
+  const frame = JSON.parse(app.frame(dt, now / 1000));
+  const snapshot = frame.snapshot;
+  window.__povStatus = frame.pov;
+  if (frame.pov.active) {
+    if (frame.pov.rendered) {
       povFailures = 0;
     } else {
       povFailures += 1;
       if (povFailures > 30) {
         appendDiagnostic("pov: renderer failing; returning to map mode");
+        povRendererReady = false;
         app.renderer_lost();
       }
     }
-  } else {
-    snapshot = JSON.parse(app.update(dt));
-    renderMapFrame = true;
   }
   perf.updateMs = performance.now() - t0;
   updateSnapshot(snapshot);
-  if (renderMapFrame) renderMap();
+  if (snapshot.view.mode !== "pov" && frame.map_dirty) renderMap();
   handleEffects();
   perf.frames += 1;
   if (now - perf.lastRoll >= 1000) {
@@ -381,7 +386,7 @@ const viewerFrame = (now) => {
     perf.frames = 0;
     perf.lastRoll = now;
   }
-  if (povActive || app.needs_frame()) scheduleFrame();
+  if (frame.needs_frame || app.needs_frame()) scheduleFrame();
 };
 
 const scheduleFrame = () => {
@@ -724,8 +729,7 @@ const webgpuAvailable = probeWebGpu();
 initWorkerProbe();
 await initWasm();
 if (webgpuAvailable) {
-  window.__werApp.renderer_available();
-  scheduleFrame();
+  await initializePovRenderer();
 }
 await initStorage();
 initBenchmark();

@@ -920,9 +920,13 @@ impl Default for InputMapper {
 impl InputMapper {
     /// Update routing after a semantic presentation/focus action.
     pub fn set_context(&mut self, context: InputContext) {
+        let leaving_pov = active_view(self.context) == ViewKind::Pov
+            && (!context.surface_focused || active_view(context) != ViewKind::Pov);
         self.context = context;
-        if !context.surface_focused {
+        if leaving_pov || !context.surface_focused {
             self.drag = None;
+            self.look_delta = [0.0; 2];
+            self.pov_wheel_steps = 0;
         }
     }
 
@@ -1573,6 +1577,47 @@ mod tests {
             ctx,
         );
         assert_eq!(mapper.take_frame().look_delta, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn leaving_pov_context_cancels_drag_look_and_animation_intent() {
+        let pov = context(PresentationMode::Pov, ViewKind::Pov);
+        let map = context(PresentationMode::Map, ViewKind::Map);
+        let mut mapper = InputMapper::default();
+        mapper.handle_event(
+            NormalizedInputEvent::PointerButton {
+                pointer: 7,
+                button: PointerButton::Primary,
+                phase: ButtonPhase::Pressed,
+                position: [10.0, 10.0],
+                view: ViewKind::Pov,
+            },
+            pov,
+        );
+        mapper.handle_event(
+            NormalizedInputEvent::PointerMoved {
+                pointer: 7,
+                position: [15.0, 8.0],
+                view: ViewKind::Pov,
+            },
+            pov,
+        );
+        assert!(mapper.has_continuous_input());
+
+        mapper.set_context(map);
+        assert!(!mapper.has_continuous_input());
+        mapper.set_context(pov);
+        mapper.handle_event(
+            NormalizedInputEvent::PointerMoved {
+                pointer: 7,
+                position: [20.0, 4.0],
+                view: ViewKind::Pov,
+            },
+            pov,
+        );
+        let frame = mapper.take_frame();
+        assert_eq!(frame.look_delta, [0.0, 0.0]);
+        assert!(!frame.primary_drag);
     }
 
     #[test]

@@ -11,9 +11,13 @@
 use viewer_host::input::{ButtonPhase, Modifiers, PhysicalKey, PointerButton, WheelDelta};
 use viewer_host::{
     action::{ServiceRequestId, ViewerEffect, WorkerBackend, ACTION_DESCRIPTORS},
+    controller::{GroundSample, PovGroundSampler},
     input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent},
-    map::{Channel, MapBackend, Overlays},
-    PresentationMode, ViewKind, ViewerAction,
+    map::Channel,
+    panel::{Severity, ViewerWarning},
+    ExplorationWorld, NoopWorldTickHook, PlatformTelemetry, PresentationMode, ServiceNotification,
+    ServiceResponse, ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput,
+    ViewKind, ViewerAction, ViewerController,
 };
 use world_core::{
     anchor::{
@@ -37,7 +41,6 @@ use world_core::{
     terrain, Biome, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, POSSIBILITY_DIMS,
     REGION_SIZE, WORLD_ALGORITHM_VERSION,
 };
-use world_runtime::budget::Budget;
 use world_runtime::stream::RegionMap;
 use world_runtime::task::{InlineExecutor, TaskExecutor};
 use world_runtime::tier::ResourceTier;
@@ -352,79 +355,18 @@ pub fn route_attraction_sample() -> u64 {
     h
 }
 
-/// The browser map channels (phase-7-plan.md §3.3 "map channel selection"):
-/// the presentation-only subset of the native shell's channel list the web
-/// toolbar exposes, painted from the shared `world_runtime::mapcolor` table
-/// so both viewers show the identical false-color world.
-const WEB_MAP_CHANNELS: [Channel; 14] = [
-    Channel::Composite,
-    Channel::Elevation,
-    Channel::Geology,
-    Channel::Temperature,
-    Channel::Moisture,
-    Channel::River,
-    Channel::Wetness,
-    Channel::Soil,
-    Channel::Biome,
-    Channel::Vegetation,
-    Channel::Herbivore,
-    Channel::Predator,
-    Channel::Diversity,
-    Channel::DominantSpecies,
-];
-
-/// Settle passes for a fresh window: fresh regions snap to target at load,
-/// and a handful of extra passes drains realization/resonance — the same
-/// fixture count the native headless screenshot path uses.
-const SETTLE_PASSES: u32 = 8;
-
+/// Browser-owned presentation/service state around the one shared controller.
+/// World/viewer semantics deliberately do not live here.
 #[derive(Debug)]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-struct WebAppState {
-    frame_index: u64,
-    world_pos: (f64, f64),
-    possibility: PossibilityVector,
-    target: PossibilityVector,
-    active_channel: Channel,
-    zoom: u32,
-    overlays: Overlays,
-    /// The real streamed world window (phase-7-plan.md §4.1 milestone 2):
-    /// the same `RegionMap` the native shell drives, settled inline —
-    /// wasm has no threads here, and ADR 0018 makes the settled state
-    /// identical regardless.
-    map: RegionMap,
-    field: PossibilityField,
-    /// View half-extent in regions, derived from the tier's load radius
-    /// exactly as the native shell derives its composer size.
+struct BrowserHostState {
+    controller: ViewerController,
     half_regions: i32,
-    /// Lazily settled on first compose so constructing the facade (and the
-    /// many native unit tests that never render) stays cheap.
-    settled: bool,
-    /// The per-domain steering bias (zeros until the bias keys are wired in
-    /// the browser), fed to every stream update like the native shell's.
-    bias: [f32; POSSIBILITY_DIMS],
-    /// Last stream update's statistics — the data source for the browser
-    /// info panel, mirroring the native painted panel (panel.rs).
     last_stats: world_runtime::FrameStats,
-    /// Cumulative finished region-layer integrations by layer id (the
-    /// native panel's REGEN BY LAYER block).
     regen_totals: [u64; world_core::layer::LAYER_COUNT as usize],
-    /// The shared POV host (phase-7-plan.md §9.9): the same fly/walk camera
-    /// and chunk lifecycle manager the native shell drives. The wasm side
-    /// feeds its uploads to the wgpu renderer; on native these power the
-    /// facade unit tests without any GPU.
-    pov_camera: pov_host::PovCamera,
     pov_chunks: pov_host::PovChunkManager,
-    /// Exact organism replacement lifecycle shared with the native POV
-    /// shell. Like chunk geometry, this is derived upload-only presentation.
     pov_organisms: pov_host::PovOrganismManager,
-    /// Meshed-chunk radius around the camera (the native `WER_POV_RADIUS`
-    /// default), reduced on the Low tier — inline meshing pays the whole
-    /// window on POV entry, so the small tier keeps entry snappy.
     pov_radius: i32,
-    tier: &'static str,
-    cache_ceiling_mb: u32,
-    runtime_tier: ResourceTier,
     benchmark_ms: f32,
     worker_mode: &'static str,
     worker_backlog: u32,
@@ -436,33 +378,12 @@ struct WebAppState {
     storage_failures: u32,
     record_count: u32,
     renderer: &'static str,
-    view_mode: PresentationMode,
-    focused_view: ViewKind,
-    split_ratio: f32,
-    pov_supported: bool,
-    /// POV motion mode (`pov:walk` toggles walk ↔ fly), mirroring the native
-    /// shell's `F` key.
-    pov_walk: bool,
-    /// The native POV diagnostic toggles (`B`/`N`/`V`), mirrored so the
-    /// browser viewer drives the same presentation switches the shared 3D
-    /// renderer exposes: GPU directional shadows plus terrain AO,
-    /// per-fragment detail normals, and the water passes. Presentation-only
-    /// — never part of the settle hash.
-    pov_shadow_ao: bool,
-    pov_detail_normals: bool,
-    pov_water: bool,
-    /// POV render scale (the native `WER_POV_SCALE`): the fraction of the
-    /// canvas resolution the 3D pass rasterizes at before the upscale blit —
-    /// the practical fps knob wherever fragment cost is CPU-bound.
-    pov_render_scale: f32,
-    compose_enabled: bool,
-    refinement_enabled: bool,
     device_losses: u32,
     warnings: Vec<String>,
-    executor_parallelism: usize,
+    pending_effects: Vec<ViewerEffect>,
+    service_sequence: u64,
     last_action: &'static str,
-    next_request_id: u64,
-    effects: Vec<ViewerEffect>,
+    last_output: Option<TickOutput>,
 }
 
 /// Browser-owned raw-event adapter around the platform-neutral mapper.
@@ -478,32 +399,79 @@ struct BrowserViewerDriver {
     dirty: bool,
 }
 
-impl Default for WebAppState {
+/// Presentation work prepared after the controller's sole logical update.
+#[derive(Debug)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+struct BrowserFrame {
+    output: TickOutput,
+    uploads: Vec<renderer::TerrainChunkUpload>,
+    removes: Vec<u64>,
+    organisms_changed: bool,
+    service_response_queued: bool,
+}
+
+struct BrowserGround<'a> {
+    chunks: &'a pov_host::PovChunkManager,
+}
+
+impl PovGroundSampler for BrowserGround<'_> {
+    fn sample_ground(&self, map: &RegionMap, position: (f64, f64)) -> GroundSample {
+        let (height, mesh_resident) = pov_host::walk_ground(self.chunks, map, position);
+        GroundSample {
+            height,
+            mesh_resident,
+        }
+    }
+}
+
+/// Correlated services that this scaffold cannot truthfully complete yet.
+/// The browser returns a typed failure on the following tick instead of
+/// leaving controller request state pending forever.
+fn unavailable_service_request(effect: &ViewerEffect) -> Option<(ServiceRequestId, &'static str)> {
+    match effect {
+        ViewerEffect::WriteDebugCapture(request) => {
+            Some((request.request_id, "browser debug capture"))
+        }
+        ViewerEffect::PersistSession(request) => Some((request.request_id, "session persistence")),
+        ViewerEffect::LoadSession(request) => Some((*request, "session loading")),
+        ViewerEffect::WriteDiscovery(request) => {
+            Some((request.request_id, "discovery persistence"))
+        }
+        ViewerEffect::LoadDiscoveries(request) => Some((*request, "discovery loading")),
+        ViewerEffect::MutatePreserve(request) => Some((request.request_id, "preserve persistence")),
+        ViewerEffect::WriteRoute(request) => Some((request.request_id, "route persistence")),
+        ViewerEffect::ClearRoutes(request) => Some((*request, "route clearing")),
+        ViewerEffect::ConfigurePathTracking { request_id, .. } => {
+            Some((*request_id, "path-tracking persistence"))
+        }
+        ViewerEffect::OpenAtlasImport(request) => Some((*request, "atlas import")),
+        ViewerEffect::DownloadAtlasBundle(request) => Some((*request, "atlas export")),
+        ViewerEffect::Exit
+        | ViewerEffect::ConfigureWorkerBackend(_)
+        | ViewerEffect::CancelSupersededJobs
+        | ViewerEffect::ConfigureStorage { .. }
+        | ViewerEffect::ResetLocalVault
+        | ViewerEffect::SelectMapBackend(_)
+        | ViewerEffect::RunTierBenchmark
+        | ViewerEffect::ConfigureResourceTier(_)
+        | ViewerEffect::ReportWarning(_) => None,
+    }
+}
+
+impl Default for BrowserHostState {
     fn default() -> Self {
         let tier = ResourceTier::Low;
         let cfg = tier.stream_config();
         Self {
-            frame_index: 0,
-            world_pos: (0.0, 0.0),
-            possibility: PossibilityVector::neutral(),
-            target: PossibilityVector::neutral(),
-            active_channel: Channel::Composite,
-            zoom: 1,
-            overlays: Overlays::default(),
+            // Conservative shared defaults keep POV unavailable until an
+            // actual renderer/device success notification reaches a tick.
+            controller: ViewerController::new(ExplorationWorld::new(tier)),
             half_regions: (cfg.load_radius / REGION_SIZE).ceil() as i32,
-            map: RegionMap::new(cfg),
-            field: PossibilityField::default(),
-            settled: false,
-            bias: [0.0; POSSIBILITY_DIMS],
             last_stats: world_runtime::FrameStats::default(),
             regen_totals: [0; world_core::layer::LAYER_COUNT as usize],
-            pov_camera: pov_host::PovCamera::new(),
             pov_chunks: pov_host::PovChunkManager::new(),
             pov_organisms: pov_host::PovOrganismManager::new(),
             pov_radius: 2,
-            tier: "WebLow",
-            cache_ceiling_mb: 48,
-            runtime_tier: ResourceTier::Low,
             benchmark_ms: 0.0,
             worker_mode: "inline",
             worker_backlog: 0,
@@ -515,44 +483,37 @@ impl Default for WebAppState {
             storage_failures: 0,
             record_count: 0,
             renderer: "cpu-fallback",
-            view_mode: PresentationMode::Map,
-            focused_view: ViewKind::Map,
-            split_ratio: 0.5,
-            pov_supported: false,
-            pov_walk: false,
-            pov_shadow_ao: true,
-            pov_detail_normals: true,
-            pov_water: true,
-            pov_render_scale: 1.0,
-            compose_enabled: true,
-            refinement_enabled: false,
             device_losses: 0,
             warnings: Vec::new(),
-            executor_parallelism: InlineExecutor.parallelism(),
             last_action: "",
-            next_request_id: 1,
-            effects: Vec::new(),
+            pending_effects: Vec::new(),
+            service_sequence: 0,
+            last_output: None,
         }
     }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-impl WebAppState {
+impl BrowserHostState {
     fn new(config: &str) -> Self {
-        let mut state = Self::default();
-        if config.contains("\"tier\":\"mid\"") {
-            state.set_tier(ResourceTier::Mid);
+        let tier = if config.contains("\"tier\":\"mid\"") {
+            ResourceTier::Mid
         } else if config.contains("\"tier\":\"high\"") {
-            state.set_tier(ResourceTier::High);
-        }
+            ResourceTier::High
+        } else {
+            ResourceTier::Low
+        };
+        let cfg = tier.stream_config();
+        let mut state = Self {
+            controller: ViewerController::new(ExplorationWorld::new(tier)),
+            half_regions: (cfg.load_radius / REGION_SIZE).ceil() as i32,
+            ..Self::default()
+        };
         if config.contains("\"storage\":true") {
             state.storage = "indexeddb-pending";
             state
                 .warnings
                 .push(String::from("IndexedDB storage lands in Phase 7-7"));
-        }
-        if config.contains("\"webgpu\":true") {
-            state.set_renderer_webgpu();
         }
         if config.contains("\"worker_mode\":\"workers\"") {
             state.worker_mode = "workers";
@@ -561,138 +522,77 @@ impl WebAppState {
         state
     }
 
-    fn update(&mut self, dt_ms: f64, input: InputFrame) {
-        self.frame_index = self.frame_index.wrapping_add(1);
-        // The native shell's movement contract (main.rs `apply_movement`):
-        // 500 world units/sec, Shift sprint x4, diagonals normalized, dt
-        // clamped to 100ms so a hitch never teleports the player.
-        const PLAYER_SPEED: f64 = 500.0;
-        let dt = (dt_ms / 1000.0).clamp(0.0, 0.1);
-        let last = self.world_pos;
-        if let Some((dx, dy)) = input.map_movement_delta(PLAYER_SPEED, dt) {
-            self.world_pos.0 += dx;
-            self.world_pos.1 += dy;
+    fn frame(&mut self, dt_ms: f64, input: InputFrame) -> BrowserFrame {
+        let telemetry = self.platform_telemetry();
+        let ground = BrowserGround {
+            chunks: &self.pov_chunks,
+        };
+        let mut hook = NoopWorldTickHook;
+        let output = self.controller.tick(
+            TickInput {
+                dt_seconds: dt_ms / 1000.0,
+                input,
+                platform: telemetry,
+            },
+            &InlineExecutor,
+            &mut hook,
+            &ground,
+        );
+        self.absorb_stats(output.stats);
+        let mut unavailable = Vec::new();
+        for effect in &output.effects {
+            if let ViewerEffect::ReportWarning(warning) = effect {
+                self.warn_once(&warning.message);
+            }
+            if let Some(request) = unavailable_service_request(effect) {
+                unavailable.push(request);
+            }
         }
-        // Travel is the per-frame displacement that fuels convergence
-        // (ADR 0006), exactly as the native `WorldState::update` computes it.
-        // Budgeted streaming keeps the window following the player; the
-        // initial full settle still belongs to the first compose.
-        if self.settled {
-            let travel = f64::hypot(self.world_pos.0 - last.0, self.world_pos.1 - last.1);
-            let bias = self.bias;
-            let stats = self.map.update(
-                self.world_pos,
-                travel,
-                &self.field,
-                &[],
-                &bias,
-                &self.runtime_tier.budget(),
+        self.pending_effects.extend(output.effects.iter().cloned());
+        for (request_id, service) in &unavailable {
+            self.enqueue_unavailable_response(*request_id, service);
+        }
+
+        let mut uploads = Vec::new();
+        let mut removes = Vec::new();
+        let mut organisms_changed = false;
+        if output.mode != PresentationMode::Map {
+            let camera = self.controller.pov_camera();
+            let position = (camera.pos.x, camera.pos.y);
+            (uploads, removes) = self.pov_chunks.sync(
+                self.controller.world().map(),
+                position,
+                self.pov_radius,
                 &InlineExecutor,
-                false,
             );
-            self.absorb_stats(stats);
+            organisms_changed = self.pov_organisms.sync(
+                self.controller.world().map(),
+                &self.pov_chunks,
+                position,
+                pov_host::pov_fog_end(self.pov_radius),
+            );
+        }
+        self.last_output = Some(output.clone());
+        BrowserFrame {
+            output,
+            uploads,
+            removes,
+            organisms_changed,
+            service_response_queued: !unavailable.is_empty(),
         }
     }
 
-    /// One POV frame's host work, mirroring the native `apply_pov_movement`
-    /// and `frame_pov` pair: look, move (fly: full 3D forward, strafe, and
-    /// up/down; walk: yaw-plane forward and strafe, then terrain following),
-    /// a budgeted stream update at the (unmoved) player like the native
-    /// shell's, and the chunk sync that yields this frame's uploads and
-    /// removes for the shared renderer.
-    fn pov_step(
-        &mut self,
-        dt_ms: f64,
-        input: InputFrame,
-    ) -> (Vec<renderer::TerrainChunkUpload>, Vec<u64>, bool) {
-        self.frame_index = self.frame_index.wrapping_add(1);
-        let dt = (dt_ms / 1000.0).clamp(0.0, 0.1);
-        let [look_dx, look_dy] = input.look_delta;
-        if look_dx != 0.0 || look_dy != 0.0 {
-            self.pov_camera.look(look_dx, look_dy);
+    fn platform_telemetry(&self) -> PlatformTelemetry {
+        PlatformTelemetry {
+            executor_backend: match self.worker_mode {
+                "workers" => WorkerBackend::Workers,
+                "shared-memory" => WorkerBackend::SharedWorkers,
+                _ => WorkerBackend::Inline,
+            },
+            workers: self.workers as usize,
+            storage_available: self.storage == "indexeddb",
+            ..PlatformTelemetry::default()
         }
-        // Wheel notches adjust the active mode's speed (the native POV
-        // wheel behavior).
-        let wheel = input.wheel_steps;
-        for _ in 0..wheel.abs() {
-            self.pov_camera.scroll_speed(wheel > 0);
-        }
-
-        let walk = self.pov_camera.walk;
-        let forward = if walk {
-            self.pov_camera.walk_forward()
-        } else {
-            self.pov_camera.forward()
-        };
-        let mut mv = glam::DVec3::ZERO;
-        if input.pov_axis[1] > 0 {
-            mv += forward;
-        }
-        if input.pov_axis[1] < 0 {
-            mv -= forward;
-        }
-        if input.pov_axis[0] > 0 {
-            mv += self.pov_camera.right();
-        }
-        if input.pov_axis[0] < 0 {
-            mv -= self.pov_camera.right();
-        }
-        if !walk {
-            if input.pov_axis[2] > 0 {
-                mv.z += 1.0;
-            }
-            if input.pov_axis[2] < 0 {
-                mv.z -= 1.0;
-            }
-        }
-        if mv != glam::DVec3::ZERO {
-            let speed = if walk {
-                self.pov_camera.walk_speed
-            } else {
-                self.pov_camera.speed
-            };
-            self.pov_camera.pos += mv.normalize() * (speed * dt);
-        }
-        if walk {
-            let (ground, _) = pov_host::walk_ground(
-                &self.pov_chunks,
-                &self.map,
-                (self.pov_camera.pos.x, self.pov_camera.pos.y),
-            );
-            self.pov_camera
-                .follow_ground(ground + pov_host::EYE_HEIGHT, dt);
-        }
-
-        // The world keeps streaming around the player (not the camera),
-        // exactly like the native shell: chunks past the loaded window mesh
-        // from the analytic frontier and dissolve into fog.
-        if self.settled {
-            let bias = self.bias;
-            let stats = self.map.update(
-                self.world_pos,
-                0.0,
-                &self.field,
-                &[],
-                &bias,
-                &self.runtime_tier.budget(),
-                &InlineExecutor,
-                false,
-            );
-            self.absorb_stats(stats);
-        }
-        let (uploads, removes) = self.pov_chunks.sync(
-            &self.map,
-            (self.pov_camera.pos.x, self.pov_camera.pos.y),
-            self.pov_radius,
-            &InlineExecutor,
-        );
-        let organisms_changed = self.pov_organisms.sync(
-            &self.map,
-            &self.pov_chunks,
-            (self.pov_camera.pos.x, self.pov_camera.pos.y),
-            pov_host::pov_fog_end(self.pov_radius),
-        );
-        (uploads, removes, organisms_changed)
     }
 
     /// Fold one stream update's statistics into the panel's rolling state.
@@ -707,174 +607,9 @@ impl WebAppState {
         self.last_stats = stats;
     }
 
-    /// Apply one exact semantic action. Both the shared input mapper and DOM
-    /// controls feed this reducer through [`BrowserViewerDriver`]; platform
-    /// adapters never interpret action ids or mutate viewer state directly.
-    fn apply_action(&mut self, action: ViewerAction) {
-        const NUDGE_STEP: f32 = 0.05;
-        const MAX_ZOOM: u32 = 16;
-
+    fn enqueue_action(&mut self, action: ViewerAction) {
         self.last_action = action.id().as_str();
-        match action {
-            ViewerAction::SetPresentation(mode) => self.set_presentation(mode),
-            ViewerAction::TogglePrimaryView => match self.view_mode {
-                PresentationMode::Map => self.set_presentation(PresentationMode::Pov),
-                PresentationMode::Pov => self.set_presentation(PresentationMode::Map),
-                PresentationMode::Split => {
-                    self.focused_view = match self.focused_view {
-                        ViewKind::Map => ViewKind::Pov,
-                        ViewKind::Pov => ViewKind::Map,
-                    };
-                }
-            },
-            ViewerAction::FocusView(view) => self.focused_view = view,
-            ViewerAction::SetSplitRatio(ratio) => self.split_ratio = ratio.clamp(0.1, 0.9),
-            ViewerAction::NudgePossibility { domain, direction } => {
-                let direction = match direction {
-                    viewer_host::action::NudgeDirection::Up => 1.0,
-                    viewer_host::action::NudgeDirection::Down => -1.0,
-                };
-                let value = &mut self.bias[domain.index()];
-                *value = (*value + direction * NUDGE_STEP).clamp(-1.0, 1.0);
-                self.settled = false;
-            }
-            ViewerAction::ResetPossibilityBias => {
-                self.bias = [0.0; POSSIBILITY_DIMS];
-                self.settled = false;
-            }
-            ViewerAction::CycleMapChannel => {
-                let index = WEB_MAP_CHANNELS
-                    .iter()
-                    .position(|channel| *channel == self.active_channel)
-                    .unwrap_or(0);
-                self.active_channel = WEB_MAP_CHANNELS[(index + 1) % WEB_MAP_CHANNELS.len()];
-            }
-            ViewerAction::SetMapChannel(channel) => {
-                if WEB_MAP_CHANNELS.contains(&channel) {
-                    self.active_channel = channel;
-                } else {
-                    self.warn_once("This map channel lands with the shared map presenter");
-                }
-            }
-            ViewerAction::ToggleOverlay(overlay) => {
-                let enabled = !self.overlays.enabled(overlay);
-                self.overlays.set(overlay, enabled);
-            }
-            ViewerAction::ZoomIn => self.zoom = (self.zoom * 2).min(MAX_ZOOM),
-            ViewerAction::ZoomOut => self.zoom = (self.zoom / 2).max(1),
-            ViewerAction::ToggleGpuCompose => {
-                self.compose_enabled = !self.compose_enabled;
-                self.target.set(PossibilityDomain::Planetary, 0.5625);
-            }
-            ViewerAction::ToggleRefinement => {
-                self.refinement_enabled = !self.refinement_enabled;
-                self.target.set(PossibilityDomain::Aesthetics, 0.625);
-            }
-            ViewerAction::ToggleWalk => {
-                self.pov_walk = !self.pov_walk;
-                let (ground, _) = pov_host::walk_ground(
-                    &self.pov_chunks,
-                    &self.map,
-                    (self.pov_camera.pos.x, self.pov_camera.pos.y),
-                );
-                self.pov_camera.set_walk(self.pov_walk, ground);
-            }
-            ViewerAction::TogglePovShadowAo => self.pov_shadow_ao = !self.pov_shadow_ao,
-            ViewerAction::TogglePovDetailNormals => {
-                self.pov_detail_normals = !self.pov_detail_normals;
-            }
-            ViewerAction::TogglePovWater => self.pov_water = !self.pov_water,
-            ViewerAction::SetPovRenderScale(scale) => {
-                self.pov_render_scale = if scale <= 0.25 {
-                    0.25
-                } else if scale <= 0.5 {
-                    0.5
-                } else {
-                    1.0
-                };
-            }
-            ViewerAction::SetResourceTier(tier) => self.set_tier(tier),
-            ViewerAction::SetWorkerBackend(WorkerBackend::Inline) => {
-                self.worker_mode = "inline";
-                self.worker_backlog = 0;
-                self.workers = 1;
-            }
-            ViewerAction::SetWorkerBackend(backend) => {
-                self.effects
-                    .push(ViewerEffect::ConfigureWorkerBackend(backend));
-                self.warn_once("Worker execution is unavailable; inline execution remains active");
-            }
-            ViewerAction::CancelSupersededJobs => {
-                self.effects.push(ViewerEffect::CancelSupersededJobs);
-                self.warn_once("No browser worker queue is active");
-            }
-            ViewerAction::SetMapBackend(MapBackend::Cpu) => self.compose_enabled = false,
-            ViewerAction::SetMapBackend(MapBackend::GpuAtlas) => {
-                if self.pov_supported {
-                    self.compose_enabled = true;
-                } else {
-                    self.warn_once("GPU map composition is unavailable; CPU map remains active");
-                }
-            }
-            ViewerAction::SetStorageEnabled(enabled) => {
-                self.storage = if enabled { "indexeddb" } else { "memory" };
-            }
-            ViewerAction::SaveSession => {
-                let request = self.next_request();
-                self.effects.push(ViewerEffect::PersistSession(request));
-                self.warn_once("Session persistence is not connected to the browser vault yet");
-            }
-            ViewerAction::LoadSession => {
-                let request = self.next_request();
-                self.effects.push(ViewerEffect::LoadSession(request));
-                self.warn_once("Session loading is not connected to the browser vault yet");
-            }
-            ViewerAction::ResetLocalVault => {
-                self.effects.push(ViewerEffect::ResetLocalVault);
-                self.warn_once("Vault reset is unavailable until browser persistence is connected");
-            }
-            ViewerAction::RequestAtlasImport => {
-                let request = self.next_request();
-                self.effects.push(ViewerEffect::OpenAtlasImport(request));
-                self.warn_once("Atlas import is not connected to a browser file picker yet");
-            }
-            ViewerAction::RequestAtlasExport => {
-                let request = self.next_request();
-                self.effects
-                    .push(ViewerEffect::DownloadAtlasBundle(request));
-                self.warn_once("Atlas export is not connected to browser bundle encoding yet");
-            }
-            ViewerAction::RequestTierBenchmark => {
-                self.effects.push(ViewerEffect::RunTierBenchmark);
-            }
-            ViewerAction::RequestDebugDump => {
-                self.warn_once("Browser debug capture is unavailable in this runtime scaffold");
-            }
-            ViewerAction::RequestExit => {
-                self.warn_once("The browser host does not support the Exit action");
-            }
-            ViewerAction::DropAnchor(_)
-            | ViewerAction::CaptureAnchor
-            | ViewerAction::CycleCaptureCategory
-            | ViewerAction::ToggleCapturePolarity
-            | ViewerAction::ClearAnchors
-            | ViewerAction::ToggleTransitionMode
-            | ViewerAction::RecordLastAnchor
-            | ViewerAction::SummonDiscoveries
-            | ViewerAction::TogglePreserve
-            | ViewerAction::TogglePathTracking
-            | ViewerAction::ToggleRouteRecording
-            | ViewerAction::ToggleRouteAttraction
-            | ViewerAction::ClearRoutes => {
-                self.warn_once("This exploration action lands with the shared controller");
-            }
-        }
-    }
-
-    fn next_request(&mut self) -> ServiceRequestId {
-        let request = ServiceRequestId(self.next_request_id);
-        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        request
+        self.controller.enqueue_action(action);
     }
 
     fn warn_once(&mut self, warning: &str) {
@@ -883,118 +618,60 @@ impl WebAppState {
         }
     }
 
-    fn set_presentation(&mut self, mode: PresentationMode) {
-        match mode {
-            PresentationMode::Map => {
-                self.view_mode = PresentationMode::Map;
-                self.focused_view = ViewKind::Map;
-            }
-            PresentationMode::Pov if self.pov_supported => {
-                self.view_mode = PresentationMode::Pov;
-                self.focused_view = ViewKind::Pov;
-                let ground = pov_host::entry_ground(&self.map, self.world_pos);
-                self.pov_camera.enter_at(self.world_pos, ground);
-                if self.pov_camera.walk {
-                    let (ground, _) = pov_host::walk_ground(
-                        &self.pov_chunks,
-                        &self.map,
-                        (self.pov_camera.pos.x, self.pov_camera.pos.y),
-                    );
-                    self.pov_camera.snap_to_ground(ground);
-                }
-            }
-            PresentationMode::Pov => {
-                self.view_mode = PresentationMode::Map;
-                self.focused_view = ViewKind::Map;
-                self.warn_once("POV renderer unavailable; staying in map mode");
-            }
-            PresentationMode::Split => {
-                self.warn_once("Split presentation lands in the multi-view renderer milestone");
-            }
-        }
-    }
-
-    /// WebGPU presentation is up: the atlas path composes the map, and the
-    /// POV mode gate opens — the shared 3D renderer is GPU-only on every
-    /// platform (no CPU POV twin exists; phase-7-plan.md §9.9).
     fn set_renderer_webgpu(&mut self) {
         self.renderer = "webgpu-atlas";
-        self.pov_supported = true;
+        self.enqueue_pov_availability(true, None);
     }
 
-    /// CPU fallback (chosen or device loss): the map keeps working, and POV
-    /// — GPU-only — closes cleanly, returning to map mode rather than
-    /// stranding the viewer in an unrenderable state (phase-7-plan.md §9.9:
-    /// "device-loss and unsupported-feature paths return to map mode
-    /// cleanly").
-    fn set_renderer_cpu(&mut self) {
-        self.renderer = "cpu-fallback";
-        self.pov_supported = false;
-        if matches!(
-            self.view_mode,
-            PresentationMode::Pov | PresentationMode::Split
-        ) {
-            self.view_mode = PresentationMode::Map;
-            self.focused_view = ViewKind::Map;
-            self.warnings
-                .push(String::from("POV requires WebGPU; returned to map mode"));
-        }
+    fn enqueue_pov_availability(&mut self, supported: bool, reason: Option<ViewerWarning>) {
+        let sequence = self.next_service_sequence();
+        self.controller
+            .enqueue_service_notification(ServiceNotification::PovAvailability {
+                sequence,
+                supported,
+                reason,
+            });
     }
 
+    fn enqueue_unavailable_response(&mut self, request_id: ServiceRequestId, service: &str) {
+        let sequence = self.next_service_sequence();
+        self.controller.enqueue_service_response(ServiceResponse {
+            sequence,
+            request_id,
+            result: ServiceResponseResult::Failed(ViewerWarning {
+                id: "browser-service-unavailable",
+                message: format!("{service} is unavailable in this browser runtime."),
+                severity: Severity::Warning,
+            }),
+        });
+    }
+
+    fn next_service_sequence(&mut self) -> ServiceResponseSequence {
+        self.service_sequence = self
+            .service_sequence
+            .checked_add(1)
+            .expect("browser service sequence exhausted");
+        ServiceResponseSequence(self.service_sequence)
+    }
+
+    /// Device loss changes platform renderer state immediately, then queues
+    /// the shared capability/fallback transition for the next logical tick.
     fn renderer_lost(&mut self) {
-        self.set_renderer_cpu();
+        self.renderer = "cpu-fallback";
         self.device_losses = self.device_losses.saturating_add(1);
-        self.warn_once("WebGPU device lost; CPU map fallback active");
-    }
-
-    fn set_tier(&mut self, tier: ResourceTier) {
-        self.runtime_tier = tier;
-        self.tier = match tier {
-            ResourceTier::Low => "WebLow",
-            ResourceTier::Mid => "WebMid",
-            ResourceTier::High => "WebHigh",
-        };
-        self.cache_ceiling_mb = match tier {
-            ResourceTier::Low => 48,
-            ResourceTier::Mid => 96,
-            ResourceTier::High => 160,
-        };
-        self.refinement_enabled = tier.refinement();
-        // Tiers change the streamed window (radii, caches, organism density)
-        // but never world identity (ADR 0018), so rebuilding the map here
-        // re-settles to the same authoritative state at the new extent.
-        let cfg = tier.stream_config();
-        self.half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
-        self.map = RegionMap::new(cfg);
-        self.settled = false;
-    }
-
-    /// Settle the streamed window around the current position, inline. Fresh
-    /// regions snap to their target on load, so a fixed pass count fully
-    /// settles the view — the native headless screenshot fixture pattern.
-    fn ensure_settled(&mut self) {
-        if self.settled {
-            return;
-        }
-        let bias = self.bias;
-        for _ in 0..SETTLE_PASSES {
-            let stats = self.map.update(
-                self.world_pos,
-                0.0,
-                &self.field,
-                &[],
-                &bias,
-                &Budget::unlimited(),
-                &InlineExecutor,
-                false,
-            );
-            self.absorb_stats(stats);
-        }
-        self.settled = true;
+        self.enqueue_pov_availability(
+            false,
+            Some(ViewerWarning {
+                id: "webgpu-device-lost",
+                message: String::from("WebGPU device lost; CPU map fallback active"),
+                severity: Severity::Warning,
+            }),
+        );
     }
 
     fn region(&self) -> RegionCoord {
-        RegionCoord::from_world(self.world_pos.0, self.world_pos.1)
+        let traveler = self.controller.world().traveler().position;
+        RegionCoord::from_world(traveler.0, traveler.1)
     }
 
     fn settle_hash(&self) -> u64 {
@@ -1002,7 +679,7 @@ impl WebAppState {
         let mut h = mix(0xB207_0000_0000_0003, origin_feature_hash());
         h = mix(h, region.x as u32 as u64);
         h = mix(h, region.y as u32 as u64);
-        for dim in self.possibility.dims {
+        for dim in self.controller.world().field().sample(region).dims {
             h = mix(h, u64::from(dim.to_bits()));
         }
         h
@@ -1010,13 +687,25 @@ impl WebAppState {
 
     fn snapshot_json(&self) -> String {
         let region = self.region();
-        let active_channel = WEB_MAP_CHANNELS
+        let map_preferences = self.controller.map_preferences();
+        let layout = self.controller.layout();
+        let pov = self.controller.pov_state();
+        let world = self.controller.world();
+        let traveler = world.traveler().position;
+        let possibility = world.field().sample(region);
+        let active_channel = Channel::ALL
             .iter()
-            .position(|channel| *channel == self.active_channel)
+            .position(|channel| *channel == map_preferences.channel)
             .unwrap_or(0);
-        let focused = match self.focused_view {
+        let focused = match layout.focused {
             ViewKind::Map => "map",
             ViewKind::Pov => "pov",
+        };
+        let tier = world.tier();
+        let (tier_name, cache_ceiling_mb) = match tier {
+            ResourceTier::Low => ("WebLow", 48),
+            ResourceTier::Mid => ("WebMid", 96),
+            ResourceTier::High => ("WebHigh", 160),
         };
         format!(
             concat!(
@@ -1043,18 +732,18 @@ impl WebAppState {
                 "\"warnings\":[{}]",
                 "}}"
             ),
-            self.frame_index,
-            self.world_pos.0,
-            self.world_pos.1,
+            world.update_serial(),
+            traveler.0,
+            traveler.1,
             region.x,
             region.y,
-            vector_json(self.possibility),
-            vector_json(self.target),
+            vector_json(possibility),
+            vector_json(possibility),
             active_channel,
-            self.active_channel.id(),
-            self.zoom,
+            map_preferences.channel.id(),
+            map_preferences.zoom,
             self.worker_mode,
-            self.executor_parallelism,
+            InlineExecutor.parallelism(),
             self.workers,
             self.worker_backlog,
             self.cancellations,
@@ -1064,23 +753,23 @@ impl WebAppState {
             self.storage_failures,
             self.record_count,
             self.renderer,
-            self.compose_enabled,
-            self.refinement_enabled,
+            map_preferences.backend == viewer_host::map::MapBackend::GpuAtlas,
+            map_preferences.refinement,
             self.device_losses,
-            self.view_mode.as_str(),
+            layout.mode.as_str(),
             focused,
-            self.split_ratio,
-            self.pov_supported,
-            if self.pov_walk { "walk" } else { "fly" },
-            self.pov_shadow_ao,
-            self.pov_detail_normals,
-            self.pov_water,
-            self.pov_render_scale,
-            self.tier,
-            self.runtime_tier.name(),
-            self.cache_ceiling_mb,
+            layout.split_ratio,
+            pov.supported,
+            if pov.walk { "walk" } else { "fly" },
+            pov.shadow_ao,
+            pov.detail_normals,
+            pov.water,
+            pov.render_scale,
+            tier_name,
+            tier.name(),
+            cache_ceiling_mb,
             self.benchmark_ms,
-            bias_json(&self.bias),
+            bias_json(world.bias()),
             self.stats_json(),
             self.settle_hash(),
             self.last_action,
@@ -1151,14 +840,15 @@ impl WebAppState {
     /// of the cell under a world position. Reads the cache only — never
     /// generates — so hovering costs nothing.
     fn inspect_json(&self, wx: f64, wy: f64) -> String {
+        let map = self.controller.world().map();
         let coord = RegionCoord::from_world(wx, wy);
-        let res = self.map.config().field_resolution;
+        let res = map.config().field_resolution;
         let cell = REGION_SIZE / f64::from(res);
         let (ox, oy) = coord.origin();
         let cx = (((wx - ox) / cell) as i64).clamp(0, i64::from(res) - 1) as u16;
         let cy = (((wy - oy) / cell) as i64).clamp(0, i64::from(res) - 1) as u16;
-        let state = self.map.get(coord);
-        let tiles = self.map.cache().get(coord);
+        let state = map.get(coord);
+        let tiles = map.cache().get(coord);
         let channel =
             |index: usize| tiles.and_then(|t| t.channels[index].as_deref().map(|t| t.get(cx, cy)));
         let number =
@@ -1212,19 +902,21 @@ impl WebAppState {
     /// Image edge length in pixels: one pixel per field cell across the
     /// `2·half+1` region window, exactly like the native composer.
     fn map_side(&self) -> usize {
-        (2 * self.half_regions + 1) as usize * usize::from(self.map.config().field_resolution)
+        (2 * self.half_regions + 1) as usize
+            * usize::from(self.controller.world().map().config().field_resolution)
     }
 
     /// The CPU map header. The pixel payload travels separately through
-    /// [`WebAppState::compose_map`] as raw bytes — a Phase 7-4 window is
+    /// [`BrowserHostState::compose_map`] as raw bytes — a Phase 7-4 window is
     /// hundreds of kilobytes, far too large for a number-per-byte JSON array.
     fn cpu_map_json(&self) -> String {
         let side = self.map_side();
+        let map = self.controller.world().map();
         format!(
             "{{\"kind\":\"rgba8\",\"renderer\":\"{}\",\"width\":{side},\"height\":{side},\"resolution\":{},\"channel\":\"{}\"}}",
             self.renderer,
-            self.map.config().field_resolution,
-            self.active_channel.id()
+            map.config().field_resolution,
+            self.controller.map_preferences().channel.id()
         )
     }
 
@@ -1234,12 +926,12 @@ impl WebAppState {
     /// plus the grid darkening and the player cross. Native-only overlays
     /// (routes, preserves, organisms, pinned-flash) arrive with the vault
     /// and realization steps of Phase 7.
-    fn compose_map(&mut self) -> Vec<u8> {
-        self.ensure_settled();
+    fn compose_map(&self) -> Vec<u8> {
         let side = self.map_side();
         let mut pixels = vec![0u8; side * side * 4];
-        let center = RegionCoord::from_world(self.world_pos.0, self.world_pos.1);
-        let channel = self.active_channel.id();
+        let traveler = self.controller.world().traveler().position;
+        let center = RegionCoord::from_world(traveler.0, traveler.1);
+        let channel = self.controller.map_preferences().channel.id();
 
         for row_region in 0..=(2 * self.half_regions) {
             // Row 0 is the northernmost (max y) region.
@@ -1261,12 +953,12 @@ impl WebAppState {
         // visible over any channel. The window is centered on the player's
         // *region*, so the marker sits at the player's own pixel, exactly
         // like the native `draw_player_marker`.
-        let res = f64::from(self.map.config().field_resolution);
+        let res = f64::from(self.controller.world().map().config().field_resolution);
         let cell = REGION_SIZE / res;
         let west = f64::from(center.x - self.half_regions) * REGION_SIZE;
         let north = f64::from(center.y + self.half_regions + 1) * REGION_SIZE;
-        let player_px = ((self.world_pos.0 - west) / cell) as i64;
-        let player_py = ((north - self.world_pos.1) / cell) as i64;
+        let player_px = ((traveler.0 - west) / cell) as i64;
+        let player_py = ((north - traveler.1) / cell) as i64;
         for d in -3i64..=3 {
             for (px, py) in [(player_px + d, player_py), (player_px, player_py + d)] {
                 if px >= 0 && py >= 0 && (px as usize) < side && (py as usize) < side {
@@ -1289,9 +981,10 @@ impl WebAppState {
         row_region: usize,
         col_region: usize,
     ) {
-        let res = self.map.config().field_resolution;
+        let map = self.controller.world().map();
+        let res = map.config().field_resolution;
         let side = self.map_side();
-        let tiles = self.map.cache().get(coord);
+        let tiles = map.cache().get(coord);
         let tile = |channel_index: usize| tiles.and_then(|t| t.channels[channel_index].as_deref());
         let biome = tiles.and_then(|t| t.biome.as_deref());
         let (origin_x, origin_y) = coord.origin();
@@ -1338,7 +1031,7 @@ impl WebAppState {
                     "herbivore" => scalar(tile(CHANNEL_HERBIVORE), &mapcolor::herbivore_color),
                     "predator" => scalar(tile(CHANNEL_PREDATOR), &mapcolor::predator_color),
                     "diversity" => scalar(tile(CHANNEL_DIVERSITY), &mapcolor::diversity_color),
-                    "dominant" => match self.map.dominant_species_id(coord, cx, cy) {
+                    "dominant" => match map.dominant_species_id(coord, cx, cy) {
                         Some(id) => mapcolor::species_color(id),
                         None => missing(),
                     },
@@ -1354,13 +1047,13 @@ impl WebAppState {
                             Biome::from_id(b.get(cx, cy)),
                             r.get(cx, cy),
                             w.get(cx, cy),
-                            self.map.dominant_species_id(coord, cx, cy),
+                            map.dominant_species_id(coord, cx, cy),
                         ),
                         _ => missing(),
                     },
                 };
                 // Region grid, on by default like the native shell.
-                if self.overlays.grid && (cx == 0 || cy == 0) {
+                if self.controller.map_preferences().overlays.grid && (cx == 0 || cy == 0) {
                     rgb = mapcolor::lerp_rgb(rgb, [0, 0, 0], 0.35);
                 }
 
@@ -1379,26 +1072,30 @@ impl WebAppState {
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl BrowserViewerDriver {
-    fn context(&self, state: &WebAppState) -> InputContext {
-        InputContext {
-            mode: state.view_mode,
-            focused: state.focused_view,
-            surface_focused: self.surface_focused,
-        }
+    fn context(&self, state: &BrowserHostState) -> InputContext {
+        state.controller.input_context(self.surface_focused)
     }
 
-    fn handle(&mut self, state: &WebAppState, event: NormalizedInputEvent) -> bool {
+    fn handle(&mut self, state: &mut BrowserHostState, event: NormalizedInputEvent) -> bool {
         let handled = self.mapper.handle_event(event, self.context(state));
+        self.drain_actions(state);
         self.dirty |= handled;
         handled
     }
 
-    fn enqueue_action(&mut self, action: ViewerAction) {
+    fn enqueue_action(&mut self, state: &mut BrowserHostState, action: ViewerAction) {
         self.mapper.enqueue_action(action);
+        self.drain_actions(state);
         self.dirty = true;
     }
 
-    fn set_surface_focus(&mut self, state: &WebAppState, focused: bool) {
+    fn drain_actions(&mut self, state: &mut BrowserHostState) {
+        for action in self.mapper.drain_actions() {
+            state.enqueue_action(action);
+        }
+    }
+
+    fn set_surface_focus(&mut self, state: &BrowserHostState, focused: bool) {
         self.surface_focused = focused;
         if !focused {
             self.mapper.clear_held_state();
@@ -1407,15 +1104,19 @@ impl BrowserViewerDriver {
         self.dirty = true;
     }
 
-    fn take_frame(&mut self, state: &mut WebAppState) -> InputFrame {
-        let actions = self.mapper.drain_actions().collect::<Vec<_>>();
-        for action in actions {
-            state.apply_action(action);
-            self.mapper.set_context(self.context(state));
-        }
+    fn take_frame(&mut self, state: &mut BrowserHostState) -> InputFrame {
+        self.drain_actions(state);
+        // Re-sample the controller's preview after the final action drain so
+        // already-held navigation follows a same-batch Tab/focus action.
+        let context = self.context(state);
+        self.mapper.set_context(context);
         let frame = self.mapper.take_frame();
         self.dirty = false;
         frame
+    }
+
+    fn synchronize_context(&mut self, state: &BrowserHostState) {
+        self.mapper.set_context(self.context(state));
     }
 
     fn needs_frame(&self) -> bool {
@@ -1455,11 +1156,40 @@ fn effects_json(effects: Vec<ViewerEffect>) -> String {
                 request.request_id.0
             ),
             ViewerEffect::PersistSession(request) => {
-                format!("{{\"kind\":\"persist-session\",\"request\":{}}}", request.0)
+                format!(
+                    "{{\"kind\":\"persist-session\",\"request\":{}}}",
+                    request.request_id.0
+                )
             }
             ViewerEffect::LoadSession(request) => {
                 format!("{{\"kind\":\"load-session\",\"request\":{}}}", request.0)
             }
+            ViewerEffect::WriteDiscovery(request) => format!(
+                "{{\"kind\":\"write-discovery\",\"request\":{}}}",
+                request.request_id.0
+            ),
+            ViewerEffect::LoadDiscoveries(request) => format!(
+                "{{\"kind\":\"load-discoveries\",\"request\":{}}}",
+                request.0
+            ),
+            ViewerEffect::MutatePreserve(request) => format!(
+                "{{\"kind\":\"mutate-preserve\",\"request\":{}}}",
+                request.request_id.0
+            ),
+            ViewerEffect::WriteRoute(request) => format!(
+                "{{\"kind\":\"write-route\",\"request\":{}}}",
+                request.request_id.0
+            ),
+            ViewerEffect::ClearRoutes(request) => {
+                format!("{{\"kind\":\"clear-routes\",\"request\":{}}}", request.0)
+            }
+            ViewerEffect::ConfigurePathTracking {
+                request_id,
+                enabled,
+            } => format!(
+                "{{\"kind\":\"configure-path-tracking\",\"request\":{},\"enabled\":{enabled}}}",
+                request_id.0
+            ),
             ViewerEffect::OpenAtlasImport(request) => {
                 format!("{{\"kind\":\"open-atlas\",\"request\":{}}}", request.0)
             }
@@ -1476,6 +1206,10 @@ fn effects_json(effects: Vec<ViewerEffect>) -> String {
             ViewerEffect::ResetLocalVault => String::from("{\"kind\":\"reset-vault\"}"),
             ViewerEffect::SelectMapBackend(_) => String::from("{\"kind\":\"select-map-backend\"}"),
             ViewerEffect::RunTierBenchmark => String::from("{\"kind\":\"benchmark\"}"),
+            ViewerEffect::ConfigureResourceTier(tier) => format!(
+                "{{\"kind\":\"configure-tier\",\"tier\":\"{}\"}}",
+                tier.name()
+            ),
             ViewerEffect::ReportWarning(warning) => format!(
                 "{{\"kind\":\"warning\",\"message\":\"{}\"}}",
                 json_escape(&warning.message)
@@ -1671,7 +1405,7 @@ mod wasm {
     #[wasm_bindgen]
     #[derive(Debug)]
     pub struct WebApp {
-        state: super::WebAppState,
+        state: super::BrowserHostState,
         driver: super::BrowserViewerDriver,
         shutdown: bool,
     }
@@ -1685,20 +1419,95 @@ mod wasm {
         pub fn new(config: JsValue) -> Result<WebApp, JsValue> {
             let config = config.as_string().unwrap_or_default();
             Ok(WebApp {
-                state: super::WebAppState::new(&config),
+                state: super::BrowserHostState::new(&config),
                 driver: super::BrowserViewerDriver::default(),
                 shutdown: false,
             })
         }
 
-        /// Advance Map mode from the mapper's one typed frame sample.
-        pub fn update(&mut self, dt_ms: f64) -> Result<JsValue, JsValue> {
+        /// Advance exactly one logical viewer frame in every presentation.
+        /// Input is sampled once and the shared controller performs the sole
+        /// traveler/world update before any optional POV presentation work.
+        pub fn frame(&mut self, dt_ms: f64, time_seconds: f64) -> Result<JsValue, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
             let input = self.driver.take_frame(&mut self.state);
-            self.state.update(dt_ms, input);
-            Ok(JsValue::from_str(&self.state.snapshot_json()))
+            let frame = self.state.frame(dt_ms, input);
+            if frame.service_response_queued {
+                self.driver.dirty = true;
+            }
+            self.driver.synchronize_context(&self.state);
+
+            let pov_active = frame.output.mode == super::PresentationMode::Pov;
+            let organism_upload = frame
+                .organisms_changed
+                .then(|| self.state.pov_organisms.upload());
+            let time = time_seconds.rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
+            let rendered = pov_active
+                && POV_RENDERER.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(renderer) = slot.as_mut() else {
+                        return false;
+                    };
+                    let (width, height) = renderer.size();
+                    let camera = self.state.controller.pov_camera();
+                    let shadow = pov_host::shadow_frame(
+                        camera,
+                        &self.state.pov_chunks,
+                        self.state.pov_organisms.shadow_bounds(),
+                        pov_host::shadow_resolution(self.state.controller.world().tier()),
+                    );
+                    let params = pov_host::frame_params(
+                        camera,
+                        width as f32 / height.max(1) as f32,
+                        self.state.pov_radius,
+                        CLEAR_COLOR,
+                        time,
+                        self.state.controller.pov_toggles(),
+                        shadow,
+                    );
+                    renderer.render_pov(
+                        &params,
+                        &frame.uploads,
+                        &frame.removes,
+                        organism_upload,
+                        CLEAR_COLOR,
+                        None,
+                        frame.output.pov.render_scale,
+                    )
+                });
+            let counters = self.state.pov_chunks.counters();
+            let organism_counts = self.state.pov_organisms.counters();
+            let snapshot = self.state.snapshot_json();
+            let needs_frame = frame.output.needs_frame || self.driver.needs_frame();
+            Ok(JsValue::from_str(&format!(
+                concat!(
+                    "{{\"snapshot\":{},\"map_dirty\":{},\"needs_frame\":{},",
+                    "\"update_serial\":{},\"travel\":{:.6},",
+                    "\"pov\":{{\"active\":{},\"rendered\":{},",
+                    "\"camera\":[{:.1},{:.1},{:.1}],",
+                    "\"chunks\":{},\"meshed\":{},\"uploads\":{},",
+                    "\"organisms\":{{\"published\":{},\"drawn\":{},",
+                    "\"waiting_for_ground\":{}}}}}}}"
+                ),
+                snapshot,
+                frame.output.dirty.map,
+                needs_frame,
+                frame.output.update_serial,
+                frame.output.travel,
+                pov_active,
+                rendered,
+                frame.output.pov.position[0],
+                frame.output.pov.position[1],
+                frame.output.pov.position[2],
+                self.state.pov_chunks.len(),
+                counters.meshed,
+                frame.uploads.len(),
+                organism_counts.published,
+                organism_counts.drawn(),
+                organism_counts.waiting_for_ground,
+            )))
         }
 
         /// Queue one exact descriptor id and optional payload. DOM controls
@@ -1709,7 +1518,7 @@ mod wasm {
             }
             let action = super::ViewerAction::decode_exact(&id, value.as_deref())
                 .map_err(|error| JsValue::from_str(&error.to_string()))?;
-            self.driver.enqueue_action(action);
+            self.driver.enqueue_action(&mut self.state, action);
             Ok(())
         }
 
@@ -1748,7 +1557,7 @@ mod wasm {
                     super_key,
                 },
             };
-            self.driver.handle(&self.state, event)
+            self.driver.handle(&mut self.state, event)
         }
 
         /// Translate one pointer position in physical canvas pixels.
@@ -1761,7 +1570,7 @@ mod wasm {
         ) -> Result<bool, JsValue> {
             let view = parse_view(&view)?;
             self.driver.handle(
-                &self.state,
+                &mut self.state,
                 super::NormalizedInputEvent::PointerMoved {
                     pointer: u64::from(pointer),
                     position: [x, y],
@@ -1791,7 +1600,7 @@ mod wasm {
                 other => super::PointerButton::Other(other),
             };
             Ok(self.driver.handle(
-                &self.state,
+                &mut self.state,
                 super::NormalizedInputEvent::PointerButton {
                     pointer: u64::from(pointer),
                     button,
@@ -1809,7 +1618,7 @@ mod wasm {
         /// End a pointer gesture after DOM `pointercancel` or lost capture.
         pub fn pointer_cancel(&mut self, pointer: u32) -> bool {
             self.driver.handle(
-                &self.state,
+                &mut self.state,
                 super::NormalizedInputEvent::PointerCancelled {
                     pointer: u64::from(pointer),
                 },
@@ -1820,7 +1629,7 @@ mod wasm {
         pub fn wheel(&mut self, delta: f64, lines: bool, view: String) -> Result<bool, JsValue> {
             let view = parse_view(&view)?;
             Ok(self.driver.handle(
-                &self.state,
+                &mut self.state,
                 super::NormalizedInputEvent::Wheel {
                     delta: if lines {
                         super::WheelDelta::Lines(delta)
@@ -1840,7 +1649,7 @@ mod wasm {
         /// Clear every held gesture on browser/window focus loss.
         pub fn host_focus(&mut self, focused: bool) {
             self.driver.handle(
-                &self.state,
+                &mut self.state,
                 super::NormalizedInputEvent::FocusChanged { focused },
             );
         }
@@ -1848,11 +1657,16 @@ mod wasm {
         /// Whether held input or queued work needs another animation frame.
         pub fn needs_frame(&self) -> bool {
             self.driver.needs_frame()
+                || self
+                    .state
+                    .last_output
+                    .as_ref()
+                    .is_some_and(|output| output.needs_frame)
         }
 
         /// Drain typed platform effects after the action frame is reduced.
         pub fn take_effects(&mut self) -> String {
-            super::effects_json(std::mem::take(&mut self.state.effects))
+            super::effects_json(std::mem::take(&mut self.state.pending_effects))
         }
 
         /// Accept the completed synchronous browser benchmark measurement.
@@ -1860,18 +1674,24 @@ mod wasm {
             self.state.benchmark_ms = milliseconds.max(0.0) as f32;
         }
 
-        /// Report that the browser has a usable WebGPU presentation path.
+        /// Report successful completion of the actual asynchronous renderer
+        /// initialization. A navigator capability probe must not call this.
         pub fn renderer_available(&mut self) {
             self.state.set_renderer_webgpu();
+            self.driver.dirty = true;
         }
 
         /// Report device loss/initialization failure without forging an action.
         pub fn renderer_lost(&mut self) {
+            POV_RENDERER.with(|slot| {
+                slot.borrow_mut().take();
+            });
             self.state.renderer_lost();
             self.driver.mapper.clear_held_state();
             self.driver
                 .mapper
                 .set_context(self.driver.context(&self.state));
+            self.driver.dirty = true;
         }
 
         /// Return the CPU map header (size, channel, renderer) as JSON. The
@@ -1879,17 +1699,16 @@ mod wasm {
         /// the deterministic CPU-composed presentation of the settled window
         /// (phase-7-plan.md §4.1 milestone 2); WebGPU atlas composition
         /// remains a later presentation path.
-        pub fn render_cpu_map(&mut self) -> Result<JsValue, JsValue> {
+        pub fn render_cpu_map(&self) -> Result<JsValue, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
             Ok(JsValue::from_str(&self.state.cpu_map_json()))
         }
 
-        /// Compose the settled window and return the RGBA8 bytes (row 0 =
-        /// north), sized per the [`WebApp::render_cpu_map`] header. Settles
-        /// the window inline on first use.
-        pub fn map_pixels(&mut self) -> Result<Vec<u8>, JsValue> {
+        /// Compose current cache state into RGBA8 bytes (row 0 = north).
+        /// This is presentation-only and performs no world update.
+        pub fn map_pixels(&self) -> Result<Vec<u8>, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
@@ -1908,82 +1727,6 @@ mod wasm {
             Ok(JsValue::from_str(
                 &self.state.inspect_json(world_x, world_y),
             ))
-        }
-
-        /// One POV frame (the native `frame_pov`): apply look/move input,
-        /// stream, sync chunks, and draw through the shared renderer set up
-        /// by [`pov_init`]. Returns a small JSON status; `rendered:false`
-        /// means the renderer is missing or the surface failed — the caller
-        /// should fall back to map mode after repeated failures.
-        pub fn pov_frame(&mut self, dt_ms: f64, time_seconds: f64) -> Result<JsValue, JsValue> {
-            if self.shutdown {
-                return Err(JsValue::from_str("WebApp is shut down"));
-            }
-            let input = self.driver.take_frame(&mut self.state);
-            if self.state.view_mode != super::PresentationMode::Pov {
-                return Ok(JsValue::from_str("{\"active\":false,\"rendered\":false}"));
-            }
-            let (uploads, removes, organisms_changed) = self.state.pov_step(dt_ms, input);
-            let organism_upload = organisms_changed.then(|| self.state.pov_organisms.upload());
-            // The water-wobble clock, wrapped at the shader period like the
-            // native shell so f32 never loses phase precision.
-            let time = time_seconds.rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
-            let rendered = POV_RENDERER.with(|slot| {
-                let mut slot = slot.borrow_mut();
-                let Some(renderer) = slot.as_mut() else {
-                    return false;
-                };
-                let (w, h) = renderer.size();
-                let shadow = pov_host::shadow_frame(
-                    &self.state.pov_camera,
-                    &self.state.pov_chunks,
-                    self.state.pov_organisms.shadow_bounds(),
-                    pov_host::shadow_resolution(self.state.runtime_tier),
-                );
-                let params = pov_host::frame_params(
-                    &self.state.pov_camera,
-                    w as f32 / h.max(1) as f32,
-                    self.state.pov_radius,
-                    CLEAR_COLOR,
-                    time,
-                    pov_host::PovToggles {
-                        shadow_ao: self.state.pov_shadow_ao,
-                        detail_normals: self.state.pov_detail_normals,
-                        water: self.state.pov_water,
-                    },
-                    shadow,
-                );
-                renderer.render_pov(
-                    &params,
-                    &uploads,
-                    &removes,
-                    organism_upload,
-                    CLEAR_COLOR,
-                    None,
-                    self.state.pov_render_scale,
-                )
-            });
-            let camera = &self.state.pov_camera;
-            let counters = self.state.pov_chunks.counters();
-            let organism_counts = self.state.pov_organisms.counters();
-            Ok(JsValue::from_str(&format!(
-                concat!(
-                    "{{\"active\":true,\"rendered\":{},",
-                    "\"camera\":[{:.1},{:.1},{:.1}],",
-                    "\"chunks\":{},\"meshed\":{},\"uploads\":{},",
-                    "\"organisms\":{{\"published\":{},\"drawn\":{},\"waiting_for_ground\":{}}}}}"
-                ),
-                rendered,
-                camera.pos.x,
-                camera.pos.y,
-                camera.pos.z,
-                self.state.pov_chunks.len(),
-                counters.meshed,
-                uploads.len(),
-                organism_counts.published,
-                organism_counts.drawn(),
-                organism_counts.waiting_for_ground,
-            )))
         }
 
         /// Stop accepting frame updates.
@@ -2014,7 +1757,12 @@ mod wasm_input_tests {
         button
             .action(String::from("toggle-refinement"), None)
             .expect("exact pulse action");
-        button.update(0.0).expect("button frame");
+        let first_frame = button
+            .frame(0.0, 0.0)
+            .expect("button frame")
+            .as_string()
+            .expect("frame JSON");
+        assert!(first_frame.contains("\"update_serial\":1"));
         assert!(snapshot(&button).contains("\"refinement\":true"));
         assert!(button
             .action(String::from("Toggle-Refinement"), None)
@@ -2025,6 +1773,12 @@ mod wasm_input_tests {
                 Some(String::from("ignored"))
             )
             .is_err());
+        let second_frame = button
+            .frame(0.0, 0.0)
+            .expect("second button frame")
+            .as_string()
+            .expect("frame JSON");
+        assert!(second_frame.contains("\"update_serial\":2"));
 
         let mut keyboard = WebApp::new(JsValue::from_str("{}")).expect("web app");
         keyboard.surface_focus(true);
@@ -2046,7 +1800,7 @@ mod wasm_input_tests {
             false,
             false,
         ));
-        keyboard.update(0.0).expect("key frame");
+        keyboard.frame(0.0, 0.0).expect("key frame");
         assert!(snapshot(&keyboard).contains("\"refinement\":true"));
         assert!(!keyboard.key_event(
             String::from("period"),
@@ -2060,8 +1814,29 @@ mod wasm_input_tests {
 
         keyboard.surface_focus(false);
         assert!(!keyboard.key_event(String::from("Tab"), true, false, false, false, false, false,));
-        keyboard.update(0.0).expect("toolbar-focus frame");
+        keyboard.frame(0.0, 0.0).expect("toolbar-focus frame");
         assert!(snapshot(&keyboard).contains("\"view\":{\"mode\":\"map\""));
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_adapter_controller_trace_matches_the_native_golden() {
+        let mut app = WebApp::new(JsValue::from_str("{}")).expect("web app");
+        app.renderer_available();
+        app.surface_focus(true);
+        for code in ["KeyW", "Tab", "KeyB"] {
+            assert!(app.key_event(String::from(code), true, false, false, false, false, false,));
+        }
+        let frame = app
+            .frame(100.0, 0.0)
+            .expect("preview frame")
+            .as_string()
+            .expect("frame JSON");
+        assert!(frame.contains("\"update_serial\":1"));
+        assert!(frame.contains("\"travel\":4.000000"));
+        let snapshot = snapshot(&app);
+        assert!(snapshot.contains("\"view\":{\"mode\":\"pov\""));
+        assert!(snapshot.contains("\"shadow_ao\":false"));
+        assert!(snapshot.contains("\"world_pos\":[-0.000,4.000]"));
     }
 }
 
@@ -2163,23 +1938,60 @@ mod tests {
         assert!(!app.contains("MOVE_KEYS"));
         assert!(!app.contains("POV_MOVE"));
         assert!(!app.contains("requestPointerLock"));
+        assert!(app.contains("app.frame(dt, now / 1000)"));
+        assert!(!app.contains("app.update("));
+        assert!(!app.contains("app.pov_frame("));
+    }
+
+    /// A small settle-able window so controller-integration tests stay fast.
+    fn small_controller_app() -> super::BrowserHostState {
+        use world_core::REGION_SIZE;
+
+        let config = world_runtime::StreamConfig {
+            near_radius: 0.5 * REGION_SIZE,
+            far_radius: 1.5 * REGION_SIZE,
+            load_radius: 1.5 * REGION_SIZE,
+            unload_radius: 2.5 * REGION_SIZE,
+            field_resolution: 8,
+            ..world_runtime::StreamConfig::default()
+        };
+        let world = viewer_host::ExplorationWorld::with_runtime(
+            config,
+            world_runtime::Budget::unlimited(),
+            world_runtime::ResourceTier::Low,
+        );
+        super::BrowserHostState {
+            controller: viewer_host::ViewerController::new(world),
+            half_regions: 1,
+            ..super::BrowserHostState::default()
+        }
+    }
+
+    fn settle(state: &mut super::BrowserHostState) {
+        for _ in 0..12 {
+            let _ = state.frame(0.0, viewer_host::input::InputFrame::default());
+        }
     }
 
     #[test]
-    fn browser_button_and_key_paths_share_one_mapper_queue() {
+    fn browser_button_and_key_paths_share_one_controller_queue() {
         use viewer_host::input::{ButtonPhase, Modifiers, NormalizedInputEvent, PhysicalKey};
 
-        let mut button_state = super::WebAppState::default();
+        let mut button_state = small_controller_app();
         let mut button_driver = super::BrowserViewerDriver::default();
         button_driver.set_surface_focus(&button_state, true);
-        button_driver.enqueue_action(viewer_host::ViewerAction::ToggleRefinement);
-        let _ = button_driver.take_frame(&mut button_state);
+        button_driver.enqueue_action(
+            &mut button_state,
+            viewer_host::ViewerAction::ToggleRefinement,
+        );
+        let input = button_driver.take_frame(&mut button_state);
+        let _ = button_state.frame(0.0, input);
 
-        let mut key_state = super::WebAppState::default();
+        let mut key_state = small_controller_app();
         let mut key_driver = super::BrowserViewerDriver::default();
         key_driver.set_surface_focus(&key_state, true);
         assert!(key_driver.handle(
-            &key_state,
+            &mut key_state,
             NormalizedInputEvent::Key {
                 key: PhysicalKey::Period,
                 phase: ButtonPhase::Pressed,
@@ -2187,30 +1999,73 @@ mod tests {
                 modifiers: Modifiers::default(),
             },
         ));
-        let _ = key_driver.take_frame(&mut key_state);
+        let input = key_driver.take_frame(&mut key_state);
+        let _ = key_state.frame(0.0, input);
 
-        assert!(button_state.refinement_enabled);
+        assert!(button_state.controller.map_preferences().refinement);
         assert_eq!(
-            button_state.refinement_enabled,
-            key_state.refinement_enabled
+            button_state.controller.map_preferences(),
+            key_state.controller.map_preferences()
         );
         assert_eq!(button_state.last_action, key_state.last_action);
     }
 
     #[test]
-    fn browser_surface_focus_and_primary_drag_are_mapper_owned() {
+    fn pre_frame_tab_previews_pov_context_for_held_and_following_keys() {
+        use viewer_host::input::{ButtonPhase, Modifiers, NormalizedInputEvent, PhysicalKey};
+
+        let mut state = small_controller_app();
+        state.set_renderer_webgpu();
+        let mut driver = super::BrowserViewerDriver::default();
+        driver.set_surface_focus(&state, true);
+
+        // W starts held in Map, then Tab changes the preview before both the
+        // following B event and the one per-frame intent sample.
+        for key in [PhysicalKey::KeyW, PhysicalKey::Tab, PhysicalKey::KeyB] {
+            assert!(driver.handle(
+                &mut state,
+                NormalizedInputEvent::Key {
+                    key,
+                    phase: ButtonPhase::Pressed,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ));
+        }
+
+        let input = driver.take_frame(&mut state);
+        assert_eq!(input.map_axis, [0, 0]);
+        assert_eq!(input.pov_axis, [0, 1, 0]);
+        let frame = state.frame(0.0, input);
+        assert_eq!(frame.output.mode, viewer_host::PresentationMode::Pov);
+        assert!(
+            !frame.output.pov.shadow_ao,
+            "B used the previewed POV binding"
+        );
+        assert!(!frame.output.effects.iter().any(|effect| matches!(
+            effect,
+            viewer_host::ViewerEffect::ReportWarning(warning)
+                if warning.id == "discovery-no-anchor"
+        )));
+    }
+
+    #[test]
+    fn browser_surface_focus_and_primary_drag_remain_mapper_owned() {
         use viewer_host::input::{
             ButtonPhase, Modifiers, NormalizedInputEvent, PhysicalKey, PointerButton,
         };
 
-        let mut state = super::WebAppState::new("{\"webgpu\":true}");
-        state.apply_action(viewer_host::ViewerAction::SetPresentation(
+        let mut state = small_controller_app();
+        state.set_renderer_webgpu();
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
             viewer_host::PresentationMode::Pov,
         ));
+        let _ = state.frame(0.0, viewer_host::input::InputFrame::default());
+
         let mut driver = super::BrowserViewerDriver::default();
         driver.set_surface_focus(&state, false);
         assert!(!driver.handle(
-            &state,
+            &mut state,
             NormalizedInputEvent::Key {
                 key: PhysicalKey::Tab,
                 phase: ButtonPhase::Pressed,
@@ -2218,11 +2073,14 @@ mod tests {
                 modifiers: Modifiers::default(),
             },
         ));
-        assert_eq!(state.view_mode, viewer_host::PresentationMode::Pov);
+        assert_eq!(
+            state.controller.layout().mode,
+            viewer_host::PresentationMode::Pov
+        );
 
         driver.set_surface_focus(&state, true);
         driver.handle(
-            &state,
+            &mut state,
             NormalizedInputEvent::PointerMoved {
                 pointer: 7,
                 position: [10.0, 20.0],
@@ -2231,7 +2089,7 @@ mod tests {
         );
         assert_eq!(driver.take_frame(&mut state).look_delta, [0.0, 0.0]);
         assert!(driver.handle(
-            &state,
+            &mut state,
             NormalizedInputEvent::PointerButton {
                 pointer: 7,
                 button: PointerButton::Primary,
@@ -2241,7 +2099,7 @@ mod tests {
             },
         ));
         assert!(driver.handle(
-            &state,
+            &mut state,
             NormalizedInputEvent::PointerMoved {
                 pointer: 7,
                 position: [14.0, 17.0],
@@ -2250,67 +2108,50 @@ mod tests {
         ));
         assert_eq!(driver.take_frame(&mut state).look_delta, [4.0, -3.0]);
         driver.handle(
-            &state,
+            &mut state,
             NormalizedInputEvent::PointerCancelled { pointer: 7 },
         );
         assert!(!driver.take_frame(&mut state).primary_drag);
     }
 
     #[test]
-    fn web_app_snapshot_tracks_inline_state() {
-        let mut app = super::WebAppState::new("{\"tier\":\"mid\"}");
-        app.update(
-            16.666_667,
-            viewer_host::input::InputFrame {
-                map_axis: [1, 0],
-                ..viewer_host::input::InputFrame::default()
-            },
-        );
-        app.apply_action(viewer_host::ViewerAction::ToggleRefinement);
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"tier\":{\"name\":\"WebMid\""));
-        assert!(snapshot.contains("\"region\":[0,0]"));
-        assert!(snapshot.contains("\"executor\":{\"mode\":\"inline\""));
-        assert!(snapshot.contains("\"renderer\":{\"mode\":\"cpu-fallback\""));
-        assert!(snapshot.contains("\"settle_hash\":\"0x"));
-        assert!(snapshot.contains("\"last_action\":\"toggle-refinement\""));
-    }
+    fn one_browser_frame_performs_exactly_one_shared_world_update() {
+        let mut state = small_controller_app();
+        assert_eq!(state.controller.world().update_serial(), 0);
 
-    /// A small settle-able window so the map tests stay fast (the viz.rs
-    /// fixture pattern).
-    fn small_window_app() -> super::WebAppState {
-        use world_core::REGION_SIZE;
-        super::WebAppState {
-            map: world_runtime::RegionMap::new(world_runtime::StreamConfig {
-                near_radius: 1.5 * REGION_SIZE,
-                far_radius: 3.0 * REGION_SIZE,
-                load_radius: 3.0 * REGION_SIZE,
-                unload_radius: 4.0 * REGION_SIZE,
-                field_resolution: 8,
-                ..world_runtime::StreamConfig::default()
-            }),
-            half_regions: 3,
-            ..super::WebAppState::default()
-        }
+        let first = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(first.output.frame, 1);
+        assert_eq!(first.output.update_serial, 1);
+        assert_eq!(state.controller.world().update_serial(), 1);
+
+        let second = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(second.output.frame, 2);
+        assert_eq!(second.output.update_serial, 2);
+        assert_eq!(state.controller.world().update_serial(), 2);
+
+        let serial = state.controller.world().update_serial();
+        let _ = state.compose_map();
+        let _ = state.cpu_map_json();
+        let _ = state.inspect_json(0.0, 0.0);
+        let _ = state.snapshot_json();
+        assert_eq!(state.controller.world().update_serial(), serial);
     }
 
     #[test]
-    fn movement_matches_the_native_speed_contract() {
-        // main.rs `apply_movement`: 500 u/s, sprint x4, normalized
-        // diagonals, dt clamped to 100ms.
-        let mut app = super::WebAppState::default();
-        app.update(
+    fn map_input_uses_the_shared_movement_contract() {
+        let mut state = small_controller_app();
+        let moved = state.frame(
             16.666_667,
             viewer_host::input::InputFrame {
                 map_axis: [1, 0],
                 ..viewer_host::input::InputFrame::default()
             },
         );
-        assert!((app.world_pos.0 - 500.0 / 60.0).abs() < 0.01);
-        assert_eq!(app.world_pos.1, 0.0);
+        assert!((moved.output.traveler.0 - 500.0 / 60.0).abs() < 0.01);
+        assert_eq!(moved.output.traveler.1, 0.0);
 
-        let mut diagonal = super::WebAppState::default();
-        diagonal.update(
+        let mut diagonal = small_controller_app();
+        let moved = diagonal.frame(
             1000.0,
             viewer_host::input::InputFrame {
                 map_axis: [1, 1],
@@ -2318,345 +2159,197 @@ mod tests {
             },
         );
         let expected = 500.0 * 0.1 / std::f64::consts::SQRT_2;
-        assert!((diagonal.world_pos.0 - expected).abs() < 1e-9);
-        assert!((diagonal.world_pos.1 - expected).abs() < 1e-9);
-
-        let mut sprint = super::WebAppState::default();
-        sprint.update(
-            16.666_667,
-            viewer_host::input::InputFrame {
-                map_axis: [-1, 0],
-                sprint: true,
-                ..viewer_host::input::InputFrame::default()
-            },
-        );
-        assert!((sprint.world_pos.0 + 4.0 * 500.0 / 60.0).abs() < 0.05);
+        assert!((moved.output.traveler.0 - expected).abs() < 1e-9);
+        assert!((moved.output.traveler.1 - expected).abs() < 1e-9);
     }
 
     #[test]
-    fn movement_streams_the_window_after_the_first_settle() {
-        let mut app = small_window_app();
-        app.compose_map();
-        // Sprint east; budgeted per-frame updates must keep the streamed
-        // window following the player (the native streaming contract).
-        for _ in 0..40 {
-            app.update(
-                100.0,
-                viewer_host::input::InputFrame {
-                    map_axis: [1, 0],
-                    sprint: true,
-                    ..viewer_host::input::InputFrame::default()
-                },
-            );
-        }
-        for _ in 0..5 {
-            app.update(100.0, viewer_host::input::InputFrame::default());
-        }
-        let center = world_core::RegionCoord::from_world(app.world_pos.0, app.world_pos.1);
-        assert!(app.world_pos.0 >= 8000.0 - 1e-6);
-        assert!(
-            app.map.cache().get(center).is_some(),
-            "the window followed the player"
-        );
-    }
-
-    #[test]
-    fn cpu_map_header_describes_the_window() {
-        let app = super::WebAppState::default();
-        let header = app.cpu_map_json();
-        // Low tier: load radius 12 regions -> a 25-region window at the
-        // default 32 cells/region.
-        assert!(header.contains("\"kind\":\"rgba8\""));
-        assert!(header.contains("\"width\":800"));
-        assert!(header.contains("\"height\":800"));
-        assert!(header.contains("\"channel\":\"composite\""));
-        assert!(
-            !header.contains("\"pixels\""),
-            "pixels travel as raw bytes, not JSON"
-        );
-    }
-
-    #[test]
-    fn map_pixels_compose_the_settled_window() {
-        let mut app = small_window_app();
-        let side = app.map_side();
-        assert_eq!(side, 7 * 8);
-        let pixels = app.compose_map();
-        assert_eq!(pixels.len(), side * side * 4);
-        let first = &pixels[0..4];
-        assert!(
-            pixels.chunks_exact(4).any(|px| px != first),
-            "a composed window must not be a solid color"
-        );
-        assert!(
-            pixels.chunks_exact(4).all(|px| px[3] == 255),
-            "the map is opaque"
-        );
-
-        // Orientation + palette pin: an interior cell of region (0, 0) must
-        // match the shared mapcolor Composite table exactly, at the pixel
-        // the north-up layout places it (the viz.rs paint contract).
-        let coord = world_core::RegionCoord::new(0, 0);
-        let tiles = app.map.cache().get(coord).expect("settled window");
-        let (cx, cy) = (5u16, 5u16);
-        let expected = world_runtime::mapcolor::composite_cell_color(
-            tiles.channels[world_runtime::CHANNEL_ELEVATION]
-                .as_ref()
-                .expect("tile")
-                .get(cx, cy),
-            world_core::Biome::from_id(tiles.biome.as_ref().expect("tile").get(cx, cy)),
-            tiles.channels[world_runtime::CHANNEL_RIVER]
-                .as_ref()
-                .expect("tile")
-                .get(cx, cy),
-            tiles.channels[world_runtime::CHANNEL_WETNESS]
-                .as_ref()
-                .expect("tile")
-                .get(cx, cy),
-            app.map.dominant_species_id(coord, cx, cy),
-        );
-        let px = 3 * 8 + usize::from(cx);
-        let py = 3 * 8 + usize::from(8 - 1 - cy);
-        let offset = (py * side + px) * 4;
-        assert_eq!(&pixels[offset..offset + 3], &expected);
-    }
-
-    #[test]
-    fn snapshot_carries_panel_stats_and_inspect_reads_the_cursor_cell() {
-        let mut app = small_window_app();
-        app.compose_map();
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"stats\":{\"loaded\":"));
-        assert!(snapshot.contains("\"regen_by_layer\":[{\"name\":\"terrain\",\"total\":"));
-        assert!(snapshot.contains("\"bias\":[0.000"));
-        assert!(app.last_stats.active_regions > 0);
-        assert!(app.regen_totals.iter().sum::<u64>() > 0);
-
-        let inside = app.inspect_json(10.0, 10.0);
-        assert!(inside.contains("\"region\":[0,0]"));
-        assert!(inside.contains("\"status\":\"ready\""));
-        assert!(inside.contains("\"biome\":\""));
-        assert!(!inside.contains("\"elevation\":null"));
-
-        let outside = app.inspect_json(1e7, 1e7);
-        assert!(outside.contains("\"status\":\"unloaded\""));
-        assert!(outside.contains("\"elevation\":null"));
-    }
-
-    #[test]
-    fn pov_step_moves_the_camera_and_meshes_chunks() {
-        let mut app = small_window_app();
-        app.compose_map();
-        app.set_renderer_webgpu();
-        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+    fn pov_tick_keeps_camera_traveler_and_stream_center_aligned() {
+        let mut state = small_controller_app();
+        state.set_renderer_webgpu();
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
             viewer_host::PresentationMode::Pov,
         ));
-        assert_eq!(app.view_mode, super::PresentationMode::Pov);
+        let entered = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(entered.output.mode, viewer_host::PresentationMode::Pov);
+        assert!(entered.output.pov.initialized);
+        assert!(!state.pov_chunks.is_empty());
 
-        let before = app.pov_camera.pos;
-        let (uploads, _, _) = app.pov_step(
+        let before = entered.output.pov.position;
+        let moved = state.frame(
             100.0,
             viewer_host::input::InputFrame {
                 pov_axis: [0, 1, 0],
                 ..viewer_host::input::InputFrame::default()
             },
         );
+        assert_eq!(moved.output.update_serial, entered.output.update_serial + 1);
+        assert_ne!(moved.output.pov.position, before);
+        assert_eq!(
+            moved.output.traveler,
+            (moved.output.pov.position[0], moved.output.pov.position[1])
+        );
+        assert_eq!(
+            state.controller.world().traveler().position,
+            moved.output.traveler
+        );
+        let camera_center = world_core::RegionCoord::from_world(
+            moved.output.pov.position[0],
+            moved.output.pov.position[1],
+        );
+        let traveler_center =
+            world_core::RegionCoord::from_world(moved.output.traveler.0, moved.output.traveler.1);
+        assert_eq!(camera_center, traveler_center);
         assert!(
-            !app.pov_chunks.is_empty(),
-            "chunks meshed around the camera"
-        );
-        assert!(
-            !uploads.is_empty(),
-            "first sync yields amortized chunk uploads"
-        );
-        let moved = app.pov_camera.pos - before;
-        assert!(moved.length() > 0.0, "fly movement advanced the camera");
-
-        let yaw = app.pov_camera.yaw;
-        app.pov_step(
-            16.0,
-            viewer_host::input::InputFrame {
-                look_delta: [100.0, 0.0],
-                primary_drag: true,
-                ..viewer_host::input::InputFrame::default()
-            },
-        );
-        assert_ne!(app.pov_camera.yaw, yaw, "look input turns the camera");
-
-        // Walk mode grounds the camera and keeps it grounded while moving.
-        app.apply_action(viewer_host::ViewerAction::ToggleWalk);
-        assert!(app.pov_camera.walk);
-        for _ in 0..30 {
-            app.pov_step(
-                100.0,
-                viewer_host::input::InputFrame {
-                    pov_axis: [0, 1, 0],
-                    ..viewer_host::input::InputFrame::default()
-                },
-            );
-        }
-        let (ground, _) = pov_host::walk_ground(
-            &app.pov_chunks,
-            &app.map,
-            (app.pov_camera.pos.x, app.pov_camera.pos.y),
-        );
-        assert!(
-            (app.pov_camera.pos.z - (ground + pov_host::EYE_HEIGHT)).abs() < 1.0,
-            "walk mode follows the terrain at eye height"
+            state
+                .controller
+                .world()
+                .map()
+                .cache()
+                .get(traveler_center)
+                .is_some(),
+            "the single world update streamed around the shared traveler"
         );
     }
 
     #[test]
-    fn channel_actions_change_the_painted_channel() {
-        let mut app = small_window_app();
-        let composite = app.compose_map();
-        app.apply_action(viewer_host::ViewerAction::SetMapChannel(
+    fn map_composition_reads_the_current_cache_without_updating_it() {
+        let mut state = small_controller_app();
+        settle(&mut state);
+        let serial = state.controller.world().update_serial();
+        let side = state.map_side();
+        let pixels = state.compose_map();
+
+        assert_eq!(side, 3 * 8);
+        assert_eq!(pixels.len(), side * side * 4);
+        assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(
+            pixels.chunks_exact(4).any(|pixel| pixel != &pixels[0..4]),
+            "the settled cache must not compose as one flat color"
+        );
+        assert_eq!(state.controller.world().update_serial(), serial);
+
+        let snapshot = state.snapshot_json();
+        assert!(snapshot.contains("\"stats\":{\"loaded\":"));
+        assert!(state
+            .inspect_json(10.0, 10.0)
+            .contains("\"status\":\"ready\""));
+    }
+
+    #[test]
+    fn controller_actions_drive_map_and_platform_effects() {
+        let mut state = small_controller_app();
+        settle(&mut state);
+        let composite = state.compose_map();
+        state.enqueue_action(viewer_host::ViewerAction::SetMapChannel(
             viewer_host::Channel::Elevation,
         ));
-        assert!(app.cpu_map_json().contains("\"channel\":\"elevation\""));
-        let elevation = app.compose_map();
-        assert_ne!(composite, elevation, "channels paint differently");
-        app.apply_action(viewer_host::ViewerAction::SetMapChannel(
-            viewer_host::Channel::Composite,
-        ));
-        assert!(app.cpu_map_json().contains("\"channel\":\"composite\""));
-        assert_eq!(app.compose_map(), composite);
-    }
+        state.enqueue_action(viewer_host::ViewerAction::SetStorageEnabled(true));
+        state.enqueue_action(viewer_host::ViewerAction::SaveSession);
+        state.enqueue_action(viewer_host::ViewerAction::LoadSession);
+        let frame = state.frame(0.0, viewer_host::input::InputFrame::default());
 
-    #[test]
-    fn renderer_device_loss_falls_back_to_cpu() {
-        let mut app = super::WebAppState::new("{\"webgpu\":true}");
-        assert!(app.snapshot_json().contains("\"mode\":\"webgpu-atlas\""));
-        app.renderer_lost();
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"mode\":\"cpu-fallback\""));
-        assert!(snapshot.contains("\"device_losses\":1"));
-        assert!(snapshot.contains("WebGPU device lost"));
-    }
-
-    #[test]
-    fn unavailable_worker_modes_do_not_claim_async_success() {
-        let mut app = super::WebAppState::default();
-        let inline = app.settle_hash();
-        app.apply_action(viewer_host::ViewerAction::SetWorkerBackend(
-            viewer_host::action::WorkerBackend::Workers,
-        ));
-        assert_eq!(inline, app.settle_hash());
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"mode\":\"inline\""));
-        assert!(snapshot.contains("Worker execution is unavailable"));
-        assert!(matches!(
-            app.effects.as_slice(),
-            [viewer_host::ViewerEffect::ConfigureWorkerBackend(
-                viewer_host::action::WorkerBackend::Workers
-            )]
-        ));
-    }
-
-    #[test]
-    fn tier_changes_preserve_settle_hash() {
-        let mut app = super::WebAppState::default();
-        let low = app.settle_hash();
-        app.apply_action(viewer_host::ViewerAction::SetResourceTier(
-            world_runtime::ResourceTier::Mid,
-        ));
-        assert_eq!(low, app.settle_hash());
-        app.apply_action(viewer_host::ViewerAction::SetResourceTier(
-            world_runtime::ResourceTier::High,
-        ));
-        assert_eq!(low, app.settle_hash());
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"runtime\":\"high\""));
-        assert!(snapshot.contains("\"cache_ceiling_mb\":160"));
-    }
-
-    #[test]
-    fn storage_actions_wait_for_platform_completion() {
-        let mut app = super::WebAppState::default();
-        app.update(
-            16.0,
-            viewer_host::input::InputFrame {
-                map_axis: [1, 0],
-                ..viewer_host::input::InputFrame::default()
-            },
+        assert_eq!(
+            state.controller.map_preferences().channel,
+            viewer_host::Channel::Elevation
         );
-        let before = app.settle_hash();
-        app.apply_action(viewer_host::ViewerAction::SetStorageEnabled(true));
-        app.apply_action(viewer_host::ViewerAction::SaveSession);
-        app.apply_action(viewer_host::ViewerAction::LoadSession);
-        let snapshot = app.snapshot_json();
-        assert_eq!(before, app.settle_hash());
-        assert!(snapshot.contains("\"mode\":\"indexeddb\""));
-        assert!(snapshot.contains("\"records\":0"));
-        assert!(snapshot.contains("\"failures\":0"));
-        assert_eq!(app.effects.len(), 2);
+        assert_ne!(state.compose_map(), composite);
+        assert_eq!(state.storage, "memory");
+        assert!(frame.output.effects.iter().any(|effect| matches!(
+            effect,
+            viewer_host::ViewerEffect::ConfigureStorage { enabled: true }
+        )));
+        assert!(frame
+            .output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, viewer_host::ViewerEffect::PersistSession(_))));
+        assert!(frame
+            .output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, viewer_host::ViewerEffect::LoadSession(_))));
+        let save_id = frame
+            .output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                viewer_host::ViewerEffect::PersistSession(request) => Some(request.request_id),
+                _ => None,
+            })
+            .expect("save request");
+        let load_id = frame
+            .output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                viewer_host::ViewerEffect::LoadSession(request) => Some(*request),
+                _ => None,
+            })
+            .expect("load request");
+        assert!(frame.service_response_queued);
+        assert!(state.controller.request_pending(save_id));
+        assert!(state.controller.request_pending(load_id));
+        assert_eq!(state.service_sequence, 2);
+
+        let failed = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert!(!state.controller.request_pending(save_id));
+        assert!(!state.controller.request_pending(load_id));
+        assert_eq!(
+            failed
+                .output
+                .effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    viewer_host::ViewerEffect::ReportWarning(warning)
+                        if warning.id == "browser-service-unavailable"
+                ))
+                .count(),
+            2
+        );
+        assert!(!failed.service_response_queued);
     }
 
     #[test]
-    fn unavailable_pov_keeps_map_mode() {
-        let mut app = super::WebAppState::default();
-        let before = app.settle_hash();
-        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+    fn webgpu_capability_is_false_until_renderer_init_and_loss_falls_back() {
+        let mut state = small_controller_app();
+        assert!(!state.controller.pov_state().supported);
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
             viewer_host::PresentationMode::Pov,
         ));
-        let snapshot = app.snapshot_json();
-        assert_eq!(before, app.settle_hash());
-        assert!(snapshot.contains("\"view\":{\"mode\":\"map\""));
-        assert!(snapshot.contains("POV renderer unavailable"));
-    }
+        let unavailable = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(unavailable.output.mode, viewer_host::PresentationMode::Map);
+        assert!(state.snapshot_json().contains("POV is unavailable"));
 
-    #[test]
-    fn webgpu_opens_the_pov_gate_and_device_loss_returns_to_map() {
-        // phase-7-plan.md §9.9: the POV gate follows the GPU renderer (no
-        // CPU POV twin exists on any platform), and device-loss paths
-        // return to map mode cleanly instead of stranding the viewer.
-        let mut app = super::WebAppState::new("{\"webgpu\":true}");
-        let before = app.settle_hash();
-        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+        state.set_renderer_webgpu();
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
             viewer_host::PresentationMode::Pov,
         ));
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"view\":{\"mode\":\"pov\",\"focused\":\"pov\""));
-        assert!(!snapshot.contains("pointer_lock"));
-        app.renderer_lost();
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"view\":{\"mode\":\"map\",\"focused\":\"map\""));
-        assert!(snapshot.contains("POV requires WebGPU; returned to map mode"));
-        // Recovery re-opens the gate without touching world identity.
-        app.set_renderer_webgpu();
-        app.apply_action(viewer_host::ViewerAction::SetPresentation(
-            viewer_host::PresentationMode::Pov,
-        ));
-        assert!(app.snapshot_json().contains("\"view\":{\"mode\":\"pov\""));
-        assert_eq!(before, app.settle_hash());
-    }
+        let available = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(available.output.mode, viewer_host::PresentationMode::Pov);
+        let serial = state.controller.world().update_serial();
 
-    #[test]
-    fn pov_config_actions_are_presentation_only() {
-        // The native POV surface mirrored in the browser (walk, the B/N/V
-        // diagnostic toggles, the render scale) is derived presentation:
-        // every action leaves the settle hash untouched.
-        let mut app = super::WebAppState::new("{\"webgpu\":true}");
-        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+        state.renderer_lost();
+        assert_eq!(
+            state.controller.layout().mode,
             viewer_host::PresentationMode::Pov,
-        ));
-        let before = app.settle_hash();
-        app.apply_action(viewer_host::ViewerAction::ToggleWalk);
-        app.apply_action(viewer_host::ViewerAction::TogglePovShadowAo);
-        app.apply_action(viewer_host::ViewerAction::TogglePovDetailNormals);
-        app.apply_action(viewer_host::ViewerAction::TogglePovWater);
-        app.apply_action(viewer_host::ViewerAction::SetPovRenderScale(0.5));
-        let snapshot = app.snapshot_json();
-        assert_eq!(before, app.settle_hash());
-        assert!(snapshot.contains(
-            "\"pov\":{\"motion\":\"walk\",\"shadow_ao\":false,\"detail_normals\":false,\
-             \"water\":false,\"render_scale\":0.50}"
-        ));
-        app.apply_action(viewer_host::ViewerAction::ToggleWalk);
-        app.apply_action(viewer_host::ViewerAction::SetPovRenderScale(1.0));
-        let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"motion\":\"fly\""));
-        assert!(snapshot.contains("\"render_scale\":1.00"));
-        assert_eq!(before, app.settle_hash());
+            "a platform callback cannot mutate the controller between ticks"
+        );
+        assert_eq!(state.controller.world().update_serial(), serial);
+        let fallback = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(fallback.output.update_serial, serial + 1);
+        assert_eq!(
+            state.controller.layout().mode,
+            viewer_host::PresentationMode::Map
+        );
+        assert!(!state.controller.pov_state().supported);
+        assert!(fallback.output.effects.iter().any(|effect| matches!(
+            effect,
+            viewer_host::ViewerEffect::ReportWarning(warning)
+                if warning.id == "webgpu-device-lost"
+        )));
+        assert_eq!(state.renderer, "cpu-fallback");
+        assert_eq!(state.device_losses, 1);
     }
 }

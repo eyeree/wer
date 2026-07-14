@@ -38,6 +38,12 @@ if (!app.includes("origin_feature_hash")) {
 if (!app.includes("new mod.WebApp")) {
   throw new Error("app.js does not construct the WebApp facade");
 }
+if (!app.includes("app.frame(dt, now / 1000)")) {
+  throw new Error("app.js does not drive the single shared frame facade");
+}
+if (app.includes("app.pov_frame(") || app.includes("app.update(")) {
+  throw new Error("app.js contains a second mode-specific logical frame path");
+}
 if (!app.includes("render_cpu_map")) {
   throw new Error("app.js does not render the CPU map buffer");
 }
