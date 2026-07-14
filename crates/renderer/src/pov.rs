@@ -346,12 +346,19 @@ struct OrganismParamsRaw {
     shadow: [f32; 4],
 }
 
-/// Canonical primitive vertex shared by both organism meshes.
+/// Canonical primitive vertex shared by both organism meshes and CPU-side
+/// presentation queries.
+///
+/// Positions are in the renderer's unit primitive space. Keeping this exact
+/// vertex type public lets picking consume the same cached icosphere topology
+/// that is uploaded to the GPU instead of maintaining a second mesh.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-struct PrimitiveVertex {
-    position: [f32; 3],
-    normal: [f32; 3],
+pub struct PovPrimitiveVertex {
+    /// Canonical unit-primitive position.
+    pub position: [f32; 3],
+    /// Canonical unit-primitive normal.
+    pub normal: [f32; 3],
 }
 
 /// Stable packed instance format. Attribute groups intentionally align to
@@ -490,7 +497,7 @@ impl PrimitiveMesh {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         label: &'static str,
-        vertices: &[PrimitiveVertex],
+        vertices: &[PovPrimitiveVertex],
         indices: &[u16],
     ) -> Self {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -515,7 +522,7 @@ impl PrimitiveMesh {
     }
 }
 
-fn cube_geometry() -> (Vec<PrimitiveVertex>, Vec<u16>) {
+fn cube_geometry() -> (Vec<PovPrimitiveVertex>, Vec<u16>) {
     // Four independent vertices per face retain flat face normals.
     let faces = [
         (
@@ -580,7 +587,7 @@ fn cube_geometry() -> (Vec<PrimitiveVertex>, Vec<u16>) {
         vertices.extend(
             positions
                 .into_iter()
-                .map(|position| PrimitiveVertex { position, normal }),
+                .map(|position| PovPrimitiveVertex { position, normal }),
         );
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -608,7 +615,7 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn icosphere_geometry() -> (Vec<PrimitiveVertex>, Vec<u16>) {
+fn build_icosphere_geometry() -> (Vec<PovPrimitiveVertex>, Vec<u16>) {
     let phi = (1.0 + 5.0_f32.sqrt()) * 0.5;
     let base = [
         [-1.0, phi, 0.0],
@@ -624,11 +631,11 @@ fn icosphere_geometry() -> (Vec<PrimitiveVertex>, Vec<u16>) {
         [-phi, 0.0, -1.0],
         [-phi, 0.0, 1.0],
     ];
-    let mut vertices: Vec<PrimitiveVertex> = base
+    let mut vertices: Vec<PovPrimitiveVertex> = base
         .into_iter()
         .map(|p| {
             let normal = normalize3(p);
-            PrimitiveVertex {
+            PovPrimitiveVertex {
                 position: [normal[0] * 0.5, normal[1] * 0.5, normal[2] * 0.5],
                 normal,
             }
@@ -668,14 +675,14 @@ fn icosphere_geometry() -> (Vec<PrimitiveVertex>, Vec<u16>) {
     }
     for _ in 0..2 {
         let mut midpoint_cache: HashMap<(u16, u16), u16> = HashMap::new();
-        let mut midpoint = |a: u16, b: u16, vertices: &mut Vec<PrimitiveVertex>| {
+        let mut midpoint = |a: u16, b: u16, vertices: &mut Vec<PovPrimitiveVertex>| {
             let key = (a.min(b), a.max(b));
             *midpoint_cache.entry(key).or_insert_with(|| {
                 let pa = vertices[usize::from(a)].normal;
                 let pb = vertices[usize::from(b)].normal;
                 let normal = normalize3([pa[0] + pb[0], pa[1] + pb[1], pa[2] + pb[2]]);
                 let index = u16::try_from(vertices.len()).expect("icosphere fits u16");
-                vertices.push(PrimitiveVertex {
+                vertices.push(PovPrimitiveVertex {
                     position: [normal[0] * 0.5, normal[1] * 0.5, normal[2] * 0.5],
                     normal,
                 });
@@ -693,6 +700,20 @@ fn icosphere_geometry() -> (Vec<PrimitiveVertex>, Vec<u16>) {
     }
     let indices = faces.into_iter().flatten().collect();
     (vertices, indices)
+}
+
+/// The canonical smooth two-subdivision unit icosphere used by POV organism
+/// rendering.
+///
+/// The returned slices have process lifetime and are initialized once. The
+/// renderer uploads these exact vertices and indices, while CPU-side picking
+/// may intersect them without copying or regenerating the topology.
+#[must_use]
+pub fn canonical_icosphere_geometry() -> (&'static [PovPrimitiveVertex], &'static [u16]) {
+    static GEOMETRY: std::sync::OnceLock<(Vec<PovPrimitiveVertex>, Vec<u16>)> =
+        std::sync::OnceLock::new();
+    let geometry = GEOMETRY.get_or_init(build_icosphere_geometry);
+    (geometry.0.as_slice(), geometry.1.as_slice())
 }
 
 /// std140-compatible mirror of the WGSL `ChunkOffset`, written at a fixed
@@ -1101,7 +1122,7 @@ fn create_organism_pipeline(
     shadow: bool,
 ) -> wgpu::RenderPipeline {
     let primitive_layout = wgpu::VertexBufferLayout {
-        array_stride: core::mem::size_of::<PrimitiveVertex>() as u64,
+        array_stride: core::mem::size_of::<PovPrimitiveVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &PRIMITIVE_ATTRIBUTES,
     };
@@ -1638,15 +1659,15 @@ impl Pov {
 
         queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
         let (box_vertices, box_indices) = cube_geometry();
-        let (sphere_vertices, sphere_indices) = icosphere_geometry();
+        let (sphere_vertices, sphere_indices) = canonical_icosphere_geometry();
         let box_mesh =
             PrimitiveMesh::new(device, queue, "pov-box-mesh", &box_vertices, &box_indices);
         let sphere_mesh = PrimitiveMesh::new(
             device,
             queue,
             "pov-sphere-mesh",
-            &sphere_vertices,
-            &sphere_indices,
+            sphere_vertices,
+            sphere_indices,
         );
 
         Self {
@@ -2463,7 +2484,7 @@ impl PovCapture {
 mod tests {
     use super::*;
 
-    fn assert_outward(vertices: &[PrimitiveVertex], indices: &[u16]) {
+    fn assert_outward(vertices: &[PovPrimitiveVertex], indices: &[u16]) {
         for tri in indices.chunks_exact(3) {
             let a = vertices[usize::from(tri[0])].position;
             let b = vertices[usize::from(tri[1])].position;
@@ -2595,11 +2616,11 @@ mod tests {
 
     #[test]
     fn two_subdivision_icosphere_has_canonical_topology() {
-        let (vertices, indices) = icosphere_geometry();
+        let (vertices, indices) = canonical_icosphere_geometry();
         assert_eq!(vertices.len(), 162);
         assert_eq!(indices.len(), 960);
         assert!(indices.iter().all(|&i| usize::from(i) < vertices.len()));
-        for vertex in &vertices {
+        for vertex in vertices {
             assert!((dot(vertex.position, vertex.position).sqrt() - 0.5).abs() < 1e-5);
             assert!((dot(vertex.normal, vertex.normal) - 1.0).abs() < 1e-5);
             assert!(
@@ -2612,12 +2633,26 @@ mod tests {
         for (i, a) in vertices.iter().enumerate() {
             assert!(vertices[i + 1..].iter().all(|b| a.position != b.position));
         }
-        assert_outward(&vertices, &indices);
+        assert_outward(vertices, indices);
+    }
+
+    #[test]
+    fn canonical_icosphere_reuses_one_cached_topology() {
+        let (first_vertices, first_indices) = canonical_icosphere_geometry();
+        let (second_vertices, second_indices) = canonical_icosphere_geometry();
+        assert!(core::ptr::eq(
+            first_vertices.as_ptr(),
+            second_vertices.as_ptr()
+        ));
+        assert!(core::ptr::eq(
+            first_indices.as_ptr(),
+            second_indices.as_ptr()
+        ));
     }
 
     #[test]
     fn packed_instance_is_stable_and_exactly_sixty_four_bytes() {
-        assert_eq!(core::mem::size_of::<PrimitiveVertex>(), 24);
+        assert_eq!(core::mem::size_of::<PovPrimitiveVertex>(), 24);
         assert_eq!(core::mem::size_of::<OrganismInstanceRaw>(), 64);
         assert_eq!(
             core::mem::size_of::<OrganismInstanceRaw>() as u64,

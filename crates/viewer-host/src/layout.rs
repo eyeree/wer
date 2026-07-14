@@ -115,6 +115,19 @@ impl PixelRect {
             && y < f64::from(self.bottom())
     }
 
+    /// Convert a continuous physical-surface point to coordinates relative
+    /// to this rectangle's top-left corner.
+    ///
+    /// The same half-open rule as [`Self::contains_f64`] applies. Keeping this
+    /// transform beside the rectangle prevents camera picking adapters from
+    /// independently reconstructing pane origins or accepting a point on the
+    /// exclusive right/bottom edges.
+    #[must_use]
+    pub fn local_point(self, point: [f64; 2]) -> Option<[f64; 2]> {
+        self.contains_f64(point[0], point[1])
+            .then(|| [point[0] - f64::from(self.x), point[1] - f64::from(self.y)])
+    }
+
     /// Whether `other` is wholly contained, including empty edge rectangles.
     #[must_use]
     pub const fn contains_rect(self, other: Self) -> bool {
@@ -548,6 +561,18 @@ mod tests {
         assert!(!rect.contains(111, 79));
         assert!(!rect.contains(110, 80));
         assert_eq!(rect.fitted_square(), PixelRect::new(30, 20, 60, 60));
+    }
+
+    #[test]
+    fn pane_local_points_preserve_fractional_pixels_and_half_open_edges() {
+        let pane = PixelRect::new(13, 29, 101, 67);
+        assert_eq!(pane.local_point([13.0, 29.0]), Some([0.0, 0.0]));
+        assert_eq!(pane.local_point([113.75, 95.5]), Some([100.75, 66.5]));
+        assert_eq!(pane.local_point([114.0, 29.0]), None);
+        assert_eq!(pane.local_point([13.0, 96.0]), None);
+        assert_eq!(pane.local_point([12.999, 40.0]), None);
+        assert_eq!(pane.local_point([f64::NAN, 40.0]), None);
+        assert_eq!(pane.local_point([40.0, f64::INFINITY]), None);
     }
 
     #[test]

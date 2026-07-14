@@ -21,9 +21,9 @@ use viewer_host::{
         RendererInfo, Severity, StreamingSupplement, VaultInfo, ViewerWarning, WarningRegistry,
     },
     resolve_view_layout, ExplorationWorld, MapViewportProjection, NoopWorldTickHook, PixelRect,
-    PlatformTelemetry, PresentationMode, ResolvedViewLayout, ServiceNotification, ServiceResponse,
-    ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewKind, ViewerAction,
-    ViewerController,
+    PlatformTelemetry, PovHoverCache, PresentationMode, ResolvedViewLayout, ServiceNotification,
+    ServiceResponse, ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput,
+    ViewKind, ViewerAction, ViewerController,
 };
 use world_core::{
     anchor::{
@@ -392,6 +392,7 @@ struct BrowserHostState {
     panel_key: Option<PanelDocumentKey>,
     panel_revision: u64,
     hover_world: Option<(f64, f64)>,
+    pov_hover: PovHoverCache,
     hover_revision: u64,
     performance: PerformanceInfo,
     telemetry_revision: u64,
@@ -427,6 +428,7 @@ struct BrowserFrame {
     service_response_queued: bool,
     presenter_needs_frame: bool,
     presenter_dirty: bool,
+    hover_changed: bool,
 }
 
 /// Small immediate presentation state used by canvas/control adapters. The
@@ -580,6 +582,7 @@ impl Default for BrowserHostState {
             panel_key: None,
             panel_revision: 0,
             hover_world: None,
+            pov_hover: PovHoverCache::new(),
             hover_revision: 0,
             performance: PerformanceInfo::default(),
             telemetry_revision: 0,
@@ -680,7 +683,13 @@ impl BrowserHostState {
         )
     }
 
+    #[cfg(test)]
     fn frame(&mut self, dt_ms: f64, input: InputFrame) -> BrowserFrame {
+        self.frame_at(dt_ms, input, 0.0)
+    }
+
+    fn frame_at(&mut self, dt_ms: f64, input: InputFrame, time_seconds: f32) -> BrowserFrame {
+        let pov_pointer = input.pov_pointer;
         let telemetry = self.platform_telemetry();
         let ground = BrowserGround {
             chunks: &self.pov_chunks,
@@ -717,6 +726,9 @@ impl BrowserHostState {
         let mut uploads = Vec::new();
         let mut removes = Vec::new();
         let mut organisms_changed = false;
+        // Round once exactly as PovFrameParams/WGSL do, then reuse that
+        // visible cutoff for selection and picking as well as drawing.
+        let fog_end = f64::from(pov_host::pov_fog_end(self.pov_radius) as f32);
         if output.mode != PresentationMode::Map {
             let camera = self.controller.pov_camera();
             let position = (camera.pos.x, camera.pos.y);
@@ -730,8 +742,29 @@ impl BrowserHostState {
                 self.controller.world().map(),
                 &self.pov_chunks,
                 position,
-                pov_host::pov_fog_end(self.pov_radius),
+                fog_end,
             );
+        }
+        // Ordering is intentional: the controller has already applied held
+        // primary-drag look, then resident terrain/organisms were synchronized;
+        // hover therefore describes the post-drag camera drawn this frame.
+        let hover_changed = if output.mode != PresentationMode::Map {
+            let pov_pane = self.resolved_layout().pov_pane;
+            self.pov_hover.update(
+                self.controller.world().map(),
+                self.controller.pov_camera(),
+                &self.pov_chunks,
+                &self.pov_organisms,
+                pov_pointer,
+                pov_pane,
+                fog_end,
+                time_seconds,
+            )
+        } else {
+            false
+        };
+        if hover_changed {
+            self.hover_revision = self.hover_revision.saturating_add(1);
         }
         self.last_output = Some(output.clone());
         BrowserFrame {
@@ -742,6 +775,7 @@ impl BrowserHostState {
             service_response_queued: !unavailable.is_empty(),
             presenter_needs_frame: presenter_update.flashing_regions > 0,
             presenter_dirty: presenter_update.presentation_changed,
+            hover_changed,
         }
     }
 
@@ -1076,11 +1110,18 @@ impl BrowserHostState {
             self.panel_key = Some(key);
         }
 
-        let hover = viewer_host::map_hover(
-            self.controller.world().map(),
-            self.hover_world,
-            output.map.zoom,
-        );
+        let hover = match (output.mode, output.focused) {
+            (PresentationMode::Map, _) | (PresentationMode::Split, ViewKind::Map) => {
+                viewer_host::map_hover(
+                    self.controller.world().map(),
+                    self.hover_world,
+                    output.map.zoom,
+                )
+            }
+            (PresentationMode::Pov, _) | (PresentationMode::Split, ViewKind::Pov) => {
+                self.pov_hover.hover().clone()
+            }
+        };
         let performance = self.performance;
         let streaming = self.streaming_supplement();
         let persistence = self.persistence_info();
@@ -1554,7 +1595,8 @@ mod wasm {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
             let input = self.driver.take_frame(&mut self.state);
-            let frame = self.state.frame(dt_ms, input);
+            let time = time_seconds.rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
+            let frame = self.state.frame_at(dt_ms, input, time);
             if frame.service_response_queued {
                 self.driver.dirty = true;
             }
@@ -1706,7 +1748,6 @@ mod wasm {
             let organism_upload = frame
                 .organisms_changed
                 .then(|| self.state.pov_organisms.upload());
-            let time = time_seconds.rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
             let pov_rendered = pov_active
                 && VIEWER_RENDERER.with(|slot| {
                     let mut slot = slot.borrow_mut();
@@ -1758,18 +1799,19 @@ mod wasm {
                 || self.driver.needs_frame();
             Ok(JsValue::from_str(&format!(
                 concat!(
-                    "{{\"presentation\":{},\"layout\":{},\"map_dirty\":{},\"needs_frame\":{},",
+                    "{{\"presentation\":{},\"layout\":{},\"map_dirty\":{},\"hover_changed\":{},\"needs_frame\":{},",
                     "\"update_serial\":{},\"travel\":{:.6},",
                     "\"map\":{{\"active\":{},\"path\":\"{}\",\"gpu_submitted\":{},\"upload_bytes\":{}}},",
                     "\"pov\":{{\"active\":{},\"rendered\":{},",
                     "\"camera\":[{:.1},{:.1},{:.1}],",
-                    "\"chunks\":{},\"meshed\":{},\"uploads\":{},",
+                    "\"chunks\":{},\"meshed\":{},\"uploads\":{},\"hover_queries\":{},",
                     "\"organisms\":{{\"published\":{},\"drawn\":{},",
                     "\"waiting_for_ground\":{}}}}}}}"
                 ),
                 presentation,
                 layout,
                 map_dirty,
+                frame.hover_changed,
                 needs_frame,
                 frame.output.update_serial,
                 frame.output.travel,
@@ -1785,6 +1827,7 @@ mod wasm {
                 self.state.pov_chunks.len(),
                 counters.meshed,
                 frame.uploads.len(),
+                self.state.pov_hover.geometry_queries(),
                 organism_counts.published,
                 organism_counts.drawn(),
                 organism_counts.waiting_for_ground,
@@ -1872,7 +1915,7 @@ mod wasm {
             view: String,
         ) -> Result<bool, JsValue> {
             let view = parse_view(&view)?;
-            self.driver.handle(
+            let handled = self.driver.handle(
                 &mut self.state,
                 super::NormalizedInputEvent::PointerMoved {
                     pointer: u64::from(pointer),
@@ -1880,7 +1923,10 @@ mod wasm {
                     view,
                 },
             );
-            Ok(self.driver.has_continuous_input())
+            // A hover-only move still needs one frame so the CPU pick and
+            // panel update run; continuous scheduling remains reserved for
+            // held movement/drag and active presentation animation.
+            Ok(handled || self.driver.has_continuous_input())
         }
 
         /// Translate one pointer-button transition.
@@ -2854,6 +2900,73 @@ mod tests {
                 .get(traveler_center)
                 .is_some(),
             "the single world update streamed around the shared traveler"
+        );
+    }
+
+    #[test]
+    fn pov_pointer_updates_shared_hover_after_input_and_reuses_steady_geometry() {
+        let mut state = small_controller_app();
+        state.resize_surface(400, 300);
+        settle(&mut state);
+        state.set_renderer_webgpu();
+        state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
+
+        let pointer = [200.0, 260.0];
+        let mut frame = state.frame_at(
+            0.0,
+            viewer_host::input::InputFrame {
+                pov_pointer: Some(pointer),
+                ..viewer_host::input::InputFrame::default()
+            },
+            1.0,
+        );
+        for _ in 0..12 {
+            if state.pov_chunks.is_idle() {
+                break;
+            }
+            frame = state.frame_at(
+                0.0,
+                viewer_host::input::InputFrame {
+                    pov_pointer: Some(pointer),
+                    ..viewer_host::input::InputFrame::default()
+                },
+                1.0,
+            );
+        }
+        assert_eq!(frame.output.mode, viewer_host::PresentationMode::Pov);
+        assert!(matches!(
+            state.pov_hover.hover(),
+            viewer_host::HoverInfo::Terrain(_) | viewer_host::HoverInfo::Organism(_)
+        ));
+        let panel: serde_json::Value = serde_json::from_str(
+            &state
+                .panel_document_json()
+                .expect("serialize POV hover")
+                .expect("POV panel after frame"),
+        )
+        .expect("typed POV panel");
+        assert_ne!(panel["model"]["hover"]["kind"], "none");
+
+        let camera = state.controller.pov_camera();
+        let orientation = (camera.yaw.to_bits(), camera.pitch.to_bits());
+        let queries = state.pov_hover.geometry_queries();
+        let unchanged = state.frame_at(
+            0.0,
+            viewer_host::input::InputFrame {
+                pov_pointer: Some(pointer),
+                ..viewer_host::input::InputFrame::default()
+            },
+            7.0,
+        );
+        assert!(!unchanged.hover_changed);
+        assert_eq!(state.pov_hover.geometry_queries(), queries);
+        let camera = state.controller.pov_camera();
+        assert_eq!(
+            (camera.yaw.to_bits(), camera.pitch.to_bits()),
+            orientation,
+            "unheld hover movement never becomes camera look"
         );
     }
 

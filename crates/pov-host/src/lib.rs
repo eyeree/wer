@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use renderer::pov::{
-    skirt_core_index, CORE_VERTS, DETAIL_OCTAVES, POV_GRID, POV_MESH_RES, VERTS_PER_CHUNK,
+    canonical_icosphere_geometry, skirt_core_index, CORE_VERTS, DETAIL_OCTAVES, POV_GRID,
+    POV_MESH_RES, VERTS_PER_CHUNK,
 };
 use renderer::{
     PovFrameParams, PovOrganismInstance, PovOrganismUpload, PovVertex, TerrainChunkUpload,
@@ -176,12 +177,44 @@ pub const RIVER_OVERLAY_MIN: f32 = 0.12;
 /// Mouse-look sensitivity, radians per raw device pixel.
 const LOOK_SENSITIVITY: f32 = 0.0025;
 
+/// Vertical field of view shared by the visible projection and CPU picking.
+pub const POV_VERTICAL_FOV: f32 = 60.0_f32.to_radians();
+
+/// Near clip distance shared by the visible projection and CPU picking.
+pub const POV_NEAR_DISTANCE: f64 = 0.1;
+
+/// Far clip distance of the POV projection. The normally shorter fog reach
+/// remains the caller-supplied picking limit.
+pub const POV_FAR_DISTANCE: f64 = 2048.0;
+
 /// Pitch clamp, ±89° in radians (plan §8.2).
 const PITCH_LIMIT: f32 = 89.0 * core::f32::consts::PI / 180.0;
 
 /// Eye height above the sampled ground on POV entry (presentation-only; real
 /// `ground_height` collision is 3D-2).
 const ENTRY_EYE_HEIGHT: f64 = 25.0;
+
+/// Double-precision world ray used by headless POV picking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PovRay {
+    /// Absolute world-space origin.
+    pub origin: glam::DVec3,
+    /// Normalized world-space direction.
+    pub direction: glam::DVec3,
+    /// Radial distances where this ray crosses the projection's view-axis
+    /// near and far planes. Off-axis rays travel farther than the literal
+    /// projection depths before reaching those planes.
+    pub clip_distances: [f64; 2],
+}
+
+impl PovRay {
+    /// Evaluate a point along the ray. Because screen rays are normalized,
+    /// `distance` is also the camera-space distance used by fog.
+    #[must_use]
+    pub fn at(self, distance: f64) -> glam::DVec3 {
+        self.origin + self.direction * distance
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fly camera (plan §4, §8.3)
@@ -315,12 +348,60 @@ impl PovCamera {
         let view = glam::camera::rh::view::look_to_mat4(glam::Vec3::ZERO, dir, glam::Vec3::Z);
         // The DirectX/WebGPU convention: right-handed view, clip depth 0..1.
         let proj = glam::camera::rh::proj::directx::perspective(
-            60f32.to_radians(),
+            POV_VERTICAL_FOV,
             aspect.max(1e-3),
-            0.1,
-            2048.0,
+            POV_NEAR_DISTANCE as f32,
+            POV_FAR_DISTANCE as f32,
         );
         (proj * view).to_cols_array_2d()
+    }
+
+    /// Build the world-space ray through a physical point local to the POV
+    /// pane. This is the CPU counterpart of [`Self::view_proj`]: it uses the
+    /// same 60-degree vertical field of view and pane aspect, while retaining
+    /// the camera's absolute `f64` origin at far world coordinates.
+    ///
+    /// The pane is half-open. Invalid, non-finite, or outside coordinates do
+    /// not describe rendered pixels and therefore return `None`.
+    #[must_use]
+    pub fn screen_ray(&self, pane_point: [f64; 2], pane_size: [u32; 2]) -> Option<PovRay> {
+        let [width, height] = pane_size;
+        let [x, y] = pane_point;
+        if width == 0
+            || height == 0
+            || !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x >= f64::from(width)
+            || y >= f64::from(height)
+        {
+            return None;
+        }
+
+        let ndc_x = 2.0 * x / f64::from(width) - 1.0;
+        let ndc_y = 1.0 - 2.0 * y / f64::from(height);
+        // Use the same f32 aspect and trigonometry as the projection before
+        // widening to f64; this prevents a platform adapter from inventing a
+        // subtly different frustum.
+        let aspect = (width as f32 / height as f32).max(1.0e-3);
+        let half_height = f64::from((POV_VERTICAL_FOV * 0.5).tan());
+        let forward = self.forward();
+        let right = self.right();
+        let up = right.cross(forward).normalize();
+        let direction = (forward
+            + right * (ndc_x * f64::from(aspect) * half_height)
+            + up * (ndc_y * half_height))
+            .normalize();
+        let view_depth_per_distance = direction.dot(forward);
+        Some(PovRay {
+            origin: self.pos,
+            direction,
+            clip_distances: [
+                POV_NEAR_DISTANCE / view_depth_per_distance,
+                POV_FAR_DISTANCE / view_depth_per_distance,
+            ],
+        })
     }
 }
 
@@ -781,6 +862,53 @@ impl PovOrganismVisual {
             ],
         }
     }
+
+    /// Vertical activity offset using the exact expression evaluated by the
+    /// organism WGSL vertex path. Phase 3D-4 visuals currently set amplitude
+    /// to zero, but keeping the transform here prevents future picking drift.
+    fn bob_offset(self, frame_time: f32) -> f64 {
+        let [amplitude, phase] = self.bob;
+        f64::from(
+            amplitude * (0.5 + 0.5 * (core::f32::consts::TAU * (frame_time * 0.25 + phase)).sin()),
+        )
+    }
+
+    fn local_ray(self, ray: PovRay, frame_time: f32) -> Option<PovRay> {
+        if self
+            .scale
+            .iter()
+            .any(|scale| *scale <= 0.0 || !scale.is_finite())
+        {
+            return None;
+        }
+        let center = glam::DVec3::new(
+            self.position[0],
+            self.position[1],
+            self.position[2] + self.bob_offset(frame_time),
+        );
+        let origin = ray.origin - center;
+        let (sin, cos) = self.yaw.sin_cos();
+        let (sin, cos) = (f64::from(sin), f64::from(cos));
+        let inverse_rotate = |value: glam::DVec3| {
+            glam::DVec3::new(
+                cos * value.x + sin * value.y,
+                -sin * value.x + cos * value.y,
+                value.z,
+            )
+        };
+        let scale = glam::DVec3::new(
+            f64::from(self.scale[0]),
+            f64::from(self.scale[1]),
+            f64::from(self.scale[2]),
+        );
+        Some(PovRay {
+            origin: inverse_rotate(origin) / scale,
+            // Do not normalize after inverse scale: its parameter remains the
+            // distance along the normalized world ray.
+            direction: inverse_rotate(ray.direction) / scale,
+            clip_distances: ray.clip_distances,
+        })
+    }
 }
 
 /// Fixed, approximately volume-preserving form proportions. Form bit zero
@@ -840,6 +968,9 @@ pub fn organism_visual(organism: &Organism, ground: GroundSurface) -> PovOrganis
 struct OrganismVisualKey {
     id: u64,
     slot: u16,
+    species: u64,
+    trophic: world_core::Trophic,
+    cell: world_core::LocalPos,
     expressed: [u32; 5],
     form: u8,
     position: [u64; 3],
@@ -855,6 +986,9 @@ impl OrganismVisualKey {
         Self {
             id: organism.id,
             slot: organism.slot,
+            species: organism.species,
+            trophic: organism.trophic,
+            cell: organism.cell,
             expressed: [
                 organism.expressed.hue.to_bits(),
                 organism.expressed.luminance.to_bits(),
@@ -876,7 +1010,20 @@ impl OrganismVisualKey {
 #[derive(Debug, Clone, Copy)]
 struct OrganismScratch {
     key: OrganismVisualKey,
+    organism: Organism,
     visual: PovOrganismVisual,
+}
+
+/// Closest visible realized-organism intersection for a POV ray. The copied
+/// runtime source is the exact identity and expressed data that produced the
+/// retained renderer visual; semantic inspection never performs a stale
+/// secondary lookup.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PovOrganismHit {
+    /// Distance from the camera along the normalized world ray.
+    pub distance: f64,
+    /// Source organism paired with the intersected renderer visual.
+    pub organism: Organism,
 }
 
 /// Shell-side organism presentation telemetry. Counts describe the latest
@@ -921,6 +1068,7 @@ pub struct PovOrganismManager {
     counters: PovOrganismCounters,
     shadow_bounds: Option<PovShadowBounds>,
     initialized: bool,
+    visual_generation: u64,
 }
 
 impl PovOrganismManager {
@@ -934,6 +1082,23 @@ impl PovOrganismManager {
         self.counters
     }
 
+    /// Dirty generation of the exact visual/source lists used for GPU
+    /// uploads and CPU picking.
+    #[must_use]
+    pub const fn visual_generation(&self) -> u64 {
+        self.visual_generation
+    }
+
+    /// Whether the retained list contains a time-varying bob transform.
+    /// Static lists let hover caches ignore frame time entirely.
+    #[must_use]
+    pub fn has_animated_visuals(&self) -> bool {
+        self.box_scratch
+            .iter()
+            .chain(&self.sphere_scratch)
+            .any(|entry| entry.visual.bob[0] != 0.0)
+    }
+
     /// Current complete replacement lists. Call only when [`Self::sync`]
     /// returned true; otherwise the renderer should retain its buffers.
     #[must_use]
@@ -945,6 +1110,63 @@ impl PovOrganismManager {
     #[must_use]
     pub const fn shadow_bounds(&self) -> Option<PovShadowBounds> {
         self.shadow_bounds
+    }
+
+    /// Intersect the exact retained organism visuals, including yaw,
+    /// non-uniform scale, and frame-time bob. Boxes use their oriented slabs;
+    /// spheres use the scaled ellipsoid only as a broad phase before testing
+    /// the renderer's canonical two-subdivision icosphere triangles.
+    #[must_use]
+    pub fn raycast(
+        &self,
+        ray: PovRay,
+        frame_time: f32,
+        max_distance: f64,
+    ) -> Option<PovOrganismHit> {
+        let [near_distance, far_distance] = ray.clip_distances;
+        let limit = max_distance.min(far_distance);
+        if !ray.origin.is_finite()
+            || !ray.direction.is_finite()
+            || !frame_time.is_finite()
+            || !near_distance.is_finite()
+            || !far_distance.is_finite()
+            || near_distance < 0.0
+            || limit <= near_distance
+            || (ray.direction.length_squared() - 1.0).abs() > 1.0e-9
+        {
+            return None;
+        }
+
+        let mut best: Option<PovOrganismHit> = None;
+        for entry in self.box_scratch.iter().chain(&self.sphere_scratch) {
+            let upper = best.map_or(limit, |hit| hit.distance.min(limit));
+            let Some(local_ray) = entry.visual.local_ray(ray, frame_time) else {
+                continue;
+            };
+            let distance = match entry.visual.primitive {
+                PovOrganismPrimitive::Box => ray_box_interval(
+                    local_ray,
+                    glam::DVec3::splat(-0.5),
+                    glam::DVec3::splat(0.5),
+                    f64::NEG_INFINITY,
+                    upper,
+                )
+                .map(|(enter, _)| enter)
+                .filter(|distance| *distance >= near_distance),
+                PovOrganismPrimitive::Sphere => {
+                    raycast_canonical_icosphere(local_ray, near_distance, upper)
+                }
+            };
+            if let Some(distance) = distance {
+                if distance < upper {
+                    best = Some(PovOrganismHit {
+                        distance,
+                        organism: entry.organism,
+                    });
+                }
+            }
+        }
+        best.filter(|hit| hit.distance < limit)
     }
 
     /// Scan the published realization, distance/ground filter it, build exact
@@ -996,6 +1218,7 @@ impl PovOrganismManager {
             let visual = organism_visual(organism, ground);
             let entry = OrganismScratch {
                 key: OrganismVisualKey::new(organism, visual),
+                organism: *organism,
                 visual,
             };
             match visual.primitive {
@@ -1051,9 +1274,53 @@ impl PovOrganismManager {
         );
         let count = self.counters.drawn() as u64;
         self.counters.rebuilds += 1;
+        self.visual_generation = self.visual_generation.wrapping_add(1);
         self.counters.uploaded_instances += count;
         self.counters.uploaded_bytes += count * POV_ORGANISM_INSTANCE_BYTES;
         true
+    }
+}
+
+/// Nearest CPU-side geometry under a POV pointer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PovSceneHit {
+    /// Exact resident core terrain triangle.
+    Terrain(PovTerrainHit),
+    /// Exact renderer-ready organism primitive.
+    Organism(PovOrganismHit),
+}
+
+impl PovSceneHit {
+    /// Camera distance used for depth ordering and fog rejection.
+    #[must_use]
+    pub const fn distance(self) -> f64 {
+        match self {
+            Self::Terrain(hit) => hit.distance,
+            Self::Organism(hit) => hit.distance,
+        }
+    }
+}
+
+/// Compare resident terrain and organism intersections with the renderer's
+/// opaque depth rule. A strictly nearer body wins; an equal-depth terrain hit
+/// remains visible because organisms draw later with a `Less` comparison.
+#[must_use]
+pub fn raycast_scene(
+    chunks: &PovChunkManager,
+    organisms: &PovOrganismManager,
+    ray: PovRay,
+    frame_time: f32,
+    max_distance: f64,
+) -> Option<PovSceneHit> {
+    let terrain = chunks.raycast(ray, max_distance);
+    let organism = organisms.raycast(ray, frame_time, max_distance);
+    match (terrain, organism) {
+        (Some(terrain), Some(organism)) if organism.distance < terrain.distance => {
+            Some(PovSceneHit::Organism(organism))
+        }
+        (Some(terrain), _) => Some(PovSceneHit::Terrain(terrain)),
+        (None, Some(organism)) => Some(PovSceneHit::Organism(organism)),
+        (None, None) => None,
     }
 }
 
@@ -1491,6 +1758,21 @@ pub struct GroundSurface {
     pub ambient_occlusion: u8,
 }
 
+/// Closest visible resident-terrain intersection for a POV ray.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PovTerrainHit {
+    /// Distance from the camera along the normalized world ray.
+    pub distance: f64,
+    /// Absolute world-space intersection point.
+    pub position: glam::DVec3,
+    /// Resident region whose core lattice supplied the triangle.
+    pub region: RegionCoord,
+    /// Meshed height-field cell within the 64 by 64 region lattice.
+    pub cell: [u8; 2],
+    /// Triangle within the cell: zero is v00-v10-v11, one is v00-v11-v01.
+    pub triangle: u8,
+}
+
 /// An in-flight mesh job: the key it will produce and its cancellation token.
 #[derive(Debug)]
 struct InFlight {
@@ -1514,6 +1796,9 @@ pub struct PovChunkManager {
     /// Worker-side mesh time, microseconds (atomic: workers accumulate).
     mesh_micros: Arc<AtomicU64>,
     counters: PovCounters,
+    /// Changes only when the resident CPU/GPU geometry set changes. This is
+    /// the precise dirty key for cached picking, distinct from telemetry.
+    resident_generation: u64,
 }
 
 impl std::fmt::Debug for MeshResult {
@@ -1538,6 +1823,7 @@ impl PovChunkManager {
             next_handle: 1,
             mesh_micros: Arc::new(AtomicU64::new(0)),
             counters: PovCounters::default(),
+            resident_generation: 0,
         }
     }
 
@@ -1547,6 +1833,13 @@ impl PovChunkManager {
         let mut counters = self.counters;
         counters.mesh_ms = self.mesh_micros.load(Ordering::Relaxed) as f64 / 1000.0;
         counters
+    }
+
+    /// Dirty generation of the exact resident core lattices used for both
+    /// GPU uploads and CPU picking.
+    #[must_use]
+    pub const fn resident_generation(&self) -> u64 {
+        self.resident_generation
     }
 
     /// Resident chunk count (telemetry).
@@ -1644,6 +1937,71 @@ impl PovChunkManager {
         self.ground_surface(wx, wy).map(|surface| surface.height)
     }
 
+    /// Intersect a normalized world ray with the resident terrain cores.
+    ///
+    /// Only the exact 65 by 65 CPU lattices paired with integrated renderer
+    /// uploads participate. Skirts, analytic loading-frontier terrain, and
+    /// pending chunks are deliberately absent, so a hit always describes
+    /// geometry visible in the current frame. Chunk-local XY arithmetic
+    /// preserves precision at far world coordinates.
+    #[must_use]
+    pub fn raycast(&self, ray: PovRay, max_distance: f64) -> Option<PovTerrainHit> {
+        let [near_distance, far_distance] = ray.clip_distances;
+        let limit = max_distance.min(far_distance);
+        if !ray.origin.is_finite()
+            || !ray.direction.is_finite()
+            || !near_distance.is_finite()
+            || !far_distance.is_finite()
+            || near_distance < 0.0
+            || limit <= near_distance
+            || (ray.direction.length_squared() - 1.0).abs() > 1.0e-9
+        {
+            return None;
+        }
+
+        let mut candidates = Vec::with_capacity(self.chunks.len());
+        for (&coord, entry) in &self.chunks {
+            let (ox, oy) = coord.origin();
+            let local_ray = PovRay {
+                origin: glam::DVec3::new(ray.origin.x - ox, ray.origin.y - oy, ray.origin.z),
+                direction: ray.direction,
+                clip_distances: ray.clip_distances,
+            };
+            if let Some((enter, exit)) = ray_box_interval(
+                local_ray,
+                glam::DVec3::new(0.0, 0.0, f64::from(entry.min_height)),
+                glam::DVec3::new(REGION_SIZE, REGION_SIZE, f64::from(entry.max_height)),
+                near_distance,
+                limit,
+            ) {
+                candidates.push((enter, exit, coord, local_ray));
+            }
+        }
+        candidates.sort_unstable_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.2.x.cmp(&b.2.x))
+                .then_with(|| a.2.y.cmp(&b.2.y))
+        });
+
+        let mut best = None;
+        let mut best_distance = limit;
+        for (enter, exit, coord, local_ray) in candidates {
+            if enter >= best_distance {
+                break;
+            }
+            let Some(entry) = self.chunks.get(&coord) else {
+                continue;
+            };
+            if let Some(hit) =
+                raycast_chunk_core(ray, local_ray, coord, entry, enter, exit.min(best_distance))
+            {
+                best_distance = hit.distance;
+                best = Some(hit);
+            }
+        }
+        best.filter(|hit| hit.distance < limit)
+    }
+
     /// Per-frame sync (plan §7.2–§7.4): drain finished meshes, schedule
     /// stale/missing chunks within `radius` regions of the camera on the
     /// executor's Background lane, integrate at most
@@ -1657,6 +2015,8 @@ impl PovChunkManager {
         radius: i32,
         executor: &dyn TaskExecutor,
     ) -> (Vec<TerrainChunkUpload>, Vec<u64>) {
+        let generation_before = self.resident_generation;
+        let mut resident_changed = false;
         // Drain finished meshes; a result whose key is no longer the one in
         // flight for its region (superseded or cancelled-after-start) drops.
         // The in-flight entry stays until integration so the scheduling walk
@@ -1759,6 +2119,7 @@ impl PovChunkManager {
                     max_height,
                 },
             );
+            resident_changed = true;
             let (ox, oy) = result.coord.origin();
             uploads.push(TerrainChunkUpload {
                 handle,
@@ -1781,7 +2142,11 @@ impl PovChunkManager {
             };
             if let Some(entry) = self.chunks.remove(&coord) {
                 removes.push(entry.handle);
+                resident_changed = true;
             }
+        }
+        if resident_changed {
+            self.resident_generation = generation_before.wrapping_add(1);
         }
         (uploads, removes)
     }
@@ -1875,6 +2240,233 @@ impl PovChunkManager {
             }),
         );
     }
+}
+
+fn ray_box_interval(
+    ray: PovRay,
+    min: glam::DVec3,
+    max: glam::DVec3,
+    min_distance: f64,
+    max_distance: f64,
+) -> Option<(f64, f64)> {
+    let origins = [ray.origin.x, ray.origin.y, ray.origin.z];
+    let directions = [ray.direction.x, ray.direction.y, ray.direction.z];
+    let mins = [min.x, min.y, min.z];
+    let maxs = [max.x, max.y, max.z];
+    let mut enter = min_distance;
+    let mut exit = max_distance;
+    for axis in 0..3 {
+        if directions[axis] == 0.0 {
+            if origins[axis] < mins[axis] || origins[axis] > maxs[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inverse = directions[axis].recip();
+        let mut near = (mins[axis] - origins[axis]) * inverse;
+        let mut far = (maxs[axis] - origins[axis]) * inverse;
+        if near > far {
+            core::mem::swap(&mut near, &mut far);
+        }
+        enter = enter.max(near);
+        exit = exit.min(far);
+        if enter > exit {
+            return None;
+        }
+    }
+    Some((enter, exit))
+}
+
+/// Front-face-only Moller-Trumbore intersection, matching the POV pipelines'
+/// counter-clockwise back-face culling. The direction is deliberately not
+/// required to be normalized so transformed organism rays retain world `t`.
+fn ray_triangle_distance(
+    ray: PovRay,
+    vertices: [glam::DVec3; 3],
+    min_distance: f64,
+    max_distance: f64,
+) -> Option<f64> {
+    let edge1 = vertices[1] - vertices[0];
+    let edge2 = vertices[2] - vertices[0];
+    let p = ray.direction.cross(edge2);
+    let determinant = edge1.dot(p);
+    if determinant <= 1.0e-12 {
+        return None;
+    }
+    let inverse = determinant.recip();
+    let s = ray.origin - vertices[0];
+    let u = s.dot(p) * inverse;
+    const EDGE_EPSILON: f64 = 1.0e-10;
+    if !(-EDGE_EPSILON..=1.0 + EDGE_EPSILON).contains(&u) {
+        return None;
+    }
+    let q = s.cross(edge1);
+    let v = ray.direction.dot(q) * inverse;
+    if v < -EDGE_EPSILON || u + v > 1.0 + EDGE_EPSILON {
+        return None;
+    }
+    let distance = edge2.dot(q) * inverse;
+    (distance >= min_distance && distance <= max_distance).then_some(distance)
+}
+
+fn raycast_canonical_icosphere(
+    local_ray: PovRay,
+    min_distance: f64,
+    max_distance: f64,
+) -> Option<f64> {
+    // The canonical sphere is radius 0.5. This quadratic is deliberately
+    // broad phase only: the visible silhouette is the faceted canonical mesh.
+    let a = local_ray.direction.length_squared();
+    let half_b = local_ray.origin.dot(local_ray.direction);
+    let c = local_ray.origin.length_squared() - 0.25;
+    let discriminant = half_b.mul_add(half_b, -a * c);
+    if a == 0.0 || discriminant < 0.0 {
+        return None;
+    }
+    let root = discriminant.sqrt();
+    let ellipsoid_enter = (-half_b - root) / a;
+    let ellipsoid_exit = (-half_b + root) / a;
+    if ellipsoid_exit < min_distance || ellipsoid_enter > max_distance {
+        return None;
+    }
+
+    let (vertices, indices) = canonical_icosphere_geometry();
+    let mut best = max_distance;
+    let mut found = false;
+    for triangle in indices.chunks_exact(3) {
+        let vertex = |index: u16| {
+            let [x, y, z] = vertices[usize::from(index)].position;
+            glam::DVec3::new(f64::from(x), f64::from(y), f64::from(z))
+        };
+        let triangle = [
+            vertex(triangle[0]),
+            vertex(triangle[1]),
+            vertex(triangle[2]),
+        ];
+        if let Some(distance) = ray_triangle_distance(local_ray, triangle, min_distance, best) {
+            if distance < best {
+                best = distance;
+                found = true;
+            }
+        }
+    }
+    found.then_some(best)
+}
+
+fn dda_initial_cell(local: f64, direction: f64) -> i32 {
+    let grid = local / SPACING;
+    let mut cell = grid.floor() as i32;
+    if direction < 0.0 && grid == grid.floor() {
+        cell -= 1;
+    }
+    cell.clamp(0, POV_MESH_RES as i32 - 1)
+}
+
+fn dda_next_boundary(origin: f64, direction: f64, cell: i32) -> (f64, f64, i32) {
+    if direction > 0.0 {
+        (
+            ((f64::from(cell) + 1.0) * SPACING - origin) / direction,
+            SPACING / direction,
+            1,
+        )
+    } else if direction < 0.0 {
+        (
+            (f64::from(cell) * SPACING - origin) / direction,
+            -SPACING / direction,
+            -1,
+        )
+    } else {
+        (f64::INFINITY, f64::INFINITY, 0)
+    }
+}
+
+fn raycast_chunk_core(
+    world_ray: PovRay,
+    local_ray: PovRay,
+    coord: RegionCoord,
+    entry: &ChunkEntry,
+    enter: f64,
+    exit: f64,
+) -> Option<PovTerrainHit> {
+    let start = local_ray.at(enter);
+    let mut cell_x = dda_initial_cell(start.x, local_ray.direction.x);
+    let mut cell_y = dda_initial_cell(start.y, local_ray.direction.y);
+    let (mut next_x, delta_x, step_x) =
+        dda_next_boundary(local_ray.origin.x, local_ray.direction.x, cell_x);
+    let (mut next_y, delta_y, step_y) =
+        dda_next_boundary(local_ray.origin.y, local_ray.direction.y, cell_y);
+    // Roundoff at the clipped AABB entry may put the first computed boundary
+    // microscopically behind us. Advance it without skipping a cell.
+    while next_x < enter {
+        next_x += delta_x;
+    }
+    while next_y < enter {
+        next_y += delta_y;
+    }
+
+    let mut cell_enter = enter;
+    let mut best: Option<PovTerrainHit> = None;
+    // An axis-aligned line crosses at most 64 cells; a diagonal crosses at
+    // most 127. The small guard makes malformed floating input total.
+    for _ in 0..=(POV_MESH_RES * 2) {
+        if cell_x < 0
+            || cell_x >= POV_MESH_RES as i32
+            || cell_y < 0
+            || cell_y >= POV_MESH_RES as i32
+            || cell_enter > exit
+        {
+            break;
+        }
+        let cell_exit = next_x.min(next_y).min(exit);
+        let i = cell_x as usize;
+        let j = cell_y as usize;
+        let sample = |x: usize, y: usize| f64::from(entry.heights[y * POV_GRID + x]);
+        let x0 = i as f64 * SPACING;
+        let y0 = j as f64 * SPACING;
+        let x1 = x0 + SPACING;
+        let y1 = y0 + SPACING;
+        let v00 = glam::DVec3::new(x0, y0, sample(i, j));
+        let v10 = glam::DVec3::new(x1, y0, sample(i + 1, j));
+        let v01 = glam::DVec3::new(x0, y1, sample(i, j + 1));
+        let v11 = glam::DVec3::new(x1, y1, sample(i + 1, j + 1));
+        for (triangle, vertices) in [[v00, v10, v11], [v00, v11, v01]].into_iter().enumerate() {
+            let upper = best.map_or(cell_exit, |hit| hit.distance.min(cell_exit));
+            if let Some(distance) = ray_triangle_distance(local_ray, vertices, cell_enter, upper) {
+                if best.is_none_or(|hit| distance < hit.distance) {
+                    best = Some(PovTerrainHit {
+                        distance,
+                        position: world_ray.at(distance),
+                        region: coord,
+                        cell: [i as u8, j as u8],
+                        triangle: triangle as u8,
+                    });
+                }
+            }
+        }
+        if best.is_some() {
+            break;
+        }
+        if cell_exit >= exit || (!next_x.is_finite() && !next_y.is_finite()) {
+            break;
+        }
+
+        let tie = next_x.is_finite()
+            && next_y.is_finite()
+            && (next_x - next_y).abs() <= 1.0e-12 * next_x.abs().max(next_y.abs()).max(1.0);
+        let step_along_x = next_x < next_y || tie;
+        let step_along_y = next_y < next_x || tie;
+        if step_along_x {
+            cell_x += step_x;
+            cell_enter = cell_enter.max(next_x);
+            next_x += delta_x;
+        }
+        if step_along_y {
+            cell_y += step_y;
+            cell_enter = cell_enter.max(next_y);
+            next_y += delta_y;
+        }
+    }
+    best
 }
 
 /// Interpolate one four-corner attribute over the renderer's fixed cell
@@ -2205,6 +2797,474 @@ mod tests {
             },
         );
         chunks
+    }
+
+    fn normalized_ray(origin: [f64; 3], direction: [f64; 3]) -> PovRay {
+        PovRay {
+            origin: glam::DVec3::from_array(origin),
+            direction: glam::DVec3::from_array(direction).normalize(),
+            clip_distances: [POV_NEAR_DISTANCE, POV_FAR_DISTANCE],
+        }
+    }
+
+    fn insert_height_chunk(
+        chunks: &mut PovChunkManager,
+        coord: RegionCoord,
+        handle: u64,
+        heights: Vec<f32>,
+    ) {
+        assert_eq!(heights.len(), CORE_VERTS);
+        let min_height = heights.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_height = heights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        chunks.chunks.insert(
+            coord,
+            ChunkEntry {
+                key: handle,
+                handle,
+                heights,
+                ambient_occlusion: vec![255; CORE_VERTS],
+                min_height,
+                max_height,
+            },
+        );
+    }
+
+    fn retained_organisms(
+        entries: impl IntoIterator<Item = (Organism, PovOrganismVisual)>,
+    ) -> PovOrganismManager {
+        let mut manager = PovOrganismManager::new();
+        for (organism, visual) in entries {
+            let entry = OrganismScratch {
+                key: OrganismVisualKey::new(&organism, visual),
+                organism,
+                visual,
+            };
+            match visual.primitive {
+                PovOrganismPrimitive::Box => manager.box_scratch.push(entry),
+                PovOrganismPrimitive::Sphere => manager.sphere_scratch.push(entry),
+            }
+        }
+        let order = |entry: &OrganismScratch| (entry.key.id, entry.key.slot);
+        manager.box_scratch.sort_unstable_by_key(order);
+        manager.sphere_scratch.sort_unstable_by_key(order);
+        manager.visual_generation = 1;
+        manager
+    }
+
+    fn test_visual(
+        primitive: PovOrganismPrimitive,
+        position: [f64; 3],
+        scale: [f32; 3],
+    ) -> PovOrganismVisual {
+        PovOrganismVisual {
+            primitive,
+            position,
+            scale,
+            yaw: 0.0,
+            color: [100, 120, 140, 0],
+            ambient_occlusion: 255,
+            bob: [0.0; 2],
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{actual} differs from {expected} by more than {tolerance}"
+        );
+    }
+
+    #[test]
+    fn screen_rays_match_camera_center_projection_aspect_and_far_origin() {
+        let mut camera = PovCamera::new();
+        camera.pos = glam::DVec3::new(1.0e12 + 0.25, -1.0e12 - 0.5, 700.75);
+        camera.yaw = 0.7;
+        camera.pitch = -0.3;
+        let center = camera
+            .screen_ray([800.0, 450.0], [1600, 900])
+            .expect("center ray");
+        assert_eq!(center.origin, camera.pos, "far origin must remain exact");
+        assert_close(center.direction.length(), 1.0, 1.0e-12);
+        assert!(
+            center
+                .direction
+                .abs_diff_eq(camera.forward().normalize(), 1.0e-12),
+            "center ray must equal camera forward"
+        );
+
+        let camera = PovCamera::new();
+        let forward = camera.forward();
+        let right = camera.right();
+        let up = right.cross(forward).normalize();
+        let half_fov = f64::from((POV_VERTICAL_FOV * 0.5).tan());
+        for (size, expected_aspect) in [([1600, 800], 2.0), ([600, 1200], 0.5)] {
+            let ray = camera
+                .screen_ray([0.0, 0.0], size)
+                .expect("top-left edge ray");
+            let along = ray.direction.dot(forward);
+            assert_close(
+                ray.direction.dot(right) / along,
+                -expected_aspect * half_fov,
+                1.0e-12,
+            );
+            assert_close(ray.direction.dot(up) / along, half_fov, 1.0e-12);
+            assert_close(ray.clip_distances[0], POV_NEAR_DISTANCE / along, 1.0e-12);
+            assert_close(ray.clip_distances[1], POV_FAR_DISTANCE / along, 1.0e-9);
+        }
+
+        // `view_proj` clamps pathological portrait aspects; picking must use
+        // that same frustum rather than the smaller raw width/height ratio.
+        let narrow = camera
+            .screen_ray([0.0, 1_000.0], [1, 2_000])
+            .expect("one-pixel-wide ray");
+        let along = narrow.direction.dot(forward);
+        assert_close(
+            narrow.direction.dot(right) / along,
+            -1.0e-3 * half_fov,
+            1.0e-10,
+        );
+    }
+
+    #[test]
+    fn screen_ray_rejects_invalid_or_outside_pane_coordinates() {
+        let camera = PovCamera::new();
+        for (point, size) in [
+            ([0.0, 0.0], [0, 10]),
+            ([0.0, 0.0], [10, 0]),
+            ([-0.001, 5.0], [10, 10]),
+            ([10.0, 5.0], [10, 10]),
+            ([5.0, 10.0], [10, 10]),
+            ([f64::NAN, 5.0], [10, 10]),
+            ([5.0, f64::INFINITY], [10, 10]),
+        ] {
+            assert!(camera.screen_ray(point, size).is_none(), "{point:?}");
+        }
+    }
+
+    #[test]
+    fn off_axis_raycast_uses_projection_plane_clips_not_fixed_radial_clips() {
+        let camera = PovCamera::new();
+        let ray = camera
+            .screen_ray([0.0, 0.0], [1_600, 800])
+            .expect("corner ray");
+        assert!(ray.clip_distances[0] > POV_NEAR_DISTANCE);
+        assert!(ray.clip_distances[1] > POV_FAR_DISTANCE);
+
+        let source = test_organism(0xCC, 0, 0, 1.0);
+        let before_near = ray.at(ray.clip_distances[0] * 0.5);
+        let near_manager = retained_organisms([(
+            source,
+            test_visual(
+                PovOrganismPrimitive::Box,
+                before_near.to_array(),
+                [0.001; 3],
+            ),
+        )]);
+        assert!(near_manager.raycast(ray, 0.0, 10.0).is_none());
+
+        // A corner body beyond radial 2048 is still inside the projection's
+        // view-axis far plane. A fog reach above 2048 may therefore draw and
+        // inspect it (for example a large WER_POV_RADIUS override).
+        let visible_distance = POV_FAR_DISTANCE + 25.0;
+        let visible = ray.at(visible_distance);
+        let far_manager = retained_organisms([(
+            source,
+            test_visual(PovOrganismPrimitive::Box, visible.to_array(), [2.0; 3]),
+        )]);
+        let hit = far_manager
+            .raycast(ray, 0.0, visible_distance + 10.0)
+            .expect("off-axis body before the view-axis far plane");
+        assert!(hit.distance > POV_FAR_DISTANCE);
+        assert!(hit.distance < ray.clip_distances[1]);
+    }
+
+    #[test]
+    fn terrain_raycast_hits_flat_sloped_and_both_diagonal_triangles() {
+        let flat = flat_chunk_manager(255);
+        let hit = flat
+            .raycast(normalized_ray([6.0, 7.0, 30.0], [0.0, 0.0, -1.0]), 100.0)
+            .expect("flat terrain hit");
+        assert_close(hit.distance, 20.0, 1.0e-12);
+        assert_eq!(hit.position, glam::DVec3::new(6.0, 7.0, 10.0));
+        assert_eq!(hit.cell, [1, 1]);
+        assert_eq!(hit.triangle, 1);
+
+        let mut chunks = PovChunkManager::new();
+        let mut heights = vec![0.0; CORE_VERTS];
+        heights[1] = 4.0;
+        heights[POV_GRID] = 8.0;
+        heights[POV_GRID + 1] = 12.0;
+        insert_height_chunk(&mut chunks, RegionCoord::new(0, 0), 1, heights);
+        for (xy, expected_height, expected_triangle) in [
+            ([3.0, 1.0], 5.0, 0),
+            ([1.0, 3.0], 7.0, 1),
+            ([2.0, 2.0], 6.0, 0),
+        ] {
+            let hit = chunks
+                .raycast(
+                    normalized_ray([xy[0], xy[1], 20.0], [0.0, 0.0, -1.0]),
+                    100.0,
+                )
+                .expect("sloped terrain hit");
+            assert_close(hit.position.z, expected_height, 1.0e-12);
+            assert_eq!(hit.cell, [0, 0]);
+            assert_eq!(hit.triangle, expected_triangle, "probe {xy:?}");
+        }
+    }
+
+    #[test]
+    fn terrain_raycast_traverses_cells_regions_and_far_world_coordinates() {
+        let mut cross_cell = PovChunkManager::new();
+        let mut heights = vec![0.0; CORE_VERTS];
+        // Expand the broad-phase height range away from the ray so the DDA
+        // must walk many flat cells before reaching z=0.
+        heights[POV_MESH_RES * POV_GRID] = 10.0;
+        insert_height_chunk(&mut cross_cell, RegionCoord::new(0, 0), 1, heights);
+        let cross_cell_ray = normalized_ray([1.0, 2.0, 15.0], [1.0, 0.0, -0.21]);
+        let hit = cross_cell
+            .raycast(cross_cell_ray, 500.0)
+            .expect("cross-cell hit");
+        assert!(hit.cell[0] >= 17, "DDA stopped too early: {hit:?}");
+        assert_close(hit.position.z, 0.0, 1.0e-10);
+
+        let mut cross_region = PovChunkManager::new();
+        insert_height_chunk(
+            &mut cross_region,
+            RegionCoord::new(0, 0),
+            1,
+            vec![0.0; CORE_VERTS],
+        );
+        insert_height_chunk(
+            &mut cross_region,
+            RegionCoord::new(1, 0),
+            2,
+            vec![0.0; CORE_VERTS],
+        );
+        let hit = cross_region
+            .raycast(normalized_ray([200.0, 20.0, 15.0], [1.0, 0.0, -0.1]), 500.0)
+            .expect("cross-region hit");
+        assert_eq!(hit.region, RegionCoord::new(1, 0));
+        assert_close(hit.position.x, 350.0, 1.0e-9);
+
+        let far_coord = RegionCoord::new(1_000_000, -1_000_000);
+        let (ox, oy) = far_coord.origin();
+        let mut far = PovChunkManager::new();
+        insert_height_chunk(&mut far, far_coord, 7, vec![10.0; CORE_VERTS]);
+        let hit = far
+            .raycast(
+                normalized_ray([ox + 6.25, oy + 7.75, 30.0], [0.0, 0.0, -1.0]),
+                100.0,
+            )
+            .expect("far-origin hit");
+        assert_eq!(hit.region, far_coord);
+        assert_eq!(hit.position.x, ox + 6.25);
+        assert_eq!(hit.position.y, oy + 7.75);
+        assert_close(hit.distance, 20.0, 1.0e-12);
+    }
+
+    #[test]
+    fn terrain_raycast_excludes_missing_skirts_sky_and_beyond_fog() {
+        let empty = PovChunkManager::new();
+        assert!(empty
+            .raycast(normalized_ray([1.0, 1.0, 20.0], [0.0, 0.0, -1.0]), 100.0)
+            .is_none());
+
+        let chunks = flat_chunk_manager(255);
+        // A horizontal ray below the core would hit the renderer's defensive
+        // west skirt, but skirts are intentionally not inspectable terrain.
+        assert!(chunks
+            .raycast(normalized_ray([-5.0, 5.0, 0.0], [1.0, 0.0, 0.0]), 100.0)
+            .is_none());
+        assert!(chunks
+            .raycast(normalized_ray([5.0, 5.0, 30.0], [0.0, 0.0, 1.0]), 100.0)
+            .is_none());
+        let down = normalized_ray([5.0, 5.0, 30.0], [0.0, 0.0, -1.0]);
+        assert!(chunks.raycast(down, 19.999).is_none());
+        assert!(chunks.raycast(down, 20.0).is_none(), "fog edge is hidden");
+        assert!(chunks.raycast(down, 20.001).is_some());
+    }
+
+    #[test]
+    fn yawed_box_uses_oriented_slabs_and_rejects_behind_or_fogged_hits() {
+        let organism = test_organism(0xAA, 3, 0, 1.0);
+        let mut visual = test_visual(PovOrganismPrimitive::Box, [0.0, 0.0, 0.0], [6.0, 1.0, 2.0]);
+        visual.yaw = core::f32::consts::FRAC_PI_4;
+        let manager = retained_organisms([(organism, visual)]);
+        let along_long_axis = normalized_ray([-10.0, -10.0, 0.0], [1.0, 1.0, 0.0]);
+        let hit = manager
+            .raycast(along_long_axis, 0.0, 100.0)
+            .expect("yawed OBB hit");
+        assert_eq!(hit.organism, organism);
+        assert!(manager
+            .raycast(along_long_axis, 0.0, hit.distance)
+            .is_none());
+        assert!(manager
+            .raycast(along_long_axis, 0.0, hit.distance + 1.0e-9)
+            .is_some());
+
+        // This point is inside the rotated body's conservative world AABB,
+        // but outside its narrow local-y slab.
+        assert!(manager
+            .raycast(
+                normalized_ray([2.2, -2.2, 5.0], [0.0, 0.0, -1.0]),
+                0.0,
+                100.0,
+            )
+            .is_none());
+        assert!(manager
+            .raycast(
+                normalized_ray([-10.0, -10.0, 0.0], [-1.0, -1.0, 0.0]),
+                0.0,
+                100.0,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn scaled_canonical_icosphere_requires_broad_and_faceted_intersections() {
+        let organism = test_organism(0xBB, 2, 1, 1.0);
+        let mut visual = test_visual(
+            PovOrganismPrimitive::Sphere,
+            [10.0, 0.0, 0.0],
+            [4.0, 2.0, 6.0],
+        );
+        visual.yaw = 0.7;
+        let manager = retained_organisms([(organism, visual)]);
+        let ray = normalized_ray([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        let local = visual.local_ray(ray, 0.0).expect("valid scale");
+        let expected = raycast_canonical_icosphere(local, POV_NEAR_DISTANCE, 100.0)
+            .expect("canonical facets hit");
+        let hit = manager.raycast(ray, 0.0, 100.0).expect("scaled sphere hit");
+        assert_close(hit.distance, expected, 1.0e-12);
+        assert_eq!(hit.organism, organism);
+
+        let broad_miss = normalized_ray([-2.0, 0.51, 0.0], [1.0, 0.0, 0.0]);
+        assert!(raycast_canonical_icosphere(broad_miss, 0.0, 10.0).is_none());
+
+        // A near-tangent ray enters the analytic radius-0.5 sphere but not
+        // the inscribed two-subdivision facets. The broad phase must never be
+        // promoted to a visible hit.
+        let facet_miss = (0..720)
+            .map(|step| {
+                let angle = f64::from(step) * core::f64::consts::TAU / 720.0;
+                normalized_ray(
+                    [-2.0, 0.499 * angle.cos(), 0.499 * angle.sin()],
+                    [1.0, 0.0, 0.0],
+                )
+            })
+            .find(|ray| raycast_canonical_icosphere(*ray, 0.0, 10.0).is_none())
+            .expect("inscribed facets leave a gap inside the analytic sphere");
+        let a = facet_miss.direction.length_squared();
+        let half_b = facet_miss.origin.dot(facet_miss.direction);
+        let c = facet_miss.origin.length_squared() - 0.25;
+        assert!(half_b.mul_add(half_b, -a * c) > 0.0);
+    }
+
+    #[test]
+    fn organism_raycast_selects_nearest_source_identity_and_tracks_bob() {
+        let mut far_source = test_organism(1, 1, 0, 1.0);
+        far_source.species = 0x1111_2222_3333_4444;
+        far_source.cell = LocalPos::new(7, 6);
+        far_source.expressed.aggression = 0.875;
+        let near_source = test_organism(99, 3, 0, 1.0);
+        let far_visual = test_visual(PovOrganismPrimitive::Box, [20.0, 0.0, 0.0], [2.0; 3]);
+        let near_visual = test_visual(PovOrganismPrimitive::Box, [10.0, 0.0, 0.0], [2.0; 3]);
+        let manager = retained_organisms([(far_source, far_visual), (near_source, near_visual)]);
+        let hit = manager
+            .raycast(normalized_ray([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]), 0.0, 100.0)
+            .expect("nearest body");
+        assert_eq!(hit.organism, near_source, "distance beats stable id order");
+        assert_close(hit.distance, 9.0, 1.0e-12);
+
+        let mut bob_visual =
+            test_visual(PovOrganismPrimitive::Box, [0.0, 10.0, 0.0], [2.0, 2.0, 1.0]);
+        bob_visual.bob = [2.0, 0.0];
+        let bob_manager = retained_organisms([(far_source, bob_visual)]);
+        assert!(bob_manager.has_animated_visuals());
+        assert!(bob_manager
+            .raycast(normalized_ray([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]), 0.0, 100.0,)
+            .is_some());
+        assert!(bob_manager
+            .raycast(normalized_ray([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]), 1.0, 100.0,)
+            .is_none());
+        let bob_hit = bob_manager
+            .raycast(normalized_ray([0.0, 0.0, 2.0], [0.0, 1.0, 0.0]), 1.0, 100.0)
+            .expect("time-shifted bob hit");
+        assert_eq!(bob_hit.organism, far_source);
+    }
+
+    #[test]
+    fn scene_raycast_respects_body_terrain_occlusion_and_depth_ties() {
+        let chunks = flat_chunk_manager(255);
+        let source = test_organism(7, 0, 0, 1.0);
+        let ray = normalized_ray([32.0, 48.0, 20.0], [0.0, 0.0, -1.0]);
+
+        let behind = retained_organisms([(
+            source,
+            test_visual(PovOrganismPrimitive::Box, [32.0, 48.0, 9.0], [1.0; 3]),
+        )]);
+        assert!(matches!(
+            raycast_scene(&chunks, &behind, ray, 0.0, 100.0),
+            Some(PovSceneHit::Terrain(_))
+        ));
+
+        let nearer = retained_organisms([(
+            source,
+            test_visual(PovOrganismPrimitive::Box, [32.0, 48.0, 12.0], [2.0; 3]),
+        )]);
+        assert!(matches!(
+            raycast_scene(&chunks, &nearer, ray, 0.0, 100.0),
+            Some(PovSceneHit::Organism(hit)) if hit.organism == source
+        ));
+
+        let tied = retained_organisms([(
+            source,
+            test_visual(PovOrganismPrimitive::Box, [32.0, 48.0, 9.5], [1.0; 3]),
+        )]);
+        let hit = raycast_scene(&chunks, &tied, ray, 0.0, 100.0).expect("tie hit");
+        assert!(matches!(hit, PovSceneHit::Terrain(_)));
+        assert_close(hit.distance(), 10.0, 1.0e-12);
+    }
+
+    #[test]
+    fn resident_and_visual_generations_change_only_with_pick_geometry_or_source() {
+        let map = settled_map();
+        let mut chunks = PovChunkManager::new();
+        assert_eq!(chunks.resident_generation(), 0);
+        let (uploads, _) = chunks.sync(&map, (0.0, 0.0), 0, &InlineExecutor);
+        assert_eq!(uploads.len(), 1);
+        let integrated = chunks.resident_generation();
+        assert_eq!(integrated, 1);
+        let (uploads, removes) = chunks.sync(&map, (0.0, 0.0), 0, &InlineExecutor);
+        assert!(uploads.is_empty() && removes.is_empty());
+        assert_eq!(chunks.resident_generation(), integrated);
+
+        let chunks = flat_chunk_manager(255);
+        let mut organism = test_organism(42, 2, 0, 1.0);
+        let mut manager = PovOrganismManager::new();
+        assert_eq!(manager.visual_generation(), 0);
+        assert!(manager.sync_organisms(core::iter::once(&organism), &chunks, (0.0, 0.0), 1_000.0,));
+        let first = manager.visual_generation();
+        let instances = manager.upload().boxes.clone();
+        assert!(!manager.sync_organisms(
+            core::iter::once(&organism),
+            &chunks,
+            (0.01, 0.01),
+            1_000.0,
+        ));
+        assert_eq!(manager.visual_generation(), first);
+
+        // Species is panel-visible source identity but does not alter this
+        // visual's primitive/transform/color. It must still dirty picking.
+        organism.species ^= 0xDEAD_BEEF;
+        assert!(manager.sync_organisms(
+            core::iter::once(&organism),
+            &chunks,
+            (0.01, 0.01),
+            1_000.0,
+        ));
+        assert_eq!(manager.visual_generation(), first + 1);
+        assert_eq!(manager.upload().boxes, instances);
     }
 
     #[test]

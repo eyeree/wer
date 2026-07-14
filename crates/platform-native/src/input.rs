@@ -40,6 +40,12 @@ impl WinitInputAdapter {
         self.surface_focused
     }
 
+    /// Last physical surface position supplied by winit, used only to route
+    /// button/wheel gestures through the shared visible pane rectangle.
+    pub(crate) const fn cursor_position(&self) -> Option<[f64; 2]> {
+        self.cursor
+    }
+
     pub(crate) fn modifiers_changed(&mut self, state: ModifiersState) -> NormalizedInputEvent {
         self.modifiers = modifiers(state);
         NormalizedInputEvent::ModifiersChanged(self.modifiers)
