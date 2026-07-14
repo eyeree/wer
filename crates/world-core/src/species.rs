@@ -31,7 +31,8 @@ pub const TROPHIC_TIERS: usize = 4;
 
 /// A species' trophic role in its ecosystem.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Trophic {
     /// Primary producer (plants, phytoplankton).
     Producer = 0,

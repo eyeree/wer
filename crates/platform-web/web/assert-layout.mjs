@@ -50,11 +50,15 @@ try {
     agent([
       "wait",
       "--fn",
-      `document.body.dataset.originFeatureHash !== undefined && window.__mapStatus?.presented === true && window.__mapStatus.resize_generation > ${previousResizeGeneration} && window.__mapStatus.resize_redraw_generation === window.__mapStatus.resize_generation && window.__viewerCharacterization().canvases.map.backing.width === Math.round(window.__viewerCharacterization().boxes.canvasHost.width * window.devicePixelRatio) && window.__viewerCharacterization().canvases.map.backing.height === Math.round(window.__viewerCharacterization().boxes.canvasHost.height * window.devicePixelRatio)`,
+      `document.body.dataset.originFeatureHash !== undefined && window.__mapStatus?.presented === true && window.__mapStatus.resize_generation > ${previousResizeGeneration} && window.__mapStatus.resize_redraw_generation === window.__mapStatus.resize_generation && window.__viewerCharacterization().panel.busy === "false" && window.__viewerCharacterization().panel.sections > 0 && window.__viewerCharacterization().canvases.map.backing.width === Math.round(window.__viewerCharacterization().boxes.canvasHost.width * window.devicePixelRatio) && window.__viewerCharacterization().canvases.map.backing.height === Math.round(window.__viewerCharacterization().boxes.canvasHost.height * window.devicePixelRatio)`,
     ]);
 
     const measured = evaluate(`(() => {
       const characterization = window.__viewerCharacterization();
+      const panelRoot = document.querySelector("[data-panel-document]");
+      const panelField = document.querySelector("[data-panel-field]");
+      window.__layoutPanelRoot ||= panelRoot;
+      window.__layoutPanelField ||= panelField;
       const map = characterization.canvases.mapViewport;
       const center = map
         ? JSON.parse(window.__werApp.map_world_at(map.dx + map.dw / 2, map.dy + map.dh / 2))
@@ -62,9 +66,23 @@ try {
       const outside = map
         ? JSON.parse(window.__werApp.map_world_at(map.dx - 0.01, map.dy + map.dh / 2))
         : null;
-      return { characterization, center, outside, mapStatus: window.__mapStatus };
+      return {
+        characterization,
+        center,
+        outside,
+        mapStatus: window.__mapStatus,
+        panelIdentity: {
+          rootStable: window.__layoutPanelRoot === panelRoot,
+          fieldStable: window.__layoutPanelField === panelField,
+          connected: panelRoot?.isConnected ?? false,
+          hidden: panelRoot?.hidden ?? true,
+        },
+        clippedPanelText: Array.from(
+          document.querySelectorAll("[data-panel-field-row]:not([hidden]) dt, [data-panel-field-row]:not([hidden]) dd"),
+        ).filter((node) => node.scrollWidth > node.clientWidth + 1).map((node) => node.textContent),
+      };
     })()`);
-    const { characterization: layout, center, outside, mapStatus } = measured;
+    const { characterization: layout, center, outside, mapStatus, panelIdentity, clippedPanelText } = measured;
     previousResizeGeneration = mapStatus.resize_generation;
     const name = `${requested.width}x${requested.height}@${requested.dpr}`;
     assert(layout.viewport.layoutContract === requested.contract, `${name}: wrong layout contract`);
@@ -102,6 +120,21 @@ try {
       `${name}: resize did not independently redraw the new backing store`,
     );
 
+    assert(
+      panelIdentity.rootStable && panelIdentity.fieldStable && panelIdentity.connected && !panelIdentity.hidden,
+      `${name}: information panel or a stable field node was rebuilt/unmounted`,
+    );
+    assert(
+      clippedPanelText.length === 0,
+      `${name}: panel labels/values clipped horizontally: ${JSON.stringify(clippedPanelText)}`,
+    );
+    assert(
+      layout.panel.columns.length === 3 &&
+        layout.panel.columns.map((column) => column.id).join(",") === "explorer,world,system" &&
+        layout.panel.columns.every((column) => column.connected && column.box.width > 0),
+      `${name}: shared document is not mounted in exactly three stable columns`,
+    );
+
     const document = layout.document;
     if (requested.contract === "bounded-desktop") {
       assert(
@@ -115,6 +148,25 @@ try {
           `${name}: ${boxName} escaped the bounded desktop viewport`,
         );
       }
+      const columns = layout.panel.columns;
+      assert(
+        layout.panel.gridTemplateColumns.trim().split(/\s+/).length === 3,
+        `${name}: desktop panel grid did not resolve to three columns`,
+      );
+      assert(
+        columns.every(
+          (column) =>
+            column.overflowY === "auto" &&
+            column.box.bottom <= layout.boxes.infoPanel.bottom + 0.001 &&
+            column.clientHeight <= layout.boxes.infoPanel.height,
+        ),
+        `${name}: desktop panel columns are not independently bounded and scrollable`,
+      );
+      assert(
+        columns[0].box.right <= columns[1].box.x + 0.001 &&
+          columns[1].box.right <= columns[2].box.x + 0.001,
+        `${name}: desktop panel columns overlap`,
+      );
     } else {
       assert(document.scrollWidth === document.clientWidth, `${name}: narrow layout overflowed horizontally`);
       assert(document.scrollHeight > document.clientHeight, `${name}: narrow stack did not expose page scroll`);
@@ -122,8 +174,109 @@ try {
         layout.boxes.infoPanel.bottom <= document.scrollHeight + 0.001,
         `${name}: narrow information panel is unreachable`,
       );
+      const columns = layout.panel.columns;
+      assert(
+        layout.panel.gridTemplateColumns.trim().split(/\s+/).length === 1 &&
+          columns.every((column) => column.overflowY === "visible"),
+        `${name}: narrow panel did not become a one-column page-scroll stack`,
+      );
+      assert(
+        columns[0].box.bottom <= columns[1].box.y + 0.001 &&
+          columns[1].box.bottom <= columns[2].box.y + 0.001,
+        `${name}: narrow panel columns overlap vertically`,
+      );
     }
   }
+
+  const cadence = evaluate(`(() => {
+    // First synchronize the injected DOM count with the readout. Its own text
+    // change is intentionally excluded from that counter, so this settles.
+    window.__refreshPanelForTest();
+    window.__refreshPanelForTest();
+    const field = document.querySelector("[data-panel-field]");
+    const mapCounters = () => ({
+      updateSerial: window.__mapStatus.update_serial,
+      resize: window.__mapStatus.resize_generation,
+      redraw: window.__mapStatus.resize_redraw_generation,
+      presented: window.__mapStatus.presented,
+      uploadBytes: window.__mapStatus.upload_bytes,
+    });
+    const before = {
+      builds: window.__werApp.panel_build_count(),
+      panel: window.__panelStatus(),
+      map: mapCounters(),
+    };
+    window.__refreshPanelForTest();
+    window.__refreshPanelForTest();
+    window.__refreshPanelForTest();
+    const after = {
+      builds: window.__werApp.panel_build_count(),
+      panel: window.__panelStatus(),
+      map: mapCounters(),
+      fieldStable: field === document.querySelector("[data-panel-field]"),
+    };
+    return { before, after };
+  })()`);
+  assert(
+    cadence.after.builds === cadence.before.builds,
+    "unchanged panel refreshes rebuilt the shared Rust document",
+  );
+  assert(
+    cadence.after.panel.domUpdates === cadence.before.panel.domUpdates &&
+      cadence.after.fieldStable,
+    "unchanged panel refreshes mutated or replaced DOM fields",
+  );
+  assert(
+    JSON.stringify(cadence.after.map) === JSON.stringify(cadence.before.map),
+    "panel refresh changed map update/resize/redraw/presentation counters",
+  );
+
+  const modeMount = evaluate(`(async () => {
+    const panel = document.querySelector("[data-panel-document]");
+    const field = document.querySelector("[data-panel-field]");
+    const results = [];
+    const telemetry = () => ({
+      compose: document.querySelector('[data-panel-field="performance.compose"]')?.textContent,
+      present: document.querySelector('[data-panel-field="performance.present"]')?.textContent,
+      upload: document.querySelector('[data-panel-field="performance.upload"]')?.textContent,
+    });
+    // Force one observable CPU upload before the mode transition. This makes
+    // the stale-value regression deterministic rather than relying on boot
+    // timing or the final idle Map frame.
+    window.__werApp.action("zoom-in");
+    // A direct wasm action deliberately does not own the RAF scheduler. Send
+    // one unbound DOM key to exercise the production adapter's scheduling
+    // path, then sample immediately after that single dirty frame.
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "F24" }));
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    window.__refreshPanelForTest();
+    const cpuTelemetry = telemetry();
+    // The headless browser has no adapter. Inject only the shared capability
+    // notification so the controller can exercise POV/Split state while the
+    // renderer continues taking its tested fallback path.
+    window.__werApp.renderer_available();
+    for (const mode of ["map", "pov", "split", "map"]) {
+      document.querySelector('button[data-action="set-presentation"][data-value="' + mode + '"]')?.click();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      window.__refreshPanelForTest();
+      results.push({ requested: mode, actual: document.querySelector('[data-panel-field="view.mode"]')?.textContent, panel: panel === document.querySelector("[data-panel-document]"), field: field === document.querySelector("[data-panel-field]"), connected: panel.isConnected, hidden: panel.hidden, telemetry: telemetry() });
+    }
+    return { cpuTelemetry, results };
+  })()`);
+  assert(
+    modeMount.results.every(
+      (entry) => entry.actual === entry.requested && entry.panel && entry.field && entry.connected && !entry.hidden,
+    ),
+    `Map/POV/Split transitions did not enter their requested mode or preserve the shared panel: ${JSON.stringify(modeMount)}`,
+  );
+  const povMount = modeMount.results.find((entry) => entry.requested === "pov");
+  assert(
+    modeMount.cpuTelemetry.upload !== "0 KiB/f" &&
+      povMount?.telemetry.compose === "0.00 ms" &&
+      povMount?.telemetry.present === "0.00 ms" &&
+      povMount?.telemetry.upload === "0 KiB/f",
+    `POV performance telemetry retained stale CPU-map values: ${JSON.stringify(modeMount)}`,
+  );
 } finally {
   try {
     agent(["close"]);

@@ -2071,10 +2071,12 @@ impl Pov {
     /// Record the fixed 3D-4 order: directional depth, then opaque terrain,
     /// boxes, spheres, the sky (exactly the depth-untouched pixels), then
     /// translucent river overlays, and finally sea.
+    #[allow(clippy::too_many_arguments)] // Mirrors the fixed pass inputs without hidden state.
     pub(crate) fn draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
+        viewport: crate::SurfaceViewport,
         draws: &[(u64, u32)],
         clear: [f64; 4],
         water: bool,
@@ -2163,6 +2165,7 @@ impl Pov {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        viewport.set(&mut pass);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -2385,6 +2388,7 @@ impl PovCapture {
             self.pov.draw(
                 &mut encoder,
                 target,
+                crate::SurfaceViewport::new(0, 0, rw, rh),
                 &draws,
                 clear,
                 frame.water,
@@ -2395,6 +2399,7 @@ impl PovCapture {
             self.pov.draw(
                 &mut encoder,
                 &view,
+                crate::SurfaceViewport::new(0, 0, self.width, self.height),
                 &draws,
                 clear,
                 frame.water,

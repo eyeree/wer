@@ -26,6 +26,8 @@ pov-host = { path = "../pov-host" }
 renderer = { path = "../renderer" }
 glam = { workspace = true, features = ["f64"] }
 log = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
 
 # Browser-only dependencies. Gating them to the wasm target keeps a native
 # `cargo check` of the whole workspace fast and free of browser bindings, while

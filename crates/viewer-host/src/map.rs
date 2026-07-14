@@ -33,7 +33,8 @@ pub use world_runtime::mapcolor::{composite_cell_color, expressed_color};
 
 /// Which scalar or categorical field the map paints.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Channel {
     /// Composite terrain, biome, and water color.
     Composite,
@@ -621,7 +622,7 @@ impl MapLayer {
 }
 
 /// Map overlay toggles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Overlays {
     /// Region grid lines.
     pub grid: bool,
@@ -716,7 +717,8 @@ pub fn pick_organism(
 }
 
 /// Map rendering path selected by the controller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MapBackend {
     /// Canonical CPU raster.
     Cpu,
@@ -726,7 +728,8 @@ pub enum MapBackend {
 
 /// Why a requested GPU-atlas draw was prepared through the canonical CPU
 /// path instead. The actual path remains available as [`MapRenderPacket::backend`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MapBackendFallback {
     /// The platform has no initialized map-capable GPU renderer.
     GpuUnavailable,

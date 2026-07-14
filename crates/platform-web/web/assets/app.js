@@ -1,12 +1,21 @@
 import { runStartupBenchmark } from "./benchmark.js";
 import { openVault } from "./storage.js";
 
-const fields = new Map(
-  Array.from(document.querySelectorAll("[data-field]"), (node) => [node.dataset.field, node]),
+const statusFields = new Map(
+  Array.from(document.querySelectorAll("[data-status-field]"), (node) => [
+    node.dataset.statusField,
+    node,
+  ]),
+);
+const platformFields = new Map(
+  Array.from(document.querySelectorAll("[data-platform-field]"), (node) => [
+    node.dataset.platformField,
+    node,
+  ]),
 );
 
 let workerProbe;
-let lastSnapshot;
+let lastPresentation;
 const registeredActions = new Set();
 // The wasm module namespace, kept for the async POV renderer bring-up.
 let wasmMod;
@@ -22,11 +31,9 @@ let surfaceBacking = { width: 1, height: 1, dpr: 1 };
 let surfaceResizeGeneration = 0;
 let resizeRedrawGeneration = 0;
 
-const write = (name, value, cls) => {
-  const node = fields.get(name);
+const writeStatus = (name, value, cls) => {
+  const node = statusFields.get(name);
   if (!node) return;
-  // Skipping unchanged text keeps the throttled panel refresh from causing
-  // any DOM/layout work in the steady state.
   if (node.textContent !== `${value}`) node.textContent = value;
   if (cls && node.className !== cls) node.className = cls;
 };
@@ -41,7 +48,7 @@ const perf = {
   updateMs: null,
   composeMs: null,
   presentMs: null,
-  uploadKb: null,
+  uploadKib: null,
 };
 
 // Newest entries win: the log keeps a bounded tail so the DOM (and the
@@ -49,7 +56,7 @@ const perf = {
 const MAX_DIAGNOSTIC_LINES = 100;
 
 const appendDiagnostic = (message) => {
-  const node = fields.get("diagnostics");
+  const node = platformFields.get("diagnostics");
   if (!node) return;
   const lines = `${node.textContent}\n${message}`.trim().split("\n");
   node.textContent = lines.slice(-MAX_DIAGNOSTIC_LINES).join("\n");
@@ -149,11 +156,11 @@ const applySharedLayout = (layout) => {
 // here would be dropped, since the probe runs before `initWasm` resolves.
 const probeWebGpu = () => {
   if ("gpu" in navigator) {
-    write("webgpu-status", "WebGPU available", "ok");
+    writeStatus("webgpu-status", "WebGPU available", "ok");
     appendDiagnostic("WebGPU: available");
     return true;
   }
-  write("webgpu-status", "WebGPU unavailable", "warn");
+  writeStatus("webgpu-status", "WebGPU unavailable", "warn");
   appendDiagnostic("WebGPU: unavailable; CPU/static fallback active");
   return false;
 };
@@ -271,20 +278,17 @@ const initWasm = async () => {
     }
     const hash = mod.origin_feature_hash();
     const hex = `0x${hash.toString(16).padStart(16, "0")}`;
-    write("wasm-status", "wasm loaded", "ok");
-    write("origin-hash", `origin ${hex}`, "ok");
+    writeStatus("wasm-status", "wasm loaded", "ok");
+    writeStatus("origin-hash", `origin ${hex}`, "ok");
     appendDiagnostic(`origin_feature_hash=${hex}`);
     document.body.dataset.originFeatureHash = hex;
-    const snapshot = JSON.parse(app.info_snapshot());
-    updateSnapshot(snapshot);
-    syncViewMode(snapshot, "cpu");
     // The first shared frame performs the first and only world update. Map
     // presentation is read-only and waits for that frame instead of secretly
     // settling the world from `map_pixels`.
     scheduleFrame();
   } catch (error) {
-    write("wasm-status", "wasm failed", "err");
-    write("origin-hash", "origin hash unavailable", "err");
+    writeStatus("wasm-status", "wasm failed", "err");
+    writeStatus("origin-hash", "origin hash unavailable", "err");
     appendDiagnostic(`wasm initialization failed: ${String(error)}`);
     throw error;
   }
@@ -303,6 +307,8 @@ const initWorkerProbe = () => {
 const initStorage = async () => {
   const state = await openVault();
   appendDiagnostic(`storage:${state.mode}`);
+  window.__werApp?.storage_status(state.mode, state.failures);
+  requestPanelRefresh(true);
   if (state.available) dispatchAction("set-storage-enabled", "true");
 };
 
@@ -321,18 +327,18 @@ const renderMap = () => {
   const t2 = performance.now();
   perf.composeMs = t1 - t0;
   perf.presentMs = t2 - t1;
-  perf.uploadKb = pixels.byteLength / 1024;
+  perf.uploadKib = pixels.byteLength / 1024;
   return presented;
 };
 
-// Mirror the wasm snapshot into the toolbar so toggles visibly register:
+// Mirror the small serde-built presentation DTO into the toolbar so toggles visibly register:
 // buttons carry pressed state, selects show the mode the runtime is in.
 // Shared action descriptors are the one source of truth (alignment plan §5.2).
-const syncControls = (snapshot) => {
-  const pov = snapshot.view.pov;
+const syncControls = (presentation) => {
+  const pov = presentation.view.pov;
   const pressed = {
-    "toggle-gpu-compose": snapshot.map.backend === "gpu-atlas",
-    "toggle-refinement": snapshot.renderer.refinement,
+    "toggle-gpu-compose": presentation.map.backend === "gpu-atlas",
+    "toggle-refinement": presentation.map.refinement,
     "toggle-walk": pov.motion === "walk",
     "toggle-pov-shadow-ao": pov.shadow_ao,
     "toggle-pov-detail-normals": pov.detail_normals,
@@ -343,16 +349,19 @@ const syncControls = (snapshot) => {
     if (control) control.setAttribute("aria-pressed", String(state));
   }
   for (const control of document.querySelectorAll('button[data-action="toggle-overlay"]')) {
-    control.setAttribute("aria-pressed", String(snapshot.map.overlays[control.dataset.overlayKey]));
+    control.setAttribute(
+      "aria-pressed",
+      String(presentation.map.overlays[control.dataset.overlayKey]),
+    );
   }
   for (const control of document.querySelectorAll('button[data-action="set-presentation"]')) {
-    control.setAttribute("aria-pressed", String(control.dataset.value === snapshot.view.mode));
+    control.setAttribute("aria-pressed", String(control.dataset.value === presentation.view.mode));
   }
   const selectValues = {
-    "set-map-channel": snapshot.channel,
-    "set-resource-tier": snapshot.tier.runtime,
+    "set-map-channel": presentation.map.channel,
+    "set-resource-tier": presentation.tier.runtime,
     "set-worker-backend": { inline: "inline", workers: "workers", "shared-memory": "shared-workers" }[
-      snapshot.executor.mode
+      presentation.executor.mode
     ],
     "set-pov-render-scale": `${pov.render_scale}`,
   };
@@ -362,25 +371,16 @@ const syncControls = (snapshot) => {
   }
 };
 
-const updateSnapshot = (snapshot) => {
-  lastSnapshot = snapshot;
-  write("region", `${snapshot.region[0]}, ${snapshot.region[1]}`);
-  write("channel", snapshot.channel);
-  write("tier", `${snapshot.tier.name} / ${snapshot.tier.cache_ceiling_mb} MB`);
-  write("executor", `${snapshot.executor.mode} / ${snapshot.executor.parallelism}`);
-  write("storage", snapshot.storage.mode);
-  zoom = snapshot.zoom;
-  write("zoom", `x${zoom}`);
-  write("webgpu-status", `${snapshot.renderer.mode} / refine ${snapshot.renderer.refinement}`);
-  write("map-decor-status", snapshot.map.decor_status.replaceAll("-", " "));
-  const pov = snapshot.view.pov;
-  write(
-    "view",
-    snapshot.view.mode === "pov"
-      ? `pov (${pov.motion}, scale ${pov.render_scale}${pov.water ? "" : ", water off"})`
-      : `map${snapshot.view.pov_supported ? "" : " / pov unavailable"}`,
+const updatePresentation = (presentation) => {
+  lastPresentation = presentation;
+  if (presentation.view.mode === "pov") clearPanelHover();
+  zoom = presentation.map.zoom;
+  writeStatus(
+    "webgpu-status",
+    `${presentation.renderer.mode} / refine ${presentation.map.refinement}`,
   );
-  syncControls(snapshot);
+  writeStatus("map-decor-status", presentation.decor_status.replaceAll("-", " "));
+  syncControls(presentation);
 };
 
 const dispatchAction = (id, value = "") => {
@@ -419,9 +419,9 @@ const initializePovRenderer = async () => {
   } catch (error) {
     povEntering = false;
     appendDiagnostic(`pov init failed: ${String(error)}`);
-    // The device-loss path: back to map mode with the CPU map (the
-    // phase-7 "unsupported-feature paths return to map mode cleanly").
-    window.__werApp?.renderer_lost();
+    // Initialization failure is distinct from losing a device that had
+    // rendered successfully; both return to the CPU map without losing state.
+    window.__werApp?.renderer_unavailable();
     scheduleFrame();
     return;
   }
@@ -475,7 +475,7 @@ const viewerFrame = (now) => {
   lastViewerTime = now;
   const t0 = performance.now();
   const frame = JSON.parse(app.frame(dt, now / 1000));
-  const snapshot = frame.snapshot;
+  const presentation = frame.presentation;
   applySharedLayout(frame.layout);
   window.__povStatus = frame.pov;
   if (frame.pov.active) {
@@ -491,8 +491,15 @@ const viewerFrame = (now) => {
     }
   }
   perf.updateMs = performance.now() - t0;
-  updateSnapshot(snapshot);
-  syncViewMode(snapshot, frame.map.path);
+  updatePresentation(presentation);
+  syncViewMode(presentation, frame.map.path);
+  // CPU composition/presentation timings are measured around drawCpuMap.
+  // GPU Map and POV are submitted inside the wasm frame call, so these
+  // unavailable path-specific values are explicitly zero instead of leaking
+  // the last CPU frame into the shared information model.
+  perf.composeMs = 0;
+  perf.presentMs = 0;
+  perf.uploadKib = 0;
   let mapPresented = false;
   const redrawsResize = surfaceResizeDirty;
   if (frame.map.active && frame.map.path === "cpu") {
@@ -508,11 +515,12 @@ const viewerFrame = (now) => {
     ...frame.map,
     dirty: frame.map_dirty,
     presented: mapPresented,
+    update_serial: frame.update_serial,
     resize_generation: surfaceResizeGeneration,
     resize_redraw_generation: resizeRedrawGeneration,
   };
   if (frame.map.active && frame.map.path === "gpu-atlas") {
-    perf.uploadKb = frame.map.upload_bytes / 1024;
+    perf.uploadKib = frame.map.upload_bytes / 1024;
   }
   handleEffects();
   perf.frames += 1;
@@ -521,6 +529,7 @@ const viewerFrame = (now) => {
     perf.frames = 0;
     perf.lastRoll = now;
   }
+  requestPanelRefresh();
   if (frame.needs_frame || app.needs_frame()) scheduleFrame();
 };
 
@@ -530,8 +539,8 @@ const scheduleFrame = () => {
 
 // Keep the canvas swap and frame loop in lockstep with the facade's view
 // mode, whatever changed it (button, Tab key, device loss).
-const syncViewMode = (snapshot, mapPath = "cpu") => {
-  const wantPov = snapshot.view.mode === "pov";
+const syncViewMode = (presentation, mapPath = "cpu") => {
+  const wantPov = presentation.view.mode === "pov";
   if (wantPov && !povActive) {
     enterPov();
   } else if (!wantPov && povActive) {
@@ -544,59 +553,240 @@ const syncViewMode = (snapshot, mapPath = "cpu") => {
   }
 };
 
-// ---- Throttled info panel (the native painted panel, phase-7-plan.md §3.2:
-// an HTML info panel replaces it in the browser). Stats refresh at 2 Hz —
-// never per frame — so the panel cannot meaningfully affect performance.
+// ---- Shared information document -------------------------------------------------
+// Rust owns sampling, labels, formatting, severity, and column placement. The
+// browser creates one accessible node per stable id, then mutates only the
+// value/severity/visibility properties that actually changed. Normal frame
+// telemetry is capped at 2 Hz; hover invalidation is intentionally immediate.
 const PANEL_REFRESH_MS = 500;
+const panelRoot = document.querySelector("[data-panel-document]");
+const panelColumnHosts = new Map(
+  Array.from(document.querySelectorAll("[data-panel-column]"), (node) => [
+    node.dataset.panelColumn,
+    node,
+  ]),
+);
+const panelSections = new Map();
+const panelFields = new Map();
+let panelDomUpdates = 0;
+let panelRefreshes = 0;
+let panelLastRefresh = Number.NEGATIVE_INFINITY;
+let panelRefreshTimer = 0;
+let panelSchemaVersion = null;
+let panelDocumentRevision = null;
 
-const megabytes = (bytes) => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-const millis = (value) => (value === null ? "—" : `${value.toFixed(1)}ms`);
-
-const updatePanelStats = (snapshot) => {
-  const stats = snapshot.stats;
-  if (!stats) return;
-  write("player", `${snapshot.world_pos[0].toFixed(0)}, ${snapshot.world_pos[1].toFixed(0)}`);
-  write("fps", viewerFrameHandle || povActive ? `${perf.fps}` : "idle");
-  write("update-ms", millis(perf.updateMs));
-  write("compose-ms", millis(perf.composeMs));
-  write("present-ms", millis(perf.presentMs));
-  write("upload-kb", perf.uploadKb === null ? "—" : `${perf.uploadKb.toFixed(0)} KB/f`);
-  write("stat-regions", `${stats.active_regions}`);
-  write(
-    "stat-cache",
-    `${megabytes(stats.cache_bytes + stats.macro_cache_bytes)} / ${snapshot.tier.cache_ceiling_mb} MB`,
-  );
-  write(
-    "stat-pool",
-    `${stats.pool_hits}h/${stats.pool_misses}m ${megabytes(stats.pool_bytes)}`,
-  );
-  write("stat-jobs", `${stats.dispatched} run, ${stats.cancelled} cancelled`);
-  write("stat-deferred", `${stats.deferred_regens}`);
-  write("stat-converged", `${stats.converged}`);
-  write("stat-cost", `${stats.regen_cost}`);
-  write("stat-rosters", `${stats.rosters_built} built, ${megabytes(stats.roster_cache_bytes)}`);
-  write("stat-organisms", `${stats.organisms}`);
-  write("stat-realized", `${stats.authoritative_realized}a/${stats.organisms_realized}v`);
-  write("stat-resonance", `${stats.resonance.toFixed(2)} (${stats.resonance_nodes} nodes)`);
-  write("stat-anchors", `${stats.anchors}`);
-  write(
-    "regen-by-layer",
-    stats.regen_by_layer.map((layer) => `${layer.name} ${layer.total}`).join(" · "),
-  );
-  const domains = ["Pla", "Cli", "Geo", "Hyd", "Eco", "Mor", "Beh", "Aes"];
-  write(
-    "bias",
-    snapshot.bias
-      .map((value, i) => `${domains[i]} ${value >= 0 ? "+" : ""}${value.toFixed(2)}`)
-      .join(" · "),
-  );
+const recordPanelMutation = (fieldId = null) => {
+  // The counter readout is instrumentation, not panel content. Counting its
+  // own text update would create a permanent N -> N+1 feedback rebuild at
+  // every refresh, so this one observer-effect mutation is deliberately
+  // excluded. Structure and every semantic field mutation remain counted.
+  if (fieldId === "performance.dom-updates") return;
+  panelDomUpdates += 1;
 };
 
-setInterval(() => {
+const safeDomId = (kind, id) =>
+  `panel-${kind}-${id.replaceAll(/[^A-Za-z0-9_-]/g, "-")}`;
+
+const newPanelField = (field, sectionId, attached) => {
+  const row = document.createElement("div");
+  row.className = "panel-field";
+  row.dataset.panelFieldRow = field.id;
+  row.dataset.severity = field.severity;
+  row.dataset.span = field.span;
+  row.hidden = !field.visible;
+
+  const label = document.createElement("dt");
+  label.textContent = field.label;
+  const value = document.createElement("dd");
+  value.dataset.panelField = field.id;
+  value.textContent = field.value;
+  row.append(label, value);
+
+  const state = {
+    row,
+    value,
+    sectionId,
+    label: field.label,
+    span: field.span,
+    severity: field.severity,
+    visible: field.visible,
+  };
+  panelFields.set(field.id, state);
+  if (attached) recordPanelMutation();
+  return state;
+};
+
+const newPanelSection = (section) => {
+  const host = panelColumnHosts.get(section.column);
+  if (!host) throw new Error(`panel document named unknown column ${section.column}`);
+
+  const node = document.createElement("section");
+  node.className = "panel-section";
+  node.dataset.panelSection = section.id;
+  const heading = document.createElement("h2");
+  heading.id = safeDomId("section", section.id);
+  heading.textContent = section.title;
+  node.setAttribute("aria-labelledby", heading.id);
+  if (section.id === "warnings") {
+    node.setAttribute("aria-live", "polite");
+    node.setAttribute("aria-atomic", "false");
+  }
+  const values = document.createElement("dl");
+  node.append(heading, values);
+
+  const state = {
+    node,
+    values,
+    column: section.column,
+    title: section.title,
+    span: section.span,
+  };
+  panelSections.set(section.id, state);
+  for (const field of section.fields) {
+    if (panelFields.has(field.id)) throw new Error(`duplicate panel field id ${field.id}`);
+    values.append(newPanelField(field, section.id, false).row);
+  }
+  host.append(node);
+  recordPanelMutation();
+  return state;
+};
+
+const ensurePanelStructure = (section) => {
+  let state = panelSections.get(section.id);
+  if (!state) return newPanelSection(section);
+  if (
+    state.column !== section.column ||
+    state.title !== section.title ||
+    state.span !== section.span
+  ) {
+    throw new Error(`panel section schema changed for ${section.id}`);
+  }
+  for (const field of section.fields) {
+    const existing = panelFields.get(field.id);
+    if (!existing) {
+      state.values.append(newPanelField(field, section.id, true).row);
+    } else if (
+      existing.sectionId !== section.id ||
+      existing.label !== field.label ||
+      existing.span !== field.span
+    ) {
+      throw new Error(`panel field schema changed for ${field.id}`);
+    }
+  }
+  return state;
+};
+
+const applyPanelDocument = (documentModel) => {
+  if (!panelRoot || !Number.isInteger(documentModel.schema_version)) {
+    throw new Error("invalid shared panel document");
+  }
+  if (panelSchemaVersion !== null && panelSchemaVersion !== documentModel.schema_version) {
+    throw new Error(
+      `panel schema changed from ${panelSchemaVersion} to ${documentModel.schema_version}`,
+    );
+  }
+  panelSchemaVersion = documentModel.schema_version;
+
+  const sectionIds = new Set();
+  const fieldIds = new Set();
+  for (const section of documentModel.sections) {
+    if (sectionIds.has(section.id)) throw new Error(`duplicate panel section id ${section.id}`);
+    sectionIds.add(section.id);
+    ensurePanelStructure(section);
+    for (const field of section.fields) {
+      if (fieldIds.has(field.id)) throw new Error(`duplicate panel field id ${field.id}`);
+      fieldIds.add(field.id);
+      const state = panelFields.get(field.id);
+      if (state.value.textContent !== field.value) {
+        state.value.textContent = field.value;
+        recordPanelMutation(field.id);
+      }
+      if (state.severity !== field.severity) {
+        state.row.dataset.severity = field.severity;
+        state.severity = field.severity;
+        recordPanelMutation(field.id);
+      }
+      if (state.visible !== field.visible) {
+        state.row.hidden = !field.visible;
+        state.visible = field.visible;
+        recordPanelMutation(field.id);
+      }
+    }
+  }
+
+  // Warning ids may disappear from a later document. Keep their nodes mounted
+  // and hidden so an id always resolves to the same DOM object if it returns.
+  for (const [id, state] of panelFields) {
+    if (!fieldIds.has(id) && state.visible) {
+      state.row.hidden = true;
+      state.visible = false;
+      recordPanelMutation(id);
+    }
+  }
+  if (panelRoot.getAttribute("aria-busy") !== "false") {
+    panelRoot.setAttribute("aria-busy", "false");
+    recordPanelMutation();
+  }
+  panelDocumentRevision = documentModel.revision;
+};
+
+const finiteTelemetry = (value) => (Number.isFinite(value) ? value : 0);
+
+const refreshPanel = () => {
   const app = window.__werApp;
+  window.clearTimeout(panelRefreshTimer);
+  panelRefreshTimer = 0;
   if (!app || document.hidden) return;
-  updatePanelStats(JSON.parse(app.info_snapshot()));
-}, PANEL_REFRESH_MS);
+  panelLastRefresh = performance.now();
+  try {
+    const documentModel = JSON.parse(
+      app.panel_document(
+        perf.fps,
+        finiteTelemetry(perf.updateMs),
+        finiteTelemetry(perf.composeMs),
+        finiteTelemetry(perf.presentMs),
+        finiteTelemetry(perf.uploadKib),
+        panelDomUpdates,
+      ),
+    );
+    applyPanelDocument(documentModel);
+    panelRefreshes += 1;
+  } catch (error) {
+    appendDiagnostic(`panel refresh failed: ${String(error)}`);
+  }
+};
+
+const requestPanelRefresh = (immediate = false) => {
+  if (!window.__werApp || document.hidden) return;
+  const now = performance.now();
+  const delay = immediate ? 0 : Math.max(0, panelLastRefresh + PANEL_REFRESH_MS - now);
+  if (delay === 0) {
+    refreshPanel();
+    return;
+  }
+  if (!panelRefreshTimer) {
+    panelRefreshTimer = window.setTimeout(refreshPanel, delay);
+  }
+};
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) requestPanelRefresh();
+});
+
+window.__panelStatus = () => ({
+  connected: panelRoot?.isConnected ?? false,
+  hidden: panelRoot?.hidden ?? true,
+  schemaVersion: panelSchemaVersion,
+  revision: panelDocumentRevision,
+  refreshes: panelRefreshes,
+  domUpdates: panelDomUpdates,
+  sections: panelSections.size,
+  fields: panelFields.size,
+});
+
+// Deterministic browser-acceptance hook: it exercises the same production
+// serializer and changed-only binder without introducing a timer race.
+window.__refreshPanelForTest = refreshPanel;
 
 document.querySelector(".toolbar")?.addEventListener("click", (event) => {
   const control = event.target.closest("button[data-action]");
@@ -660,7 +850,9 @@ const canvasPoint = (canvas, event) => {
 
 for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
   const routedView = () =>
-    canvas === povCanvas() && lastSnapshot?.view.mode !== "pov" ? "map" : canvas.dataset.viewKind;
+    canvas === povCanvas() && lastPresentation?.view.mode !== "pov"
+      ? "map"
+      : canvas.dataset.viewKind;
   canvas.addEventListener("focus", () => window.__werApp?.surface_focus(true));
   canvas.addEventListener("blur", () => window.__werApp?.surface_focus(false));
   canvas.addEventListener("pointerdown", (event) => {
@@ -714,64 +906,44 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
   );
 }
 
+let hoverEngaged = false;
+let lastHoverSample = Number.NEGATIVE_INFINITY;
+
+const clearPanelHover = () => {
+  const app = window.__werApp;
+  if (!app || !hoverEngaged) return;
+  app.clear_hover();
+  hoverEngaged = false;
+  requestPanelRefresh(true);
+};
+
 const updateMapHover = (event) => {
   const canvas = event.currentTarget;
-  if (!mapViewport || !lastSnapshot || lastSnapshot.view.mode !== "map" || canvas.hidden) {
-    write("cursor", "none");
+  const app = window.__werApp;
+  const mode = lastPresentation?.view.mode;
+  if (!app || !mapViewport || (mode !== "map" && mode !== "split") || canvas.hidden) {
+    clearPanelHover();
     return;
   }
   const [physicalX, physicalY] = canvasPoint(canvas, event);
-  const world = JSON.parse(window.__werApp.map_world_at(physicalX, physicalY));
+  const world = JSON.parse(app.map_world_at(physicalX, physicalY));
   if (!world) {
-    write("cursor", "none");
+    clearPanelHover();
     return;
   }
+  const now = performance.now();
+  if (now - lastHoverSample < 100) return;
+  lastHoverSample = now;
   const [wx, wy] = world;
-  const organism = JSON.parse(window.__werApp.map_organism_at(physicalX, physicalY));
-  write(
-    "cursor",
-    organism
-      ? `${organism.id} @ ${Math.round(organism.world[0])}, ${Math.round(organism.world[1])}`
-      : `${Math.round(wx)}, ${Math.round(wy)}`,
-  );
-  inspectCursor(wx, wy);
+  app.map_hover(wx, wy);
+  hoverEngaged = true;
+  requestPanelRefresh(true);
 };
 
 document.getElementById("world-canvas").addEventListener("pointermove", updateMapHover);
 document.getElementById("pov-canvas").addEventListener("pointermove", updateMapHover);
-
-// The native CURSOR readout, throttled: hovering samples the settled cell
-// through the cache-read-only `inspect` export at most every 100ms.
-let lastInspect = 0;
-const inspectCursor = (wx, wy) => {
-  const app = window.__werApp;
-  const now = performance.now();
-  if (!app || now - lastInspect < 100) return;
-  lastInspect = now;
-  const cell = JSON.parse(app.inspect(wx, wy));
-  const value = (v, digits = 1) => (v === null ? "—" : v.toFixed(digits));
-  write(
-    "cursor-status",
-    `${cell.status}  region ${cell.region[0]}, ${cell.region[1]}`,
-  );
-  write(
-    "cursor-stability",
-    cell.stability === null ? "—" : `${cell.stability.toFixed(2)} rev ${cell.revision}`,
-  );
-  write(
-    "cursor-etm",
-    `${value(cell.elevation, 0)} / ${value(cell.temperature)} / ${value(cell.moisture, 2)}`,
-  );
-  write(
-    "cursor-rrw",
-    `${value(cell.hardness, 2)} / ${value(cell.river, 2)} / ${value(cell.wetness, 2)}`,
-  );
-  write(
-    "cursor-sfv",
-    `${value(cell.soil_depth, 2)} / ${value(cell.fertility, 2)} / ${value(cell.vegetation, 2)}`,
-  );
-  write("cursor-biome", cell.biome === null ? "—" : cell.biome);
-};
+document.getElementById("world-canvas").addEventListener("pointerleave", clearPanelHover);
+document.getElementById("pov-canvas").addEventListener("pointerleave", clearPanelHover);
 
 // Milestone 0 characterization probe. Browser automation calls this stable,
 // read-only surface instead of reconstructing layout selectors or parsing
@@ -780,8 +952,7 @@ const inspectCursor = (wx, wy) => {
 // milestone. GPU pixels are never read back (ADR 0017).
 window.__viewerCharacterization = () => {
   const round = (value) => Math.round(value * 1000) / 1000;
-  const rect = (selector) => {
-    const node = document.querySelector(selector);
+  const nodeRect = (node) => {
     if (!node) return null;
     const box = node.getBoundingClientRect();
     return {
@@ -793,6 +964,7 @@ window.__viewerCharacterization = () => {
       bottom: round(box.bottom),
     };
   };
+  const rect = (selector) => nodeRect(document.querySelector(selector));
   const canvas = (selector) => {
     const node = document.querySelector(selector);
     return node
@@ -804,7 +976,10 @@ window.__viewerCharacterization = () => {
       : null;
   };
   const documentElement = document.documentElement;
-  const snapshot = window.__werApp ? JSON.parse(window.__werApp.info_snapshot()) : null;
+  const columnNodes = Array.from(document.querySelectorAll("[data-panel-column]"));
+  const columnsStyle = document.querySelector(".panel-columns")
+    ? getComputedStyle(document.querySelector(".panel-columns"))
+    : null;
   return {
     viewport: {
       width: window.innerWidth,
@@ -826,6 +1001,23 @@ window.__viewerCharacterization = () => {
       statusBar: rect(".status-bar"),
       infoPanel: rect(".info-panel"),
     },
+    panel: {
+      connected: panelRoot?.isConnected ?? false,
+      hidden: panelRoot?.hidden ?? true,
+      busy: panelRoot?.getAttribute("aria-busy") ?? null,
+      gridTemplateColumns: columnsStyle?.gridTemplateColumns ?? null,
+      sections: panelSections.size,
+      fields: panelFields.size,
+      columns: columnNodes.map((node) => ({
+        id: node.dataset.panelColumn,
+        connected: node.isConnected,
+        box: nodeRect(node),
+        overflowY: getComputedStyle(node).overflowY,
+        scrollHeight: node.scrollHeight,
+        clientHeight: node.clientHeight,
+      })),
+      status: window.__panelStatus(),
+    },
     canvases: {
       map: canvas("#world-canvas"),
       pov: canvas("#pov-canvas"),
@@ -840,14 +1032,15 @@ window.__viewerCharacterization = () => {
               ]),
             ),
     },
-    renderer: snapshot
+    renderer: lastPresentation
       ? {
-          mode: snapshot.renderer.mode,
-          compose: snapshot.renderer.compose,
-          refinement: snapshot.renderer.refinement,
-          viewMode: snapshot.view.mode,
-          povSupported: snapshot.view.pov_supported,
-          domStatus: document.querySelector('[data-field="webgpu-status"]')?.textContent ?? null,
+          mode: lastPresentation.renderer.mode,
+          compose: lastPresentation.map.backend,
+          refinement: lastPresentation.map.refinement,
+          viewMode: lastPresentation.view.mode,
+          povSupported: lastPresentation.view.pov_supported,
+          domStatus:
+            document.querySelector('[data-status-field="webgpu-status"]')?.textContent ?? null,
           povStatus: window.__povStatus ?? null,
         }
       : null,
