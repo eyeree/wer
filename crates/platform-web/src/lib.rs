@@ -1,20 +1,22 @@
-//! `platform-web` — the browser/wasm application shell (section 3.2 & Phase 7).
+//! `platform-web` — the browser/wasm shell and service adapter.
 //!
-//! For the bootstrap this is a **minimal WebGPU/wasm smoke target**: it exists so
-//! `world-core` is exercised through a real `wasm32` entry point from the start,
-//! before native-only assumptions accumulate (section 19). The full runtime
-//! (Web Workers, browser storage, WebGPU tiers, suspend/resume) arrives in
-//! Phase 7. Phase 2 grew the shell only by two parity exports: the lithology
-//! seed and a drainage routing sample (phase-2-plan.md §12.5).
+//! The landed static runtime drives the shared [`viewer_host`] controller,
+//! composer, inspection, panel model, POV host, and multi-view renderer through
+//! one logical frame facade. This crate owns only browser-facing wasm glue,
+//! renderer/surface lifecycle, and typed platform capability injection; viewer
+//! semantics stay platform-neutral under ADR 0028. Portable parity exports
+//! remain here so CI executes deterministic world probes as actual wasm. The
+//! current IndexedDB and worker modules are capability probes: correlated vault
+//! effects remain unavailable and logical world ticks use [`InlineExecutor`].
 
 #[cfg(target_arch = "wasm32")]
 use viewer_host::input::{ButtonPhase, Modifiers, PhysicalKey, PointerButton, WheelDelta};
 use viewer_host::PreparedMapSource;
 use viewer_host::{
-    action::{ServiceRequestId, ViewerEffect, WorkerBackend, ACTION_DESCRIPTORS},
+    action::{ActionScope, ServiceRequestId, ViewerEffect, WorkerBackend, ACTION_DESCRIPTORS},
     atlas::{AtlasManager, RefinementRequest},
     controller::{GroundSample, PovGroundSampler},
-    input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent},
+    input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent, BINDING_DESCRIPTORS},
     map::{Channel, MapBackend, MapBackendFallback, MapComposer, MapDecor, MapRenderRequest},
     panel::{
         PanelBuildInput, PanelDocumentCache, PanelDocumentKey, PerformanceInfo, PersistenceInfo,
@@ -50,6 +52,43 @@ use world_core::{
 use world_runtime::stream::RegionMap;
 use world_runtime::task::InlineExecutor;
 use world_runtime::tier::ResourceTier;
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BrowserStartupTier {
+    #[default]
+    Auto,
+    Low,
+    Mid,
+    High,
+}
+
+impl BrowserStartupTier {
+    const fn resolve(self) -> ResourceTier {
+        match self {
+            Self::Auto | Self::Low => ResourceTier::Low,
+            Self::Mid => ResourceTier::Mid,
+            Self::High => ResourceTier::High,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BrowserStartupWorkerMode {
+    #[default]
+    Inline,
+    Workers,
+    SharedWorkers,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BrowserStartupConfig {
+    tier: BrowserStartupTier,
+    storage: bool,
+    worker_mode: BrowserStartupWorkerMode,
+}
 
 /// Shared native/wasm parity expectations. The wasm integration suite imports
 /// these exact constants, so the two execution gates cannot drift apart.
@@ -294,7 +333,9 @@ pub fn record_codec_sample() -> u64 {
 /// fixed [`DiscoveryRecord`]. The record carries only quantized integers and
 /// `steer`/`project_plausible` are float-deterministic, so shared steering is
 /// portable **end-to-end** — the shared-anchor guarantee (ADR 0013). Live
-/// vault I/O is deliberately not exported (no browser storage until Phase 7).
+/// vault I/O is deliberately not exported: the parity codec is live, while
+/// correlated browser vault/session effects still return typed unavailable
+/// responses.
 #[must_use]
 pub fn shared_steer_sample() -> u64 {
     let mut record = parity_discovery();
@@ -598,14 +639,9 @@ impl Default for BrowserHostState {
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl BrowserHostState {
-    fn new(config: &str) -> Self {
-        let tier = if config.contains("\"tier\":\"mid\"") {
-            ResourceTier::Mid
-        } else if config.contains("\"tier\":\"high\"") {
-            ResourceTier::High
-        } else {
-            ResourceTier::Low
-        };
+    fn new(config: &str) -> Result<Self, serde_json::Error> {
+        let config: BrowserStartupConfig = serde_json::from_str(config)?;
+        let tier = config.tier.resolve();
         let cfg = tier.stream_config();
         let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
         let mut state = Self {
@@ -613,7 +649,7 @@ impl BrowserHostState {
             composer: MapComposer::new(half_regions, cfg.field_resolution),
             ..Self::default()
         };
-        if config.contains("\"storage\":true") {
+        if config.storage {
             state.storage = "indexeddb-pending";
             state.warn_once(ViewerWarning {
                 id: "indexeddb-pending",
@@ -623,11 +659,18 @@ impl BrowserHostState {
                 severity: Severity::Warning,
             });
         }
-        if config.contains("\"worker_mode\":\"workers\"") {
-            state.worker_mode = "workers";
-            state.workers = 2;
+        match config.worker_mode {
+            BrowserStartupWorkerMode::Inline => {}
+            BrowserStartupWorkerMode::Workers => {
+                state.worker_mode = "workers";
+                state.workers = 2;
+            }
+            BrowserStartupWorkerMode::SharedWorkers => {
+                state.worker_mode = "shared-memory";
+                state.workers = 2;
+            }
         }
-        state
+        Ok(state)
     }
 
     fn resize_surface(&mut self, width: u32, height: u32) {
@@ -668,37 +711,29 @@ impl BrowserHostState {
         )
     }
 
-    fn layout_json(&self) -> String {
-        fn rect(value: Option<PixelRect>) -> String {
-            value.map_or_else(
-                || String::from("null"),
-                |rect| format!("[{}, {}, {}, {}]", rect.x, rect.y, rect.width, rect.height),
-            )
-        }
-
+    fn layout_value(&self) -> serde_json::Value {
         let layout = self.resolved_layout();
         let focused = match layout.focused {
             ViewKind::Map => "map",
             ViewKind::Pov => "pov",
         };
-        format!(
-            concat!(
-                "{{\"content\":{},\"map_pane\":{},\"map_content\":{},",
-                "\"pov_pane\":{},\"pov_aspect\":{},\"focused\":\"{}\",",
-                "\"split_ratio\":{:.9},\"focus_border\":{},\"divider\":{}}}"
-            ),
-            rect(Some(layout.content)),
-            rect(layout.map_pane),
-            rect(layout.map_content),
-            rect(layout.pov_pane),
-            layout
-                .pov_aspect
-                .map_or_else(|| String::from("null"), |aspect| format!("{aspect:.9}")),
-            focused,
-            layout.split_ratio,
-            rect(layout.focus_border(layout.focused)),
-            rect(layout.divider),
-        )
+        let rect = |rect: PixelRect| [rect.x, rect.y, rect.width, rect.height];
+        serde_json::json!({
+            "content": rect(layout.content),
+            "map_pane": layout.map_pane.map(rect),
+            "map_content": layout.map_content.map(rect),
+            "pov_pane": layout.pov_pane.map(rect),
+            "pov_aspect": layout.pov_aspect,
+            "focused": focused,
+            "split_ratio": layout.split_ratio,
+            "focus_border": layout.focus_border(layout.focused).map(rect),
+            "divider": layout.divider.map(rect),
+        })
+    }
+
+    fn layout_json(&self) -> String {
+        serde_json::to_string(&self.layout_value())
+            .expect("resolved browser layout contains only finite serializable values")
     }
 
     #[cfg(test)]
@@ -1071,11 +1106,11 @@ impl BrowserHostState {
         }
     }
 
-    fn presentation_json(&self) -> Option<String> {
+    fn presentation(&self) -> Option<BrowserPresentation> {
         let output = self.last_output.as_ref()?;
         let map = self.controller.map_preferences();
         let pov = output.pov;
-        let presentation = BrowserPresentation {
+        Some(BrowserPresentation {
             view: BrowserViewPresentation {
                 mode: output.mode,
                 focused: output.focused,
@@ -1113,11 +1148,7 @@ impl BrowserHostState {
             } else {
                 "browser-vault-unavailable"
             },
-        };
-        Some(
-            serde_json::to_string(&presentation)
-                .expect("browser presentation contains only serializable finite state"),
-        )
+        })
     }
 
     fn panel_document_json(&mut self) -> Result<Option<String>, serde_json::Error> {
@@ -1186,12 +1217,15 @@ impl BrowserHostState {
     fn cpu_map_json(&self) -> String {
         let side = self.map_side();
         let map = self.controller.world().map();
-        format!(
-            "{{\"kind\":\"rgba8\",\"renderer\":\"{}\",\"width\":{side},\"height\":{side},\"resolution\":{},\"channel\":\"{}\"}}",
-            self.renderer,
-            map.config().field_resolution,
-            self.controller.map_preferences().channel.id()
-        )
+        serde_json::to_string(&serde_json::json!({
+            "kind": "rgba8",
+            "renderer": self.renderer,
+            "width": side,
+            "height": side,
+            "resolution": map.config().field_resolution,
+            "channel": self.controller.map_preferences().channel.id(),
+        }))
+        .expect("CPU map metadata contains only serializable values")
     }
 
     /// Compose the canonical shared CPU map. Browser vault-derived decor is
@@ -1297,19 +1331,39 @@ impl BrowserViewerDriver {
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn action_descriptors_json() -> String {
-    format!(
-        "[{}]",
-        ACTION_DESCRIPTORS
-            .iter()
-            .map(|descriptor| format!(
-                "{{\"id\":\"{}\",\"label\":\"{}\",\"help\":\"{}\"}}",
-                descriptor.id.as_str(),
-                json_escape(descriptor.label),
-                json_escape(descriptor.help),
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
+    let descriptors = ACTION_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            let scope = match descriptor.scope {
+                ActionScope::Global => "global",
+                ActionScope::FocusedView => "focused-view",
+                ActionScope::Map => "map",
+                ActionScope::Pov => "pov",
+            };
+            let bindings = descriptor
+                .default_binding_ids
+                .iter()
+                .map(|id| {
+                    let binding = BINDING_DESCRIPTORS
+                        .iter()
+                        .find(|binding| binding.id == *id)
+                        .expect("action descriptor names a registered binding");
+                    serde_json::json!({
+                        "id": binding.id,
+                        "help": binding.help,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": descriptor.id.as_str(),
+                "label": descriptor.label,
+                "help": descriptor.help,
+                "scope": scope,
+                "bindings": bindings,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&descriptors).expect("action descriptors are serializable")
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -1317,32 +1371,32 @@ fn map_descriptors_json() -> String {
     let channels = viewer_host::CHANNEL_DESCRIPTORS
         .iter()
         .map(|descriptor| {
-            format!(
-                "{{\"id\":\"{}\",\"label\":\"{}\",\"group\":\"{}\",\"group_label\":\"{}\",\"order\":{}}}",
-                descriptor.id,
-                json_escape(descriptor.label),
-                descriptor.group.id(),
-                json_escape(descriptor.group.label()),
-                descriptor.order,
-            )
+            serde_json::json!({
+                "id": descriptor.id,
+                "label": descriptor.label,
+                "group": descriptor.group.id(),
+                "group_label": descriptor.group.label(),
+                "order": descriptor.order,
+            })
         })
-        .collect::<Vec<_>>()
-        .join(",");
+        .collect::<Vec<_>>();
     let overlays = viewer_host::MAP_OVERLAY_DESCRIPTORS
         .iter()
         .map(|descriptor| {
-            format!(
-                "{{\"id\":\"{}\",\"label\":\"{}\",\"group\":\"{}\",\"group_label\":\"{}\",\"order\":{}}}",
-                descriptor.id,
-                json_escape(descriptor.label),
-                descriptor.group.id(),
-                json_escape(descriptor.group.label()),
-                descriptor.order,
-            )
+            serde_json::json!({
+                "id": descriptor.id,
+                "label": descriptor.label,
+                "group": descriptor.group.id(),
+                "group_label": descriptor.group.label(),
+                "order": descriptor.order,
+            })
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{\"channels\":[{channels}],\"overlays\":[{overlays}]}}")
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "channels": channels,
+        "overlays": overlays,
+    }))
+    .expect("map descriptors are serializable")
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -1350,82 +1404,79 @@ fn effects_json(effects: Vec<ViewerEffect>) -> String {
     let effects = effects
         .into_iter()
         .map(|effect| match effect {
-            ViewerEffect::Exit => String::from("{\"kind\":\"exit\"}"),
-            ViewerEffect::WriteDebugCapture(request) => format!(
-                "{{\"kind\":\"debug-capture\",\"request\":{}}}",
-                request.request_id.0
-            ),
-            ViewerEffect::PersistSession(request) => {
-                format!(
-                    "{{\"kind\":\"persist-session\",\"request\":{}}}",
-                    request.request_id.0
-                )
-            }
-            ViewerEffect::LoadSession(request) => {
-                format!("{{\"kind\":\"load-session\",\"request\":{}}}", request.0)
-            }
-            ViewerEffect::WriteDiscovery(request) => format!(
-                "{{\"kind\":\"write-discovery\",\"request\":{}}}",
-                request.request_id.0
-            ),
-            ViewerEffect::LoadDiscoveries(request) => format!(
-                "{{\"kind\":\"load-discoveries\",\"request\":{}}}",
-                request.0
-            ),
-            ViewerEffect::MutatePreserve(request) => format!(
-                "{{\"kind\":\"mutate-preserve\",\"request\":{}}}",
-                request.request_id.0
-            ),
-            ViewerEffect::WriteRoute(request) => format!(
-                "{{\"kind\":\"write-route\",\"request\":{}}}",
-                request.request_id.0
-            ),
-            ViewerEffect::ClearRoutes(request) => {
-                format!("{{\"kind\":\"clear-routes\",\"request\":{}}}", request.0)
-            }
+            ViewerEffect::Exit => serde_json::json!({"kind": "exit"}),
+            ViewerEffect::WriteDebugCapture(request) => serde_json::json!({
+                "kind": "debug-capture",
+                "request": request.request_id.0,
+            }),
+            ViewerEffect::PersistSession(request) => serde_json::json!({
+                "kind": "persist-session",
+                "request": request.request_id.0,
+            }),
+            ViewerEffect::LoadSession(request) => serde_json::json!({
+                "kind": "load-session",
+                "request": request.0,
+            }),
+            ViewerEffect::WriteDiscovery(request) => serde_json::json!({
+                "kind": "write-discovery",
+                "request": request.request_id.0,
+            }),
+            ViewerEffect::LoadDiscoveries(request) => serde_json::json!({
+                "kind": "load-discoveries",
+                "request": request.0,
+            }),
+            ViewerEffect::MutatePreserve(request) => serde_json::json!({
+                "kind": "mutate-preserve",
+                "request": request.request_id.0,
+            }),
+            ViewerEffect::WriteRoute(request) => serde_json::json!({
+                "kind": "write-route",
+                "request": request.request_id.0,
+            }),
+            ViewerEffect::ClearRoutes(request) => serde_json::json!({
+                "kind": "clear-routes",
+                "request": request.0,
+            }),
             ViewerEffect::ConfigurePathTracking {
                 request_id,
                 enabled,
-            } => format!(
-                "{{\"kind\":\"configure-path-tracking\",\"request\":{},\"enabled\":{enabled}}}",
-                request_id.0
-            ),
-            ViewerEffect::OpenAtlasImport(request) => {
-                format!("{{\"kind\":\"open-atlas\",\"request\":{}}}", request.0)
-            }
-            ViewerEffect::DownloadAtlasBundle(request) => {
-                format!("{{\"kind\":\"download-atlas\",\"request\":{}}}", request.0)
-            }
+            } => serde_json::json!({
+                "kind": "configure-path-tracking",
+                "request": request_id.0,
+                "enabled": enabled,
+            }),
+            ViewerEffect::OpenAtlasImport(request) => serde_json::json!({
+                "kind": "open-atlas",
+                "request": request.0,
+            }),
+            ViewerEffect::DownloadAtlasBundle(request) => serde_json::json!({
+                "kind": "download-atlas",
+                "request": request.0,
+            }),
             ViewerEffect::ConfigureWorkerBackend(_) => {
-                String::from("{\"kind\":\"configure-workers\"}")
+                serde_json::json!({"kind": "configure-workers"})
             }
-            ViewerEffect::CancelSupersededJobs => String::from("{\"kind\":\"cancel-jobs\"}"),
-            ViewerEffect::ConfigureStorage { enabled } => {
-                format!("{{\"kind\":\"configure-storage\",\"enabled\":{enabled}}}")
+            ViewerEffect::CancelSupersededJobs => serde_json::json!({"kind": "cancel-jobs"}),
+            ViewerEffect::ConfigureStorage { enabled } => serde_json::json!({
+                "kind": "configure-storage",
+                "enabled": enabled,
+            }),
+            ViewerEffect::ResetLocalVault => serde_json::json!({"kind": "reset-vault"}),
+            ViewerEffect::SelectMapBackend(_) => {
+                serde_json::json!({"kind": "select-map-backend"})
             }
-            ViewerEffect::ResetLocalVault => String::from("{\"kind\":\"reset-vault\"}"),
-            ViewerEffect::SelectMapBackend(_) => String::from("{\"kind\":\"select-map-backend\"}"),
-            ViewerEffect::RunTierBenchmark => String::from("{\"kind\":\"benchmark\"}"),
-            ViewerEffect::ConfigureResourceTier(tier) => format!(
-                "{{\"kind\":\"configure-tier\",\"tier\":\"{}\"}}",
-                tier.name()
-            ),
-            ViewerEffect::ReportWarning(warning) => format!(
-                "{{\"kind\":\"warning\",\"message\":\"{}\"}}",
-                json_escape(&warning.message)
-            ),
+            ViewerEffect::RunTierBenchmark => serde_json::json!({"kind": "benchmark"}),
+            ViewerEffect::ConfigureResourceTier(tier) => serde_json::json!({
+                "kind": "configure-tier",
+                "tier": tier.name(),
+            }),
+            ViewerEffect::ReportWarning(warning) => serde_json::json!({
+                "kind": "warning",
+                "message": warning.message,
+            }),
         })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{effects}]")
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+        .collect::<Vec<_>>();
+    serde_json::to_string(&effects).expect("browser effects are serializable")
 }
 
 /// Claim the single automatic follow-up frame allowed for one run of failed
@@ -1585,7 +1636,15 @@ mod wasm {
         super::route_attraction_sample()
     }
 
-    /// Phase 7 browser application facade. JS forwards primitive raw events
+    /// Generated browser controls/help metadata from the canonical shared
+    /// action and binding registries. This free export lets the static help
+    /// route stay a thin document without constructing a world/controller.
+    #[wasm_bindgen]
+    pub fn viewer_action_descriptors() -> String {
+        super::action_descriptors_json()
+    }
+
+    /// Browser application facade. JS forwards primitive raw events
     /// and exact action ids; the shared mapper produces typed frame intent and
     /// ordered actions before this facade updates presentation state. A cached
     /// shared panel document keeps DOM/browser APIs out of neutral crates.
@@ -1599,14 +1658,18 @@ mod wasm {
 
     #[wasm_bindgen]
     impl WebApp {
-        /// Create a browser app with inline execution. Worker/storage/GPU modes
-        /// are surfaced as explicit runtime status until later Phase 7 steps
-        /// wire their browser adapters.
+        /// Create a browser app with inline execution. Worker and IndexedDB
+        /// modes are exact capability/status inputs; they do not overclaim a
+        /// wired worker executor or correlated persistence backend.
         #[wasm_bindgen(constructor)]
         pub fn new(config: JsValue) -> Result<WebApp, JsValue> {
-            let config = config.as_string().unwrap_or_default();
+            let config = config
+                .as_string()
+                .ok_or_else(|| JsValue::from_str("WebApp config must be a JSON string"))?;
             Ok(WebApp {
-                state: super::BrowserHostState::new(&config),
+                state: super::BrowserHostState::new(&config).map_err(|error| {
+                    JsValue::from_str(&format!("invalid WebApp config: {error}"))
+                })?,
                 driver: super::BrowserViewerDriver::default(),
                 shutdown: false,
             })
@@ -1948,51 +2011,54 @@ mod wasm {
             let organism_counts = self.state.pov_organisms.counters();
             let presentation = self
                 .state
-                .presentation_json()
+                .presentation()
                 .expect("the current frame installed presentation state");
-            let layout = self.state.layout_json();
+            let layout = self.state.layout_value();
             let needs_frame = frame.output.needs_frame
                 || frame.presenter_needs_frame
                 || self.driver.needs_frame();
-            Ok(JsValue::from_str(&format!(
-                concat!(
-                    "{{\"presentation\":{},\"layout\":{},\"map_dirty\":{},\"hover_changed\":{},\"needs_frame\":{},",
-                    "\"update_serial\":{},\"travel\":{:.6},",
-                    "\"renderer_frame\":{{\"attempted\":{},\"presented\":{}}},",
-                    "\"map\":{{\"active\":{},\"path\":\"{}\",\"gpu_submitted\":{},\"drawn\":{},\"upload_bytes\":{}}},",
-                    "\"pov\":{{\"active\":{},\"rendered\":{},",
-                    "\"camera\":[{:.1},{:.1},{:.1}],",
-                    "\"chunks\":{},\"meshed\":{},\"uploads\":{},\"hover_queries\":{},",
-                    "\"organisms\":{{\"published\":{},\"drawn\":{},",
-                    "\"waiting_for_ground\":{}}}}}}}"
-                ),
-                presentation,
-                layout,
-                map_dirty,
-                frame.hover_changed,
-                needs_frame,
-                frame.output.update_serial,
-                frame.output.travel,
-                renderer_attempted,
-                surface_presented,
-                map_active,
-                map_path,
-                map_drawn && prepared_map_backend == super::MapBackend::GpuAtlas,
-                map_drawn,
-                map_upload_bytes,
-                pov_active,
-                pov_rendered,
-                frame.output.pov.position[0],
-                frame.output.pov.position[1],
-                frame.output.pov.position[2],
-                self.state.pov_chunks.len(),
-                counters.meshed,
-                frame.uploads.len(),
-                self.state.pov_hover.geometry_queries(),
-                organism_counts.published,
-                organism_counts.drawn(),
-                organism_counts.waiting_for_ground,
-            )))
+            let frame_document = serde_json::json!({
+                "presentation": presentation,
+                "layout": layout,
+                "map_dirty": map_dirty,
+                "hover_changed": frame.hover_changed,
+                "needs_frame": needs_frame,
+                "update_serial": frame.output.update_serial,
+                "travel": frame.output.travel,
+                "renderer_frame": {
+                    "attempted": renderer_attempted,
+                    "presented": surface_presented,
+                },
+                "map": {
+                    "active": map_active,
+                    "path": map_path,
+                    "gpu_submitted": map_drawn
+                        && prepared_map_backend == super::MapBackend::GpuAtlas,
+                    "drawn": map_drawn,
+                    "upload_bytes": map_upload_bytes,
+                },
+                "pov": {
+                    "active": pov_active,
+                    "rendered": pov_rendered,
+                    "camera": frame.output.pov.position,
+                    "orientation": [frame.output.pov.yaw, frame.output.pov.pitch],
+                    "fly_speed": frame.output.pov.fly_speed,
+                    "walk_speed": frame.output.pov.walk_speed,
+                    "chunks": self.state.pov_chunks.len(),
+                    "meshed": counters.meshed,
+                    "uploads": frame.uploads.len(),
+                    "hover_queries": self.state.pov_hover.geometry_queries(),
+                    "organisms": {
+                        "published": organism_counts.published,
+                        "drawn": organism_counts.drawn(),
+                        "waiting_for_ground": organism_counts.waiting_for_ground,
+                    },
+                },
+            });
+            Ok(JsValue::from_str(
+                &serde_json::to_string(&frame_document)
+                    .expect("browser frame document contains serializable finite values"),
+            ))
         }
 
         /// Resize both shared layout and the live wgpu surface to an exact
@@ -2269,8 +2335,10 @@ mod wasm {
                 .state
                 .map_projection()
                 .and_then(|projection| projection.physical_to_world((physical_x, physical_y)))
-                .map_or_else(|| String::from("null"), |(x, y)| format!("[{x:.9},{y:.9}]"));
-            Ok(JsValue::from_str(&value))
+                .map(|(x, y)| [x, y]);
+            Ok(JsValue::from_str(&serde_json::to_string(&value).expect(
+                "map projection returns finite serializable coordinates",
+            )))
         }
 
         /// Set the shared cache-only map hover source. Sampling and organism
@@ -2433,8 +2501,9 @@ mod wasm_input_tests {
             .expect("preview frame")
             .as_string()
             .expect("frame JSON");
-        assert!(frame.contains("\"update_serial\":1"));
-        assert!(frame.contains("\"travel\":4.000000"));
+        let frame: serde_json::Value = serde_json::from_str(&frame).expect("typed frame JSON");
+        assert_eq!(frame["update_serial"], 1);
+        assert_eq!(frame["travel"], 4.0);
         let document: serde_json::Value =
             serde_json::from_str(&panel(&mut app)).expect("typed panel JSON");
         assert_eq!(document["model"]["view"]["mode"], "pov");
@@ -2643,6 +2712,34 @@ mod tests {
         assert!(super::claim_gpu_map_retry(&mut scheduled));
     }
 
+    #[test]
+    fn browser_startup_config_is_exact_typed_json() {
+        let state = super::BrowserHostState::new(
+            r#"{"tier":"high","storage":true,"worker_mode":"shared-workers"}"#,
+        )
+        .expect("exact startup config");
+        assert_eq!(
+            state.controller.world().tier(),
+            world_runtime::ResourceTier::High
+        );
+        assert_eq!(state.storage, "indexeddb-pending");
+        assert_eq!(state.worker_mode, "shared-memory");
+
+        for invalid in [
+            r#"{"tier":"HIGH"}"#,
+            r#"{"tier":"midpoint"}"#,
+            r#"{"storage":"true"}"#,
+            r#"{"worker_mode":"worker"}"#,
+            r#"{"unknown":true}"#,
+            r#"prefix {"tier":"high"}"#,
+        ] {
+            assert!(
+                super::BrowserHostState::new(invalid).is_err(),
+                "substring-shaped config must be rejected: {invalid}"
+            );
+        }
+    }
+
     fn attribute_values<'a>(source: &'a str, attribute: &str) -> Vec<&'a str> {
         let needle = format!("{attribute}=\"");
         source
@@ -2656,15 +2753,23 @@ mod tests {
     fn browser_controls_and_help_use_registered_action_ids() {
         let index = include_str!("../web/index.html");
         let help = include_str!("../web/help/index.html");
+        let help_script = include_str!("../web/assets/help.js");
         let controls = attribute_values(index, "data-action");
-        let documented = attribute_values(help, "data-help-action");
+        let descriptors: serde_json::Value =
+            serde_json::from_str(&super::action_descriptors_json()).expect("descriptor JSON");
+        let documented = descriptors
+            .as_array()
+            .expect("action descriptor array")
+            .iter()
+            .map(|descriptor| descriptor["id"].as_str().expect("action descriptor id"))
+            .collect::<Vec<_>>();
         assert!(!controls.is_empty());
         for id in &controls {
             assert!(
                 viewer_host::action::action_descriptor(id).is_some(),
                 "unknown browser control action {id}"
             );
-            assert!(documented.contains(id), "browser help omits control {id}");
+            assert!(documented.contains(id), "shared help omits control {id}");
         }
         for descriptor in viewer_host::action::ACTION_DESCRIPTORS {
             assert!(
@@ -2673,12 +2778,16 @@ mod tests {
                 descriptor.id.as_str()
             );
         }
-        for id in documented {
+        for id in &documented {
             assert!(
                 viewer_host::action::action_descriptor(id).is_some(),
                 "help documents unknown action {id}"
             );
         }
+        assert!(help.contains("data-generated-help"));
+        assert!(!help.contains("data-help-action="));
+        assert!(help_script.contains("viewer_action_descriptors()"));
+        assert!(help_script.contains("row.dataset.helpAction = descriptor.id"));
         let app = include_str!("../web/assets/app.js");
         assert!(!app.contains("MOVE_KEYS"));
         assert!(!app.contains("POV_MOVE"));
@@ -2776,9 +2885,9 @@ mod tests {
         );
         assert!(projection.physical_to_world((99.999, 350.5)).is_none());
         assert!(projection.grid_coverage().one_pixel_feasible);
-        assert!(state
-            .layout_json()
-            .contains("\"map_content\":[100, 0, 701, 701]"));
+        let json: serde_json::Value =
+            serde_json::from_str(&state.layout_json()).expect("typed layout JSON");
+        assert_eq!(json["map_content"], serde_json::json!([100, 0, 701, 701]));
     }
 
     #[test]
@@ -2806,10 +2915,11 @@ mod tests {
             Some(viewer_host::ViewKind::Pov)
         );
         assert_eq!(state.view_at(f64::from(layout.content.right()), 1.0), None);
-        let json = state.layout_json();
-        assert!(json.contains("\"focused\":\"map\""));
-        assert!(json.contains("\"split_ratio\":0.500000000"));
-        assert!(json.contains("\"focus_border\":[0, 0, 451, 701]"));
+        let json: serde_json::Value =
+            serde_json::from_str(&state.layout_json()).expect("typed layout JSON");
+        assert_eq!(json["focused"], "map");
+        assert_eq!(json["split_ratio"], 0.5);
+        assert_eq!(json["focus_border"], serde_json::json!([0, 0, 451, 701]));
     }
 
     #[test]
@@ -3038,9 +3148,8 @@ mod tests {
             .panel_document_json()
             .expect("serialize panel")
             .expect("panel after a frame");
-        let _ = state
-            .presentation_json()
-            .expect("presentation after a frame");
+        let presentation = state.presentation().expect("presentation after a frame");
+        let _ = serde_json::to_string(&presentation).expect("serialize presentation");
         assert_eq!(state.controller.world().update_serial(), serial);
     }
 

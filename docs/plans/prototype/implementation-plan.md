@@ -4,7 +4,10 @@
 
 This document defines the high-level implementation approach for the Infinite World Exploration Game.
 
-The project will begin as a **native Rust application** with a custom engine architecture designed from the outset to support a later **browser/WebAssembly/WebGPU target**.
+The project began as a **native Rust application** with a custom engine
+architecture designed for **browser/WebAssembly/WebGPU** portability. Both
+shells now run the same world model and shared viewer contracts; native and web
+remain separate environment adapters.
 
 This plan is intentionally architectural and phased. Lower-level implementation plans will be created before work begins on each subsystem.
 
@@ -39,11 +42,12 @@ The system must prioritize:
 
 ## 3. Platform Strategy
 
-### 3.1 Initial Platform
+### 3.1 Native Foundation
 
-The first implementation will target native desktop platforms using Rust.
+The native desktop implementation remains the primary profiling and deep-debug
+environment.
 
-Initial development should favor:
+Native development favors:
 
 - Fast iteration.
 - Strong profiling and debugging.
@@ -52,9 +56,12 @@ Initial development should favor:
 - Easier experimentation with low-level engine architecture.
 - A controlled performance environment.
 
-### 3.2 Browser Support
+### 3.2 Browser Runtime
 
-Browser support will be added after the native foundation is validated.
+The browser viewer/runtime slice is delivered as a static artifact after
+validation of the native foundation. Streamed world updates, Map/POV/Split,
+input, panel, and recovery are live; the serializable worker executor and
+durable browser vault backend remain Phase 7 work.
 
 The browser target will use:
 
@@ -65,7 +72,10 @@ The browser target will use:
 - Browser-compatible persistence such as IndexedDB or OPFS.
 - A TypeScript or minimal JavaScript shell for browser integration.
 
-Browser support is a planned platform target, not a late-stage port. Core architectural choices must remain compatible with it throughout native development.
+Browser support is a first-class platform, not a divergent port. Core world,
+viewer, and renderer contracts compile for both targets; environment services
+stay at platform boundaries. `renderer` contains the narrow wasm canvas-surface
+adapter required to hand an `HtmlCanvasElement` to `wgpu`.
 
 ---
 
@@ -78,20 +88,20 @@ Browser support is a planned platform target, not a late-stage port. Core archit
 - WGSL shaders.
 - `winit` or equivalent for window and event management.
 - A Rust ECS or custom data-oriented entity store.
-- Rayon initially, or another task system suitable for native parallelism.
-- Tracy, Puffin, or equivalent profiling instrumentation.
+- The priority-lane `TaskExecutor` implementation shared with sign-off tools.
+- Per-pass timing and committed performance ledgers.
 - `serde` with versioned formats for serialization.
-- Dear ImGui, egui, or another immediate-mode tool UI.
+- A native bitmap information-panel renderer over shared semantic panel data.
 
 ### 4.2 Browser Runtime
 
 - `wasm32-unknown-unknown`.
 - `wasm-bindgen`.
 - WebGPU through `wgpu`.
-- Web Workers.
+- Web Worker capability probing; a serializable worker executor remains open.
 - `SharedArrayBuffer` where cross-origin isolation is available.
-- IndexedDB or OPFS for local persistent caches.
-- TypeScript for platform glue and application shell.
+- IndexedDB capability probing; durable vault/session effects remain open.
+- Minimal JavaScript for DOM/canvas integration and the application shell.
 
 ---
 
@@ -123,27 +133,39 @@ world-runtime/
     abstract task execution interface
 
 renderer/
-    wgpu renderer
+    cross-platform wgpu device and surface renderer
     WGSL shaders
-    GPU field refinement
-    terrain and ecology presentation
-    resource paging
-    render graph
+    GPU map atlas and refinement
+    POV terrain, organisms, water, and shadows
+    one-surface Map / POV / Split frame recording
+
+pov-host/
+    fly and walk camera
+    pure terrain and organism presentation geometry
+    chunk and organism scheduling
+    CPU-side POV picking
+
+viewer-host/
+    normalized input and typed semantic actions
+    one-traveler exploration/view controller
+    Map / POV / Split layout and focus
+    CPU map composition and GPU-atlas preparation
+    CPU-authoritative inspection
+    semantic information-panel documents
 
 platform-native/
-    native windowing
-    native filesystem
-    native networking
-    native task pool
-    native application lifecycle
+    winit input/window adapter
+    native file storage and lane executor
+    bitmap panel and file-bound debug capture
+    surface and application lifecycle
 
 platform-web/
-    wasm-bindgen interface
-    canvas integration
-    worker management
-    browser storage
-    browser networking
-    browser lifecycle recovery
+    wasm-bindgen and DOM input adapter
+    canvas/DPR integration
+    Worker and IndexedDB capability probes
+    unavailable worker/vault effect reporting
+    DOM panel renderer
+    surface and lifecycle recovery
 
 tools/
     world inspectors
@@ -152,9 +174,15 @@ tools/
     atlas tools
     deterministic replay tools
     validation tools
+    web build / serve / sign-off tools
 ```
 
-The platform-neutral crates must avoid direct dependencies on native filesystem APIs, native thread creation, sockets, platform-specific graphics backends, or browser APIs.
+The authoritative platform-neutral crates must avoid direct dependencies on
+native filesystem APIs, native thread creation, sockets, platform-specific
+graphics backends, or browser APIs. `viewer-host` is environment-neutral under
+ADR 0028: it may depend on the cross-platform world, POV, and renderer crates,
+but never winit, DOM/browser APIs, filesystems, sockets, or platform thread
+creation. `renderer` does not depend back on `viewer-host`.
 
 ---
 
@@ -192,6 +220,13 @@ The GPU may perform:
 - Rendering.
 
 Authoritative world state must not depend exclusively on native-only GPU features or synchronous GPU readback.
+
+Presentation behavior is shared without becoming world authority. Normalized
+input and typed actions enter one `viewer-host` controller tick, which computes
+travel and updates `RegionMap` once. Map, POV, and Split are derived panes of
+that same post-update state. The renderer records every visible pane in one
+surface acquire/submit/present and exposes no live readback; CPU Map data and
+resident POV presentation geometry supply picking and information panels.
 
 ---
 
@@ -985,6 +1020,10 @@ The engine maintains stable frame and generation budgets across target native ha
 
 ## Phase 7 — Browser Runtime
 
+Status: the static streamed viewer and later native/web alignment recorded by
+ADR 0028 have landed. The worker executor and durable browser-vault backend
+remain incomplete.
+
 Goals:
 
 - Deliver the existing world model through modern desktop browsers.
@@ -1153,7 +1192,9 @@ Mitigation:
 
 The project will:
 
-- Start as a native Rust implementation.
+- Retain the native Rust implementation as the profiling/debug foundation while
+  shipping a static browser viewer/runtime over the same world model and
+  reporting unfinished worker/vault services explicitly.
 - Use `wgpu` and WGSL.
 - Maintain a CPU-authoritative world model.
 - Use a data-oriented architecture.
@@ -1163,6 +1204,8 @@ The project will:
 - Recompute incrementally through explicit dependencies.
 - Use temporal budgets instead of immediate regeneration.
 - Treat GPU compute as an optimization, not a requirement.
-- Compile core systems for WebAssembly from the beginning.
-- Add a browser runtime after the native continuity prototype and core architecture are validated.
+- Compile core systems and shared viewer contracts for WebAssembly.
+- Keep native and browser shells as thin environment adapters around one
+  traveler/controller, one Map/POV/Split layout model, and one multi-view
+  surface frame.
 - Produce lower-level implementation plans before subsystem implementation begins.

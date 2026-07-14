@@ -266,3 +266,69 @@ the three rolling Terrain ghost rows are bounded job scratch and are not
 misreported as cache payload. Finite temporal-budget scaling now floors
 `max_regen_cost` at the largest declared atomic cost (31), preserving liveness
 for the ADR 0018 quarter-budget schedule.
+
+## Native/web alignment — Map, POV, and Split
+
+Measured for the native/web alignment milestone on the WSL2 reference machine
+above with the release profile, Mesa llvmpipe, the origin pose, default POV
+radius 3, and POV render scale 1. Map uses the tier's complete streamed window;
+POV and Split use a fixed 1024×768 offscreen target. The times below are one
+cold process's total wall time, including world settle, meshing, renderer
+startup, capture, and file output; peak RSS is `/usr/bin/time` telemetry. They
+are characterization numbers, not frame-time claims or CI thresholds.
+
+Representative commands:
+
+```sh
+WER_TIER=low target/release/wer --screenshot /tmp/low-map.ppm composite 0 0 1
+WER_TIER=low target/release/wer --pov-script \
+  "size:1024x768; pos:0,0; snap:/tmp/low-pov.ppm"
+WER_TIER=low target/release/wer --pov-script \
+  "size:1024x768; pos:0,0; split:/tmp/low-split.ppm"
+```
+
+The same commands were repeated with `WER_TIER=mid` and `high`.
+
+| tier | Map CPU capture (output, elapsed, peak RSS) | POV capture (elapsed, peak RSS) | Split capture (elapsed, peak RSS) |
+|---|---|---|---|
+| Low | 1640×800, **0.18 s**, 44,216 KiB | **0.83 s**, 294,668 KiB | **0.85 s**, 301,156 KiB |
+| Mid | 1768×928, **0.25 s**, 57,668 KiB | **0.94 s**, 323,652 KiB | **0.94 s**, 324,160 KiB |
+| High | 1960×1120, **0.37 s**, 81,876 KiB | **1.19 s**, 354,388 KiB | **1.19 s**, 366,248 KiB |
+
+POV and Split report the same resident presentation set because they are two
+layouts over one traveler and post-update world state:
+
+| tier | drawn / published organisms | box / sphere | live / capacity instance bytes | first-capture terrain uploads |
+|---|---:|---:|---:|---:|
+| Low | 9,593 / 9,829 | 5,667 / 3,926 | 599.6 / 768.0 KiB | 49 |
+| Mid | 19,203 / 19,689 | 11,392 / 7,811 | 1,200.2 / 1,536.0 KiB | 49 |
+| High | 38,360 / 39,327 | 22,598 / 15,762 | 2,397.5 / 3,072.0 KiB | 49 |
+
+Two same-target `split:` instructions were then run in one process at every
+tier. Each second capture was byte-identical to the first and reported **0
+terrain uploads** and **0.0 KiB organism replacement**, versus 49 uploads and
+599.6 / 1,200.2 / 2,397.5 KiB on the first capture. This is direct evidence
+that file-bound Split capture retains the POV resources and does not turn ADR
+0021 into a live readback path.
+
+Steady presentation work is gated structurally, not by machine-dependent timing:
+
+- shared atlas tests require zero dependency-keyed region uploads on an
+  unchanged sync and stable Map backing storage;
+- shared panel-cache and web DOM tests require an unchanged semantic key to
+  produce no document rebuild and no DOM field mutation; and
+- shared POV hover tests require an unchanged screen ray and geometry key to
+  reuse the cached hit without another geometry query.
+
+These are zero-work/reuse assertions, not a claim that a general-purpose
+allocator recorded zero process allocations. The browser
+`web-signoff --assert-layout` run passed all six viewport/DPR cases plus real
+click, primary-drag, key, DOM-wheel, generated-help, panel-cadence, Split-focus,
+one-update, and loss-fallback assertions. `web-signoff --profile-alignment` is
+the repeatable local Low/Mid/High × Map/POV/Split collection command; its
+wall-clock fields are informational and intentionally have no thresholds.
+Ordinary headless Chrome has no renderer surface, so a settled Split GPU delta
+measurement is explicitly not applicable there rather than faked. That
+environment-specific measurement belongs to a hardware/CDP run; shared atlas
+tests and the native repeated Split captures above remain the deterministic
+zero-delta evidence.

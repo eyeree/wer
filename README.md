@@ -1,9 +1,9 @@
 # Infinite World Exploration Game
 
-A native Rust engine (with a planned browser/WebAssembly/WebGPU target) for an
-exploration game built around **continuous travel through possibility space** —
-one seamless journey across an infinite landscape of possible worlds, steered by
-*anchors* the player collects.
+A native and browser Rust/WebAssembly/WebGPU engine for an exploration game
+built around **continuous travel through possibility space** — one seamless
+journey across an infinite landscape of possible worlds, steered by *anchors*
+the player collects.
 
 See the design and architecture documents:
 
@@ -11,36 +11,39 @@ See the design and architecture documents:
 - [`docs/plans/prototype/implementation-plan.md`](docs/plans/prototype/implementation-plan.md) — the high-level technical plan.
 - [`docs/adr/`](docs/adr/) — architecture decision records.
 
-This repository is currently at **Phase 6** (performance and scale, see
-[`phase-6-plan.md`](phase-6-plan.md), building on the Phase 1–5 stacks): the
-layered generation and invalidation precision of Phase 2 (`wer-ledger`), the
-procedural ecosystems of Phase 3, the resonance-gated steering of Phase 4
-(`wer-anchor`), and the durable, shareable exploration of Phase 5
-(`wer-vault`, `wer-atlas`) — now running on the optimization-era substrate:
-a priority-lane executor with cancellation, a tile pool and byte-ceilinged
-caches, SIMD kernels bit-identical to their scalar twins, a GPU-composed
-debug map with refinement octaves (derived presentation only), and Low/Mid/
-High resource tiers that scale world density without changing a single
-generated output (`wer-scale` machine-checks all of it; the measured ledger
-lives in [`docs/perf-baseline.md`](docs/perf-baseline.md)). The post-Phase-6
-A.8 correction makes macro routing elevation entirely fixed-point and gives
-ordinary Terrain a realized-current 3×3 P/G halo plus a centered Slope output
-(ADR 0027; Terrain and Drainage layer revisions are 1, world version remains 2).
+The repository has landed Phases 1–6 plus the static Phase 7 browser viewer:
+deterministic layered generation,
+procedural ecosystems, resonance-gated steering, sparse persistence and atlas
+sharing, performance/resource tiers, and a real streamed browser Map/POV/Split
+runtime. Native and browser now use the same `viewer-host` behavior for actions,
+one-traveler world updates, Map composition, inspection, panel data, and layout
+([ADR 0028](docs/adr/0028-shared-viewer-host-and-one-world-multi-view.md)). The
+measured performance ledger lives in
+[`docs/plans/prototype/perf-baseline.md`](docs/plans/prototype/perf-baseline.md).
+Post-Phase-6 Improvement A.8 makes macro routing elevation entirely fixed-point
+and gives ordinary Terrain a realized-current 3×3 P/G halo plus a centered
+Slope output (ADR 0027; Terrain and Drainage layer revisions are 1, world
+version remains 2).
 
 ## Workspace layout
 
-Platform-neutral crates compile for both native and `wasm32`; platform crates
-hold everything OS/browser-specific (see
-[ADR 0002](docs/adr/0002-workspace-crate-boundaries.md)).
+The authoritative world and viewer behavior is environment-neutral.
+Cross-platform viewer/rendering crates compile for native and `wasm32`; winit,
+DOM, storage, and executor APIs stay at platform boundaries, with only a narrow
+wasm canvas-surface adapter in `renderer` (see
+[ADR 0002](docs/adr/0002-workspace-crate-boundaries.md) and
+[ADR 0028](docs/adr/0028-shared-viewer-host-and-one-world-multi-view.md)).
 
 | Crate | Kind | Responsibility |
 |-------|------|----------------|
 | [`world-core`](crates/world-core) | neutral lib | Deterministic hashing, coordinates, possibility space, the layer graph and every environmental generator. |
 | [`world-runtime`](crates/world-runtime) | neutral lib | Region streaming, convergence, dep-hash staleness, topological cost-budgeted dispatch; abstract storage & task interfaces. |
-| [`renderer`](crates/renderer) | native/gpu lib | wgpu/WGSL renderer (debug-map presentation). |
-| [`platform-native`](crates/platform-native) | bin `wer` | winit window + event loop, input, tier detection, the GPU-map shell. |
-| [`platform-web`](crates/platform-web) | cdylib | wasm-bindgen smoke shell (grows into the browser runtime). |
-| [`tools`](crates/tools) | bins `wer-inspect`, `wer-replay`, `wer-ledger`, `wer-anchor`, `wer-atlas`, `wer-vault`, `wer-scale` | Inspectors, the continuity replay, the phase sign-off harnesses, the lane executor, atlas bundle tooling, and the shared native file-tree storage backend. |
+| [`renderer`](crates/renderer) | cross-platform GPU lib | wgpu/WGSL device, surfaces, Map atlas and POV rendering; records Map, POV, or Split as one multi-view frame. |
+| [`pov-host`](crates/pov-host) | cross-platform presentation lib | Fly/walk camera, terrain and organism presentation geometry, chunk scheduling, and CPU-side POV picking. |
+| [`viewer-host`](crates/viewer-host) | environment-neutral viewer lib | Normalized input, typed actions, the one-traveler controller, layout/focus, Map composition/atlas preparation, inspection, and semantic panel documents. |
+| [`platform-native`](crates/platform-native) | bin `wer` | Thin winit adapter plus native executor, storage, bitmap panel, capture, and lifecycle services. |
+| [`platform-web`](crates/platform-web) | cdylib+rlib and static shell | Thin wasm/DOM adapter, streamed viewer runtime, capability probes, DOM panel rendering, canvas lifecycle, and recovery; world jobs remain inline and vault effects remain unavailable. |
+| [`tools`](crates/tools) | command-line bins | Inspectors, replay/sign-off harnesses, web build/serve/sign-off, lane executor, atlas tooling, and native file-tree storage. |
 
 ## Prerequisites
 
@@ -84,12 +87,16 @@ cargo run --bin wer-atlas -- check my.bundle
 # Headless map screenshot (no window/GPU): settle the world and dump a PPM.
 cargo run --release --bin wer -- --screenshot map.ppm composite 0 0
 
-# Headless POV screenshots (offscreen GPU, ADR 0021): drive the fly/walk
+# Headless POV/Split screenshots (offscreen GPU, ADR 0021): drive the fly/walk
 # camera through a scripted sequence — pos:x,y[,z] | mouse:dx,dy |
-# move:f[,r[,u]] | walk | fly | settle[:n] | size:WxH | snap:file.ppm —
-# the POV debugging harness.
+# move:f[,r[,u]] | walk | fly | settle[:n] | size:WxH | snap:file.ppm |
+# split:file.ppm. `split:` captures Map + POV + the shared panel/focus border.
 cargo run --release --bin wer -- --pov-script \
   "pos:300,-10; walk; move:200; snap:walk-a.ppm; mouse:400,0; move:200; snap:walk-b.ppm"
+
+# A fixed-size Split capture at an explicit resource tier.
+WER_TIER=high cargo run --release --bin wer -- --pov-script \
+  "size:1024x768; pos:0,0; split:aligned-split.ppm"
 
 # Test everything, including determinism goldens and the continuity replay.
 cargo test --workspace
@@ -98,8 +105,8 @@ cargo test --workspace
 cargo bench -p world-core --bench generation
 cargo bench -p world-runtime --bench update
 
-# Continuously verify the core still compiles for the browser target.
-cargo check -p world-core -p world-runtime -p platform-web --target wasm32-unknown-unknown
+# Continuously verify the shared runtime/viewer and web shell for wasm.
+cargo check -p world-core -p world-runtime -p viewer-host -p platform-web --target wasm32-unknown-unknown
 
 # Execute every deterministic parity probe as real wasm in Node.
 wasm-pack test --node crates/platform-web
@@ -132,14 +139,12 @@ The executable is written to
 
 ## Driving the prototype
 
-`cargo run --release --bin wer` opens a top-down false-color map of the
-streaming window centered on the player, with an information panel on the
-right: frame and streaming telemetry (fps, update time, active regions, cache
-size, generation-job queue), the selected channel, current possibility nudges,
-active anchors, the key bindings, and — when the mouse is over the map — the
-world/region coordinates, streaming state, field samples, and biome of the
-cell under the cursor. Watch the distance transform while the ground near you
-stays put.
+`cargo run --release --bin wer` opens the shared viewer in Map mode. Map, POV,
+and side-by-side Split all follow one traveler and one post-update world state.
+The information panel remains visible in every mode and reports frame/streaming
+telemetry, presentation state, steering, persistence, warnings, and the Map or
+POV feature under the pointer. In Split, the highlighted pane owns
+view-scoped input; click a pane or press `Tab` to change focus.
 
 Transformation is fueled by travel
 ([ADR 0006](docs/adr/0006-travel-fueled-convergence.md)): stand still and the
@@ -148,7 +153,8 @@ world drifts toward it only as you move (sprinting drifts it faster).
 
 | Input | Effect |
 |-------|--------|
-| `WASD` / arrows (+`Shift`) | Move (sprint) |
+| `WASD` / arrows | Move in the focused view; Map translates the traveler, POV moves along the camera basis |
+| `Shift` | Map: sprint. POV fly mode: descend (`Space` ascends) |
 | `1`–`8` (+`Shift`) | Nudge a possibility dimension up (down): Planetary, Climate, Geology, Hydrology, Ecology, Morphology, Behavior, Aesthetics |
 | `Z` | Reset all nudges |
 | `E` / `Q` | Drop an Emphasize / Suppress anchor at the player |
@@ -163,10 +169,29 @@ world drifts toward it only as you move (sprinting drifts it faster).
 | `Delete` | Clear all recorded routes from the vault |
 | `V` | Cycle the visualized channel (composite, layers, ecology, influence, stability, …) |
 | `G` / `N` / `X` / `M` / `F` | Toggle region grid / stability rings / changed-while-pinned flash / organism markers / discovered-region dimming |
-| Mouse wheel | Zoom the map view in/out (x1–x16); zoomed in past x4, hovering an organism marker shows that organism's details in the panel instead of the region info |
-| `Tab` | Toggle the 3D POV mode: a fly camera over lit, fogged terrain meshed from the same authoritative fields the map shows, with realized near-field organisms rendered as genome-derived box and sphere forms. Terrain and organisms cast and receive one GPU directional shadow map; terrain ambient occlusion remains CPU-baked. The ocean is a translucent animated surface at sea level over a sediment sea floor (coastlines correct at every possibility state by construction); rivers and wetlands glint on the ground, with strong channels carrying a conformal water overlay. In POV: **hold the left mouse button and drag to look**, `WASD` along view/strafe, `Space`/`LShift` up/down, wheel adjusts the active mode's speed, `F` toggles walk ↔ fly (walk holds the eye 1.7 units above the rendered terrain, cliffs climb as fast ramps, the sea floor is walkable). A HUD chip in the top-right corner shows fps and the frame-budget split (`upd` world update / `gpu` render+present), and three diagnostic toggles isolate render cost: `B` directional shadows and terrain AO, `N` per-fragment detail normals, `V` the water passes. All map bindings above are map-mode-only. `WER_POV=1` starts in POV; `WER_POV_RADIUS` (1–8, default 3) sets the chunk draw radius. **On llvmpipe, fps is governed by window pixels** — fragment shading and presentation are CPU work proportional to window area — so the big knobs are `WER_POV_SCALE` (0.25–1.0: rasterize the 3D pass at a fraction of the window resolution and upscale; 0.5 ≈ 4× fewer fragments), a smaller window (`WER_WINDOW=WxH` pins one for reproducible measurements), and `WER_PRESENT_MODE=immediate` (uncaps the FIFO vblank quantization). `WER_START=x,y` spawns at a world position for debugging |
-| `F12` | Write a debug dump to `./dump/<UTC datetime>/`: a screenshot of the active view (map or POV) plus `state.txt` with the player/camera state (position, forward vector), steering, telemetry, the region's dependency-hash chain, and vault counters. POV dumps also report published, drawn, and waiting-for-ground organism counts. Works in both modes |
+| Mouse wheel | Map: zoom x1–x16. POV: adjust movement speed. Split routes the wheel to the focused pane |
+| Primary click | Focus that pane in Split; hover updates Map or POV inspection |
+| Primary drag | Look in POV only while the primary button is held |
+| `Tab` | In a single view, toggle Map/POV; in Split, focus the other pane |
+| `F12` | Write `screenshot.ppm` and `state.txt` under `./dump/<UTC datetime>/`; Map, POV, and Split use the live shared layout and record mode, focus, panes, traveler/camera pose, hover, steering, telemetry, dependency hashes, and vault counters |
 | `Esc` | Quit |
+
+The possibility, anchor, route, load, channel, and overlay bindings in the
+table apply when Map is focused; Save (`O`) remains global. When POV is focused,
+`F` toggles walk/fly,
+`B` toggles directional shadows and terrain AO, `N` toggles detail normals,
+and `V` toggles water. Walk holds the camera at eye height over the rendered
+terrain; fly also enables `Space`/left `Shift` vertical motion. Map organism
+inspection becomes available at zoom x4 and above. POV inspection raycasts the
+resident CPU terrain lattice and renderer-ready organism primitives—never GPU
+readback.
+
+Set `WER_VIEW=map|pov|split` to choose the native startup mode
+(`WER_POV=1` remains a legacy POV alias). `WER_POV_RADIUS` (1–8, default 3)
+sets the chunk radius, and `WER_POV_SCALE` (0.25–1.0) sets the internal POV
+raster scale. For reproducible presentation measurements, also pin
+`WER_WINDOW=WxH` and optionally set `WER_PRESENT_MODE=immediate`. `WER_START=x,y`
+chooses the initial world position.
 
 The white and orange rings are the near (pinned) and far (free) stability
 radii. Any region that flashes red changed while pinned — that is a continuity
@@ -193,20 +218,35 @@ GitHub Pages. To build and serve it locally:
 cargo run --bin web-build
 node crates/platform-web/web/smoke.mjs target/web-dist
 cargo run --bin web-signoff
-cargo run --bin web-signoff -- --assert-layout  # optional agent-browser viewport/DPR matrix
+cargo run --bin web-signoff -- --assert-layout      # functional viewport/input/Split matrix
+cargo run --bin web-signoff -- --profile-alignment  # local Low/Mid/High × Map/POV/Split diagnostics
 cargo run --bin web-serve            # optional: [port] [dir], default 8080 target/web-dist
 ```
 
 `web-serve` exists because browsers refuse ES modules and wasm from `file://`
 URLs (CORS) — the viewer needs an HTTP origin. It serves loopback-only with
 correct MIME types (including `application/wasm`) and the
-cross-origin-isolation headers the shared-memory worker mode needs, which a
-generic `python3 -m http.server` does not send.
+cross-origin-isolation headers a future shared-memory worker backend requires,
+which a generic `python3 -m http.server` does not send.
 
 Open <http://localhost:8080> and check the console for
 `[wer] wasm smoke ok — origin feature hash: …`. The viewer status bar also
 prints the same hash. That value **must** match the native `wer-inspect 0 0`
 output — the determinism guarantee the browser port depends on.
+
+The toolbar selects Map, POV, or Split. Split focus is visible and routes
+view-scoped keys/wheel to the clicked pane; `Tab` swaps focus while a view
+surface owns keyboard focus. The Help page builds its control table at runtime
+from the shared Rust action/binding descriptors. Use `?tier=low`, `?tier=mid`,
+or `?tier=high` to pin the startup resource tier for diagnostics (the shipped
+default is Low).
+
+For headless functional debugging, inspect
+`window.__viewerCharacterization()`, `window.__mapStatus`,
+`window.__povStatus`, and `window.__rendererFrameStatus`. Headless Chrome can
+verify DPR/layout, input, world-update counts, panel cadence, hover caching,
+and fallback status, but it cannot validate visible WebGPU pixels; use the
+Windows CDP path documented in [AGENTS.md](AGENTS.md) for GPU screenshots.
 
 CI also pins `wasm-pack` 0.13.1 and executes the complete parity suite in Node,
 including signed fixed routing elevations and three complete macro tiles.
@@ -215,20 +255,24 @@ including signed fixed routing elevations and three complete macro tiles.
 
 Publish `target/web-dist` as-is. The artifact is subpath-safe: pages link to
 `./assets`, `./generated`, `./docs/world-model.html`, and `./help/` with
-relative URLs, so GitHub Pages can serve it from a project path. Runtime storage
-uses browser APIs only; there is no server, socket, filesystem, or generated
-world cache in the deployment.
+relative URLs, so GitHub Pages can serve it from a project path. There is no
+server, socket, filesystem, or generated-world cache in the deployment. The
+shell probes IndexedDB, but browser vault/session effects are still reported as
+unavailable rather than claiming durable persistence.
 
-Browser compatibility tiers:
+Low/Mid/High are resource presets, independent of browser capabilities:
 
-| Tier | Expected support | Behavior |
-|------|------------------|----------|
-| WebLow | no WebGPU or weak worker/storage support | CPU map, inline execution, small cache ceiling |
-| WebMid | ordinary desktop browser | WebGPU atlas mode when available, worker mode selectable |
-| WebHigh | strong desktop with stable WebGPU | larger cache ceiling and refinement default |
+| Tier | Runtime budget and presentation density |
+|------|-------------------------------------------|
+| Low | Phase 5/default radii, one organism slot per cell, 48 MiB field-cache ceiling |
+| Mid | Wider streaming window, two presentation slots per cell, 96 MiB field-cache ceiling |
+| High | Widest streaming window, four presentation slots per cell, 160 MiB field-cache ceiling |
 
-Unsupported WebGPU, worker, storage, and POV paths fall back visibly in the
-HTML status/info panel and do not change settled hashes.
+WebGPU availability independently selects GPU Map/POV support; without it the
+viewer uses CPU Map and reduces POV/Split to Map with a warning. World jobs
+currently remain on `InlineExecutor`: the browser Worker and IndexedDB code are
+capability probes, not completed task or vault backends. These limitations are
+visible in the status/info panel and do not change settled hashes.
 
 ## Determinism
 

@@ -32,19 +32,25 @@
 //! - `F` — toggle the discovered-region dimming overlay
 //! - `V` — cycle the visualized channel (includes the anchor `influence`
 //!   field); `G` grid, `N` rings, `X` changed-while-pinned flash
-//! - `Tab` — toggle the 3D POV mode (3d-phase-1-plan.md): a fly camera over
-//!   the meshed near-field terrain. In POV: hold the **left mouse button**
-//!   and drag to look, `WASD` along view/strafe, `Space`/`LShift` up/down,
-//!   wheel adjusts the active mode's speed. `F` toggles walk ↔ fly
+//! - `Tab` — toggle Map/POV in a single view, or move focus between panes in
+//!   Split. `WER_VIEW=map|pov|split` selects the startup presentation; in
+//!   Split, clicking a pane also focuses it and the visible cyan border shows
+//!   which pane owns keyboard/wheel input. Both panes follow one traveler and
+//!   one post-update world state. POV is a fly camera over the meshed
+//!   near-field terrain: hold the **left mouse button** and drag to look,
+//!   `WASD` along view/strafe, `Space`/`LShift` up/down, and wheel adjusts the
+//!   focused mode's speed. `F` toggles walk ↔ fly
 //!   (3d-phase-2-plan.md): walk rides the rendered terrain at eye height
 //!   (`Space`/`LShift` reserved, cliffs climb as fast ramps, the sea floor
 //!   is walkable); toggling back to fly keeps the pose. Every map binding
-//!   above is map-mode-only. `WER_POV=1` starts in POV; `WER_POV_RADIUS`
-//!   sets the chunk draw radius in regions (default 3).
+//!   above is active when Map is focused. Legacy `WER_POV=1` still starts in
+//!   POV when `WER_VIEW` is absent; `WER_POV_RADIUS` sets the chunk draw radius
+//!   in regions (default 3).
 //! - `F12` — write a debug dump into `./dump/<UTC datetime>/`: a screenshot
-//!   of the active view (map or POV) plus `state.txt` with the player/camera
-//!   state, steering, telemetry, dep-hash chain, and vault counters
-//!   ([`dump`]). Works in both map and POV modes.
+//!   of the active Map, POV, or Split surface (including the shared panel and
+//!   focus border) plus `state.txt` with mode/focus/pane rectangles, both
+//!   traveler and camera poses, hover, steering, telemetry, dependency hashes,
+//!   and vault counters ([`dump`]).
 //! - `Esc` — quit
 //! - Mouse over the map — the info panel shows the cell under the cursor
 //!   (world/region coordinates, streaming state, field samples, biome)
@@ -62,7 +68,7 @@
 //! binary PPM. A zoom past the organism threshold also picks the organism
 //! nearest the center position, exercising the zoomed panel readout.
 //!
-//! Headless POV screenshot mode (offscreen GPU, ADR 0021):
+//! Headless POV/Split screenshot mode (offscreen GPU, ADR 0021):
 //! `wer --pov-script "<instructions>"` drives the POV camera through a
 //! `;`-separated instruction sequence and captures snapshots — the
 //! debugging/testing harness for POV rendering. Instructions:
@@ -71,16 +77,17 @@
 //! forward/right/up in world units; in walk mode `f`/`r` move in the walk
 //! basis, `u` is ignored, and the eye snaps to the ground at the
 //! destination), `walk` / `fly` (toggle the 3D-2 walk mode, exactly like
-//! the live `F` key), `settle[:n]` (world updates), and `snap:file.ppm`.
+//! the live `F` key), `settle[:n]` (world updates), `snap:file.ppm` (POV
+//! only), and `split:file.ppm` (Map + POV + shared panel, Map-focused).
+//! `WER_TIER=low|mid|high` selects the explicit capture tier; unset defaults
+//! to Low so established headless output remains stable. The same selector is
+//! honored by `--screenshot`.
 //! Example:
-//! `wer --pov-script "pos:300,-10; walk; move:200; snap:walk-a.ppm; mouse:400,0; move:200; snap:walk-b.ppm"`
+//! `wer --pov-script "size:1024x768; pos:300,-10; mouse:-60,100; split:aligned.ppm"`
 
 mod dump;
-mod executor;
 mod input;
 mod panel;
-mod pov;
-mod viz;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -105,7 +112,9 @@ use viewer_host::layout::{
     resolve_view_layout, MapViewportProjection, PixelRect, PresentationMode, ResolvedViewLayout,
     ViewKind, ViewLayout,
 };
-use viewer_host::map::{MapBackend, MapRenderRequest, PreparedMapSource};
+use viewer_host::map::{
+    Channel, MapBackend, MapComposer, MapDecor, MapRenderRequest, Overlays, PreparedMapSource,
+};
 use viewer_host::panel::{
     build_panel_document, PanelBuildInput, PanelDocument, PanelDocumentCache, PanelDocumentKey,
     PerformanceInfo, PersistenceInfo, PlatformTelemetry, RendererInfo, Severity,
@@ -129,16 +138,15 @@ use world_core::{
 use world_core::{PossibilityField, RegionCoord, LAYER_COUNT, POSSIBILITY_DIMS, REGION_SIZE};
 use world_runtime::{
     compare_session_runtime, stream_config_from_record, AdapterClass, Budget, FrameStats,
-    RegionMap, ResourceTier, SessionCompatibility, StreamConfig, TierInputs, Vault, VaultStats,
+    RegionMap, ResourceTier, SessionCompatibility, TierInputs, Vault, VaultStats,
 };
 #[cfg(test)]
-use world_runtime::{RouteTracker, Storage, VaultPersistenceError};
+use world_runtime::{RouteTracker, Storage, StreamConfig, VaultPersistenceError};
 
-use executor::LaneExecutor;
 use panel::Hud;
-use pov::{PovCamera, PovChunkManager, PovCounters, PovOrganismCounters, PovOrganismManager};
-use tools::FileStorage;
-use viz::{Channel, MapComposer, MapDecor, Overlays};
+use pov_host as pov;
+use pov_host::{PovCamera, PovChunkManager, PovCounters, PovOrganismCounters, PovOrganismManager};
+use tools::{FileStorage, LaneExecutor};
 
 /// Letterbox color around the square map (linear RGBA).
 const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
@@ -176,17 +184,6 @@ fn build_window_renderer(window: &Arc<Window>) -> Result<Renderer, renderer::Ren
 fn clear_renderer_loss_input(mapper: &mut InputMapper, adapter: &mut input::WinitInputAdapter) {
     mapper.clear_held_state();
     adapter.cancel_pointer_gesture();
-}
-
-/// Exact physical rectangles for the native map plus its temporary bitmap
-/// information strip. The combined rectangle preserves the source HUD aspect,
-/// while the square left edge remains the single draw/pick destination used by
-/// the shared map projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NativeMapRects {
-    combined: PixelRect,
-    map: PixelRect,
-    panel: PixelRect,
 }
 
 /// Live native presentation geometry: one aspect-fitted view deck followed
@@ -285,31 +282,6 @@ const fn surface_viewport(rect: PixelRect) -> SurfaceViewport {
     SurfaceViewport::new(rect.x, rect.y, rect.width, rect.height)
 }
 
-impl NativeMapRects {
-    fn resolve(surface: PixelRect, map_side: u32, panel_width: u32) -> Option<Self> {
-        let source_width = map_side.checked_add(panel_width)?;
-        let combined = surface.fitted_aspect(source_width, map_side)?;
-        // The source is at least square, so its fitted physical rectangle is
-        // at least as wide as it is tall (including degenerate tiny surfaces).
-        let map_width = combined.height.min(combined.width);
-        let map = PixelRect::new(combined.x, combined.y, map_width, map_width);
-        let panel = PixelRect::new(
-            map.right(),
-            combined.y,
-            combined.width.saturating_sub(map.width),
-            combined.height,
-        );
-        if map.width == 0 || map.height == 0 || panel.width == 0 || panel.height == 0 {
-            return None;
-        }
-        Some(Self {
-            combined,
-            map,
-            panel,
-        })
-    }
-}
-
 #[cfg(test)]
 mod native_map_rect_tests {
     use super::*;
@@ -335,44 +307,13 @@ mod native_map_rect_tests {
     }
 
     #[test]
-    fn native_map_and_panel_partition_one_aspect_fitted_rectangle() {
-        for (width, height) in [(1280, 720), (900, 700), (701, 509), (320, 200), (127, 511)] {
-            let surface = PixelRect::new(0, 0, width, height);
-            let rects = NativeMapRects::resolve(surface, 600, 300).unwrap();
-            assert!(surface.contains_rect(rects.combined));
-            assert_eq!(rects.map.x, rects.combined.x);
-            assert_eq!(rects.map.y, rects.combined.y);
-            assert_eq!(rects.map.width, rects.map.height);
-            assert_eq!(rects.map.height, rects.combined.height);
-            assert_eq!(rects.panel.x, rects.map.right());
-            assert_eq!(rects.panel.y, rects.combined.y);
-            assert_eq!(rects.panel.right(), rects.combined.right());
-            assert_eq!(rects.panel.bottom(), rects.combined.bottom());
-            assert!(!rects.map.overlaps(rects.panel));
-
-            let expected_panel = (u64::from(rects.combined.height) * 300 + 300) / 600;
-            assert!(u64::from(rects.panel.width).abs_diff(expected_panel) <= 1);
-        }
-    }
-
-    #[test]
-    fn panel_and_letterbox_are_outside_the_map_pick_projection() {
-        let surface = PixelRect::new(0, 0, 1280, 720);
-        let rects = NativeMapRects::resolve(surface, 600, 300).unwrap();
-        let projection = MapViewportProjection::new(rects.map, (12.5, -8.25), 3, 16, 8)
-            .expect("valid map geometry");
-
-        let map_center = (
-            f64::from(rects.map.x) + f64::from(rects.map.width) * 0.5,
-            f64::from(rects.map.y) + f64::from(rects.map.height) * 0.5,
-        );
-        assert!(projection.physical_to_world(map_center).is_some());
-        assert!(projection
-            .physical_to_world((f64::from(rects.map.right()), map_center.1))
-            .is_none());
-        assert!(projection
-            .physical_to_world((f64::from(rects.combined.x) - 0.5, map_center.1))
-            .is_none());
+    fn headless_tier_defaults_low_and_accepts_only_named_presets() {
+        assert_eq!(parse_headless_tier(None), Ok(ResourceTier::Low));
+        assert_eq!(parse_headless_tier(Some("LOW")), Ok(ResourceTier::Low));
+        assert_eq!(parse_headless_tier(Some("mid")), Ok(ResourceTier::Mid));
+        assert_eq!(parse_headless_tier(Some("High")), Ok(ResourceTier::High));
+        let error = parse_headless_tier(Some("auto")).expect_err("headless tier is explicit");
+        assert!(error.contains("expected low, mid, or high"));
     }
 
     #[test]
@@ -505,7 +446,19 @@ mod native_map_rect_tests {
             PixelRect::new(0, 0, 1, 1),
             PixelRect::new(0, 0, 1, 2),
         ] {
-            assert_eq!(NativeMapRects::resolve(surface, 600, 300), None);
+            assert_eq!(
+                NativeFrameRects::resolve(
+                    surface,
+                    600,
+                    300,
+                    ViewLayout {
+                        mode: PresentationMode::Split,
+                        focused: ViewKind::Map,
+                        split_ratio: 0.5,
+                    },
+                ),
+                None
+            );
         }
     }
 
@@ -2444,13 +2397,110 @@ fn commit_pov_panel_upload(
     u64::from(dimensions.0) * u64::from(dimensions.1) * 4
 }
 
+/// Headless captures default to Low so their established bytes and cost stay
+/// stable. An explicit `WER_TIER` opts Map, POV, and Split into the same Mid or
+/// High stream/density presets used by the live shell; unlike live startup,
+/// headless work does not probe an adapter and therefore rejects bad values
+/// instead of silently choosing a hardware-derived tier.
+fn parse_headless_tier(explicit: Option<&str>) -> Result<ResourceTier, String> {
+    explicit.map_or(Ok(ResourceTier::Low), |value| {
+        ResourceTier::parse(value)
+            .ok_or_else(|| format!("invalid WER_TIER={value:?}; expected low, mid, or high"))
+    })
+}
+
+fn headless_tier() -> Result<ResourceTier, String> {
+    match std::env::var("WER_TIER") {
+        Ok(value) => parse_headless_tier(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_headless_tier(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(String::from("WER_TIER is not valid Unicode"))
+        }
+    }
+}
+
+/// Build the same semantic panel projection used by the live shell for a
+/// deterministic scripted Split capture. The rendered Map/POV both consume
+/// `map`; this lightweight world value supplies the builder's viewer settings
+/// and tier metadata without introducing a second runtime update authority.
+fn headless_script_panel(
+    map: &RegionMap,
+    camera: &PovCamera,
+    tier: ResourceTier,
+    pinned_violations: u64,
+) -> PanelDocument {
+    let camera_xy = (camera.pos.x, camera.pos.y);
+    let mut world = ExplorationWorld::with_runtime(tier.stream_config(), Budget::unlimited(), tier);
+    world.restore_traveler(camera_xy, camera_xy);
+    let controller = ViewerController::new(world);
+    let mut map_preferences = controller.map_preferences();
+    map_preferences.backend = MapBackend::Cpu;
+    let mut pov_state = controller.pov_state();
+    pov_state.position = camera.pos.to_array();
+    pov_state.yaw = camera.yaw;
+    pov_state.pitch = camera.pitch;
+    pov_state.fly_speed = camera.speed;
+    pov_state.walk = camera.walk;
+    pov_state.walk_speed = camera.walk_speed;
+    pov_state.initialized = true;
+    pov_state.supported = true;
+    let tick = TickOutput {
+        frame: 1,
+        update_serial: 1,
+        mode: PresentationMode::Split,
+        focused: ViewKind::Map,
+        traveler: camera_xy,
+        travel: 0.0,
+        stats: FrameStats::default(),
+        map: map_preferences,
+        pov: pov_state,
+        effects: Vec::new(),
+        platform: PlatformTelemetry {
+            executor_backend: WorkerBackend::Inline,
+            workers: 1,
+            ..PlatformTelemetry::default()
+        },
+        dirty: PresentationDirty {
+            map: true,
+            pov: true,
+            panel: true,
+        },
+        needs_frame: false,
+    };
+    build_panel_document(PanelBuildInput {
+        tick: &tick,
+        world: controller.world(),
+        hover: viewer_host::map_hover(map, Some(camera_xy), map_preferences.zoom),
+        performance: PerformanceInfo::default(),
+        streaming: StreamingSupplement {
+            regen_totals: [0; LAYER_COUNT as usize],
+            macro_tiles: map.macro_cache().len(),
+            rosters: map.roster_cache().len(),
+            organisms: map.organism_count(),
+            jobs_in_flight: map.jobs_in_flight(),
+            pinned_violations,
+        },
+        persistence: PersistenceInfo::default(),
+        renderer: RendererInfo {
+            requested_map_backend: MapBackend::Cpu,
+            effective_map_backend: MapBackend::Cpu,
+            ..RendererInfo::default()
+        },
+        capture: controller.capture_preferences(),
+        warnings: &[],
+        split_ratio: 0.5,
+        revision: 1,
+    })
+}
+
 /// Headless screenshot: settle the streaming window at `pos` and write the
 /// composed false-color map as a binary PPM (P6). No window, no GPU — the map
 /// is CPU-composed, which is exactly what makes it inspectable in tests and
 /// from the command line.
 fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> Result<(), String> {
-    let cfg = StreamConfig::default();
-    let mut world = ExplorationWorld::with_runtime(cfg, Budget::unlimited(), ResourceTier::Low);
+    let tier = headless_tier()?;
+    let cfg = tier.stream_config();
+    let mut world = ExplorationWorld::with_runtime(cfg, Budget::unlimited(), tier);
     world.restore_traveler(pos, pos);
     let mut controller = ViewerController::new(world);
     let mut hook = NoopWorldTickHook;
@@ -2555,10 +2605,11 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> R
     let pixels = hud.compose(composer.pixels(), &document.sections);
     dump::write_ppm(std::path::Path::new(path), pixels, width, height)?;
     log::info!(
-        "wrote {width}x{height} {} map+panel at ({}, {}) to {path}",
+        "wrote {width}x{height} {} map+panel at ({}, {}) to {path} ({} tier)",
         channel.name(),
         pos.0,
-        pos.1
+        pos.1,
+        tier.name(),
     );
     Ok(())
 }
@@ -2571,10 +2622,14 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> R
 /// debugging/testing harness for POV rendering. No window, no event loop.
 fn run_pov_script(script: &str) -> Result<(), String> {
     let instrs = pov::parse_pov_script(script)?;
-    let cfg = StreamConfig::default();
+    let tier = headless_tier()?;
+    let cfg = tier.stream_config();
     let field = PossibilityField::default();
     let bias = [0.0f32; POSSIBILITY_DIMS];
     let mut map = RegionMap::new(cfg);
+    let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
+    let mut composer = MapComposer::new(half_regions, cfg.field_resolution);
+    let mut hud = Hud::new(composer.side() as usize);
     let mut camera = PovCamera::new();
     let mut chunks = PovChunkManager::new();
     let mut organisms = PovOrganismManager::new();
@@ -2590,6 +2645,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
         .map_or(1.0, |s| s.clamp(0.25, 1.0));
     let mut size = (1024u32, 768u32);
     let mut capture: Option<renderer::pov::PovCapture> = None;
+    let mut capture_size = None;
 
     fn settle_world(
         map: &mut RegionMap,
@@ -2620,7 +2676,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
         match instr {
             pov::PovInstr::Size(w, h) => {
                 if capture.is_some() {
-                    return Err(String::from("size must come before the first snap"));
+                    return Err(String::from("size must come before the first capture"));
                 }
                 size = (w, h);
             }
@@ -2657,7 +2713,12 @@ fn run_pov_script(script: &str) -> Result<(), String> {
             pov::PovInstr::Settle(n) => {
                 settle_world(&mut map, (camera.pos.x, camera.pos.y), &field, &bias, n);
             }
-            pov::PovInstr::Snap(path) => {
+            instruction @ (pov::PovInstr::Snap(_) | pov::PovInstr::Split(_)) => {
+                let split = matches!(instruction, pov::PovInstr::Split(_));
+                let path = match instruction {
+                    pov::PovInstr::Snap(path) | pov::PovInstr::Split(path) => path,
+                    _ => unreachable!("capture alternatives matched above"),
+                };
                 // Canonical near-field realization advances at a bounded
                 // number of regions per update. Wait for its explicit
                 // completion observation rather than assuming the old fixed
@@ -2680,13 +2741,51 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                         camera_xy.0, camera_xy.1
                     ));
                 }
-                if capture.is_none() {
+                let split_rectangles = if split {
+                    let (source_width, source_height) = hud.size();
+                    let panel_width = source_width.checked_sub(source_height).ok_or_else(|| {
+                        String::from("native panel source is narrower than its map")
+                    })?;
+                    Some(
+                        NativeFrameRects::resolve(
+                            PixelRect::new(0, 0, size.0, size.1),
+                            source_height,
+                            panel_width,
+                            ViewLayout {
+                                mode: PresentationMode::Split,
+                                focused: ViewKind::Map,
+                                split_ratio: 0.5,
+                            },
+                        )
+                        .ok_or_else(|| {
+                            String::from("capture size is too small for Split views and panel")
+                        })?,
+                    )
+                } else {
+                    None
+                };
+                let pov_size = split_rectangles.map_or(size, |rectangles| {
+                    let pane = rectangles
+                        .views
+                        .pov_pane
+                        .expect("Split layout always has a POV pane");
+                    (pane.width, pane.height)
+                });
+                if capture_size != Some(pov_size) {
+                    // A capture target owns pane-sized GPU attachments. When
+                    // a script switches between `snap:` and `split:`, rebuild
+                    // both the file-bound target and its upload-only resident
+                    // mirrors so the new target is seeded completely.
+                    chunks = PovChunkManager::new();
+                    organisms = PovOrganismManager::new();
                     capture = Some(
-                        renderer::pov::PovCapture::new(size.0, size.1)
+                        renderer::pov::PovCapture::new(pov_size.0, pov_size.1)
                             .map_err(|e| format!("pov capture init: {e}"))?,
                     );
+                    capture_size = Some(pov_size);
                 }
                 let cap = capture.as_mut().expect("just ensured");
+                let mut terrain_uploads = 0usize;
                 for _ in 0..256 {
                     let (uploads, removes) = chunks.sync(
                         &map,
@@ -2694,6 +2793,7 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                         radius,
                         &world_runtime::InlineExecutor,
                     );
+                    terrain_uploads += uploads.len();
                     let done = uploads.is_empty() && chunks.is_idle();
                     cap.apply(&uploads, &removes, None);
                     if done {
@@ -2703,14 +2803,14 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                 let organisms_changed =
                     organisms.sync(&map, &chunks, camera_xy, pov::pov_fog_end(radius));
                 cap.apply(&[], &[], organisms_changed.then(|| organisms.upload()));
-                let aspect = size.0 as f32 / size.1 as f32;
+                let aspect = pov_size.0 as f32 / pov_size.1 as f32;
                 // Time-frozen captures (3d-phase-3-plan.md §4.3): two snaps
                 // of the same pose are byte-comparable; toggles all-on.
                 let shadow = pov::shadow_frame(
                     &camera,
                     &chunks,
                     organisms.shadow_bounds(),
-                    pov::shadow_resolution(ResourceTier::Low),
+                    pov::shadow_resolution(tier),
                 );
                 let params = pov::frame_params(
                     &camera,
@@ -2722,19 +2822,55 @@ fn run_pov_script(script: &str) -> Result<(), String> {
                     shadow,
                 );
                 let rgba = cap.snapshot_at_scale(&params, CLEAR_COLOR, scale);
-                dump::write_ppm(std::path::Path::new(&path), &rgba, size.0, size.1)?;
+                if let Some(rectangles) = split_rectangles {
+                    composer.set_zoom(1);
+                    composer.compose(
+                        &map,
+                        camera_xy,
+                        Channel::Composite,
+                        Overlays {
+                            grid: false,
+                            rings: false,
+                            pinned_flash: false,
+                            organisms: true,
+                            discovered: false,
+                        },
+                        &[],
+                        &MapDecor::default(),
+                    );
+                    let document =
+                        headless_script_panel(&map, &camera, tier, composer.pinned_violations);
+                    let (panel_rgba, panel_width, panel_height) = {
+                        let (pixels, panel_width, panel_height, _) =
+                            hud.panel_image_for(document.revision, &document.sections);
+                        (pixels.to_vec(), panel_width, panel_height)
+                    };
+                    let combined = dump::compose_capture_surface(
+                        size,
+                        rectangles,
+                        Some((composer.pixels(), (composer.side(), composer.side()))),
+                        Some((&rgba, pov_size)),
+                        (&panel_rgba, (panel_width, panel_height)),
+                    )?;
+                    dump::write_ppm(std::path::Path::new(&path), &combined, size.0, size.1)?;
+                } else {
+                    dump::write_ppm(std::path::Path::new(&path), &rgba, pov_size.0, pov_size.1)?;
+                }
                 let organism_counts = organisms.counters();
                 let organism_buffers = cap.organism_stats();
+                let presentation = if split { "split (map focus)" } else { "pov" };
                 log::info!(
-                    "pov snapshot {path}: {}x{} at ({:.1}, {:.1}, {:.1}) yaw {:.1}° pitch {:.1}° | {} chunks | {}/{} organisms drawn (box {}, sphere {}, waiting {}, culled {}; realization {} updates) | instances {:.1}/{:.1} KiB live/cap, {:.1} KiB replacement",
+                    "{presentation} snapshot {path}: {}x{} {} tier at traveler/camera ({:.1}, {:.1}, {:.1}) yaw {:.1}° pitch {:.1}° | {} chunks, {} terrain uploads this capture | {}/{} organisms drawn (box {}, sphere {}, waiting {}, culled {}; realization {} updates) | instances {:.1}/{:.1} KiB live/cap, {:.1} KiB replacement",
                     size.0,
                     size.1,
+                    tier.name(),
                     camera.pos.x,
                     camera.pos.y,
                     camera.pos.z,
                     camera.yaw.to_degrees(),
                     camera.pitch.to_degrees(),
                     chunks.len(),
+                    terrain_uploads,
                     organism_counts.drawn(),
                     organism_counts.published,
                     organism_counts.boxes,
@@ -2868,8 +3004,9 @@ fn main() {
         .split_first()
         .and_then(|(first, rest)| (first == "--pov-script").then_some(rest))
     {
-        let usage = "usage: wer --pov-script \"pos:300,-10; snap:a.ppm; mouse:200,-50; move:150; snap:b.ppm\"\n\
-                     instructions: size:WxH | pos:x,y[,z] | mouse:dx,dy | move:f[,r[,u]] | settle[:n] | snap:file.ppm";
+        let usage = "usage: wer --pov-script \"pos:300,-10; snap:a.ppm; mouse:200,-50; split:both.ppm\"\n\
+                     instructions: size:WxH | pos:x,y[,z] | mouse:dx,dy | move:f[,r[,u]] | walk | fly | settle[:n] | snap:file.ppm | split:file.ppm\n\
+                     optional environment: WER_TIER=low|mid|high (default low)";
         match rest {
             [script] => {
                 if let Err(err) = run_pov_script(script) {

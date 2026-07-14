@@ -236,10 +236,12 @@ into one implementation unit.
     should build on a reconciled aggregate/entity model rather than becoming a
     second independent ecology.
 
-12. **Build the player-facing platform in dependency order** (Section 4.5).
-    Complete the terrain/vegetation/organism renderer, then the browser runtime
-    and asynchronous storage, and only then networking, trust, multiplayer, and
-    community sharing.
+12. **Continue the player-facing platform in dependency order** (Section 4.5).
+    The derived terrain/organism POV and aligned Map/POV/Split static browser
+    viewer have landed. Complete the browser worker and durable-vault service
+    backends, then build deeper exploration interactions and content on that
+    shared boundary before networking, trust, multiplayer, or community
+    sharing.
 
 ### 4.1 Correctness and architectural contract concerns
 
@@ -926,9 +928,11 @@ the current prototype demonstrates:
 * Organisms are sampled markers, not agents with behavior or local simulation.
 * Ecology has no migration, reproduction, competition, succession clock, or
   evolutionary history.
-* The renderer is a debug map, not the planned terrain/vegetation/organism 3D
-  renderer.
-* The web target is a compile/parity shell, not a browser game runtime.
+* The renderer is a derived Map/POV/Split prototype, not a production-quality
+  terrain, vegetation, organism, animation, or effects renderer.
+* The web target is a static browser runtime with aligned viewer behavior and
+  visible fallbacks, but it remains the same world-model prototype rather than
+  a complete browser game.
 * Atlas exchange is file-based; there is no networking, server, trust model,
   multiplayer, or collaborative service.
 
