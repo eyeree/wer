@@ -11,6 +11,10 @@ use world_runtime::FrameStats;
 
 use crate::viz::Channel;
 
+// Milestone 1 moves the semantic inspection values while retaining this
+// native bitmap renderer and its existing module paths until Milestone 6.
+pub use viewer_host::inspect::{CursorInfo, EcologyInfo, OrganismInfo};
+
 /// Panel width in pixels: three stat columns of scale-2 (16 px) glyphs plus
 /// the margins. Three-up rows keep the panel short enough that the cursor
 /// and steering blocks stay visible on the Low-tier map strip.
@@ -75,90 +79,6 @@ pub fn hud_chip(text: &str) -> (Vec<u8>, u32, u32) {
         pen_x += 8 * SCALE;
     }
     (rgba, width as u32, height as u32)
-}
-
-/// Everything the panel shows about the cell under the mouse.
-#[derive(Debug, Clone)]
-pub struct CursorInfo {
-    /// World position under the cursor.
-    pub world: (f64, f64),
-    /// Region coordinate under the cursor.
-    pub region: (i32, i32),
-    /// Region streaming state, if resident.
-    pub stability: f32,
-    /// Realized-state revision of the region.
-    pub revision: u32,
-    /// Generation status label.
-    pub status: &'static str,
-    /// Sampled field values (present when the tiles are generated).
-    pub elevation: Option<f32>,
-    /// Temperature (°C) under the cursor.
-    pub temperature: Option<f32>,
-    /// Moisture under the cursor.
-    pub moisture: Option<f32>,
-    /// Rock hardness under the cursor.
-    pub hardness: Option<f32>,
-    /// River expression under the cursor.
-    pub river: Option<f32>,
-    /// Surface wetness under the cursor.
-    pub wetness: Option<f32>,
-    /// Soil depth under the cursor.
-    pub soil_depth: Option<f32>,
-    /// Soil fertility under the cursor.
-    pub fertility: Option<f32>,
-    /// Vegetation density under the cursor.
-    pub vegetation: Option<f32>,
-    /// Canopy height under the cursor.
-    pub canopy: Option<f32>,
-    /// Biome classification of the cell (from the biome id tile).
-    pub biome: Option<&'static str>,
-    /// Aggregate ecology readout at the cell (from L8), when settled.
-    pub ecology: Option<EcologyInfo>,
-}
-
-/// The aggregate-ecology facts the panel shows for the cell under the cursor
-/// (phase-3-plan.md §11).
-#[derive(Debug, Clone)]
-pub struct EcologyInfo {
-    /// Roster size for the cell's habitat signature.
-    pub roster_size: usize,
-    /// Dominant species id.
-    pub dominant_id: u64,
-    /// Species count per trophic role: producer, herbivore, omnivore,
-    /// carnivore, decomposer.
-    pub trophic_counts: [usize; 5],
-    /// Herbivore pressure.
-    pub herbivore: f32,
-    /// Predator pressure.
-    pub predator: f32,
-    /// Species diversity.
-    pub diversity: f32,
-}
-
-/// The realized organism under the cursor when the view is zoomed in past
-/// the pick threshold. Everything here is transient presentation state
-/// (phase-3-plan.md §7.6) — the readout inspects a realized instance, it
-/// never becomes identity.
-#[derive(Debug, Clone, Copy)]
-pub struct OrganismInfo {
-    /// Stable instance identity (the `feature_hash` of its cell slot).
-    pub id: u64,
-    /// The species it instantiates ([`world_core::Species::id`]).
-    pub species: u64,
-    /// Trophic role label.
-    pub trophic: &'static str,
-    /// Jittered world position.
-    pub world: (f64, f64),
-    /// Expressed hue in `[0, 1)`.
-    pub hue: f32,
-    /// Expressed bioluminance in `[0, 1]`.
-    pub luminance: f32,
-    /// Expressed body size in world units.
-    pub size: f32,
-    /// Expressed activity in `[0, 1]`.
-    pub activity: f32,
-    /// Expressed aggression in `[0, 1]`.
-    pub aggression: f32,
 }
 
 /// One frame's worth of panel content.

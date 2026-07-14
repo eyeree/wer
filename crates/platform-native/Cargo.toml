@@ -19,6 +19,9 @@ world-core = { path = "../world-core" }
 # `pass-timing`: the native shell is a primary consumer of the per-pass
 # telemetry (phase-6-plan.md §5.2); wasm builds never see the feature.
 world-runtime = { path = "../world-runtime", features = ["pass-timing"] }
+# Cross-platform viewer value contracts and, in later alignment milestones,
+# the shared input/controller/presentation host (ADR 0028).
+viewer-host = { path = "../viewer-host" }
 # The shared native file-tree Storage backend (phase-5-plan.md §5.3) — the
 # tools crate has no windowing/GPU dependencies, so this stays lightweight.
 tools = { path = "../tools" }
