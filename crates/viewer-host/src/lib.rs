@@ -26,7 +26,7 @@ pub use controller::{
 };
 pub use inspect::{
     map_hover, organism_info, pick_map_organism_info, sample_cell, CellInfo, CellStatus,
-    EcologyInfo, HoverInfo, OrganismInfo,
+    EcologyInfo, HoverInfo, OrganismInfo, PovHoverCache,
 };
 pub use layout::{
     resolve_view_layout, MapGridCoverage, MapViewportProjection, PixelRect, PresentationMode,

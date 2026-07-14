@@ -838,9 +838,9 @@ mod tests {
         assert!(report.contains("CellInfo {"));
         assert!(report.contains("organism within one cell:"));
 
-        // Diagnostic sampling is independent of presentation hover. POV has
-        // no hover until M7, but its F12 report must still describe the player
-        // cell promised by this module's contract.
+        // Diagnostic sampling is independent of presentation hover. Even a
+        // sky/missing-geometry POV hover must leave the F12 report's player
+        // cell diagnostics intact.
         let mut no_hover_panel = app.debug_panel_document();
         no_hover_panel.model.hover = viewer_host::inspect::HoverInfo::None;
         let no_hover_report = app

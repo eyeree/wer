@@ -5,12 +5,15 @@
 //! world, or becomes an identity authority (ADR 0028 and
 //! `native-web-alignment.md` section 5.7).
 
+use pov_host::{PovCamera, PovChunkManager, PovOrganismManager, PovSceneHit};
 use world_core::{Biome, HabitatSignature, LocalPos, RegionCoord, Trophic, REGION_SIZE};
 use world_runtime::{
     GenerationStatus, Organism, RegionMap, CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY,
     CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE,
     CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
+
+use crate::layout::PixelRect;
 
 /// Streaming/generation state reported for an inspected cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -154,6 +157,173 @@ pub enum HoverInfo {
     Terrain(CellInfo),
     /// Realized organism information.
     Organism(OrganismInfo),
+}
+
+/// Exact presentation inputs that can change a CPU-side POV geometry query.
+///
+/// The world update serial is deliberately absent. Resident terrain and
+/// renderer-ready organisms expose narrower generations, so a continuous POV
+/// frame does not repeat the ray query merely because unrelated simulation or
+/// telemetry advanced (`native-web-alignment.md` section 5.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PovHoverGeometryKey {
+    pointer: [u64; 2],
+    pane: PixelRect,
+    camera_position: [u64; 3],
+    camera_orientation: [u32; 2],
+    terrain_generation: u64,
+    organism_generation: u64,
+    fog_end: u64,
+    animation_time: u32,
+}
+
+impl PovHoverGeometryKey {
+    fn new(
+        pointer: [f64; 2],
+        pane: PixelRect,
+        camera: &PovCamera,
+        chunks: &PovChunkManager,
+        organisms: &PovOrganismManager,
+        fog_end: f64,
+        time_seconds: f32,
+    ) -> Self {
+        Self {
+            pointer: pointer.map(f64::to_bits),
+            pane,
+            camera_position: [camera.pos.x, camera.pos.y, camera.pos.z].map(f64::to_bits),
+            camera_orientation: [camera.yaw, camera.pitch].map(f32::to_bits),
+            terrain_generation: chunks.resident_generation(),
+            organism_generation: organisms.visual_generation(),
+            fog_end: fog_end.to_bits(),
+            // Static visuals must not turn an animated presentation clock into
+            // an unconditional per-frame ray query. Once a nonzero bob exists,
+            // its wrapped frame time is part of the geometry actually drawn.
+            animation_time: if organisms.has_animated_visuals() {
+                time_seconds.to_bits()
+            } else {
+                0
+            },
+        }
+    }
+}
+
+/// Cached CPU-side POV picking plus the current shared semantic hover value.
+///
+/// Geometry is recomputed only when its exact presentation inputs change.
+/// [`HoverInfo`] is nevertheless rebuilt on every [`Self::update`] so a
+/// resident cell's generation status, ecology, or other information can
+/// advance without forcing an otherwise-identical ray/triangle query.
+pub struct PovHoverCache {
+    geometry_key: Option<PovHoverGeometryKey>,
+    hit: Option<PovSceneHit>,
+    hover: HoverInfo,
+    geometry_queries: u64,
+}
+
+impl std::fmt::Debug for PovHoverCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PovHoverCache")
+            .field("geometry_key", &self.geometry_key)
+            .field("hover", &self.hover)
+            .field("geometry_queries", &self.geometry_queries)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PovHoverCache {
+    fn default() -> Self {
+        Self {
+            geometry_key: None,
+            hit: None,
+            hover: HoverInfo::None,
+            geometry_queries: 0,
+        }
+    }
+}
+
+impl PovHoverCache {
+    /// Construct an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the cached POV hit and rebuild its semantic information.
+    ///
+    /// `surface_pointer` is expressed in the same physical surface pixels as
+    /// `pov_pane`. A missing pane/pointer, a point outside the half-open pane,
+    /// or an invalid camera ray resolves to [`HoverInfo::None`] without
+    /// querying resident geometry. `true` means the semantic hover value
+    /// changed, which shells use for immediate panel invalidation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &mut self,
+        map: &RegionMap,
+        camera: &PovCamera,
+        chunks: &PovChunkManager,
+        organisms: &PovOrganismManager,
+        surface_pointer: Option<[f64; 2]>,
+        pov_pane: Option<PixelRect>,
+        fog_end: f64,
+        time_seconds: f32,
+    ) -> bool {
+        let routed = surface_pointer.zip(pov_pane).and_then(|(pointer, pane)| {
+            pane.local_point(pointer)
+                .map(|local| (pointer, pane, local))
+        });
+
+        let next_key = routed.map(|(pointer, pane, _)| {
+            PovHoverGeometryKey::new(
+                pointer,
+                pane,
+                camera,
+                chunks,
+                organisms,
+                fog_end,
+                time_seconds,
+            )
+        });
+        if self.geometry_key != next_key {
+            self.geometry_key = next_key;
+            self.hit = routed
+                .and_then(|(_, pane, local)| camera.screen_ray(local, [pane.width, pane.height]))
+                .and_then(|ray| {
+                    self.geometry_queries = self.geometry_queries.saturating_add(1);
+                    pov_host::raycast_scene(chunks, organisms, ray, time_seconds, fog_end)
+                });
+        }
+
+        let next_hover = pov_scene_hover(map, self.hit.as_ref());
+        let changed = self.hover != next_hover;
+        self.hover = next_hover;
+        changed
+    }
+
+    /// Current semantic information under the POV pointer.
+    #[must_use]
+    pub const fn hover(&self) -> &HoverInfo {
+        &self.hover
+    }
+
+    /// Number of resident geometry queries performed since construction.
+    ///
+    /// This excludes missing/outside pointers and semantic-only refreshes, so
+    /// tests and shell telemetry can verify steady-state hover caching without
+    /// conflating it with ordinary panel sampling.
+    #[must_use]
+    pub const fn geometry_queries(&self) -> u64 {
+        self.geometry_queries
+    }
+}
+
+fn pov_scene_hover(map: &RegionMap, hit: Option<&PovSceneHit>) -> HoverInfo {
+    match hit {
+        None => HoverInfo::None,
+        Some(PovSceneHit::Terrain(hit)) => {
+            HoverInfo::Terrain(sample_cell(map, (hit.position.x, hit.position.y)))
+        }
+        Some(PovSceneHit::Organism(hit)) => HoverInfo::Organism(organism_info(&hit.organism)),
+    }
 }
 
 fn serialize_hex_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -512,5 +682,213 @@ mod tests {
         };
         assert_eq!(info.id, source.id);
         assert_eq!(info.slot, source.slot);
+    }
+
+    #[test]
+    fn pov_hover_cache_keys_exact_geometry_inputs_and_ignores_static_time() {
+        let map = RegionMap::new(config());
+        let mut camera = PovCamera::new();
+        camera.pos.x = 1_000_000.25;
+        camera.pos.y = -2_000_000.5;
+        camera.pos.z = 80.0;
+        let chunks = PovChunkManager::new();
+        let organisms = PovOrganismManager::new();
+        assert!(!organisms.has_animated_visuals());
+
+        let mut cache = PovHoverCache::new();
+        let pane = PixelRect::new(13, 29, 200, 100);
+        let pointer = [113.0, 79.0];
+        let update = |cache: &mut PovHoverCache,
+                      camera: &PovCamera,
+                      pointer: Option<[f64; 2]>,
+                      pane: Option<PixelRect>,
+                      fog_end: f64,
+                      time_seconds: f32| {
+            cache.update(
+                &map,
+                camera,
+                &chunks,
+                &organisms,
+                pointer,
+                pane,
+                fog_end,
+                time_seconds,
+            )
+        };
+
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some(pointer),
+            Some(pane),
+            640.0,
+            1.0,
+        ));
+        assert_eq!(cache.hover(), &HoverInfo::None);
+        assert_eq!(cache.geometry_queries(), 1);
+
+        // An identical frame and a presentation clock change cannot repeat a
+        // static scene query.
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some(pointer),
+            Some(pane),
+            640.0,
+            1.0,
+        ));
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some(pointer),
+            Some(pane),
+            640.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 1);
+
+        camera.yaw += 0.125;
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some(pointer),
+            Some(pane),
+            640.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 2);
+
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some([pointer[0] + 0.25, pointer[1]]),
+            Some(pane),
+            640.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 3);
+
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some([pointer[0] + 0.25, pointer[1]]),
+            Some(PixelRect::new(pane.x, pane.y, pane.width + 1, pane.height)),
+            640.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 4);
+
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some([pointer[0] + 0.25, pointer[1]]),
+            Some(PixelRect::new(pane.x, pane.y, pane.width + 1, pane.height)),
+            641.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 5);
+
+        // Outside/missing pane state clears the cached hit without querying
+        // the resident geometry. Returning inside performs one fresh query.
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some([f64::from(pane.right()), pointer[1]]),
+            Some(pane),
+            641.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 5);
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some(pointer),
+            None,
+            641.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 5);
+        assert!(!update(
+            &mut cache,
+            &camera,
+            Some(pointer),
+            Some(pane),
+            641.0,
+            31.5,
+        ));
+        assert_eq!(cache.geometry_queries(), 6);
+    }
+
+    #[test]
+    fn pov_hover_cache_refreshes_semantics_without_requerying_geometry() {
+        let mut map = RegionMap::new(config());
+        let camera = PovCamera::new();
+        let chunks = PovChunkManager::new();
+        let organisms = PovOrganismManager::new();
+        let pane = PixelRect::new(10, 20, 200, 100);
+        let pointer = [110.0, 70.0];
+        let fog_end = 640.0;
+        let time_seconds = 0.0;
+        let mut position = camera.pos;
+        position.x = PLAYER.0;
+        position.y = PLAYER.1;
+        position.z = 12.0;
+        let terrain_hit = PovSceneHit::Terrain(pov_host::PovTerrainHit {
+            distance: 25.0,
+            position,
+            region: RegionCoord::new(0, 0),
+            cell: [0, 0],
+            triangle: 0,
+        });
+        let initial_hover = HoverInfo::Terrain(sample_cell(&map, PLAYER));
+        let mut cache = PovHoverCache {
+            geometry_key: Some(PovHoverGeometryKey::new(
+                pointer,
+                pane,
+                &camera,
+                &chunks,
+                &organisms,
+                fog_end,
+                time_seconds,
+            )),
+            hit: Some(terrain_hit),
+            hover: initial_hover,
+            geometry_queries: 1,
+        };
+
+        assert!(!cache.update(
+            &map,
+            &camera,
+            &chunks,
+            &organisms,
+            Some(pointer),
+            Some(pane),
+            fog_end,
+            time_seconds,
+        ));
+        assert_eq!(cache.geometry_queries(), 1);
+
+        update(
+            &mut map,
+            &Budget {
+                max_regen_cost: 0,
+                ..Budget::unlimited()
+            },
+        );
+        assert!(cache.update(
+            &map,
+            &camera,
+            &chunks,
+            &organisms,
+            Some(pointer),
+            Some(pane),
+            fog_end,
+            time_seconds,
+        ));
+        let HoverInfo::Terrain(cell) = cache.hover() else {
+            panic!("cached terrain hit must remain terrain semantic information");
+        };
+        assert_eq!(cell.status, CellStatus::Generating);
+        assert_eq!(cache.geometry_queries(), 1);
     }
 }

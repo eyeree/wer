@@ -97,7 +97,7 @@ use viewer_host::controller::{
 };
 use viewer_host::input::InputFrame;
 use viewer_host::input::{InputContext, InputMapper, NormalizedInputEvent};
-use viewer_host::inspect::HoverInfo;
+use viewer_host::inspect::{HoverInfo, PovHoverCache};
 use viewer_host::layout::{MapViewportProjection, PixelRect, PresentationMode, ViewKind};
 use viewer_host::map::{MapBackend, MapRenderRequest, PreparedMapSource};
 use viewer_host::panel::{
@@ -190,6 +190,26 @@ impl NativeMapRects {
     }
 }
 
+/// Gate POV gestures through the same half-open rectangle used by rendering
+/// and picking. The temporary native information strip is not a view surface;
+/// routing it as Map makes POV presses/wheels inert in single-POV mode while
+/// still letting a release clear an already-held drag by pointer identity.
+fn routed_native_pointer_view(
+    focused: ViewKind,
+    pov_pane: Option<PixelRect>,
+    pointer: Option<[f64; 2]>,
+) -> ViewKind {
+    if focused == ViewKind::Pov
+        && !pointer
+            .zip(pov_pane)
+            .is_some_and(|(point, pane)| pane.contains_f64(point[0], point[1]))
+    {
+        ViewKind::Map
+    } else {
+        focused
+    }
+}
+
 #[cfg(test)]
 mod native_map_rect_tests {
     use super::*;
@@ -233,6 +253,36 @@ mod native_map_rect_tests {
         assert!(projection
             .physical_to_world((f64::from(rects.combined.x) - 0.5, map_center.1))
             .is_none());
+    }
+
+    #[test]
+    fn pov_gestures_route_only_inside_the_exact_render_pane() {
+        let surface = PixelRect::new(0, 0, 1280, 720);
+        let rects = NativeMapRects::resolve(surface, 600, 300).unwrap();
+        assert_eq!(
+            routed_native_pointer_view(
+                ViewKind::Pov,
+                Some(rects.map),
+                Some([f64::from(rects.map.x) + 0.5, f64::from(rects.map.y) + 0.5,]),
+            ),
+            ViewKind::Pov
+        );
+        assert_eq!(
+            routed_native_pointer_view(
+                ViewKind::Pov,
+                Some(rects.map),
+                Some([f64::from(rects.panel.x) + 0.5, f64::from(rects.panel.y)]),
+            ),
+            ViewKind::Map
+        );
+        assert_eq!(
+            routed_native_pointer_view(ViewKind::Pov, Some(rects.map), None),
+            ViewKind::Map
+        );
+        assert_eq!(
+            routed_native_pointer_view(ViewKind::Map, Some(rects.map), None),
+            ViewKind::Map
+        );
     }
 
     #[test]
@@ -624,6 +674,8 @@ struct App {
     /// Exact upload-only presentation of the currently published organisms.
     /// It scans only in POV and retains renderer replacement lists at rest.
     pov_organisms: PovOrganismManager,
+    /// Cached CPU-side hit against the exact resident POV geometry.
+    pov_hover: PovHoverCache,
     /// Chunk draw radius in regions (`WER_POV_RADIUS`, default 3).
     pov_radius: i32,
     /// Canonical binding, held-state, wheel, and primary-drag authority.
@@ -645,6 +697,10 @@ struct App {
     pov_panel_revision: Option<u64>,
     /// Map hover in physical surface pixels, sampled from shared frame input.
     cursor_pos: Option<(f64, f64)>,
+    /// Persistent POV hover in physical surface pixels. The shared input mapper
+    /// owns pointer routing; this shell retains its sampled value so geometry
+    /// changes can refresh hover even when the mouse itself did not move.
+    pov_pointer: Option<[f64; 2]>,
     /// Cumulative regenerated-tile counts per layer (panel telemetry).
     regen_totals: [u64; LAYER_COUNT as usize],
     /// The most recent `World::update` counters, kept for the `F12` debug
@@ -737,6 +793,7 @@ impl App {
             atlas: AtlasManager::default(),
             pov_chunks: PovChunkManager::new(),
             pov_organisms: PovOrganismManager::new(),
+            pov_hover: PovHoverCache::new(),
             // The llvmpipe escape hatch (3d-phase-1-plan.md §8.5).
             pov_radius: std::env::var("WER_POV_RADIUS")
                 .ok()
@@ -750,6 +807,7 @@ impl App {
             panel_revision: None,
             pov_panel_revision: None,
             cursor_pos: None,
+            pov_pointer: None,
             regen_totals: [0; LAYER_COUNT as usize],
             last_stats: FrameStats::default(),
             last_frame: Instant::now(),
@@ -1285,7 +1343,7 @@ impl App {
                 Some(self.controller.world().traveler().position),
                 preferences.zoom,
             ),
-            PresentationMode::Pov => HoverInfo::None,
+            PresentationMode::Pov => self.pov_hover.hover().clone(),
         };
         let surface_format = self
             .renderer
@@ -1375,6 +1433,28 @@ impl App {
         Some((rects, projection))
     }
 
+    /// Resolve the exact native POV/panel fit before either picking or panel
+    /// construction. The returned square `map` rectangle is the live POV pane;
+    /// both the camera ray and renderer viewport consume it unchanged.
+    fn pov_frame_layout(&self) -> Option<NativeMapRects> {
+        let (width, height) = self.renderer.as_ref()?.size();
+        let (source_width, source_height) = self.hud.size();
+        let panel_width = source_width.checked_sub(source_height)?;
+        NativeMapRects::resolve(
+            PixelRect::new(0, 0, width, height),
+            source_height,
+            panel_width,
+        )
+    }
+
+    fn pointer_gesture_view(&self) -> ViewKind {
+        let focused = self.input_context().focused;
+        let pov_pane = (focused == ViewKind::Pov)
+            .then(|| self.pov_frame_layout().map(|rects| rects.map))
+            .flatten();
+        routed_native_pointer_view(focused, pov_pane, self.winit_input.cursor_position())
+    }
+
     /// Map the mouse in physical surface pixels through the exact destination
     /// used by this frame. Letterbox and panel points deliberately return
     /// `None`.
@@ -1457,6 +1537,7 @@ impl App {
         self.input.set_context(context);
         let input = self.input.take_frame();
         self.cursor_pos = input.map_pointer.map(|point| (point[0], point[1]));
+        self.pov_pointer = input.pov_pointer;
         let platform = self.platform_telemetry();
         let update_start = Instant::now();
         let ground = NativeGroundSampler {
@@ -1496,11 +1577,24 @@ impl App {
             );
         }
         let effects = std::mem::take(&mut output.effects);
+        // A POV debug capture must observe the geometry/hover prepared for
+        // this same tick. Other effects keep their ordinary pre-presentation
+        // handling; only F12 capture is deferred until frame_pov has synced,
+        // picked, built the panel, and submitted the matching view.
+        let (deferred_captures, effects): (Vec<_>, Vec<_>) = if output.mode == PresentationMode::Pov
+        {
+            effects
+                .into_iter()
+                .partition(|effect| matches!(effect, ViewerEffect::WriteDebugCapture(_)))
+        } else {
+            (Vec::new(), effects)
+        };
         self.last_tick_output = Some(output.clone());
         self.handle_effects(effects, event_loop);
 
         if output.mode == PresentationMode::Pov {
             self.frame_pov(&output, update_seconds);
+            self.handle_effects(deferred_captures, event_loop);
             return;
         }
 
@@ -1654,6 +1748,11 @@ impl App {
     fn frame_pov(&mut self, output: &TickOutput, update_seconds: f64) {
         let mut stats = output.stats;
         let camera = self.controller.pov_camera();
+        let fog_end = f64::from(pov::pov_fog_end(self.pov_radius) as f32);
+        // Ordering contract for native hover: the controller tick has already
+        // applied primary-drag look and the single world update. Synchronize
+        // the geometry those values select next, then pick, then build the
+        // panel and draw. Hover alone never contributes a look delta.
         // The frame-side POV work (scheduling + amortized integration) fills
         // the Mesh pass, following the Flush precedent (plan §8.1); the
         // worker-side mesh milliseconds ride the manager's counters instead.
@@ -1668,7 +1767,7 @@ impl App {
             self.controller.world().map(),
             &self.pov_chunks,
             (camera.pos.x, camera.pos.y),
-            pov::pov_fog_end(self.pov_radius),
+            fog_end,
         );
         let organism_upload = organisms_changed.then(|| self.pov_organisms.upload());
         let mut upload_bytes = (uploads.len()
@@ -1681,6 +1780,50 @@ impl App {
         stats.pass_ms[world_runtime::Pass::Mesh.index()] +=
             mesh_start.elapsed().as_secs_f32() * 1000.0;
         self.last_stats = stats;
+
+        let Some(frame_rects) = self.pov_frame_layout() else {
+            return;
+        };
+        let pov_viewport = frame_rects.map_viewport();
+        let panel_viewport = frame_rects
+            .panel_viewport()
+            .expect("resolved native POV panel has a visible viewport");
+        // The water-wobble clock (3d-phase-3-plan.md §7.1): wrapped at the
+        // shader's period so f32 never loses phase precision. This exact value
+        // also drives animated-organism picking.
+        let time = self
+            .start
+            .elapsed()
+            .as_secs_f64()
+            .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
+        let resolution = pov::shadow_resolution(self.tier);
+        let shadow = pov::shadow_frame(
+            self.controller.pov_camera(),
+            &self.pov_chunks,
+            self.pov_organisms.shadow_bounds(),
+            resolution,
+        );
+        let params = pov::frame_params(
+            self.controller.pov_camera(),
+            pov_viewport.width as f32 / pov_viewport.height.max(1) as f32,
+            self.pov_radius,
+            CLEAR_COLOR,
+            time,
+            self.controller.pov_toggles(),
+            shadow,
+        );
+        debug_assert_eq!(f64::from(params.fog_end), fog_end);
+        self.pov_hover.update(
+            self.controller.world().map(),
+            self.controller.pov_camera(),
+            &self.pov_chunks,
+            &self.pov_organisms,
+            self.pov_pointer,
+            Some(frame_rects.map),
+            f64::from(params.fog_end),
+            params.time,
+        );
+        let hover = self.pov_hover.hover().clone();
 
         let mut panel_tick = output.clone();
         panel_tick.stats = stats;
@@ -1704,7 +1847,7 @@ impl App {
         let document = self.panel_state.document(
             &panel_tick,
             self.controller.world(),
-            HoverInfo::None,
+            hover,
             performance,
             streaming,
             persistence,
@@ -1716,43 +1859,10 @@ impl App {
         let render_start = Instant::now();
         let mut organism_buffer_stats = None;
         if let Some(renderer) = self.renderer.as_mut() {
-            let (w, h) = renderer.size();
             let (panel_rgba, panel_width, panel_height, _) = self
                 .hud
                 .panel_image_for(document.revision, &document.sections);
             let panel_changed = self.pov_panel_revision != Some(document.revision);
-            let Some(frame_rects) =
-                NativeMapRects::resolve(PixelRect::new(0, 0, w, h), panel_height, panel_width)
-            else {
-                return;
-            };
-            let pov_viewport = frame_rects.map_viewport();
-            let panel_viewport = frame_rects
-                .panel_viewport()
-                .expect("resolved native POV panel has a visible viewport");
-            // The water-wobble clock (3d-phase-3-plan.md §7.1): wrapped at
-            // the shader's period so f32 never loses phase precision.
-            let time = self
-                .start
-                .elapsed()
-                .as_secs_f64()
-                .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
-            let resolution = pov::shadow_resolution(self.tier);
-            let shadow = pov::shadow_frame(
-                self.controller.pov_camera(),
-                &self.pov_chunks,
-                self.pov_organisms.shadow_bounds(),
-                resolution,
-            );
-            let params = pov::frame_params(
-                self.controller.pov_camera(),
-                pov_viewport.width as f32 / pov_viewport.height.max(1) as f32,
-                self.pov_radius,
-                CLEAR_COLOR,
-                time,
-                self.controller.pov_toggles(),
-                shadow,
-            );
             // Keep the complete shared information surface mounted beside a
             // projection-correct POV pane. Unchanged panel pixels retain the
             // renderer texture and incur no upload.
@@ -1944,14 +2054,14 @@ impl ApplicationHandler for App {
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let focused = self.input_context().focused;
-                if let Some(event) = self.winit_input.mouse_input(state, button, focused) {
+                let view = self.pointer_gesture_view();
+                if let Some(event) = self.winit_input.mouse_input(state, button, view) {
                     self.handle_input_event(event, event_loop);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let focused = self.input_context().focused;
-                let event = self.winit_input.wheel(delta, focused);
+                let view = self.pointer_gesture_view();
+                let event = self.winit_input.wheel(delta, view);
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::KeyboardInput {

@@ -529,7 +529,7 @@ const viewerFrame = (now) => {
     perf.frames = 0;
     perf.lastRoll = now;
   }
-  requestPanelRefresh();
+  requestPanelRefresh(frame.hover_changed);
   if (frame.needs_frame || app.needs_frame()) scheduleFrame();
 };
 
@@ -848,6 +848,8 @@ const canvasPoint = (canvas, event) => {
   ];
 };
 
+const expectedCaptureLosses = new Set();
+
 for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
   const routedView = () =>
     canvas === povCanvas() && lastPresentation?.view.mode !== "pov"
@@ -858,6 +860,7 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
   canvas.addEventListener("pointerdown", (event) => {
     const app = window.__werApp;
     if (!app) return;
+    expectedCaptureLosses.delete(event.pointerId);
     canvas.focus();
     const [x, y] = canvasPoint(canvas, event);
     const handled = app.pointer_button(event.pointerId, event.button, true, x, y, routedView());
@@ -876,16 +879,28 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     if (!app) return;
     const [x, y] = canvasPoint(canvas, event);
     const handled = app.pointer_button(event.pointerId, event.button, false, x, y, routedView());
-    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    if (canvas.hasPointerCapture(event.pointerId)) {
+      expectedCaptureLosses.add(event.pointerId);
+      canvas.releasePointerCapture(event.pointerId);
+    }
     if (handled) event.preventDefault();
     scheduleFrame();
   });
   canvas.addEventListener("pointercancel", (event) => {
-    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    if (canvas.hasPointerCapture(event.pointerId)) {
+      expectedCaptureLosses.add(event.pointerId);
+      canvas.releasePointerCapture(event.pointerId);
+    }
+    window.__werApp?.pointer_cancel(event.pointerId);
+    scheduleFrame();
+  });
+  canvas.addEventListener("pointerleave", (event) => {
+    if (canvas.hasPointerCapture(event.pointerId)) return;
     window.__werApp?.pointer_cancel(event.pointerId);
     scheduleFrame();
   });
   canvas.addEventListener("lostpointercapture", (event) => {
+    if (expectedCaptureLosses.delete(event.pointerId)) return;
     window.__werApp?.pointer_cancel(event.pointerId);
     scheduleFrame();
   });
