@@ -11,6 +11,7 @@ members = [
     "crates/world-runtime",
     "crates/renderer",
     "crates/pov-host",
+    "crates/viewer-host",
     "crates/platform-native",
     "crates/platform-web",
     "crates/tools",

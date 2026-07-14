@@ -16,6 +16,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }
+# Cross-platform viewer value contracts and, in later alignment milestones,
+# the shared input/controller/presentation host (ADR 0028).
+viewer-host = { path = "../viewer-host" }
 # The browser POV host (phase-7-plan.md §9.9): the same shared camera/mesher/
 # chunk-manager stack the native shell drives, plus the wgpu renderer it
 # feeds. Both compile on native too, so the facade stays unit-testable.

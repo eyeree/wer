@@ -7,6 +7,7 @@
 //! Phase 7. Phase 2 grew the shell only by two parity exports: the lithology
 //! seed and a drainage routing sample (phase-2-plan.md §12.5).
 
+use viewer_host::PresentationMode;
 use world_core::{
     anchor::{
         anchor_set_signature, bound_target, domain_mask, project_plausible, steer, Anchor,
@@ -427,7 +428,7 @@ struct WebAppState {
     record_count: u32,
     session_snapshot: Option<String>,
     renderer: &'static str,
-    view_mode: &'static str,
+    view_mode: PresentationMode,
     pov_supported: bool,
     pointer_lock: bool,
     /// POV motion mode (`pov:walk` toggles walk ↔ fly), mirroring the native
@@ -489,7 +490,7 @@ impl Default for WebAppState {
             record_count: 0,
             session_snapshot: None,
             renderer: "cpu-fallback",
-            view_mode: "map",
+            view_mode: PresentationMode::Map,
             pov_supported: false,
             pointer_lock: false,
             pov_walk: false,
@@ -771,7 +772,7 @@ impl WebAppState {
             self.benchmark_ms = 1.0 + self.workers as f32;
         } else if command.contains("mode:pov") {
             if self.pov_supported {
-                self.view_mode = "pov";
+                self.view_mode = PresentationMode::Pov;
                 // Entering POV places the camera at eye level over the
                 // player (native `toggle_view_mode`); re-entering with walk
                 // still on grounds immediately instead of ramping down.
@@ -788,13 +789,13 @@ impl WebAppState {
                     self.pov_camera.snap_to_ground(ground);
                 }
             } else {
-                self.view_mode = "map";
+                self.view_mode = PresentationMode::Map;
                 self.warnings.push(String::from(
                     "POV renderer unavailable; staying in map mode",
                 ));
             }
         } else if command.contains("mode:map") {
-            self.view_mode = "map";
+            self.view_mode = PresentationMode::Map;
             self.pointer_lock = false;
         } else if command.contains("pov:pointer-lock") {
             self.pointer_lock = self.pov_supported;
@@ -844,8 +845,8 @@ impl WebAppState {
         self.renderer = "cpu-fallback";
         self.pov_supported = false;
         self.pointer_lock = false;
-        if self.view_mode == "pov" {
-            self.view_mode = "map";
+        if self.view_mode == PresentationMode::Pov {
+            self.view_mode = PresentationMode::Map;
             self.warnings
                 .push(String::from("POV requires WebGPU; returned to map mode"));
         }
@@ -961,7 +962,7 @@ impl WebAppState {
             self.compose_enabled,
             self.refinement_enabled,
             self.device_losses,
-            self.view_mode,
+            self.view_mode.as_str(),
             self.pov_supported,
             self.pointer_lock,
             if self.pov_walk { "walk" } else { "fly" },
@@ -1541,7 +1542,7 @@ mod wasm {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
-            if self.state.view_mode != "pov" {
+            if self.state.view_mode != super::PresentationMode::Pov {
                 return Ok(JsValue::from_str("{\"active\":false,\"rendered\":false}"));
             }
             let input = input.as_string().unwrap_or_default();
@@ -1836,7 +1837,7 @@ mod tests {
         app.compose_map();
         app.set_renderer_webgpu();
         app.apply_command("{\"id\":\"mode:pov\"}");
-        assert_eq!(app.view_mode, "pov");
+        assert_eq!(app.view_mode, super::PresentationMode::Pov);
 
         let before = app.pov_camera.pos;
         let (uploads, _, _) = app.pov_step(100.0, "{\"move_y\":1,\"time\":0}");
