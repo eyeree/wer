@@ -43,6 +43,10 @@ struct MapParams {
     refine_octave_count: u32,
     zoom: f32,
     grid_thickness_cells: f32,
+    grid_enabled: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
     refine: array<RefineOctave, 3>,
 }
 
@@ -61,9 +65,11 @@ struct MapParams {
 @group(0) @binding(5) var plane3: texture_2d<f32>;
 // Integer plane: rg16uint (biome id, dominant species index).
 @group(0) @binding(6) var ints: texture_2d<u32>;
-// CPU-drawn sparse overlay (ordered grid, routes, rings, organisms, markers),
-// map-cell resolution.
-@group(0) @binding(7) var overlay: texture_2d<f32>;
+// CPU-drawn straight-alpha sparse overlays on either side of the shader-owned
+// region grid, both at map-cell resolution. The pre-grid plane currently
+// carries PinnedFlash; the post-grid plane carries all later declared layers.
+@group(0) @binding(7) var pre_grid_overlay: texture_2d<f32>;
+@group(0) @binding(8) var post_grid_overlay: texture_2d<f32>;
 
 // --- 64-bit integer hashing over u32 pairs (lo, hi) ------------------------
 // Transcription of world-core's splitmix64/mix (ADR 0003); presentation-only
@@ -230,6 +236,9 @@ fn srgb_to_linear(encoded: vec3<f32>) -> vec3<f32> {
 }
 
 const SEA_LEVEL: f32 = 0.0;
+// Exact unorm alpha of the M4 folded grid overlay. Keeping 89/255 preserves
+// its encoded GPU bytes while the CPU's 0.35/u8 path differs by at most one.
+const GRID_ALPHA: f32 = 89.0 / 255.0;
 
 fn elevation_color(e: f32) -> vec3<f32> {
     if e < SEA_LEVEL {
@@ -432,12 +441,35 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // CPU-drawn sparse overlay on top (nearest texel — cell-crisp like the
-    // CPU path).
-    let osize = textureDimensions(overlay);
+    // Ordered sparse composition stays in encoded sRGB space, matching the
+    // canonical CPU presenter. Nearest texels keep every layer cell-crisp.
+    let pre_size = textureDimensions(pre_grid_overlay);
     let opix = vec2<i32>(i32(px), i32(py));
-    let over = textureLoad(overlay, clamp(opix, vec2<i32>(0), vec2<i32>(osize) - 1), 0);
-    rgb = mix(rgb, over.rgb, over.a);
+    let pre = textureLoad(pre_grid_overlay,
+                          clamp(opix, vec2<i32>(0), vec2<i32>(pre_size) - 1), 0);
+    rgb = mix(rgb, pre.rgb, pre.a);
+
+    // Apply exactly one CPU-equivalent region grid after PinnedFlash and
+    // before all later sparse layers. `cellx`/`celly` already include the
+    // canonical center zoom transform, so grid and source content cannot
+    // drift. Rounding upward guarantees the requested physical coverage.
+    if params.grid_enabled != 0u {
+        let grid_cells = u32(clamp(
+            ceil(params.grid_thickness_cells),
+            1.0,
+            f32(res),
+        ));
+        let local_x = cellx % res;
+        let local_y = celly % res;
+        if local_x < grid_cells || local_y >= res - grid_cells {
+            rgb = mix(rgb, vec3<f32>(0.0), GRID_ALPHA);
+        }
+    }
+
+    let post_size = textureDimensions(post_grid_overlay);
+    let post = textureLoad(post_grid_overlay,
+                           clamp(opix, vec2<i32>(0), vec2<i32>(post_size) - 1), 0);
+    rgb = mix(rgb, post.rgb, post.a);
 
     return vec4<f32>(srgb_to_linear(rgb), 1.0);
 }

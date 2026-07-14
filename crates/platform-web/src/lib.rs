@@ -17,9 +17,10 @@ use viewer_host::{
     input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent},
     map::{Channel, MapBackend, MapComposer, MapDecor, MapRenderRequest},
     panel::{Severity, ViewerWarning},
-    ExplorationWorld, NoopWorldTickHook, PlatformTelemetry, PresentationMode, ServiceNotification,
-    ServiceResponse, ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput,
-    ViewKind, ViewerAction, ViewerController,
+    resolve_view_layout, ExplorationWorld, MapViewportProjection, NoopWorldTickHook, PixelRect,
+    PlatformTelemetry, PresentationMode, ResolvedViewLayout, ServiceNotification, ServiceResponse,
+    ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewKind, ViewerAction,
+    ViewerController,
 };
 use world_core::{
     anchor::{
@@ -365,7 +366,7 @@ struct BrowserHostState {
     controller: ViewerController,
     composer: MapComposer,
     atlas: AtlasManager,
-    overlay_hash: Option<u64>,
+    overlay_hashes: [Option<u64>; 2],
     prepared_cpu_key: Option<u64>,
     last_stats: world_runtime::FrameStats,
     regen_totals: [u64; world_core::layer::LAYER_COUNT as usize],
@@ -392,6 +393,7 @@ struct BrowserHostState {
     service_sequence: u64,
     last_action: &'static str,
     last_output: Option<TickOutput>,
+    surface: PixelRect,
 }
 
 /// Browser-owned raw-event adapter around the platform-neutral mapper.
@@ -479,7 +481,7 @@ impl Default for BrowserHostState {
             controller: ViewerController::new(ExplorationWorld::new(tier)),
             composer: MapComposer::new(half_regions, cfg.field_resolution),
             atlas: AtlasManager::default(),
-            overlay_hash: None,
+            overlay_hashes: [None; 2],
             prepared_cpu_key: None,
             last_stats: world_runtime::FrameStats::default(),
             regen_totals: [0; world_core::layer::LAYER_COUNT as usize],
@@ -506,6 +508,7 @@ impl Default for BrowserHostState {
             pending_effects: Vec::new(),
             service_sequence: 0,
             last_output: None,
+            surface: PixelRect::new(0, 0, 1, 1),
         }
     }
 }
@@ -538,6 +541,59 @@ impl BrowserHostState {
             state.workers = 2;
         }
         state
+    }
+
+    fn resize_surface(&mut self, width: u32, height: u32) {
+        let next = PixelRect::new(0, 0, width.max(1), height.max(1));
+        if self.surface == next {
+            return;
+        }
+        self.surface = next;
+        // Grid coverage is destination-pixel dependent, so a resize changes
+        // shader parameters even when the world and sparse planes did not.
+        self.prepared_cpu_key = None;
+        self.overlay_hashes = [None; 2];
+        self.force_cpu_map_redraw = true;
+    }
+
+    fn resolved_layout(&self) -> ResolvedViewLayout {
+        resolve_view_layout(self.surface, self.controller.layout())
+    }
+
+    fn map_projection(&self) -> Option<MapViewportProjection> {
+        let destination = self.resolved_layout().map_content?;
+        let world = self.controller.world();
+        MapViewportProjection::new(
+            destination,
+            world.traveler().position,
+            self.composer.half_regions(),
+            world.map().config().field_resolution,
+            self.controller.map_preferences().zoom,
+        )
+    }
+
+    fn layout_json(&self) -> String {
+        fn rect(value: Option<PixelRect>) -> String {
+            value.map_or_else(
+                || String::from("null"),
+                |rect| format!("[{}, {}, {}, {}]", rect.x, rect.y, rect.width, rect.height),
+            )
+        }
+
+        let layout = self.resolved_layout();
+        format!(
+            concat!(
+                "{{\"content\":{},\"map_pane\":{},\"map_content\":{},",
+                "\"pov_pane\":{},\"pov_aspect\":{}}}"
+            ),
+            rect(Some(layout.content)),
+            rect(layout.map_pane),
+            rect(layout.map_content),
+            rect(layout.pov_pane),
+            layout
+                .pov_aspect
+                .map_or_else(|| String::from("null"), |aspect| format!("{aspect:.9}")),
+        )
     }
 
     fn frame(&mut self, dt_ms: f64, input: InputFrame) -> BrowserFrame {
@@ -644,7 +700,7 @@ impl BrowserHostState {
     fn set_renderer_webgpu(&mut self) {
         self.renderer_ready = true;
         self.atlas = AtlasManager::default();
-        self.overlay_hash = None;
+        self.overlay_hashes = [None; 2];
         self.prepared_cpu_key = None;
         self.gpu_map_retry_scheduled = false;
         // Device readiness alone is not a claim that a GPU map was drawn.
@@ -699,7 +755,7 @@ impl BrowserHostState {
         self.renderer_ready = false;
         self.renderer = "cpu-fallback";
         self.atlas = AtlasManager::default();
-        self.overlay_hash = None;
+        self.overlay_hashes = [None; 2];
         self.prepared_cpu_key = None;
         self.force_cpu_map_redraw = true;
         self.gpu_map_retry_scheduled = false;
@@ -979,6 +1035,10 @@ impl BrowserHostState {
     /// currently an explicit empty source; realized organisms, grid, rings,
     /// pinned flashes, and the player marker still use native's exact code.
     fn cpu_map_pixels(&mut self) -> &[u8] {
+        let destination = self
+            .map_projection()
+            .expect("CPU Map presentation has a resolved destination")
+            .destination;
         let preferences = self.controller.map_preferences();
         let world = self.controller.world();
         let dirty_key = world.update_serial();
@@ -993,6 +1053,7 @@ impl BrowserHostState {
             MapRenderRequest {
                 map: world.map(),
                 player: traveler,
+                destination,
                 channel: preferences.channel,
                 overlays: preferences.overlays,
                 anchors: world.anchors(),
@@ -1427,6 +1488,7 @@ mod wasm {
 
             let pov_active = frame.output.mode == super::PresentationMode::Pov;
             let map_active = frame.output.mode == super::PresentationMode::Map;
+            let map_projection = map_active.then(|| self.state.map_projection()).flatten();
             let (prepared_map_backend, gpu_map_rendered, map_upload_bytes, schedule_map_retry) =
                 if map_active {
                     VIEWER_RENDERER.with(|slot| {
@@ -1436,7 +1498,7 @@ mod wasm {
                             controller,
                             composer,
                             atlas,
-                            overlay_hash,
+                            overlay_hashes,
                             prepared_cpu_key,
                             gpu_map_retry_scheduled,
                             ..
@@ -1451,6 +1513,9 @@ mod wasm {
                             super::MapRenderRequest {
                                 map: world.map(),
                                 player: traveler,
+                                destination: map_projection
+                                    .expect("active Map mode has a resolved destination")
+                                    .destination,
                                 channel: preferences.channel,
                                 overlays: preferences.overlays,
                                 anchors: world.anchors(),
@@ -1466,6 +1531,7 @@ mod wasm {
                         );
                         let backend = packet.backend;
                         let dirty_key = packet.dirty_key;
+                        let destination = packet.viewport.destination;
                         match packet.source {
                             super::PreparedMapSource::Cpu(cpu) => {
                                 debug_assert_eq!(
@@ -1480,20 +1546,31 @@ mod wasm {
                             }
                             super::PreparedMapSource::GpuAtlas(gpu) => {
                                 *prepared_cpu_key = None;
-                                let overlay_changed = *overlay_hash != Some(gpu.overlay_hash);
+                                let pre_grid_changed = overlay_hashes[0] != Some(gpu.pre_grid_hash);
+                                let post_grid_changed =
+                                    overlay_hashes[1] != Some(gpu.post_grid_hash);
                                 let renderer = slot.as_mut().expect(
                                     "a prepared GPU packet requires an initialized renderer",
                                 );
-                                let result = renderer.render_map_gpu(
+                                let result = renderer.render_map_gpu_in(
                                     &gpu.params,
                                     &gpu.slots,
                                     &gpu.uploads,
-                                    overlay_changed.then_some(gpu.overlay_rgba),
+                                    pre_grid_changed.then_some(gpu.pre_grid_rgba),
+                                    post_grid_changed.then_some(gpu.post_grid_rgba),
+                                    None,
+                                    renderer::SurfaceViewport::new(
+                                        destination.x,
+                                        destination.y,
+                                        destination.width,
+                                        destination.height,
+                                    ),
                                     None,
                                     CLEAR_COLOR,
                                 );
                                 if let Some(bytes) = result {
-                                    *overlay_hash = Some(gpu.overlay_hash);
+                                    *overlay_hashes =
+                                        [Some(gpu.pre_grid_hash), Some(gpu.post_grid_hash)];
                                     *gpu_map_retry_scheduled = false;
                                     (backend, true, bytes, false)
                                 } else {
@@ -1501,7 +1578,7 @@ mod wasm {
                                     // before a failed surface submission. Reset it
                                     // so a recovered renderer receives full tiles.
                                     *atlas = super::AtlasManager::default();
-                                    *overlay_hash = None;
+                                    *overlay_hashes = [None; 2];
                                     let schedule_retry =
                                         super::claim_gpu_map_retry(gpu_map_retry_scheduled);
                                     (backend, false, 0, schedule_retry)
@@ -1577,12 +1654,13 @@ mod wasm {
             let counters = self.state.pov_chunks.counters();
             let organism_counts = self.state.pov_organisms.counters();
             let snapshot = self.state.snapshot_json();
+            let layout = self.state.layout_json();
             let needs_frame = frame.output.needs_frame
                 || frame.presenter_needs_frame
                 || self.driver.needs_frame();
             Ok(JsValue::from_str(&format!(
                 concat!(
-                    "{{\"snapshot\":{},\"map_dirty\":{},\"needs_frame\":{},",
+                    "{{\"snapshot\":{},\"layout\":{},\"map_dirty\":{},\"needs_frame\":{},",
                     "\"update_serial\":{},\"travel\":{:.6},",
                     "\"map\":{{\"active\":{},\"path\":\"{}\",\"gpu_submitted\":{},\"upload_bytes\":{}}},",
                     "\"pov\":{{\"active\":{},\"rendered\":{},",
@@ -1592,6 +1670,7 @@ mod wasm {
                     "\"waiting_for_ground\":{}}}}}}}"
                 ),
                 snapshot,
+                layout,
                 map_dirty,
                 needs_frame,
                 frame.output.update_serial,
@@ -1612,6 +1691,23 @@ mod wasm {
                 organism_counts.drawn(),
                 organism_counts.waiting_for_ground,
             )))
+        }
+
+        /// Resize both shared layout and the live wgpu surface to an exact
+        /// physical canvas backing size. CSS/DPR conversion remains a thin JS
+        /// adapter concern; all fitted rectangles are resolved here.
+        pub fn resize_surface(&mut self, width: u32, height: u32) -> Result<JsValue, JsValue> {
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            self.state.resize_surface(width, height);
+            VIEWER_RENDERER.with(|slot| {
+                if let Some(renderer) = slot.borrow_mut().as_mut() {
+                    renderer.resize(width.max(1), height.max(1));
+                }
+            });
+            self.driver.dirty = true;
+            Ok(JsValue::from_str(&self.state.layout_json()))
         }
 
         /// Queue one exact descriptor id and optional payload. DOM controls
@@ -1828,29 +1924,31 @@ mod wasm {
             Ok(self.state.cpu_map_pixels().to_vec())
         }
 
-        /// Invert a canonical composed-map source pixel through the same zoom
-        /// projection used to draw it. Returns `null` outside the map.
-        pub fn map_world_at(&self, pixel_x: f64, pixel_y: f64) -> Result<JsValue, JsValue> {
-            let traveler = self.state.controller.world().traveler().position;
+        /// Invert a physical surface point through the exact shared fitted Map
+        /// rectangle. Letterbox/outside points return `null`.
+        pub fn map_world_at(&self, physical_x: f64, physical_y: f64) -> Result<JsValue, JsValue> {
             let value = self
                 .state
-                .composer
-                .pixel_to_world(traveler, pixel_x, pixel_y)
+                .map_projection()
+                .and_then(|projection| projection.physical_to_world((physical_x, physical_y)))
                 .map_or_else(|| String::from("null"), |(x, y)| format!("[{x:.9},{y:.9}]"));
             Ok(JsValue::from_str(&value))
         }
 
-        /// Pick the shared realized-organism marker under a canonical map
-        /// source pixel. Identity is returned as a hex string so JavaScript
-        /// never rounds the stable `u64`.
-        pub fn map_organism_at(&self, pixel_x: f64, pixel_y: f64) -> Result<JsValue, JsValue> {
+        /// Pick the shared realized-organism marker under a physical surface
+        /// point. Identity is returned as hex so JavaScript never rounds the
+        /// stable `u64`.
+        pub fn map_organism_at(
+            &self,
+            physical_x: f64,
+            physical_y: f64,
+        ) -> Result<JsValue, JsValue> {
             let world = self.state.controller.world();
-            let traveler = world.traveler().position;
             let zoom = self.state.controller.map_preferences().zoom;
             let value = self
                 .state
-                .composer
-                .pixel_to_world(traveler, pixel_x, pixel_y)
+                .map_projection()
+                .and_then(|projection| projection.physical_to_world((physical_x, physical_y)))
                 .and_then(|position| viewer_host::pick_organism(world.map(), position, zoom))
                 .map_or_else(
                     || String::from("null"),
@@ -2235,6 +2333,47 @@ mod tests {
         for _ in 0..12 {
             let _ = state.frame(0.0, viewer_host::input::InputFrame::default());
         }
+    }
+
+    #[test]
+    fn browser_resize_resolves_one_exact_physical_draw_and_pick_rect() {
+        let mut state = small_controller_app();
+        state.resize_surface(901, 701);
+        let layout = state.resolved_layout();
+        assert_eq!(layout.content, viewer_host::PixelRect::new(0, 0, 901, 701));
+        assert_eq!(
+            layout.map_content,
+            Some(viewer_host::PixelRect::new(100, 0, 701, 701))
+        );
+        let projection = state.map_projection().expect("Map has a projection");
+        assert_eq!(projection.destination, layout.map_content.unwrap());
+        assert_eq!(
+            projection.physical_to_world((450.5, 350.5)),
+            Some((world_core::REGION_SIZE * 0.5, world_core::REGION_SIZE * 0.5))
+        );
+        assert!(projection.physical_to_world((99.999, 350.5)).is_none());
+        assert!(projection.grid_coverage().one_pixel_feasible);
+        assert!(state
+            .layout_json()
+            .contains("\"map_content\":[100, 0, 701, 701]"));
+    }
+
+    #[test]
+    fn browser_resize_invalidates_pixels_once_and_is_idempotent() {
+        let mut state = small_controller_app();
+        state.prepared_cpu_key = Some(17);
+        state.overlay_hashes = [Some(23), Some(24)];
+        state.force_cpu_map_redraw = false;
+        state.resize_surface(640, 480);
+        assert_eq!(state.prepared_cpu_key, None);
+        assert_eq!(state.overlay_hashes, [None; 2]);
+        assert!(state.force_cpu_map_redraw);
+
+        state.force_cpu_map_redraw = false;
+        state.prepared_cpu_key = Some(29);
+        state.resize_surface(640, 480);
+        assert_eq!(state.prepared_cpu_key, Some(29));
+        assert!(!state.force_cpu_map_redraw);
     }
 
     #[test]

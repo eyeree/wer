@@ -40,6 +40,58 @@ pub fn letterbox_viewport(surface: (u32, u32), image: (u32, u32)) -> (f32, f32, 
     ((sw - w) * 0.5, (sh - h) * 0.5, w, h)
 }
 
+/// An exact physical-pixel viewport on the presentation surface.
+///
+/// Layout ownership stays in `viewer-host`; this renderer-side transport type
+/// only prevents platform adapters from losing integer edge coordinates while
+/// handing the resolved rectangle to wgpu.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfaceViewport {
+    /// Left edge in surface pixels.
+    pub x: u32,
+    /// Top edge in surface pixels.
+    pub y: u32,
+    /// Width in surface pixels.
+    pub width: u32,
+    /// Height in surface pixels.
+    pub height: u32,
+}
+
+impl SurfaceViewport {
+    /// Construct an exact physical viewport.
+    #[must_use]
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Whether this non-empty viewport is wholly inside a surface.
+    #[must_use]
+    pub const fn is_contained_by(self, surface_width: u32, surface_height: u32) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.x <= surface_width
+            && self.y <= surface_height
+            && self.width <= surface_width - self.x
+            && self.height <= surface_height - self.y
+    }
+
+    fn set(self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_viewport(
+            self.x as f32,
+            self.y as f32,
+            self.width as f32,
+            self.height as f32,
+            0.0,
+            1.0,
+        );
+    }
+}
+
 /// The present mode for the surface: FIFO (vsync) by default — the Phase 6
 /// frame pacer — overridable through `WER_PRESENT_MODE`
 /// (`fifo`/`mailbox`/`immediate`), falling back to FIFO when the platform
@@ -528,7 +580,8 @@ impl Renderer {
     /// Reconfigure the surface after the window is resized. Zero dimensions are
     /// ignored (minimized windows).
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || (self.config.width == width && self.config.height == height)
+        {
             return;
         }
         self.config.width = width;
@@ -622,9 +675,43 @@ impl Renderer {
     /// window shape (phase-1-plan.md section 10). Returns `false` when no
     /// frame was drawn.
     pub fn render_map(&mut self, rgba: &[u8], width: u32, height: u32, clear: [f64; 4]) -> bool {
+        let (x, y, viewport_width, viewport_height) =
+            letterbox_viewport((self.config.width, self.config.height), (width, height));
+        self.render_map_in(
+            rgba,
+            width,
+            height,
+            SurfaceViewport::new(
+                x.round() as u32,
+                y.round() as u32,
+                viewport_width.round() as u32,
+                viewport_height.round() as u32,
+            ),
+            clear,
+        )
+    }
+
+    /// Upload and present a CPU-composed map into an exact physical viewport
+    /// resolved by the shared viewer layout.
+    pub fn render_map_in(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        viewport: SurfaceViewport,
+        clear: [f64; 4],
+    ) -> bool {
         self.debug_map
             .upload(&self.device, &self.queue, rgba, width, height);
-        if self.debug_map.texture.is_none() {
+        if self.debug_map.texture.is_none()
+            || !viewport.is_contained_by(self.config.width, self.config.height)
+        {
+            if self.debug_map.texture.is_some() {
+                log::error!(
+                    "map viewport {viewport:?} escapes surface {:?}",
+                    self.size()
+                );
+            }
             return false;
         }
 
@@ -661,12 +748,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // Aspect-preserving viewport: world cells stay square, HUD text
-            // stays undistorted. `letterbox_viewport` is public so input code
-            // can invert the same mapping for mouse picking.
-            let (x, y, w, h) =
-                letterbox_viewport((self.config.width, self.config.height), (width, height));
-            pass.set_viewport(x, y, w, h, 0.0, 1.0);
+            viewport.set(&mut pass);
             pass.set_pipeline(&self.debug_map.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
@@ -677,10 +759,100 @@ impl Renderer {
         true
     }
 
+    /// Upload a CPU-composed square map and bitmap panel separately, then
+    /// present both in exact shared-layout viewports during one surface pass.
+    /// Keeping the sources separate makes the map/panel seam integer-exact, so
+    /// the Map viewport used for pointer inversion is precisely what was drawn.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_map_and_panel_in(
+        &mut self,
+        map_rgba: &[u8],
+        map_width: u32,
+        map_height: u32,
+        panel_rgba: &[u8],
+        panel_width: u32,
+        panel_height: u32,
+        map_viewport: SurfaceViewport,
+        panel_viewport: SurfaceViewport,
+        clear: [f64; 4],
+    ) -> bool {
+        self.debug_map
+            .upload(&self.device, &self.queue, map_rgba, map_width, map_height);
+        self.panel_blit.upload(
+            &self.device,
+            &self.queue,
+            panel_rgba,
+            panel_width,
+            panel_height,
+        );
+        if self.debug_map.texture.is_none()
+            || self.panel_blit.texture.is_none()
+            || !map_viewport.is_contained_by(self.config.width, self.config.height)
+            || !panel_viewport.is_contained_by(self.config.width, self.config.height)
+        {
+            if self.debug_map.texture.is_some() && self.panel_blit.texture.is_some() {
+                log::error!(
+                    "map/panel viewports {map_viewport:?}/{panel_viewport:?} escape surface {:?}",
+                    self.size()
+                );
+            }
+            return false;
+        }
+
+        let Some(frame) = self.acquire_frame() else {
+            return false;
+        };
+        let (_, map_bind_group, _, _) = self.debug_map.texture.as_ref().expect("uploaded above");
+        let (_, panel_bind_group, _, _) = self.panel_blit.texture.as_ref().expect("uploaded above");
+        let view = self.surface_view(&frame);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wer-frame-map-panel"),
+            });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("debug-map-panel"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear[0],
+                            g: clear[1],
+                            b: clear[2],
+                            a: clear[3],
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            map_viewport.set(&mut pass);
+            pass.set_pipeline(&self.debug_map.pipeline);
+            pass.set_bind_group(0, map_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+
+            panel_viewport.set(&mut pass);
+            pass.set_pipeline(&self.panel_blit.pipeline);
+            pass.set_bind_group(0, panel_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        true
+    }
+
     /// Present one frame through the Phase 6 GPU-composed map path
     /// (phase-6-plan.md §6.5): delta-upload changed region tiles into the
-    /// atlas, optionally refresh the CPU-drawn overlay and panel strips, and
-    /// compose per screen pixel in `compose_map.wgsl`.
+    /// atlas, optionally refresh the CPU-drawn pre/post-grid overlay and panel
+    /// strips, and compose per screen pixel in `compose_map.wgsl`.
     ///
     /// Returns the bytes uploaded this frame (`None` when no frame was
     /// drawn). No readback of any kind exists on this path (ADR 0017).
@@ -690,8 +862,69 @@ impl Renderer {
         params: &GpuMapParams,
         slots: &[i32],
         uploads: &[MapTileUpload],
-        overlay: Option<&[u8]>,
+        pre_grid_overlay: Option<&[u8]>,
+        post_grid_overlay: Option<&[u8]>,
         panel: Option<(&[u8], u32, u32)>,
+        clear: [f64; 4],
+    ) -> Option<u64> {
+        let span = (2 * params.half_regions + 1) as u32;
+        let side = span * params.resolution;
+        let panel_width = panel.map_or_else(
+            || {
+                self.panel_blit
+                    .texture
+                    .as_ref()
+                    .map_or(0, |&(_, _, width, _)| width)
+            },
+            |(_, width, _)| width,
+        );
+        let (x, y, width, height) = letterbox_viewport(
+            (self.config.width, self.config.height),
+            (side + panel_width, side),
+        );
+        let scale = width / (side + panel_width) as f32;
+        let map_width = side as f32 * scale;
+        let map_viewport = SurfaceViewport::new(
+            x.round() as u32,
+            y.round() as u32,
+            map_width.round() as u32,
+            height.round() as u32,
+        );
+        let panel_viewport = (panel_width > 0).then_some(SurfaceViewport::new(
+            (x + map_width).round() as u32,
+            y.round() as u32,
+            (panel_width as f32 * scale).round() as u32,
+            height.round() as u32,
+        ));
+        self.render_map_gpu_in(
+            params,
+            slots,
+            uploads,
+            pre_grid_overlay,
+            post_grid_overlay,
+            panel,
+            map_viewport,
+            panel_viewport,
+            clear,
+        )
+    }
+
+    /// Present a GPU-composed map in exact shared-layout rectangles.
+    ///
+    /// `panel_viewport` is used only when a panel upload is supplied. Browser
+    /// Map mode passes the fitted square and no panel; the temporary native
+    /// single-view wrapper above retains its existing map-plus-panel layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_map_gpu_in(
+        &mut self,
+        params: &GpuMapParams,
+        slots: &[i32],
+        uploads: &[MapTileUpload],
+        pre_grid_overlay: Option<&[u8]>,
+        post_grid_overlay: Option<&[u8]>,
+        panel: Option<(&[u8], u32, u32)>,
+        map_viewport: SurfaceViewport,
+        panel_viewport: Option<SurfaceViewport>,
         clear: [f64; 4],
     ) -> Option<u64> {
         let span = (2 * params.half_regions + 1) as u32;
@@ -716,16 +949,29 @@ impl Renderer {
         let gpu_map = self.gpu_map.as_ref().expect("just ensured");
 
         let mut bytes = gpu_map.upload_tiles(&self.queue, uploads);
-        if let Some(rgba) = overlay {
-            bytes += gpu_map.upload_overlay(&self.queue, rgba);
+        if let Some(rgba) = pre_grid_overlay {
+            bytes += gpu_map.upload_pre_grid_overlay(&self.queue, rgba);
+        }
+        if let Some(rgba) = post_grid_overlay {
+            bytes += gpu_map.upload_post_grid_overlay(&self.queue, rgba);
         }
         gpu_map.write_frame(&self.queue, params, slots);
-        let mut panel_size = self.panel_blit.texture.as_ref().map(|&(_, _, w, h)| (w, h));
         if let Some((rgba, w, h)) = panel {
             self.panel_blit
                 .upload(&self.device, &self.queue, rgba, w, h);
             bytes += u64::from(w) * u64::from(h) * 4;
-            panel_size = Some((w, h));
+        }
+
+        if !map_viewport.is_contained_by(self.config.width, self.config.height)
+            || panel_viewport.is_some_and(|viewport| {
+                !viewport.is_contained_by(self.config.width, self.config.height)
+            })
+        {
+            log::error!(
+                "GPU map/panel viewports {map_viewport:?}/{panel_viewport:?} escape surface {:?}",
+                self.size()
+            );
+            return None;
         }
 
         let frame = self.acquire_frame()?;
@@ -757,20 +1003,13 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let panel_w = panel_size.map_or(0, |(w, _)| w);
-            let (x, y, vw, vh) = letterbox_viewport(
-                (self.config.width, self.config.height),
-                (side + panel_w, side),
-            );
-            let scale = vw / (side + panel_w) as f32;
-            let map_w = side as f32 * scale;
-            pass.set_viewport(x, y, map_w, vh, 0.0, 1.0);
+            map_viewport.set(&mut pass);
             let gpu_map = self.gpu_map.as_ref().expect("ensured above");
             gpu_map.draw(&mut pass);
-            if let (Some((pw, _)), Some((_, bind_group, _, _))) =
-                (panel_size, self.panel_blit.texture.as_ref())
+            if let (Some(viewport), Some((_, bind_group, _, _))) =
+                (panel_viewport, self.panel_blit.texture.as_ref())
             {
-                pass.set_viewport(x + map_w, y, pw as f32 * scale, vh, 0.0, 1.0);
+                viewport.set(&mut pass);
                 pass.set_pipeline(&self.panel_blit.pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.draw(0..3, 0..1);
@@ -915,5 +1154,19 @@ impl Renderer {
     #[must_use]
     pub fn pov_organism_stats(&self) -> Option<PovOrganismBufferStats> {
         self.pov.as_ref().map(pov::Pov::organism_stats)
+    }
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::SurfaceViewport;
+
+    #[test]
+    fn physical_viewport_containment_handles_edges_odds_and_overflow() {
+        assert!(SurfaceViewport::new(0, 0, 901, 701).is_contained_by(901, 701));
+        assert!(SurfaceViewport::new(337, 0, 227, 227).is_contained_by(901, 701));
+        assert!(!SurfaceViewport::new(0, 0, 0, 10).is_contained_by(901, 701));
+        assert!(!SurfaceViewport::new(900, 700, 2, 1).is_contained_by(901, 701));
+        assert!(!SurfaceViewport::new(u32::MAX, 0, 2, 1).is_contained_by(901, 701));
     }
 }

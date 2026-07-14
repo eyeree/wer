@@ -193,6 +193,7 @@ GitHub Pages. To build and serve it locally:
 cargo run --bin web-build
 node crates/platform-web/web/smoke.mjs target/web-dist
 cargo run --bin web-signoff
+cargo run --bin web-signoff -- --assert-layout  # optional agent-browser viewport/DPR matrix
 cargo run --bin web-serve            # optional: [port] [dir], default 8080 target/web-dist
 ```
 

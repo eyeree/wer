@@ -19,6 +19,7 @@ use world_runtime::{
 };
 
 use crate::atlas::{gpu_channel, refinement_octaves, AtlasManager, RefinementRequest};
+use crate::layout::{MapViewportProjection, PixelRect};
 
 // The per-cell color ramps live in `world_runtime::mapcolor`; the canonical
 // composer layers shared overlays, zoom, inverse picking, and pinned-revision
@@ -740,7 +741,8 @@ pub struct MapProjection {
     pub side: u32,
     /// Integer magnification about the map center.
     pub zoom: u32,
-    /// Source-cell coverage required for a visible region boundary.
+    /// Best-effort source-cell coverage for a visible region boundary,
+    /// clamped to one region by the viewport projection.
     pub grid_thickness_cells: f32,
 }
 
@@ -753,6 +755,8 @@ pub struct MapRenderRequest<'a> {
     pub map: &'a RegionMap,
     /// Shared traveler position and map center.
     pub player: (f64, f64),
+    /// Exact fitted physical destination resolved once by shared layout.
+    pub destination: PixelRect,
     /// Selected map channel.
     pub channel: Channel,
     /// Overlay preferences.
@@ -787,14 +791,23 @@ pub struct PreparedGpuMap<'a> {
     pub slots: Vec<i32>,
     /// Dependency-keyed changed region uploads; empty at steady state.
     pub uploads: Vec<MapTileUpload>,
-    /// Canonically ordered sparse layers folded into one straight-alpha image.
-    pub overlay_rgba: &'a [u8],
-    /// Stable hash of [`Self::overlay_rgba`] for upload suppression.
+    /// Sparse layers before Grid (currently PinnedFlash), straight alpha.
+    pub pre_grid_rgba: &'a [u8],
+    /// Stable hash of [`Self::pre_grid_rgba`] for independent upload suppression.
+    pub pre_grid_hash: u64,
+    /// Canonically ordered sparse layers after Grid, straight alpha.
+    pub post_grid_rgba: &'a [u8],
+    /// Stable hash of [`Self::post_grid_rgba`] for independent upload suppression.
+    pub post_grid_hash: u64,
+    /// Stable combined hash of both ordered overlay planes.
     pub overlay_hash: u64,
 }
 
 /// Prepared source for exactly one actual map backend.
 #[derive(Debug)]
+// Keeping the inline GPU uniform here avoids a heap allocation on every
+// prepared frame; the packet is short-lived and never collected in bulk.
+#[allow(clippy::large_enum_variant)]
 pub enum PreparedMapSource<'a> {
     /// Canonical CPU image.
     Cpu(PreparedCpuMap<'a>),
@@ -807,6 +820,8 @@ pub enum PreparedMapSource<'a> {
 /// code only uploads and submits the selected path.
 #[derive(Debug)]
 pub struct MapRenderPacket<'a> {
+    /// Exact world/source/physical transform used to prepare this packet.
+    pub viewport: MapViewportProjection,
     /// Shared source projection.
     pub projection: MapProjection,
     /// Selected map channel.
@@ -821,7 +836,9 @@ pub struct MapRenderPacket<'a> {
     pub fallback: Option<MapBackendFallback>,
     /// Host/controller-provided key for redraw suppression.
     pub dirty_key: u64,
-    /// Hash of the packet's CPU image or GPU folded-overlay pixels.
+    /// Hash of the packet's CPU image or ordered GPU sparse-overlay planes.
+    /// Shader-derived base/refinement/grid pixels deliberately are not read
+    /// back or included (ADR 0017).
     pub pixel_hash: u64,
     /// Prepared work for the actual backend.
     pub source: PreparedMapSource<'a>,
@@ -936,6 +953,10 @@ pub struct MapComposer {
     /// Field cells per region edge (matches the stream config resolution).
     resolution: u16,
     pixels: Vec<u8>,
+    /// Reusable GPU sparse-overlay plane for layers before Grid. `pixels`
+    /// holds the post-grid plane while a GPU packet borrows both; keeping the
+    /// allocations fixed lets platforms suppress each texture upload by hash.
+    pre_grid_overlay: Vec<u8>,
     /// Integer view magnification about the image center (scroll wheel).
     /// Presentation only: the base image is composed as usual and then the
     /// center block is blown up nearest-neighbor, so zooming reveals no data
@@ -984,6 +1005,7 @@ impl MapComposer {
             half_regions,
             resolution,
             pixels: vec![0; side * side * 4],
+            pre_grid_overlay: vec![0; side * side * 4],
             zoom: 1,
             grid_thickness_cells: 1.0,
             zoom_scratch: vec![0; side * side * 4],
@@ -1047,6 +1069,16 @@ impl MapComposer {
         atlas: &mut AtlasManager,
         request: MapRenderRequest<'_>,
     ) -> MapRenderPacket<'a> {
+        let viewport = MapViewportProjection::new(
+            request.destination,
+            request.player,
+            self.half_regions,
+            self.resolution,
+            self.zoom,
+        )
+        .expect("a MapComposer always has valid projection geometry");
+        let grid_coverage = viewport.grid_coverage();
+        self.set_grid_thickness_cells(grid_coverage.source_cells);
         let projection = self.projection();
         let gpu_selection = if request.requested_backend == MapBackend::GpuAtlas {
             if request.gpu_available {
@@ -1079,14 +1111,22 @@ impl MapComposer {
                 resolution: u32::from(resolution),
                 channel,
                 zoom: projection.zoom,
+                grid_enabled: request.overlays.grid,
                 grid_thickness_cells: projection.grid_thickness_cells,
                 refine,
                 refine_count,
             };
-            let overlay_rgba =
-                self.compose_overlays(request.map, request.player, request.overlays, request.decor);
-            let overlay_hash = map_pixel_hash(overlay_rgba);
+            let (pre_grid_rgba, post_grid_rgba) = self.compose_gpu_overlays(
+                request.map,
+                request.player,
+                request.overlays,
+                request.decor,
+            );
+            let pre_grid_hash = map_pixel_hash(pre_grid_rgba);
+            let post_grid_hash = map_pixel_hash(post_grid_rgba);
+            let overlay_hash = mix(pre_grid_hash, post_grid_hash);
             return MapRenderPacket {
+                viewport,
                 projection,
                 channel: request.channel,
                 overlays: request.overlays,
@@ -1099,7 +1139,10 @@ impl MapComposer {
                     params,
                     slots,
                     uploads,
-                    overlay_rgba,
+                    pre_grid_rgba,
+                    pre_grid_hash,
+                    post_grid_rgba,
+                    post_grid_hash,
                     overlay_hash,
                 }),
             };
@@ -1117,6 +1160,7 @@ impl MapComposer {
         );
         let pixel_hash = map_pixel_hash(rgba);
         MapRenderPacket {
+            viewport,
             projection,
             channel: request.channel,
             overlays: request.overlays,
@@ -1220,35 +1264,37 @@ impl MapComposer {
         &self.pixels
     }
 
-    /// Compose only the sparse overlay content into a transparent RGBA
-    /// buffer for the GPU-composed map (phase-6-plan.md §6.5): pinned-flash
-    /// fills, undiscovered dimming, routes, preserve outlines, organisms,
-    /// rings, grid, and the player marker. Only base field painting stays in
-    /// the atlas shader; folding the grid here preserves its exact declared
-    /// order relative to translucent overlays. Transient presenter state is
-    /// read-only here and must be advanced once through
-    /// [`Self::update_for_tick`] (ADR 0017).
-    pub fn compose_overlays(
+    /// Compose the sparse GPU layers on either side of Grid into two reusable
+    /// transparent RGBA buffers (phase-6-plan.md §6.5). The WGSL pass blends
+    /// the pre-grid plane, applies its destination-aware grid exactly once,
+    /// then blends the post-grid plane. This preserves the canonical layer
+    /// order without baking a viewport-dependent grid into either texture.
+    /// Transient presenter state is read-only here and must be advanced once
+    /// through [`Self::update_for_tick`] (ADR 0017).
+    pub fn compose_gpu_overlays(
         &mut self,
         map: &RegionMap,
         player: (f64, f64),
         overlays: Overlays,
         decor: &MapDecor,
-    ) -> &[u8] {
+    ) -> (&[u8], &[u8]) {
+        self.pre_grid_overlay.fill(0);
         self.pixels.fill(0);
         let center = RegionCoord::from_world(player.0, player.1);
         for layer in MAP_LAYER_SEQUENCE {
+            // Grid is shader-owned between these two source-resolution
+            // textures, even when its preference is currently disabled.
+            if layer == MapLayer::Grid {
+                continue;
+            }
             if !layer.enabled(overlays) {
                 continue;
             }
             match layer {
                 // The selected base channel is prepared from the GPU atlas.
-                // Grid stays in the sparse overlay so it composes after the
-                // pinned flash and before every later layer, exactly matching
-                // the canonical stack.
                 MapLayer::Base => {}
                 MapLayer::PinnedFlash => self.fold_flashing_regions(center),
-                MapLayer::Grid => self.draw_overlay_grid(),
+                MapLayer::Grid => unreachable!("Grid is the overlay split point"),
                 MapLayer::Discovered => {
                     if let Some(seen) = &decor.seen {
                         for row in 0..=(2 * self.half_regions) {
@@ -1279,7 +1325,7 @@ impl MapComposer {
                 MapLayer::Player => self.draw_player_marker(player),
             }
         }
-        &self.pixels
+        (&self.pre_grid_overlay, &self.pixels)
     }
 
     /// Apply the pinned-change tint as its declared visual layer. Keeping this
@@ -1316,7 +1362,7 @@ impl MapComposer {
         let res = self.resolution as usize;
         let side = self.side() as usize;
         let span = 2 * self.half_regions;
-        let pixels = &mut self.pixels;
+        let pixels = &mut self.pre_grid_overlay;
         for &coord in self.flash.keys() {
             let row_region = center.y + self.half_regions - coord.y;
             let col_region = coord.x - center.x + self.half_regions;
@@ -1357,25 +1403,6 @@ impl MapComposer {
                     0.35,
                 );
                 self.pixels[offset..offset + 3].copy_from_slice(&rgb);
-            }
-        }
-    }
-
-    /// Encode the grid as an affine sparse-overlay operation. Folding it into
-    /// the one RGBA overlay preserves Base → PinnedFlash → Grid ordering even
-    /// though the GPU submits the folded overlay in one final texture blend.
-    fn draw_overlay_grid(&mut self) {
-        let res = self.resolution as usize;
-        let cells = (self.grid_thickness_cells.ceil() as usize).clamp(1, res);
-        let side = self.side() as usize;
-        for py in 0..side {
-            let local_y = py % res;
-            for px in 0..side {
-                let local_x = px % res;
-                if local_x >= cells && local_y < res - cells {
-                    continue;
-                }
-                Self::blend_overlay_pixel(&mut self.pixels, (py * side + px) * 4, [0, 0, 0], 89);
             }
         }
     }
@@ -2028,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn folded_gpu_overlay_preserves_translucent_layer_order() {
+    fn split_gpu_overlays_preserve_translucent_layer_order_around_grid() {
         let mut map = settled_map();
         let mut composer = MapComposer::new(1, 8);
         composer.update_for_tick(1, &map);
@@ -2060,16 +2087,21 @@ mod tests {
                 &MapDecor::default(),
             )
             .to_vec();
-        let overlay = composer
-            .compose_overlays(&map, player, overlays, &decor)
-            .to_vec();
+        let (pre_grid, post_grid) = composer.compose_gpu_overlays(&map, player, overlays, &decor);
+        let pre_grid = pre_grid.to_vec();
+        let post_grid = post_grid.to_vec();
 
         let offset = (8 * 24 + 8) * 4;
-        assert_eq!(&overlay[offset..offset + 4], &[65, 8, 8, 218]);
-        let alpha = f32::from(overlay[offset + 3]) / 255.0;
+        assert_eq!(&pre_grid[offset..offset + 4], &[255, 30, 30, 153]);
+        assert_eq!(&post_grid[offset..offset + 4], &[0, 0, 0, 113]);
+        let pre_alpha = f32::from(pre_grid[offset + 3]) / 255.0;
+        let post_alpha = f32::from(post_grid[offset + 3]) / 255.0;
         for component in 0..3 {
-            let folded = (f32::from(base[offset + component]) * (1.0 - alpha)
-                + f32::from(overlay[offset + component]) * alpha)
+            let after_pre = f32::from(base[offset + component]) * (1.0 - pre_alpha)
+                + f32::from(pre_grid[offset + component]) * pre_alpha;
+            let after_grid = after_pre * 0.65;
+            let folded = (after_grid * (1.0 - post_alpha)
+                + f32::from(post_grid[offset + component]) * post_alpha)
                 .round() as i16;
             let canonical = i16::from(cpu[offset + component]);
             assert!(
@@ -2136,6 +2168,7 @@ mod tests {
         let base = MapRenderRequest {
             map: &map,
             player: (0.0, 0.0),
+            destination: PixelRect::new(7, 11, 4, 4),
             channel: Channel::Composite,
             overlays: Overlays::default(),
             anchors: &[],
@@ -2149,7 +2182,8 @@ mod tests {
             let packet = composer.prepare_render(&mut atlas, base);
             assert_eq!(packet.projection.side, 24);
             assert_eq!(packet.projection.zoom, 4);
-            assert_eq!(packet.projection.grid_thickness_cells, 1.25);
+            assert_eq!(packet.projection.grid_thickness_cells, 1.5);
+            assert_eq!(packet.viewport.destination, base.destination);
             assert_eq!(packet.channel, Channel::Composite);
             assert_eq!(packet.requested_backend, MapBackend::Cpu);
             assert_eq!(packet.backend, MapBackend::Cpu);
@@ -2175,6 +2209,237 @@ mod tests {
     }
 
     #[test]
+    fn cpu_and_gpu_packets_share_exact_viewport_and_clamped_grid_coverage() {
+        let map = settled_map();
+        let decor = MapDecor::default();
+        let mut composer = MapComposer::new(1, 8);
+        let mut atlas = AtlasManager::default();
+
+        for (destination, zoom) in [
+            (PixelRect::new(7, 11, 1, 1), 1),
+            (PixelRect::new(13, 17, 3, 3), 1),
+            (PixelRect::new(19, 23, 7, 7), 2),
+            (PixelRect::new(29, 31, 31, 31), 4),
+        ] {
+            composer.set_zoom(zoom);
+            let request = MapRenderRequest {
+                map: &map,
+                player: (300.25, -10.5),
+                destination,
+                channel: Channel::Composite,
+                overlays: Overlays::default(),
+                anchors: &[],
+                decor: &decor,
+                requested_backend: MapBackend::Cpu,
+                gpu_available: true,
+                refinement: RefinementRequest::default(),
+                dirty_key: u64::from(zoom),
+            };
+            let expected = MapViewportProjection::new(
+                destination,
+                request.player,
+                composer.half_regions(),
+                map.config().field_resolution,
+                zoom,
+            )
+            .unwrap();
+            let expected_coverage = expected.grid_coverage();
+
+            // Preparation owns the projection-derived width; stale/manual
+            // values must not leak into either backend.
+            composer.set_grid_thickness_cells(7.75);
+            let (cpu_viewport, cpu_projection) = {
+                let packet = composer.prepare_render(&mut atlas, request);
+                assert_eq!(packet.backend, MapBackend::Cpu);
+                assert_eq!(packet.viewport.destination, destination);
+                assert_eq!(packet.viewport, expected);
+                assert_eq!(
+                    packet.projection.grid_thickness_cells,
+                    expected_coverage.source_cells
+                );
+                (packet.viewport, packet.projection)
+            };
+
+            composer.set_grid_thickness_cells(f32::NAN);
+            let (gpu_viewport, gpu_projection, gpu_grid_width) = {
+                let packet = composer.prepare_render(
+                    &mut atlas,
+                    MapRenderRequest {
+                        requested_backend: MapBackend::GpuAtlas,
+                        ..request
+                    },
+                );
+                assert_eq!(packet.backend, MapBackend::GpuAtlas);
+                assert_eq!(packet.viewport.destination, destination);
+                let gpu = packet.gpu().expect("composite has an atlas path");
+                (
+                    packet.viewport,
+                    packet.projection,
+                    gpu.params.grid_thickness_cells,
+                )
+            };
+
+            assert_eq!(gpu_viewport, cpu_viewport);
+            assert_eq!(gpu_projection, cpu_projection);
+            assert_eq!(gpu_grid_width, expected_coverage.source_cells);
+            assert!(gpu_grid_width <= f32::from(map.config().field_resolution));
+        }
+    }
+
+    #[test]
+    fn shader_owned_grid_matches_cpu_samples_and_is_absent_from_both_overlays() {
+        fn destination_source_texel(index: u32, extent: u32, side: u32) -> u32 {
+            ((((f64::from(index) + 0.5) / f64::from(extent)) * f64::from(side)).floor() as u32)
+                .min(side - 1)
+        }
+
+        let map = settled_map();
+        let decor = MapDecor::default();
+        let mut composer = MapComposer::new(1, 8);
+        composer.set_zoom(2);
+        let mut atlas = AtlasManager::default();
+        let destination = PixelRect::new(7, 11, 7, 7);
+        let without_grid = no_overlays();
+        let with_grid = Overlays {
+            grid: true,
+            ..without_grid
+        };
+        let base_request = MapRenderRequest {
+            map: &map,
+            player: (0.0, 0.0),
+            destination,
+            channel: Channel::Composite,
+            overlays: without_grid,
+            anchors: &[],
+            decor: &decor,
+            requested_backend: MapBackend::Cpu,
+            gpu_available: true,
+            refinement: RefinementRequest::default(),
+            dirty_key: 0,
+        };
+
+        let cpu_without = composer
+            .prepare_render(&mut atlas, base_request)
+            .cpu_rgba()
+            .unwrap()
+            .to_vec();
+        let (cpu_with, cpu_projection) = {
+            let packet = composer.prepare_render(
+                &mut atlas,
+                MapRenderRequest {
+                    overlays: with_grid,
+                    ..base_request
+                },
+            );
+            (packet.cpu_rgba().unwrap().to_vec(), packet.projection)
+        };
+        let (pre_without, post_without) = {
+            let packet = composer.prepare_render(
+                &mut atlas,
+                MapRenderRequest {
+                    requested_backend: MapBackend::GpuAtlas,
+                    ..base_request
+                },
+            );
+            let gpu = packet.gpu().unwrap();
+            (gpu.pre_grid_rgba.to_vec(), gpu.post_grid_rgba.to_vec())
+        };
+        let (pre_with, post_with, viewport, gpu_grid_width, grid_enabled) = {
+            let packet = composer.prepare_render(
+                &mut atlas,
+                MapRenderRequest {
+                    overlays: with_grid,
+                    requested_backend: MapBackend::GpuAtlas,
+                    ..base_request
+                },
+            );
+            let gpu = packet.gpu().unwrap();
+            (
+                gpu.pre_grid_rgba.to_vec(),
+                gpu.post_grid_rgba.to_vec(),
+                packet.viewport,
+                gpu.params.grid_thickness_cells,
+                gpu.params.grid_enabled,
+            )
+        };
+
+        assert_eq!(viewport.destination, destination);
+        assert_eq!(gpu_grid_width, cpu_projection.grid_thickness_cells);
+        assert!(grid_enabled);
+        assert!(gpu_grid_width > 1.0, "fixture must exercise widening");
+        assert_eq!(pre_with, pre_without, "Grid must not enter the pre plane");
+        assert_eq!(
+            post_with, post_without,
+            "Grid must not enter the post plane"
+        );
+        let cells = (gpu_grid_width.ceil() as u32).clamp(1, u32::from(viewport.region_resolution));
+        let side = viewport.source_side;
+        let resolution = u32::from(viewport.region_resolution);
+        let mut grid_samples = 0;
+        let mut clear_samples = 0;
+
+        for row in 0..destination.height {
+            for column in 0..destination.width {
+                let physical = (
+                    f64::from(destination.x + column) + 0.5,
+                    f64::from(destination.y + row) + 0.5,
+                );
+                let (source_x, source_y) = viewport.physical_to_source_texel(physical).unwrap();
+                let source_offset = ((source_y * side + source_x) * 4) as usize;
+
+                // Player is an always-present later layer. Excluding its
+                // texels lets this assertion isolate the one folded grid
+                // operation without weakening the declared layer ordering.
+                if post_without[source_offset + 3] != 0 {
+                    continue;
+                }
+                let expected_grid =
+                    source_x % resolution < cells || source_y % resolution >= resolution - cells;
+                if expected_grid {
+                    grid_samples += 1;
+                } else {
+                    clear_samples += 1;
+                }
+
+                // CPU packets contain the already-magnified raster. Sampling
+                // that raster at the destination pixel center must select the
+                // same grid classification as WGSL's direct source transform.
+                let output_x =
+                    destination_source_texel(column, destination.width, cpu_projection.side);
+                let output_y =
+                    destination_source_texel(row, destination.height, cpu_projection.side);
+                let output_offset = ((output_y * cpu_projection.side + output_x) * 4) as usize;
+                if expected_grid {
+                    let expected_rgb = lerp_rgb(
+                        [
+                            cpu_without[output_offset],
+                            cpu_without[output_offset + 1],
+                            cpu_without[output_offset + 2],
+                        ],
+                        [0, 0, 0],
+                        0.35,
+                    );
+                    assert_eq!(&cpu_with[output_offset..output_offset + 3], &expected_rgb);
+                } else {
+                    assert_eq!(
+                        &cpu_with[output_offset..output_offset + 4],
+                        &cpu_without[output_offset..output_offset + 4]
+                    );
+                }
+            }
+        }
+        assert!(grid_samples > 0);
+        assert!(clear_samples > 0);
+
+        // Grid is now literal WGSL work between two independently sampled
+        // planes; neither source texture contains a duplicate grid layer.
+        let shader = renderer::gpumap::SHADER_COMPOSE_MAP;
+        assert!(shader.contains("params.grid_thickness_cells"));
+        assert!(shader.contains("textureLoad(pre_grid_overlay"));
+        assert!(shader.contains("textureLoad(post_grid_overlay"));
+    }
+
+    #[test]
     fn prepared_gpu_packet_reuses_slots_uploads_and_pixel_backing() {
         let map = settled_map();
         let decor = MapDecor::default();
@@ -2184,6 +2449,7 @@ mod tests {
         let request = MapRenderRequest {
             map: &map,
             player: (0.0, 0.0),
+            destination: PixelRect::new(0, 0, 40, 40),
             channel: Channel::Composite,
             overlays: Overlays::default(),
             anchors: &[],
@@ -2197,7 +2463,7 @@ mod tests {
             dirty_key: 7,
         };
 
-        let (first_slots, first_overlay_hash, first_overlay_ptr) = {
+        let (first_slots, first_overlay_hash, first_pre_ptr, first_post_ptr) = {
             let packet = composer.prepare_render(&mut atlas, request);
             assert_eq!(packet.backend, MapBackend::GpuAtlas);
             assert_eq!(packet.fallback, None);
@@ -2208,12 +2474,15 @@ mod tests {
             assert_eq!(gpu.params.refine_count, 3);
             assert!(!gpu.uploads.is_empty(), "first atlas sync uploads tiles");
             assert!(gpu.slots.iter().any(|slot| *slot >= 0));
-            assert_eq!(gpu.overlay_hash, map_pixel_hash(gpu.overlay_rgba));
+            assert_eq!(gpu.pre_grid_hash, map_pixel_hash(gpu.pre_grid_rgba));
+            assert_eq!(gpu.post_grid_hash, map_pixel_hash(gpu.post_grid_rgba));
+            assert_eq!(gpu.overlay_hash, mix(gpu.pre_grid_hash, gpu.post_grid_hash));
             assert_eq!(packet.pixel_hash, gpu.overlay_hash);
             (
                 gpu.slots.clone(),
                 gpu.overlay_hash,
-                gpu.overlay_rgba.as_ptr(),
+                gpu.pre_grid_rgba.as_ptr(),
+                gpu.post_grid_rgba.as_ptr(),
             )
         };
 
@@ -2222,7 +2491,100 @@ mod tests {
         assert_eq!(gpu.slots, first_slots);
         assert!(gpu.uploads.is_empty(), "steady atlas has zero uploads");
         assert_eq!(gpu.overlay_hash, first_overlay_hash);
-        assert_eq!(gpu.overlay_rgba.as_ptr(), first_overlay_ptr);
+        assert_eq!(gpu.pre_grid_rgba.as_ptr(), first_pre_ptr);
+        assert_eq!(gpu.post_grid_rgba.as_ptr(), first_post_ptr);
+    }
+
+    #[test]
+    fn split_overlay_hashes_isolate_pre_and_post_layer_changes() {
+        let mut map = settled_map();
+        let mut composer = MapComposer::new(1, 8);
+        composer.update_for_tick(1, &map);
+        let mut atlas = AtlasManager::default();
+        let empty_decor = MapDecor::default();
+        let pinned_only = Overlays {
+            pinned_flash: true,
+            ..no_overlays()
+        };
+
+        let baseline = {
+            let packet = composer.prepare_render(
+                &mut atlas,
+                MapRenderRequest {
+                    map: &map,
+                    player: (0.0, 0.0),
+                    destination: PixelRect::new(0, 0, 24, 24),
+                    channel: Channel::Composite,
+                    overlays: pinned_only,
+                    anchors: &[],
+                    decor: &empty_decor,
+                    requested_backend: MapBackend::GpuAtlas,
+                    gpu_available: true,
+                    refinement: RefinementRequest::default(),
+                    dirty_key: 1,
+                },
+            );
+            let gpu = packet.gpu().unwrap();
+            (gpu.pre_grid_hash, gpu.post_grid_hash)
+        };
+
+        force_pinned_revision_change(&mut map, PossibilityDomain::Aesthetics);
+        composer.update_for_tick(2, &map);
+        let flashing = {
+            let packet = composer.prepare_render(
+                &mut atlas,
+                MapRenderRequest {
+                    map: &map,
+                    player: (0.0, 0.0),
+                    destination: PixelRect::new(0, 0, 24, 24),
+                    channel: Channel::Composite,
+                    overlays: pinned_only,
+                    anchors: &[],
+                    decor: &empty_decor,
+                    requested_backend: MapBackend::GpuAtlas,
+                    gpu_available: true,
+                    refinement: RefinementRequest::default(),
+                    dirty_key: 2,
+                },
+            );
+            let gpu = packet.gpu().unwrap();
+            (gpu.pre_grid_hash, gpu.post_grid_hash)
+        };
+        assert_ne!(flashing.0, baseline.0, "PinnedFlash changes pre-grid only");
+        assert_eq!(flashing.1, baseline.1, "post-grid upload remains reusable");
+
+        let discovered_decor = MapDecor {
+            seen: Some(BTreeSet::new()),
+            ..MapDecor::default()
+        };
+        let discovered = {
+            let packet = composer.prepare_render(
+                &mut atlas,
+                MapRenderRequest {
+                    map: &map,
+                    player: (0.0, 0.0),
+                    destination: PixelRect::new(0, 0, 24, 24),
+                    channel: Channel::Composite,
+                    overlays: Overlays {
+                        discovered: true,
+                        ..pinned_only
+                    },
+                    anchors: &[],
+                    decor: &discovered_decor,
+                    requested_backend: MapBackend::GpuAtlas,
+                    gpu_available: true,
+                    refinement: RefinementRequest::default(),
+                    dirty_key: 3,
+                },
+            );
+            let gpu = packet.gpu().unwrap();
+            (gpu.pre_grid_hash, gpu.post_grid_hash)
+        };
+        assert_eq!(discovered.0, flashing.0, "pre-grid upload remains reusable");
+        assert_ne!(
+            discovered.1, flashing.1,
+            "Discovered changes post-grid only"
+        );
     }
 
     #[test]
@@ -2234,6 +2596,7 @@ mod tests {
         let request = MapRenderRequest {
             map: &map,
             player: (0.0, 0.0),
+            destination: PixelRect::new(0, 0, 24, 24),
             channel: Channel::Geology,
             overlays: no_overlays(),
             anchors: &[],
@@ -2282,6 +2645,7 @@ mod tests {
         let request = MapRenderRequest {
             map: &map,
             player: (0.0, 0.0),
+            destination: PixelRect::new(0, 0, 24, 24),
             channel: Channel::Composite,
             overlays: no_overlays(),
             anchors: &[],
