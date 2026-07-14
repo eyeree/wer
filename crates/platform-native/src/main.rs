@@ -87,204 +87,77 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use renderer::{letterbox_viewport, Renderer};
-use viewer_host::action::{NudgeDirection, ViewerAction};
-use viewer_host::input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent};
+use viewer_host::action::{
+    PreserveMutation, ServiceRequestId, ViewerAction, ViewerEffect, WorkerBackend,
+};
+use viewer_host::controller::{
+    GroundSample, LoadedSession, PovGroundSampler, ServiceNotification, ServiceResponse,
+    ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewerController,
+};
+#[cfg(test)]
+use viewer_host::input::InputFrame;
+use viewer_host::input::{InputContext, InputMapper, NormalizedInputEvent};
 use viewer_host::layout::{PresentationMode, ViewKind};
 use viewer_host::map::MapBackend;
+use viewer_host::panel::{PlatformTelemetry, Severity, ViewerWarning};
+use viewer_host::world::{
+    ExplorationWorld, WorldPostUpdate, WorldPreUpdate, WorldServiceInput, WorldTickHook,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
+#[cfg(test)]
 use world_core::{
-    bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, Biome, PossibilityDomain,
-    PossibilityField, PossibilitySignature, RegionCoord, TraitCategory, Trophic, LAYER_COUNT,
-    POSSIBILITY_DIMS, REGION_SIZE,
+    bound_target, domain_mask, Anchor, AnchorSource, PossibilityDomain, PossibilitySignature,
+};
+use world_core::{
+    AnchorKind, Biome, PossibilityField, RegionCoord, Trophic, LAYER_COUNT, POSSIBILITY_DIMS,
+    REGION_SIZE,
 };
 use world_runtime::{
-    apply_session_regions, compare_session_runtime, session_runtime_record,
-    stream_config_from_record, AdapterClass, Budget, FrameStats, GenerationStatus, RegionMap,
-    ResourceTier, RouteRecorder, RouteTracker, SessionCompatibility, SessionSnapshotInput, Storage,
-    StreamConfig, TierInputs, Vault, VaultPersistenceError, VaultStats, CHANNEL_CANOPY,
-    CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_MOISTURE, CHANNEL_RIVER,
-    CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    compare_session_runtime, stream_config_from_record, AdapterClass, Budget, FrameStats,
+    GenerationStatus, RegionMap, ResourceTier, SessionCompatibility, StreamConfig, TierInputs,
+    Vault, VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
+    CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
+    CHANNEL_WETNESS,
 };
+#[cfg(test)]
+use world_runtime::{RouteTracker, Storage, VaultPersistenceError};
 
 use executor::LaneExecutor;
 use gpumap::AtlasManager;
 use panel::{CursorInfo, EcologyInfo, Hud, OrganismInfo, PanelInfo, VaultInfo};
-use pov::{
-    PovCamera, PovChunkManager, PovCounters, PovOrganismCounters, PovOrganismManager, PovToggles,
-};
+use pov::{PovCamera, PovChunkManager, PovCounters, PovOrganismCounters, PovOrganismManager};
 use tools::FileStorage;
 use viz::{Channel, MapComposer, MapDecor, Overlays};
 
 /// Letterbox color around the square map (linear RGBA).
 const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
 
-/// Player speed in world units per second (sprint multiplies by 4).
-const PLAYER_SPEED: f64 = 500.0;
-
-/// Bias step per possibility-nudge keypress.
-const NUDGE_STEP: f32 = 0.05;
-
-/// Anchor parameters for the two Phase 1 anchor kinds.
-const ANCHOR_STRENGTH: f32 = 0.8;
-const ANCHOR_RADIUS: f64 = 2048.0;
-
-/// Largest mouse-wheel view magnification (powers of two from 1).
-const MAX_ZOOM: u32 = 16;
-
 /// Zoom level at (and past) which hovering an organism marker shows that
 /// organism in the panel instead of the region info.
 const ORGANISM_INFO_ZOOM: u32 = 4;
 
-/// Which presentation the shell drives (3d-phase-1-plan.md §8.1). Map mode
-/// is byte-for-byte the pre-POV path; POV renders the meshed terrain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ViewMode {
-    Map,
-    Pov,
-}
+#[cfg(test)]
+const PLAYER_SPEED: f64 = viewer_host::world::MAP_MOVEMENT_SPEED;
 
-impl ViewMode {
-    const fn presentation(self) -> PresentationMode {
-        match self {
-            Self::Map => PresentationMode::Map,
-            Self::Pov => PresentationMode::Pov,
-        }
-    }
-
-    const fn view_kind(self) -> ViewKind {
-        match self {
-            Self::Map => ViewKind::Map,
-            Self::Pov => ViewKind::Pov,
-        }
-    }
-}
-
-/// Shell-owned effects produced by the interim native action reducer. The
-/// shared controller takes ownership of this boundary in Milestone 3; until
-/// then, action reduction remains typed and exhaustive without giving
-/// `viewer-host` access to winit or the filesystem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeActionEffect {
-    None,
-    DebugDump,
-    Exit,
-}
-
-/// Remove the runtime's effective preserve owner and only that record's
-/// contributions. Errors distinguish impossible runtime/vault drift from a
-/// retryable persistence failure; neither deletes an arbitrary covering record
-/// or changes runtime ownership (ADR 0020, ADR 0022).
-#[derive(Debug)]
-enum PreserveRemovalError {
-    MissingVaultRecord(u64),
-    Persistence(VaultPersistenceError),
-}
-
-fn remove_effective_preserve<S: Storage>(
-    map: &mut RegionMap,
-    vault: &mut Vault<S>,
-    coord: RegionCoord,
-) -> Result<Option<(u64, String)>, PreserveRemovalError> {
-    let Some((id, _)) = map.effective_preserve(coord) else {
-        return Ok(None);
-    };
-    let Some(record) = vault.preserves().get(&id).cloned() else {
-        return Err(PreserveRemovalError::MissingVaultRecord(id));
-    };
-    let removed = vault
-        .remove_preserve(id)
-        .map_err(PreserveRemovalError::Persistence)?;
-    debug_assert!(removed, "record cloned from the vault must be removable");
-    for (region, _) in record.regions {
-        map.remove_preserve_contribution(id, region);
-    }
-    Ok(Some((id, record.name)))
-}
-
-#[derive(Debug)]
-struct RouteRemovalOutcome {
-    removed: usize,
-    total: usize,
-    error: Option<VaultPersistenceError>,
-}
-
-/// Remove routes in ascending id order, stopping at the first durability
-/// failure. Tracker state is retained exactly for records still in the vault.
-fn remove_routes<S: Storage>(
-    vault: &mut Vault<S>,
-    tracker: &mut RouteTracker,
-) -> RouteRemovalOutcome {
-    let ids: Vec<u64> = vault.routes().keys().copied().collect();
-    let total = ids.len();
-    let mut removed = 0;
-    let mut error = None;
-    for id in ids {
-        match vault.remove_route(id) {
-            Ok(true) => removed += 1,
-            Ok(false) => unreachable!("id came from the vault"),
-            Err(found) => {
-                error = Some(found);
-                break;
-            }
-        }
-    }
-    tracker.retain(|id| vault.routes().contains_key(&id));
-    RouteRemovalOutcome {
-        removed,
-        total,
-        error,
-    }
-}
-
-/// The world-simulation half of the app (everything that isn't winit/wgpu).
-struct World {
-    map: RegionMap,
-    field: PossibilityField,
-    anchors: Vec<Anchor>,
-    bias: [f32; POSSIBILITY_DIMS],
-    player: (f64, f64),
-    /// Player position at the previous update; the distance to the current
-    /// position is the travel that fuels convergence (ADR 0006).
-    last_player: (f64, f64),
-    /// Deliberate slow-steering movement mode vs fast free exploration
-    /// (phase-4-plan.md §8.2). Toggled with `R`.
-    transition_mode: bool,
-    /// The persistent record store (phase-5-plan.md §5.3): `O` saves the
-    /// session, `L` restores it. `None` if the store directory was unusable.
+/// Native persistence bridge around the platform-neutral single world tick.
+///
+/// The shared controller owns exploration, recorder, and traversal state. This
+/// service retains only the concrete file-backed vault and contributes route
+/// records/derived anchors through [`WorldTickHook`].
+struct NativeWorldServices {
     vault: Option<Vault<FileStorage>>,
-    /// The last flush's counters, for the panel.
     vault_stats: VaultStats,
-    /// Whether the frame loop has already logged the active persistence
-    /// failure. Repeats remain visible through bounded HUD telemetry.
     vault_failure_logged: bool,
-    /// Live expedition recording (`J` starts/finishes; phase-5-plan.md §7.3).
-    recorder: Option<RouteRecorder>,
-    /// Traversal detection over the recorded routes (usage bumps, §7.4).
-    tracker: RouteTracker,
-    /// Master switch for the persistent path subsystem (`H` toggles, off by
-    /// default): route recording, traversal tracking, the attraction field,
-    /// and the map polylines are all dormant while this is false. Recorded
-    /// routes stay in the vault either way — the records are the truth
-    /// (ADR 0015); `Delete` clears them.
-    path_tracking: bool,
-    /// Whether recorded routes project their attraction field (`U` toggles;
-    /// only effective while [`Self::path_tracking`] is on).
-    route_attraction: bool,
-    /// The lane executor by default; `wer --inline` swaps in the synchronous
-    /// [`world_runtime::InlineExecutor`] for A/B comparison (ADR 0018 makes
-    /// the settled world identical either way — only pacing differs).
-    executor: Box<dyn world_runtime::TaskExecutor>,
-    budget: Budget,
-    tier: ResourceTier,
+    response_sequence: u64,
+    flush_budget: Budget,
 }
 
-impl World {
-    fn new(inline: bool, tier: ResourceTier) -> Self {
-        // The store location: WER_VAULT_DIR, or ./wer-vault next to the cwd.
+impl NativeWorldServices {
+    fn open() -> Self {
         let vault_dir =
             std::env::var("WER_VAULT_DIR").unwrap_or_else(|_| String::from("wer-vault"));
         let vault = match FileStorage::open(&vault_dir)
@@ -309,248 +182,20 @@ impl World {
                 None
             }
         };
-        // Tier presets scale pacing and capacity, never identity (ADR 0018);
-        // WER_CACHE_MB overrides the field-cache ceiling for profiling runs.
-        let mut stream = tier.stream_config();
-        if let Some(mb) = std::env::var("WER_CACHE_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            stream.max_field_cache_bytes = mb * 1024 * 1024;
-        }
-        let mut world = Self {
-            map: RegionMap::new(stream),
-            field: PossibilityField::default(),
-            anchors: Vec::new(),
-            bias: [0.0; POSSIBILITY_DIMS],
-            player: (0.0, 0.0),
-            last_player: (0.0, 0.0),
-            transition_mode: false,
+        Self {
             vault,
             vault_stats: VaultStats::default(),
             vault_failure_logged: false,
-            recorder: None,
-            tracker: RouteTracker::new(),
-            path_tracking: false,
-            route_attraction: true,
-            executor: if inline {
-                Box::new(world_runtime::InlineExecutor)
-            } else {
-                Box::new(LaneExecutor::auto())
-            },
-            budget: tier.budget(),
-            tier,
-        };
-        // A preserved region realizes its recorded buckets from the very
-        // first frame, wherever the run begins (phase-5-plan.md §7.5).
-        world.apply_preserves();
-        world
-    }
-
-    fn update(&mut self) -> FrameStats {
-        let travel = f64::hypot(
-            self.player.0 - self.last_player.0,
-            self.player.1 - self.last_player.1,
-        );
-        self.last_player = self.player;
-        // Route attraction (phase-5-plan.md §7.4): recorded corridors near the
-        // player contribute derived weak anchors, riding the same
-        // order-independent steer as the player's own.
-        let mut effective = self.anchors.clone();
-        if self.path_tracking && self.route_attraction {
-            if let Some(vault) = self.vault.as_ref() {
-                effective.extend(world_core::attraction_anchors(
-                    vault.routes().values(),
-                    self.player,
-                    self.budget.max_route_attraction_nodes,
-                ));
-            }
-        }
-        let mut stats = self.map.update(
-            self.player,
-            travel,
-            &self.field,
-            &effective,
-            &self.bias,
-            &self.budget,
-            self.executor.as_ref(),
-            self.transition_mode,
-        );
-        // Expedition recording samples the frame the map just produced (§7.3,
-        // ADR 0025), including the exact route-derived anchors that steered it.
-        if let Some(recorder) = self.recorder.as_mut() {
-            recorder.observe(
-                &self.map,
-                self.player,
-                travel,
-                &effective,
-                stats.resonance_strength,
-            );
-        }
-        if let Some(vault) = self.vault.as_mut() {
-            // The persistence work is the pipeline's Flush pass; the shell
-            // times it into the same per-pass table (phase-6-plan.md §5.2).
-            let flush_start = Instant::now();
-            // Seen-set recording (phase-5-plan.md §5.3): the region under the
-            // player is discovered. O(1) and idempotent.
-            vault.mark_seen(RegionCoord::from_world(self.player.0, self.player.1));
-            // Traversal detection: re-walking a recorded corridor bumps its
-            // usage once per leg (§7.4). Dormant while path tracking is off.
-            if self.path_tracking {
-                let traversed = self.tracker.observe(vault.routes().values(), self.player);
-                for id in traversed {
-                    vault.bump_route_usage(id);
-                    log::info!("route {id:#018x} traversed (usage bumped)");
-                }
-            }
-            // Budgeted trickle of dirty records (§7.7); saves marked by `O`
-            // and event-driven records drain here.
-            match vault.flush(&self.budget) {
-                Ok(flush) => {
-                    self.vault_stats = flush;
-                    if self.vault_failure_logged && vault.active_persistence_issue().is_none() {
-                        log::info!("vault persistence recovered");
-                        self.vault_failure_logged = false;
-                    }
-                }
-                Err(error) => {
-                    self.vault_stats = error.progress();
-                    if error.persistence_error().occurrences() == 1 {
-                        log::warn!("vault persistence: {error}");
-                    }
-                    self.vault_failure_logged = true;
-                }
-            }
-            stats.pass_ms[world_runtime::Pass::Flush.index()] +=
-                flush_start.elapsed().as_secs_f32() * 1000.0;
-        }
-        stats
-    }
-
-    /// The `H` key: turn the persistent path subsystem on or off. Turning it
-    /// off mid-recording discards the unfinished expedition (nothing was
-    /// persisted yet); routes already in the vault are untouched.
-    fn toggle_path_tracking(&mut self) {
-        self.path_tracking = !self.path_tracking;
-        if !self.path_tracking && self.recorder.take().is_some() {
-            log::info!("path tracking off; in-progress recording discarded");
-        }
-        log::info!(
-            "path tracking {}",
-            if self.path_tracking { "on" } else { "off" }
-        );
-    }
-
-    /// The `Delete` key: erase every recorded route from the vault (and any
-    /// in-progress recording). Discoveries, preserves, and the seen set are
-    /// untouched — this clears paths only.
-    fn clear_routes(&mut self) {
-        if self.recorder.take().is_some() {
-            log::info!("in-progress recording discarded");
-        }
-        let Some(vault) = self.vault.as_mut() else {
-            log::warn!("no vault open; no recorded paths to clear");
-            return;
-        };
-        let outcome = remove_routes(vault, &mut self.tracker);
-        if let Some(error) = outcome.error {
-            log::warn!(
-                "route clear stopped after {}/{} durable removal(s): {error}",
-                outcome.removed,
-                outcome.total
-            );
-        } else {
-            log::info!("cleared {} recorded route(s)", outcome.removed);
+            response_sequence: 0,
+            flush_budget: Budget::default(),
         }
     }
 
-    /// The `J` key: start recording an expedition, or finish and persist it.
-    fn toggle_route_recording(&mut self) {
-        if !self.path_tracking {
-            log::info!("path tracking is off (H to enable)");
-            return;
-        }
-        match self.recorder.take() {
-            None => {
-                self.recorder = Some(RouteRecorder::new());
-                log::info!("route recording started (J again to finish)");
-            }
-            Some(recorder) => {
-                let (nodes, discoveries) = recorder.finish();
-                if nodes.len() < 2 {
-                    log::info!("route too short ({} nodes); discarded", nodes.len());
-                    return;
-                }
-                let Some(vault) = self.vault.as_mut() else {
-                    log::warn!("no vault open; route discarded");
-                    return;
-                };
-                let difficulty = world_core::route_difficulty(&nodes);
-                let name = format!("route-{}", vault.routes().len() + 1);
-                let count = nodes.len();
-                let id = match vault.record_route(nodes, discoveries, name.clone()) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        log::warn!("route discarded: {error}");
-                        return;
-                    }
-                };
-                log::info!(
-                    "recorded {name} ({id:#018x}): {count} nodes, difficulty {difficulty:.2}"
-                );
-            }
-        }
-    }
-
-    /// Record the most recent anchor into the vault as a named discovery
-    /// (the `B` key; phase-5-plan.md §7.1). Naming is a debug action with an
-    /// auto-generated placeholder name (§1.4); the record is the quantized
-    /// shareable shadow of the anchor (ADR 0013).
-    fn record_last_anchor(&mut self) {
-        let Some(anchor) = self.anchors.last().copied() else {
-            log::info!("no anchor to record; capture one first (K)");
-            return;
-        };
-        let Some(vault) = self.vault.as_mut() else {
-            log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
-            return;
-        };
-        // The capture cell's habitat identity (0 until its tiles settle).
-        let coord = RegionCoord::from_world(anchor.world_pos.0, anchor.world_pos.1);
-        let res = self.map.config().field_resolution;
-        let (ox, oy) = coord.origin();
-        let cell = REGION_SIZE / f64::from(res);
-        let cx = (((anchor.world_pos.0 - ox) / cell) as u16).min(res - 1);
-        let cy = (((anchor.world_pos.1 - oy) / cell) as u16).min(res - 1);
-        let signature_seed = self
-            .map
-            .cell_signature(coord, cx, cy)
-            .map_or(0, |s| s.seed());
-        let name = format!("discovery-{}", vault.discoveries().len() + 1);
-        let id = match vault.record_discovery(&anchor, signature_seed, name.clone()) {
-            Ok(id) => id,
-            Err(error) => {
-                log::warn!("discovery not recorded: {error}");
-                return;
-            }
-        };
-        // A discovery made mid-expedition joins the route's journal (§7.3).
-        if let Some(recorder) = self.recorder.as_mut() {
-            recorder.attach_discovery(id);
-        }
-        log::info!("recorded {name} ({id:#018x}) into the vault");
-    }
-
-    /// Synchronize every vault preserve into the live map (startup and session
-    /// load) in canonical `(content id, region coordinate)` order. The runtime
-    /// installs the complete batch before reconciling each touched resident
-    /// once, so repeated synchronization is idempotent and reversed record
-    /// traversal cannot create intermediate revision epochs (ADR 0020).
-    fn apply_preserves(&mut self) {
+    fn apply_preserves(&self, world: &mut ExplorationWorld) {
         let Some(vault) = self.vault.as_ref() else {
             return;
         };
-        let contributions: Vec<(u64, RegionCoord, PossibilitySignature)> = vault
+        let contributions = vault
             .preserves()
             .iter()
             .flat_map(|(&id, preserve)| {
@@ -560,248 +205,119 @@ impl World {
                     .map(move |&(coord, signature)| (id, coord, signature))
             })
             .collect();
-        self.map.apply_preserve_contributions(contributions);
+        world.apply_preserve_contributions(contributions);
     }
 
-    /// The `P` key: standing inside a preserve deletes it (no snap — regions
-    /// resume steering from where the preserve held them); otherwise the
-    /// pinned near window is preserved — each region's possibility state,
-    /// quantized, a few dozen bytes per region and zero geometry
-    /// (phase-5-plan.md §7.5).
-    fn toggle_preserve(&mut self) {
-        if self.vault.is_none() {
-            log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
-            return;
+    fn response(
+        &mut self,
+        request_id: ServiceRequestId,
+        result: ServiceResponseResult,
+    ) -> ServiceResponse {
+        self.response_sequence = self.response_sequence.saturating_add(1);
+        ServiceResponse {
+            sequence: ServiceResponseSequence(self.response_sequence),
+            request_id,
+            result,
         }
-        let player_region = RegionCoord::from_world(self.player.0, self.player.1);
-        match remove_effective_preserve(
-            &mut self.map,
-            self.vault.as_mut().expect("checked above"),
-            player_region,
-        ) {
-            Ok(Some((id, name))) => {
-                log::info!(
-                    "deleted preserve {name} ({id:#018x}); overlaps selected their next owner, final regions resume steering with no snap"
-                );
-                return;
-            }
-            Err(PreserveRemovalError::MissingVaultRecord(id)) => {
-                log::warn!(
-                    "runtime preserve owner {id:#018x} is absent from the vault; deletion skipped"
-                );
-                return;
-            }
-            Err(PreserveRemovalError::Persistence(error)) => {
-                log::warn!("preserve deletion failed; runtime state retained: {error}");
-                return;
-            }
-            Ok(None) => {}
-        }
-
-        let vault = self.vault.as_mut().expect("checked above");
-        let regions: Vec<(RegionCoord, PossibilitySignature)> = self
-            .map
-            .iter_active()
-            .filter(|r| r.stability >= 1.0 && !self.map.is_overridden(r.coord))
-            .map(|r| (r.coord, PossibilitySignature::of(r.current)))
-            .collect();
-        if regions.is_empty() {
-            log::info!("nothing to preserve: no pinned regions here yet");
-            return;
-        }
-        let name = format!("preserve-{}", vault.preserves().len() + 1);
-        let id = match vault.record_preserve(regions.clone(), name.clone()) {
-            Ok(id) => id,
-            Err(error) => {
-                log::warn!("preserve not created: {error}");
-                return;
-            }
-        };
-        let count = regions.len();
-        self.map.apply_preserve_contributions(
-            regions
-                .into_iter()
-                .map(|(coord, signature)| (id, coord, signature)),
-        );
-        log::info!("created {name} ({id:#018x}): {count} regions pinned");
     }
 
-    /// Add every vault discovery as an active anchor (the `I` key) — loaded
-    /// and imported records steering the live world through the unchanged
-    /// order-independent `steer` (phase-5-plan.md §7.1). Idempotent: anchors
-    /// already active are skipped.
-    fn summon_discoveries(&mut self) {
+    fn pov_availability(&mut self, supported: bool) -> ServiceNotification {
+        self.response_sequence = self.response_sequence.saturating_add(1);
+        ServiceNotification::PovAvailability {
+            sequence: ServiceResponseSequence(self.response_sequence),
+            supported,
+            reason: None,
+        }
+    }
+}
+
+impl WorldTickHook for NativeWorldServices {
+    fn before_world_update(&mut self, input: WorldPreUpdate<'_>) -> WorldServiceInput {
+        self.flush_budget = *input.budget;
         let Some(vault) = self.vault.as_ref() else {
-            log::warn!("no vault open");
-            return;
+            return WorldServiceInput::default();
         };
-        let mut added = 0;
-        for record in vault.discoveries().values() {
-            let anchor = record.to_anchor();
-            if !self.anchors.contains(&anchor) {
-                self.anchors.push(anchor);
-                added += 1;
-            }
+        let derived_anchors = if input.path_tracking && input.route_attraction {
+            world_core::attraction_anchors(
+                vault.routes().values(),
+                input.traveler,
+                input.budget.max_route_attraction_nodes,
+            )
+        } else {
+            Vec::new()
+        };
+        let active_routes = if input.path_tracking {
+            vault.routes().values().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        WorldServiceInput {
+            derived_anchors,
+            active_routes,
         }
-        log::info!(
-            "summoned {added} discovery anchors ({} active)",
-            self.anchors.len()
-        );
     }
 
-    /// Snapshot the session tier and flush everything (the `O` key).
-    fn save_session(&mut self) {
+    fn after_world_update(&mut self, output: WorldPostUpdate<'_>) {
         let Some(vault) = self.vault.as_mut() else {
-            log::warn!("no vault open; set WER_VAULT_DIR or create ./wer-vault");
             return;
         };
-        let runtime = session_runtime_record(
-            self.map.config(),
-            &self.budget,
-            Some(self.tier),
-            self.path_tracking,
-            self.route_attraction,
-        );
-        let recorder = self.recorder.as_ref().map(RouteRecorder::snapshot);
-        let tracker = if self.path_tracking {
-            self.tracker.snapshot()
-        } else {
-            world_core::RouteTrackerSnapshot::default()
-        };
-        if let Err(error) = vault.snapshot_session(SessionSnapshotInput {
-            map: &self.map,
-            player: self.player,
-            last_player: self.last_player,
-            bias: &self.bias,
-            transition_mode: self.transition_mode,
-            anchors: &self.anchors,
-            runtime,
-            recorder,
-            tracker,
-        }) {
-            log::warn!("session save rejected before persistence: {error}");
-            return;
+        let flush_start = Instant::now();
+        vault.mark_seen(RegionCoord::from_world(
+            output.traveler.0,
+            output.traveler.1,
+        ));
+        for &id in output.traversed_route_ids {
+            vault.bump_route_usage(id);
+            log::info!("route {id:#018x} traversed (usage bumped)");
         }
-        match vault.flush_all() {
-            Ok(stats) => {
-                debug_assert!(stats.is_clean());
-                self.vault_stats = stats;
-                self.vault_failure_logged = false;
-                log::info!(
-                    "session saved: {} records, {} bytes ({} regions, {} anchors)",
-                    stats.flushed,
-                    stats.bytes,
-                    self.map.len(),
-                    self.anchors.len()
-                );
+        match vault.flush(&self.flush_budget) {
+            Ok(flush) => {
+                self.vault_stats = flush;
+                if self.vault_failure_logged && vault.active_persistence_issue().is_none() {
+                    log::info!("vault persistence recovered");
+                    self.vault_failure_logged = false;
+                }
             }
             Err(error) => {
                 self.vault_stats = error.progress();
-                self.vault_failure_logged = true;
-                log::warn!("session save failed; dirty records remain retryable: {error}");
-            }
-        }
-    }
-
-    /// Restore the saved session (the `L` key): rebuild the streaming window
-    /// from the snapshot's bit-exact region states; caches, rosters, and
-    /// organisms re-derive over the following frames. `last_player` snaps to
-    /// the restored position so the first update after a load is the zero-
-    /// travel settle — loading is not an event (phase-5-plan.md §12.2).
-    /// Exact canonical gameplay availability requires further zero-travel
-    /// updates until `authoritative_realization_complete`; the shell guarantees
-    /// the first such update but does not freeze later player input (ADR 0024).
-    fn load_session(&mut self) {
-        let Some(snap) = self.vault.as_ref().and_then(|v| v.session().cloned()) else {
-            log::info!("no saved session in the vault");
-            return;
-        };
-        let compatibility = compare_session_runtime(
-            &snap.runtime,
-            self.map.config(),
-            &self.budget,
-            Some(self.tier),
-            self.path_tracking,
-            self.route_attraction,
-        );
-        match compatibility {
-            SessionCompatibility::Exact => log::info!("session metadata exact-compatible"),
-            SessionCompatibility::CompatibleNotExact => {
-                log::warn!(
-                    "session metadata differs in pacing-only budget fields; restore is not exact"
-                )
-            }
-            SessionCompatibility::Incompatible => {
-                log::warn!("session metadata is incompatible with this run; restore is non-exact")
-            }
-        }
-        let stream = if compatibility == SessionCompatibility::Exact {
-            match stream_config_from_record(&snap.runtime.stream) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    log::warn!(
-                        "session stream config is not representable on this platform ({error:?}); using current config"
-                    );
-                    *self.map.config()
+                if error.persistence_error().occurrences() == 1 {
+                    log::warn!("vault persistence: {error}");
                 }
+                self.vault_failure_logged = true;
             }
-        } else {
-            *self.map.config()
-        };
-        let mut map = RegionMap::new(stream);
-        apply_session_regions(&mut map, &snap);
-        self.map = map;
-        self.apply_preserves();
-        self.player = snap.player;
-        self.last_player = snap.player;
-        self.bias = snap.bias;
-        self.transition_mode = snap.transition_mode;
-        self.anchors = snap.anchors.iter().map(|a| a.to_anchor()).collect();
-        if compatibility != SessionCompatibility::Incompatible {
-            self.path_tracking = snap.runtime.path_tracking;
-            self.route_attraction = snap.runtime.route_attraction;
-            self.recorder = snap.recorder.map(RouteRecorder::from_snapshot);
-            self.tracker = RouteTracker::from_snapshot(snap.tracker);
-        } else {
-            self.recorder = None;
-            self.tracker = RouteTracker::new();
         }
-        log::info!(
-            "session loaded: {} regions, {} anchors at ({:.0}, {:.0}); canonical organisms settle while held still",
-            snap.regions.len(),
-            snap.anchors.len(),
-            snap.player.0,
-            snap.player.1
-        );
+        output.stats.pass_ms[world_runtime::Pass::Flush.index()] +=
+            flush_start.elapsed().as_secs_f32() * 1000.0;
+    }
+}
+
+struct NativeGroundSampler<'a> {
+    chunks: &'a PovChunkManager,
+}
+
+impl PovGroundSampler for NativeGroundSampler<'_> {
+    fn sample_ground(&self, map: &RegionMap, position: (f64, f64)) -> GroundSample {
+        let (height, mesh_resident) = pov::walk_ground(self.chunks, map, position);
+        GroundSample {
+            height,
+            mesh_resident,
+        }
     }
 }
 
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    world: World,
+    controller: ViewerController,
+    services: NativeWorldServices,
+    /// The concrete native scheduler remains outside the shared viewer host.
+    executor: Box<dyn world_runtime::TaskExecutor>,
     composer: MapComposer,
     hud: Hud,
-    channel: Channel,
-    overlays: Overlays,
-    /// The trait category a capture (`K`) anchors, cycled with `T`.
-    capture_category: TraitCategory,
-    /// Whether a capture emphasizes or suppresses, toggled with `Y`.
-    capture_polarity: AnchorKind,
     /// The detected (or overridden) resource tier (phase-6-plan.md §6.7).
     tier: ResourceTier,
-    /// GPU-composed map (phase-6-plan.md §6.5) vs the CPU composer; `,`
-    /// toggles for the A/B parity eyeball. CPU-only channels fall back
-    /// automatically.
-    gpu_compose: bool,
-    /// GPU refinement octaves above FIELD_RES (`.` toggles; GPU mode only).
-    refinement: bool,
     /// Atlas slot assignment + delta-upload keys for the GPU map.
     atlas: AtlasManager,
-    /// Map vs POV presentation; `Tab` toggles (3d-phase-1-plan.md §8.1).
-    view_mode: ViewMode,
-    /// The POV fly camera (presentation-side state only).
-    pov_camera: PovCamera,
     /// POV chunk lifecycle: keying, Background-lane meshing, amortized
     /// upload, farthest-first eviction (3d-phase-1-plan.md §7).
     pov_chunks: PovChunkManager,
@@ -819,29 +335,15 @@ struct App {
     pov_counters_last: PovCounters,
     /// Previous organism lifecycle totals for the POV telemetry delta line.
     pov_organism_counters_last: PovOrganismCounters,
-    /// Live POV diagnostic toggles (`B` directional shadows + terrain AO,
-    /// `N` detail normals, `V` water) — presentation-only switches for
-    /// chasing render cost.
-    pov_toggles: PovToggles,
     /// The POV HUD chip (fps + frame-budget split), rebuilt only when the
     /// displayed text changes: `(rgba, width, height, text it shows)`.
     pov_fps_chip: Option<(Vec<u8>, u32, u32, String)>,
-    /// POV render-scale (`WER_POV_SCALE`, clamped [0.25, 1.0]): fraction of
-    /// the surface resolution the 3D pass rasterizes at before the linear
-    /// upscale blit — the practical llvmpipe fps knob, since software
-    /// rasterization cost scales with pixel count.
-    pov_scale: f32,
     /// Content hashes of the last uploaded overlay/panel strips, so an
     /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
     overlay_hash: u64,
     panel_hash: u64,
     /// Map hover in physical surface pixels, sampled from shared frame input.
     cursor_pos: Option<(f64, f64)>,
-    /// Mouse-wheel view magnification (powers of two, 1..=MAX_ZOOM).
-    /// Presentation only; past [`ORGANISM_INFO_ZOOM`] the cursor picks
-    /// organisms. Zoomed views compose on the CPU so the base field and the
-    /// overlays stay aligned.
-    zoom: u32,
     /// Cumulative regenerated-tile counts per layer (panel telemetry).
     regen_totals: [u64; LAYER_COUNT as usize],
     /// The most recent `World::update` counters, kept for the `F12` debug
@@ -878,32 +380,53 @@ struct App {
 
 impl App {
     fn new(inline: bool, tier: ResourceTier) -> Self {
-        let cfg = tier.stream_config();
+        let mut cfg = tier.stream_config();
+        if let Some(mb) = std::env::var("WER_CACHE_MB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            cfg.max_field_cache_bytes = mb * 1024 * 1024;
+        }
         let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
         let composer = MapComposer::new(half_regions, cfg.field_resolution);
         let hud = Hud::new(composer.side() as usize);
+        let services = NativeWorldServices::open();
+        let mut world = ExplorationWorld::with_runtime(cfg, tier.budget(), tier);
+        if let Ok(value) = std::env::var("WER_START") {
+            if let Some((x, y)) = value.split_once(',') {
+                if let (Ok(x), Ok(y)) = (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
+                    world.restore_traveler((x, y), (x, y));
+                }
+            }
+        }
+        services.apply_preserves(&mut world);
+        let mut controller = ViewerController::new(world);
+        if std::env::var_os("WER_CPU_MAP").is_some() {
+            controller.enqueue_action(ViewerAction::SetMapBackend(MapBackend::Cpu));
+        }
+        if std::env::var_os("WER_POV").is_some_and(|value| value != "0") {
+            controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Pov));
+        }
+        controller.set_pov_render_scale(
+            std::env::var("WER_POV_SCALE")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .map_or(1.0, |scale| scale.clamp(0.25, 1.0)),
+        );
         Self {
             window: None,
             renderer: None,
-            world: World::new(inline, tier),
+            controller,
+            services,
+            executor: if inline {
+                Box::new(world_runtime::InlineExecutor)
+            } else {
+                Box::new(LaneExecutor::auto())
+            },
             tier,
             composer,
             hud,
-            channel: Channel::Composite,
-            overlays: Overlays::default(),
-            capture_category: TraitCategory::Morphology,
-            capture_polarity: AnchorKind::Emphasize,
-            // GPU-composed map by default; `,` toggles live, WER_CPU_MAP=1
-            // starts in CPU mode (profiling A/B, phase-6-plan.md §6.5).
-            gpu_compose: std::env::var_os("WER_CPU_MAP").is_none(),
-            refinement: tier.refinement(),
             atlas: AtlasManager::default(),
-            view_mode: if std::env::var_os("WER_POV").is_some_and(|v| v != "0") {
-                ViewMode::Pov
-            } else {
-                ViewMode::Map
-            },
-            pov_camera: PovCamera::new(),
             pov_chunks: PovChunkManager::new(),
             pov_organisms: PovOrganismManager::new(),
             // The llvmpipe escape hatch (3d-phase-1-plan.md §8.5).
@@ -915,16 +438,10 @@ impl App {
             winit_input: input::WinitInputAdapter::default(),
             pov_counters_last: PovCounters::default(),
             pov_organism_counters_last: PovOrganismCounters::default(),
-            pov_toggles: PovToggles::default(),
             pov_fps_chip: None,
-            pov_scale: std::env::var("WER_POV_SCALE")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .map_or(1.0, |s| s.clamp(0.25, 1.0)),
             overlay_hash: 0,
             panel_hash: 0,
             cursor_pos: None,
-            zoom: 1,
             regen_totals: [0; LAYER_COUNT as usize],
             last_stats: FrameStats::default(),
             last_frame: Instant::now(),
@@ -945,134 +462,23 @@ impl App {
         }
     }
 
-    /// Continuous movement from held keys, scaled by real elapsed time.
-    fn apply_movement(&mut self, input: InputFrame, dt: f64) {
-        let Some((dx, dy)) = input.map_movement_delta(PLAYER_SPEED, dt) else {
-            return;
-        };
-        self.world.player.0 += dx;
-        self.world.player.1 += dy;
-    }
-
-    /// Toggle Map ↔ POV (`Tab`, 3d-phase-1-plan.md §8.1). Entering POV
-    /// places the camera at eye level over the player. Chunks are kept
-    /// across toggles (cheap to hold, instant on re-entry; §7.4).
-    ///
-    /// Mouse look is a **left-button drag** — no cursor grab. The plan's
-    /// grab + raw-delta scheme is unusable on the reference environment:
-    /// WSLg/XWayland reports raw `DeviceEvent::MouseMotion` as absolute
-    /// jumps, which slammed the pitch to −89° on the first mouse move.
-    /// Window-space drag deltas are well-defined everywhere.
-    fn toggle_view_mode(&mut self) {
-        match self.view_mode {
-            ViewMode::Map => {
-                self.view_mode = ViewMode::Pov;
-                let ground = pov::entry_ground(&self.world.map, self.world.player);
-                self.pov_camera.enter_at(self.world.player, ground);
-                // Re-entering with walk mode still on grounds immediately
-                // (the §5.3 snap) instead of ramping down from entry height.
-                if self.pov_camera.walk {
-                    let (ground, _) = self.pov_ground();
-                    self.pov_camera.snap_to_ground(ground);
-                }
-                log::info!(
-                    "view: POV at ({:.0}, {:.0}) radius {} (hold the left button to look; Tab returns to the map)",
-                    self.world.player.0,
-                    self.world.player.1,
-                    self.pov_radius
-                );
-            }
-            ViewMode::Pov => {
-                self.view_mode = ViewMode::Map;
-                log::info!("view: map");
-            }
-        }
-    }
-
     fn input_context(&self) -> InputContext {
-        InputContext {
-            mode: self.view_mode.presentation(),
-            focused: self.view_mode.view_kind(),
-            surface_focused: self.winit_input.surface_focused(),
-        }
+        self.controller
+            .input_context(self.winit_input.surface_focused())
     }
 
     /// One ordered consumer for keyboard, pointer, wheel, and future native
     /// controls. Events enqueue through the shared mapper; only typed actions
-    /// reach [`Self::apply_action`].
-    fn handle_input_event(&mut self, event: NormalizedInputEvent, event_loop: &ActiveEventLoop) {
+    /// reach the shared controller.
+    fn handle_input_event(&mut self, event: NormalizedInputEvent, _event_loop: &ActiveEventLoop) {
         let context = self.input_context();
         self.input.handle_event(event, context);
-        self.process_actions(event_loop);
+        self.enqueue_actions();
     }
 
-    fn process_actions(&mut self, event_loop: &ActiveEventLoop) {
-        let actions: Vec<_> = self.input.drain_actions().collect();
-        for action in actions {
-            let previous_mode = self.view_mode;
-            let effect = self.apply_action(action);
-            let context = self.input_context();
-            self.input.set_context(context);
-            if previous_mode == ViewMode::Pov && self.view_mode != ViewMode::Pov {
-                // Match the old native toggle: leaving POV cancels only the
-                // look gesture, while held movement keys remain held.
-                self.input.handle_event(
-                    NormalizedInputEvent::PointerCancelled {
-                        pointer: input::MOUSE_POINTER_ID,
-                    },
-                    context,
-                );
-            }
-            match effect {
-                NativeActionEffect::None => {}
-                NativeActionEffect::DebugDump => self.debug_dump(),
-                NativeActionEffect::Exit => event_loop.exit(),
-            }
-        }
-    }
-
-    /// POV movement from held keys. Fly (plan §8.3): `W`/`S` along the full
-    /// 3D view direction (it is a fly camera), `A`/`D` strafe in the yaw
-    /// plane, `Space`/`LShift` world up/down. Walk (3d-phase-2-plan.md
-    /// §5.3): `W`/`S` along the horizontal yaw direction — looking at your
-    /// feet must not stop you — `A`/`D` strafe, `Space`/`LShift` consumed
-    /// and ignored (reserved, design §2.1), then the terrain-following step
-    /// toward `ground + EYE_HEIGHT` under the vertical-rate clamp. No
-    /// lateral collision in either mode. Bypasses `apply_movement` entirely.
-    fn apply_pov_movement(&mut self, input: InputFrame, dt: f64) {
-        let walk = self.pov_camera.walk;
-        let strafe = f64::from(input.pov_axis[0]);
-        let forward = f64::from(input.pov_axis[1]);
-        let vertical = if walk {
-            0.0
-        } else {
-            f64::from(input.pov_axis[2])
-        };
-        let mut mv = glam::DVec3::ZERO;
-        mv += self.pov_forward() * forward;
-        mv += self.pov_camera.right() * strafe;
-        mv.z += vertical;
-        if mv != glam::DVec3::ZERO {
-            let speed = if walk {
-                self.pov_camera.walk_speed
-            } else {
-                self.pov_camera.speed
-            };
-            self.pov_camera.pos += mv.normalize() * (speed * dt);
-        }
-        if walk {
-            let (ground, _) = self.pov_ground();
-            self.pov_camera.follow_ground(ground + pov::EYE_HEIGHT, dt);
-        }
-    }
-
-    /// The active mode's forward direction: the pitched view direction in
-    /// fly mode, the horizontal yaw direction in walk mode.
-    fn pov_forward(&self) -> glam::DVec3 {
-        if self.pov_camera.walk {
-            self.pov_camera.walk_forward()
-        } else {
-            self.pov_camera.forward()
+    fn enqueue_actions(&mut self) {
+        for action in self.input.drain_actions() {
+            self.controller.enqueue_action(action);
         }
     }
 
@@ -1082,287 +488,373 @@ impl App {
     fn pov_ground(&self) -> (f64, bool) {
         pov::walk_ground(
             &self.pov_chunks,
-            &self.world.map,
-            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            self.controller.world().map(),
+            (
+                self.controller.pov_camera().pos.x,
+                self.controller.pov_camera().pos.y,
+            ),
         )
     }
 
-    /// `F` in POV (3d-phase-2-plan.md §6.1): toggle walk ↔ fly. Entering
-    /// walk snaps the eye to the ground under the camera; returning to fly
-    /// keeps position and orientation.
-    fn toggle_walk(&mut self) {
-        let walk = !self.pov_camera.walk;
-        let (ground, mesh) = self.pov_ground();
-        self.pov_camera.set_walk(walk, ground);
-        if walk {
-            log::info!(
-                "pov: walk mode (ground {:.1}, {}; F returns to fly)",
-                ground,
-                if mesh { "mesh" } else { "analytic" }
-            );
-        } else {
-            log::info!("pov: fly mode");
-        }
-    }
-
-    /// Interim typed action reducer. It is intentionally exhaustive: raw
-    /// winit values never reach viewer state, and adding a shared action
-    /// requires an explicit native decision until Milestone 3 moves this
-    /// reducer into `viewer-host`.
-    fn apply_action(&mut self, action: ViewerAction) -> NativeActionEffect {
-        match action {
-            ViewerAction::SetPresentation(mode) => match mode {
-                PresentationMode::Map if self.view_mode == ViewMode::Pov => {
-                    self.toggle_view_mode();
+    fn handle_effects(&mut self, effects: Vec<ViewerEffect>, event_loop: &ActiveEventLoop) {
+        for effect in effects {
+            match effect {
+                ViewerEffect::Exit => event_loop.exit(),
+                ViewerEffect::WriteDebugCapture(request) => {
+                    let result = self.debug_dump().map_or_else(
+                        |error| {
+                            self.service_failure(
+                                "debug-capture-failed",
+                                format!("Debug capture failed: {error}"),
+                            )
+                        },
+                        |_| ServiceResponseResult::Completed,
+                    );
+                    self.enqueue_service_result(request.request_id, result);
                 }
-                PresentationMode::Pov if self.view_mode == ViewMode::Map => {
-                    self.toggle_view_mode();
+                ViewerEffect::PersistSession(request) => {
+                    let request = *request;
+                    let request_id = request.request_id;
+                    let result = self.persist_session(request.snapshot);
+                    self.enqueue_service_result(request_id, result);
                 }
-                PresentationMode::Split => {
-                    log::warn!("Split presentation lands with the shared controller in M10");
+                ViewerEffect::LoadSession(request_id) => {
+                    let result = self.load_session_result();
+                    self.enqueue_service_result(request_id, result);
                 }
-                PresentationMode::Map | PresentationMode::Pov => {}
-            },
-            ViewerAction::TogglePrimaryView => self.toggle_view_mode(),
-            ViewerAction::FocusView(_view) => {
-                // A single native pane is always focused. Split introduces
-                // persistent pane focus in Milestone 10.
-            }
-            ViewerAction::SetSplitRatio(_ratio) => {
-                log::warn!("split ratio ignored before Split presentation lands");
-            }
-            ViewerAction::NudgePossibility { domain, direction } => {
-                let step = match direction {
-                    NudgeDirection::Up => NUDGE_STEP,
-                    NudgeDirection::Down => -NUDGE_STEP,
-                };
-                let dim = &mut self.world.bias[domain.index()];
-                *dim = (*dim + step).clamp(-1.0, 1.0);
-                log::info!("bias {:?} -> {:+.2}", domain, *dim);
-            }
-            ViewerAction::ResetPossibilityBias => {
-                self.world.bias = [0.0; POSSIBILITY_DIMS];
-                log::info!("bias reset");
-            }
-            ViewerAction::DropAnchor(kind) => {
-                // Manual debug anchor: the Phase 1 behaviour is the bound-target
-                // special case — Emphasize pulls the masked domains toward 1.0,
-                // Suppress pushes them away from it (phase-4-plan.md §4.1).
-                let mask = domain_mask(&[
-                    PossibilityDomain::Climate,
-                    PossibilityDomain::Hydrology,
-                    PossibilityDomain::Ecology,
-                ]);
-                self.world.anchors.push(Anchor {
-                    world_pos: self.world.player,
-                    target: bound_target(mask, 1.0),
-                    mask,
-                    kind,
-                    strength: ANCHOR_STRENGTH,
-                    falloff_radius: ANCHOR_RADIUS,
-                    source: AnchorSource::Manual,
-                });
-                log::info!(
-                    "dropped {kind:?} anchor at ({:.0}, {:.0}) ({} total)",
-                    self.world.player.0,
-                    self.world.player.1,
-                    self.world.anchors.len()
-                );
-            }
-            ViewerAction::CaptureAnchor => {
-                // Capture the feature under the player into a run-local anchor
-                // (phase-4-plan.md §7.1): reads the covering region's baseline,
-                // the nearest authoritative slot-0 organism or the environment
-                // channels, and nudges the target toward what makes the
-                // discovery distinctive (ADR 0024).
-                let mask = self.capture_category.mask_bit();
-                match self.world.map.capture_at(
-                    self.world.player,
-                    mask,
-                    self.capture_polarity,
-                    ANCHOR_STRENGTH,
-                    ANCHOR_RADIUS,
-                ) {
-                    Some(anchor) => {
-                        log::info!(
-                            "captured {} {:?} from {:?} ({} anchors)",
-                            self.capture_category.name(),
-                            self.capture_polarity,
-                            anchor.source,
-                            self.world.anchors.len() + 1,
-                        );
-                        self.world.anchors.push(anchor);
+                ViewerEffect::WriteDiscovery(request) => {
+                    let result = self.write_discovery(&request);
+                    self.enqueue_service_result(request.request_id, result);
+                }
+                ViewerEffect::LoadDiscoveries(request_id) => {
+                    let anchors = self.services.vault.as_ref().map(|vault| {
+                        vault
+                            .discoveries()
+                            .values()
+                            .map(world_core::DiscoveryRecord::to_anchor)
+                            .filter(|anchor| !self.controller.world().anchors().contains(anchor))
+                            .collect()
+                    });
+                    let result = anchors.map_or_else(
+                        || self.service_failure("vault-unavailable", "No native vault is open."),
+                        ServiceResponseResult::DiscoveriesLoaded,
+                    );
+                    self.enqueue_service_result(request_id, result);
+                }
+                ViewerEffect::MutatePreserve(request) => {
+                    let result = self.mutate_preserve(request.mutation);
+                    self.enqueue_service_result(request.request_id, result);
+                }
+                ViewerEffect::WriteRoute(request) => {
+                    let result = self.write_route(&request.nodes, &request.discoveries);
+                    self.enqueue_service_result(request.request_id, result);
+                }
+                ViewerEffect::ClearRoutes(request_id) => {
+                    let result = self.clear_routes_result();
+                    self.enqueue_service_result(request_id, result);
+                }
+                ViewerEffect::ConfigurePathTracking {
+                    request_id,
+                    enabled,
+                } => {
+                    log::info!("path tracking {}", if enabled { "on" } else { "off" });
+                    self.enqueue_service_result(request_id, ServiceResponseResult::Completed);
+                }
+                ViewerEffect::OpenAtlasImport(request_id) => {
+                    let result = self.service_failure(
+                        "native-atlas-import",
+                        "Use wer-atlas for native atlas imports.",
+                    );
+                    self.enqueue_service_result(request_id, result);
+                }
+                ViewerEffect::DownloadAtlasBundle(request_id) => {
+                    let result = self.service_failure(
+                        "native-atlas-export",
+                        "Use wer-atlas for native atlas exports.",
+                    );
+                    self.enqueue_service_result(request_id, result);
+                }
+                ViewerEffect::ConfigureWorkerBackend(_) => {
+                    log::warn!("worker backend changes require a native restart");
+                }
+                ViewerEffect::CancelSupersededJobs => {
+                    log::warn!("native task cancellation is scheduler-owned");
+                }
+                ViewerEffect::ConfigureStorage { enabled } => {
+                    if enabled != self.services.vault.is_some() {
+                        log::warn!("native vault availability is fixed when the process starts");
                     }
-                    None => log::info!("nothing capturable under the player yet"),
                 }
-            }
-            ViewerAction::CycleCaptureCategory => {
-                let all = TraitCategory::ALL;
-                let i = all
-                    .iter()
-                    .position(|&c| c == self.capture_category)
-                    .unwrap_or(0);
-                self.capture_category = all[(i + 1) % all.len()];
-                log::info!("capture category: {}", self.capture_category.name());
-            }
-            ViewerAction::ToggleCapturePolarity => {
-                self.capture_polarity = match self.capture_polarity {
-                    AnchorKind::Emphasize => AnchorKind::Suppress,
-                    AnchorKind::Suppress => AnchorKind::Emphasize,
-                };
-                log::info!("capture polarity: {:?}", self.capture_polarity);
-            }
-            ViewerAction::ClearAnchors => {
-                self.world.anchors.clear();
-                log::info!("anchors cleared");
-            }
-            ViewerAction::ToggleTransitionMode => {
-                self.world.transition_mode = !self.world.transition_mode;
-                log::info!(
-                    "movement mode: {}",
-                    if self.world.transition_mode {
-                        "transition (slow, deliberate steering)"
-                    } else {
-                        "free exploration"
-                    }
-                );
-            }
-            ViewerAction::SaveSession => self.world.save_session(),
-            ViewerAction::LoadSession => self.world.load_session(),
-            ViewerAction::RecordLastAnchor => self.world.record_last_anchor(),
-            ViewerAction::SummonDiscoveries => self.world.summon_discoveries(),
-            ViewerAction::TogglePreserve => self.world.toggle_preserve(),
-            ViewerAction::TogglePathTracking => self.world.toggle_path_tracking(),
-            ViewerAction::ToggleRouteRecording => self.world.toggle_route_recording(),
-            ViewerAction::ToggleRouteAttraction => {
-                self.world.route_attraction = !self.world.route_attraction;
-                log::info!(
-                    "route attraction {}",
-                    if self.world.route_attraction {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                );
-            }
-            ViewerAction::ClearRoutes => self.world.clear_routes(),
-            ViewerAction::CycleMapChannel => {
-                self.channel = self.channel.next();
-                log::info!("channel: {}", self.channel.name());
-            }
-            ViewerAction::SetMapChannel(channel) => {
-                self.channel = channel;
-                log::info!("channel: {}", self.channel.name());
-            }
-            ViewerAction::ToggleOverlay(overlay) => {
-                let enabled = !self.overlays.enabled(overlay);
-                self.overlays.set(overlay, enabled);
-            }
-            ViewerAction::ZoomIn => {
-                self.set_zoom((self.zoom * 2).min(MAX_ZOOM));
-            }
-            ViewerAction::ZoomOut => {
-                self.set_zoom((self.zoom / 2).max(1));
-            }
-            ViewerAction::ToggleGpuCompose => {
-                self.gpu_compose = !self.gpu_compose;
-                log::info!(
-                    "map compose: {} (A/B parity toggle, phase-6-plan.md §6.5)",
-                    if self.gpu_compose { "GPU" } else { "CPU" }
-                );
-            }
-            ViewerAction::ToggleRefinement => {
-                self.refinement = !self.refinement;
-                log::info!(
-                    "GPU refinement octaves {}",
-                    if self.refinement { "on" } else { "off" }
-                );
-            }
-            ViewerAction::ToggleWalk => self.toggle_walk(),
-            ViewerAction::TogglePovShadowAo => {
-                self.pov_toggles.shadow_ao = !self.pov_toggles.shadow_ao;
-                log::info!(
-                    "pov: directional shadows and terrain AO {}",
-                    onoff(self.pov_toggles.shadow_ao)
-                );
-            }
-            ViewerAction::TogglePovDetailNormals => {
-                self.pov_toggles.detail_normals = !self.pov_toggles.detail_normals;
-                log::info!(
-                    "pov: detail normals {} (per-fragment lattice hashing)",
-                    onoff(self.pov_toggles.detail_normals)
-                );
-            }
-            ViewerAction::TogglePovWater => {
-                self.pov_toggles.water = !self.pov_toggles.water;
-                log::info!(
-                    "pov: water passes {} (sea plane + river overlays)",
-                    onoff(self.pov_toggles.water)
-                );
-            }
-            ViewerAction::SetPovRenderScale(scale) => {
-                if scale.is_finite() {
-                    self.pov_scale = scale.clamp(0.25, 1.0);
+                ViewerEffect::ResetLocalVault => {
+                    log::warn!("native vault reset is not exposed as an in-view operation");
                 }
-            }
-            ViewerAction::SetResourceTier(tier) => {
-                if tier != self.tier {
-                    log::warn!(
-                        "resource tier changes require a native restart (active: {}, requested: {})",
-                        self.tier.name(),
-                        tier.name()
+                ViewerEffect::SelectMapBackend(backend) => {
+                    log::info!(
+                        "map compose: {}",
+                        if backend == MapBackend::GpuAtlas {
+                            "GPU"
+                        } else {
+                            "CPU"
+                        }
                     );
                 }
-            }
-            ViewerAction::RequestTierBenchmark => {
-                log::warn!("the native shell has no live tier-benchmark service");
-            }
-            ViewerAction::SetWorkerBackend(_backend) => {
-                log::warn!("worker backend changes require a native restart");
-            }
-            ViewerAction::CancelSupersededJobs => {
-                log::warn!("native task cancellation is scheduler-owned");
-            }
-            ViewerAction::SetMapBackend(backend) => {
-                self.gpu_compose = backend == MapBackend::GpuAtlas;
-            }
-            ViewerAction::SetStorageEnabled(enabled) => {
-                if enabled != self.world.vault.is_some() {
-                    log::warn!("native vault availability is fixed when the process starts");
+                ViewerEffect::RunTierBenchmark => {
+                    log::warn!("the native shell has no live tier-benchmark service");
                 }
+                ViewerEffect::ConfigureResourceTier(tier) => {
+                    if tier != self.tier {
+                        log::warn!(
+                            "resource tier changes require a native restart (active: {}, requested: {})",
+                            self.tier.name(),
+                            tier.name()
+                        );
+                    }
+                }
+                ViewerEffect::ReportWarning(warning) => match warning.severity {
+                    Severity::Info => log::info!("{}: {}", warning.id, warning.message),
+                    Severity::Warning => log::warn!("{}: {}", warning.id, warning.message),
+                    Severity::Error => log::error!("{}: {}", warning.id, warning.message),
+                },
             }
-            ViewerAction::ResetLocalVault => {
-                log::warn!("native vault reset is not exposed as an in-view operation");
-            }
-            ViewerAction::RequestAtlasImport | ViewerAction::RequestAtlasExport => {
-                log::warn!("use wer-atlas for native atlas transfers");
-            }
-            ViewerAction::RequestDebugDump => return NativeActionEffect::DebugDump,
-            ViewerAction::RequestExit => return NativeActionEffect::Exit,
         }
-        NativeActionEffect::None
     }
 
-    fn set_zoom(&mut self, zoom: u32) {
-        let before = self.zoom;
-        self.zoom = zoom.clamp(1, MAX_ZOOM);
-        if self.zoom != before {
-            log::info!(
-                "zoom x{}{}",
-                self.zoom,
-                if self.zoom >= ORGANISM_INFO_ZOOM {
-                    " (organism picking active)"
-                } else {
-                    ""
-                }
+    fn enqueue_service_result(
+        &mut self,
+        request_id: ServiceRequestId,
+        result: ServiceResponseResult,
+    ) {
+        let response = self.services.response(request_id, result);
+        self.controller.enqueue_service_response(response);
+    }
+
+    fn service_failure(
+        &self,
+        id: &'static str,
+        message: impl Into<String>,
+    ) -> ServiceResponseResult {
+        ServiceResponseResult::Failed(ViewerWarning {
+            id,
+            message: message.into(),
+            severity: Severity::Warning,
+        })
+    }
+
+    fn persist_session(
+        &mut self,
+        snapshot: world_runtime::SessionSnapshotOwnedInput,
+    ) -> ServiceResponseResult {
+        let Some(vault) = self.services.vault.as_mut() else {
+            return self.service_failure("vault-unavailable", "No native vault is open.");
+        };
+        let region_count = snapshot.regions.len();
+        let anchor_count = snapshot.anchors.len();
+        if let Err(error) = vault.snapshot_session_owned(snapshot) {
+            return self.service_failure(
+                "session-save-rejected",
+                format!("Session save was rejected: {error}"),
             );
+        }
+        match vault.flush_all() {
+            Ok(stats) => {
+                self.services.vault_stats = stats;
+                self.services.vault_failure_logged = false;
+                log::info!(
+                    "session saved: {} records, {} bytes ({} regions, {} anchors)",
+                    stats.flushed,
+                    stats.bytes,
+                    region_count,
+                    anchor_count
+                );
+                ServiceResponseResult::Completed
+            }
+            Err(error) => {
+                self.services.vault_stats = error.progress();
+                self.services.vault_failure_logged = true;
+                self.service_failure(
+                    "session-save-failed",
+                    format!("Session save failed; dirty records remain retryable: {error}"),
+                )
+            }
+        }
+    }
+
+    fn load_session_result(&self) -> ServiceResponseResult {
+        let Some(vault) = self.services.vault.as_ref() else {
+            return self.service_failure("vault-unavailable", "No native vault is open.");
+        };
+        let Some(snapshot) = vault.session().cloned() else {
+            return self
+                .service_failure("session-missing", "No saved session exists in the vault.");
+        };
+        let world = self.controller.world();
+        let compatibility = compare_session_runtime(
+            &snapshot.runtime,
+            world.map().config(),
+            world.budget(),
+            Some(world.tier()),
+            world.path_tracking(),
+            world.route_attraction(),
+        );
+        let stream_config = if compatibility == SessionCompatibility::Exact {
+            match stream_config_from_record(&snapshot.runtime.stream) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    log::warn!(
+                        "session stream config is not representable on this platform ({error:?}); using current config"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let preserve_contributions = vault
+            .preserves()
+            .iter()
+            .flat_map(|(&id, preserve)| {
+                preserve
+                    .regions
+                    .iter()
+                    .map(move |&(coord, signature)| (id, coord, signature))
+            })
+            .collect();
+        ServiceResponseResult::SessionLoaded(LoadedSession {
+            snapshot: Box::new(snapshot),
+            stream_config,
+            restore_route_state: compatibility != SessionCompatibility::Incompatible,
+            preserve_contributions,
+        })
+    }
+
+    fn write_discovery(
+        &mut self,
+        request: &viewer_host::action::DiscoveryWriteRequest,
+    ) -> ServiceResponseResult {
+        let Some(vault) = self.services.vault.as_mut() else {
+            return self.service_failure("vault-unavailable", "No native vault is open.");
+        };
+        let name = format!("discovery-{}", vault.discoveries().len() + 1);
+        match vault.record_discovery(&request.anchor, request.signature_seed, name.clone()) {
+            Ok(id) => {
+                log::info!("recorded {name} ({id:#018x}) into the vault");
+                ServiceResponseResult::DiscoveryWritten { id }
+            }
+            Err(error) => self.service_failure(
+                "discovery-write-failed",
+                format!("Discovery was not recorded: {error}"),
+            ),
+        }
+    }
+
+    fn mutate_preserve(&mut self, mutation: PreserveMutation) -> ServiceResponseResult {
+        let Some(vault) = self.services.vault.as_mut() else {
+            return self.service_failure("vault-unavailable", "No native vault is open.");
+        };
+        match mutation {
+            PreserveMutation::Create { regions } => {
+                let name = format!("preserve-{}", vault.preserves().len() + 1);
+                match vault.record_preserve(regions.clone(), name.clone()) {
+                    Ok(id) => {
+                        log::info!(
+                            "created {name} ({id:#018x}): {} regions pinned",
+                            regions.len()
+                        );
+                        ServiceResponseResult::PreserveCreated { id, regions }
+                    }
+                    Err(error) => self.service_failure(
+                        "preserve-create-failed",
+                        format!("Preserve was not created: {error}"),
+                    ),
+                }
+            }
+            PreserveMutation::Remove { id } => {
+                let Some(record) = vault.preserves().get(&id).cloned() else {
+                    return self.service_failure(
+                        "preserve-owner-missing",
+                        format!("Runtime preserve owner {id:#018x} is absent from the vault."),
+                    );
+                };
+                match vault.remove_preserve(id) {
+                    Ok(true) => {
+                        let regions = record.regions.iter().map(|(coord, _)| *coord).collect();
+                        log::info!("deleted preserve {} ({id:#018x})", record.name);
+                        ServiceResponseResult::PreserveRemoved { id, regions }
+                    }
+                    Ok(false) => self.service_failure(
+                        "preserve-owner-missing",
+                        format!("Preserve {id:#018x} disappeared before removal."),
+                    ),
+                    Err(error) => self.service_failure(
+                        "preserve-remove-failed",
+                        format!("Preserve deletion failed; runtime state retained: {error}"),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn write_route(
+        &mut self,
+        nodes: &[world_core::RouteNode],
+        discoveries: &[u64],
+    ) -> ServiceResponseResult {
+        let Some(vault) = self.services.vault.as_mut() else {
+            return self.service_failure("vault-unavailable", "No native vault is open.");
+        };
+        let name = format!("route-{}", vault.routes().len() + 1);
+        let difficulty = world_core::route_difficulty(nodes);
+        match vault.record_route(nodes.to_vec(), discoveries.to_vec(), name.clone()) {
+            Ok(id) => {
+                log::info!(
+                    "recorded {name} ({id:#018x}): {} nodes, difficulty {difficulty:.2}",
+                    nodes.len()
+                );
+                ServiceResponseResult::Completed
+            }
+            Err(error) => self.service_failure(
+                "route-write-failed",
+                format!("Route was discarded: {error}"),
+            ),
+        }
+    }
+
+    fn clear_routes_result(&mut self) -> ServiceResponseResult {
+        let Some(vault) = self.services.vault.as_mut() else {
+            return self.service_failure("vault-unavailable", "No native vault is open.");
+        };
+        let ids: Vec<_> = vault.routes().keys().copied().collect();
+        let total = ids.len();
+        let mut removed = 0;
+        let mut failure = None;
+        for id in ids {
+            match vault.remove_route(id) {
+                Ok(true) => removed += 1,
+                Ok(false) => unreachable!("route id came from the vault"),
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let remaining_route_ids = vault.routes().keys().copied().collect();
+        let warning = failure.map(|error| ViewerWarning {
+            id: "route-clear-partial",
+            message: format!(
+                "Route clear stopped after {removed}/{total} durable removal(s): {error}"
+            ),
+            severity: Severity::Warning,
+        });
+        ServiceResponseResult::RoutesCleared {
+            remaining_route_ids,
+            warning,
         }
     }
 
     /// The panel's vault counters, shared by the live frame and the `F12`
     /// debug dump.
     fn vault_panel_info(&self) -> Option<VaultInfo> {
-        self.world.vault.as_ref().map(|v| VaultInfo {
+        self.services.vault.as_ref().map(|v| VaultInfo {
             records: v.discoveries().len() + v.routes().len() + v.preserves().len(),
             dirty: v.dirty_records(),
             seen: v.seen_count(),
@@ -1378,10 +870,11 @@ impl App {
     /// §11): the visible window's discovered set, preserve outlines, and
     /// route polylines. Empty when no vault is open.
     fn build_decor(&self) -> MapDecor {
-        let Some(vault) = self.world.vault.as_ref() else {
+        let Some(vault) = self.services.vault.as_ref() else {
             return MapDecor::default();
         };
-        let center = RegionCoord::from_world(self.world.player.0, self.world.player.1);
+        let traveler = self.controller.world().traveler().position;
+        let center = RegionCoord::from_world(traveler.0, traveler.1);
         let half = self.composer.half_regions();
         let mut seen = std::collections::BTreeSet::new();
         for dy in -half..=half {
@@ -1400,7 +893,7 @@ impl App {
         // Route polylines are part of the optional path subsystem: while
         // tracking is off the map shows no paths (the records stay in the
         // vault, just undrawn).
-        let routes = if self.world.path_tracking {
+        let routes = if self.controller.world().path_tracking() {
             vault
                 .routes()
                 .values()
@@ -1519,7 +1012,8 @@ impl App {
         let scale = f64::from(vw) / f64::from(image.0);
         let ix = (mx - f64::from(vx)) / scale;
         let iy = (my - f64::from(vy)) / scale;
-        self.composer.pixel_to_world(self.world.player, ix, iy)
+        self.composer
+            .pixel_to_world(self.controller.world().traveler().position, ix, iy)
     }
 
     /// Roll per-frame timings into the once-a-second fps / update-time
@@ -1574,43 +1068,42 @@ impl App {
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f64().min(0.1);
+        let dt = (now - self.last_frame).as_secs_f64();
         self.last_frame = now;
 
-        // Actions are normally drained immediately after each raw event so a
-        // following event observes the new view context. This second drain is
-        // the shared path for future button/controller producers.
-        self.process_actions(event_loop);
+        self.enqueue_actions();
+        let previous_layout = self.controller.layout();
         let context = self.input_context();
         self.input.set_context(context);
         let input = self.input.take_frame();
         self.cursor_pos = input.map_pointer.map(|point| (point[0], point[1]));
-        if self.view_mode == ViewMode::Pov {
-            self.pov_camera
-                .look(input.look_delta[0], input.look_delta[1]);
-            for _ in 0..input.wheel_steps.max(0) {
-                self.pov_camera.scroll_speed(true);
-            }
-            for _ in 0..(-input.wheel_steps).max(0) {
-                self.pov_camera.scroll_speed(false);
-            }
-        }
-
-        match self.view_mode {
-            ViewMode::Map => self.apply_movement(input, dt),
-            ViewMode::Pov => {
-                // The POV camera *is* the player (plan §8.1): recenter the
-                // world before `update` so streaming, retarget, and
-                // realization follow the camera — travel-fueled drift works
-                // identically to map-mode travel.
-                self.apply_pov_movement(input, dt);
-                self.world.player = (self.pov_camera.pos.x, self.pov_camera.pos.y);
-            }
-        }
-
         let update_start = Instant::now();
-        let stats = self.world.update();
+        let ground = NativeGroundSampler {
+            chunks: &self.pov_chunks,
+        };
+        let mut output = self.controller.tick(
+            TickInput {
+                dt_seconds: dt,
+                input,
+                platform: PlatformTelemetry {
+                    present_ms: self.render_ms,
+                    dom_updates: 0,
+                    surface_format: None,
+                    executor_backend: if self.executor.parallelism() == 1 {
+                        WorkerBackend::Inline
+                    } else {
+                        WorkerBackend::Workers
+                    },
+                    workers: self.executor.parallelism(),
+                    storage_available: self.services.vault.is_some(),
+                },
+            },
+            self.executor.as_ref(),
+            &mut self.services,
+            &ground,
+        );
         let update_seconds = update_start.elapsed().as_secs_f64();
+        let stats = output.stats;
         self.last_stats = stats;
         for (total, &count) in self
             .regen_totals
@@ -1620,49 +1113,66 @@ impl App {
             *total += count as u64;
         }
 
-        if self.view_mode == ViewMode::Pov {
-            self.frame_pov(stats, update_seconds);
+        let context = self.input_context();
+        self.input.set_context(context);
+        if previous_layout.focused == ViewKind::Pov && output.focused != ViewKind::Pov {
+            self.input.handle_event(
+                NormalizedInputEvent::PointerCancelled {
+                    pointer: input::MOUSE_POINTER_ID,
+                },
+                context,
+            );
+        }
+        self.handle_effects(std::mem::take(&mut output.effects), event_loop);
+
+        if output.mode == PresentationMode::Pov {
+            self.frame_pov(&output, update_seconds);
             return;
         }
 
         let cursor_world = self.cursor_world();
-        let cursor = cursor_world.map(|world| Self::sample_cursor(&self.world.map, world));
+        let cursor =
+            cursor_world.map(|world| Self::sample_cursor(self.controller.world().map(), world));
         // Zoomed in far enough, the cursor picks the organism marker under it
         // (the region info stays whenever no organism is under the mouse).
-        let organism = if self.zoom >= ORGANISM_INFO_ZOOM {
-            cursor_world.and_then(|world| Self::pick_organism(&self.world.map, world))
+        let organism = if output.map.zoom >= ORGANISM_INFO_ZOOM {
+            cursor_world.and_then(|world| Self::pick_organism(self.controller.world().map(), world))
         } else {
             None
         };
 
         let decor = self.build_decor();
-        let gpu_channel = gpumap::gpu_channel(self.channel);
+        let gpu_channel = gpumap::gpu_channel(output.map.channel);
         // A zoomed view composes on the CPU: the GPU shader has no zoom
         // transform, and the CPU path magnifies field and overlays together.
-        self.composer.set_zoom(self.zoom);
-        let use_gpu =
-            self.gpu_compose && self.zoom == 1 && gpu_channel.is_some() && self.renderer.is_some();
+        self.composer.set_zoom(output.map.zoom);
+        let use_gpu = output.map.backend == MapBackend::GpuAtlas
+            && output.map.zoom == 1
+            && gpu_channel.is_some()
+            && self.renderer.is_some();
         let compose_start = Instant::now();
         if use_gpu {
             // GPU path (phase-6-plan.md §6.5): CPU draws only the sparse
             // overlay; the field false-color composes per screen pixel from
             // the atlas.
             self.composer.compose_overlays(
-                &self.world.map,
-                self.world.player,
-                self.overlays,
+                self.controller.world().map(),
+                output.traveler,
+                output.map.overlays,
                 &decor,
             );
         } else {
             self.composer.compose(
-                &self.world.map,
-                self.world.player,
-                self.channel,
-                self.overlays,
-                &self.world.anchors,
+                self.controller.world().map(),
+                output.traveler,
+                output.map.channel,
+                output.map.overlays,
+                self.controller.world().anchors(),
                 &decor,
             );
         }
+        let capture = self.controller.capture_preferences();
+        let world = self.controller.world();
         let info = PanelInfo {
             fps: self.fps,
             update_ms: self.update_ms,
@@ -1671,25 +1181,25 @@ impl App {
             upload_kb: self.upload_kb,
             gpu_compose: use_gpu,
             tier: self.tier.name(),
-            cache_ceiling_bytes: self.world.map.config().max_field_cache_bytes,
+            cache_ceiling_bytes: world.map().config().max_field_cache_bytes,
             pass_ms: self.pass_ms,
-            workers: self.world.executor.parallelism(),
+            workers: self.executor.parallelism(),
             stats,
             regen_totals: &self.regen_totals,
-            macro_tiles: self.world.map.macro_cache().len(),
-            rosters: self.world.map.roster_cache().len(),
-            organisms: self.world.map.organism_count(),
-            jobs_in_flight: self.world.map.jobs_in_flight(),
+            macro_tiles: world.map().macro_cache().len(),
+            rosters: world.map().roster_cache().len(),
+            organisms: world.map().organism_count(),
+            jobs_in_flight: world.map().jobs_in_flight(),
             pinned_violations: self.composer.pinned_violations,
-            channel: self.channel,
-            player: self.world.player,
-            bias: &self.world.bias,
-            anchors: &self.world.anchors,
-            capture_category: self.capture_category.name(),
-            capture_polarity: self.capture_polarity,
-            transition_mode: self.world.transition_mode,
+            channel: output.map.channel,
+            player: output.traveler,
+            bias: world.bias(),
+            anchors: world.anchors(),
+            capture_category: capture.category.name(),
+            capture_polarity: capture.polarity,
+            transition_mode: world.transition_mode(),
             vault: self.vault_panel_info(),
-            zoom: self.zoom,
+            zoom: output.map.zoom,
             cursor,
             organism,
         };
@@ -1709,15 +1219,15 @@ impl App {
             let overlay_changed = overlay_hash != self.overlay_hash;
             self.overlay_hash = overlay_hash;
 
-            let center = RegionCoord::from_world(self.world.player.0, self.world.player.1);
+            let center = RegionCoord::from_world(output.traveler.0, output.traveler.1);
             let half = self.composer.half_regions();
-            let res = self.world.map.config().field_resolution;
-            let (slots, uploads) = self.atlas.sync(&self.world.map, center, half, res);
+            let res = world.map().config().field_resolution;
+            let (slots, uploads) = self.atlas.sync(world.map(), center, half, res);
             let (west, north) = (
                 f64::from(center.x - half) * REGION_SIZE,
                 f64::from(center.y + half + 1) * REGION_SIZE,
             );
-            let (refine, refine_count) = if self.refinement {
+            let (refine, refine_count) = if output.map.refinement {
                 gpumap::refinement_octaves(west, north, res, 3)
             } else {
                 (Default::default(), 0)
@@ -1726,7 +1236,7 @@ impl App {
                 half_regions: half,
                 resolution: u32::from(res),
                 channel: gpu_channel.expect("use_gpu checked"),
-                grid: self.overlays.grid,
+                grid: output.map.overlays.grid,
                 refine,
                 refine_count,
             };
@@ -1766,21 +1276,23 @@ impl App {
     /// chunk lifecycle, build the frame parameters with glam, and present
     /// through [`Renderer::render_pov`]. HUD, panel, and cursor info are
     /// skipped in POV (design §2.1); the telemetry accumulators still run.
-    fn frame_pov(&mut self, mut stats: FrameStats, update_seconds: f64) {
+    fn frame_pov(&mut self, output: &TickOutput, update_seconds: f64) {
+        let mut stats = output.stats;
+        let camera = self.controller.pov_camera();
         // The frame-side POV work (scheduling + amortized integration) fills
         // the Mesh pass, following the Flush precedent (plan §8.1); the
         // worker-side mesh milliseconds ride the manager's counters instead.
         let mesh_start = Instant::now();
         let (uploads, removes) = self.pov_chunks.sync(
-            &self.world.map,
-            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            self.controller.world().map(),
+            (camera.pos.x, camera.pos.y),
             self.pov_radius,
-            self.world.executor.as_ref(),
+            self.executor.as_ref(),
         );
         let organisms_changed = self.pov_organisms.sync(
-            &self.world.map,
+            self.controller.world().map(),
             &self.pov_chunks,
-            (self.pov_camera.pos.x, self.pov_camera.pos.y),
+            (camera.pos.x, camera.pos.y),
             pov::pov_fog_end(self.pov_radius),
         );
         let organism_upload = organisms_changed.then(|| self.pov_organisms.upload());
@@ -1808,17 +1320,17 @@ impl App {
                 .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
             let resolution = pov::shadow_resolution(self.tier);
             let shadow = pov::shadow_frame(
-                &self.pov_camera,
+                self.controller.pov_camera(),
                 &self.pov_chunks,
                 self.pov_organisms.shadow_bounds(),
                 resolution,
             );
             let params = pov::frame_params(
-                &self.pov_camera,
+                self.controller.pov_camera(),
                 w as f32 / h.max(1) as f32,
                 self.pov_radius,
                 time,
-                self.pov_toggles,
+                self.controller.pov_toggles(),
                 shadow,
             );
             // The corner HUD chip: fps plus the frame-budget split — `upd`
@@ -1846,7 +1358,7 @@ impl App {
                 organism_upload,
                 CLEAR_COLOR,
                 hud,
-                self.pov_scale,
+                output.pov.render_scale,
             );
             organism_buffer_stats = renderer.pov_organism_stats();
             if let Some(buffers) = organism_buffer_stats {
@@ -1865,16 +1377,17 @@ impl App {
             // The mode tail: the walk form's mesh-vs-analytic tag is the
             // observable for the frontier-fallback exit criterion
             // (3d-phase-2-plan.md §6.2).
-            let mode = if self.pov_camera.walk {
+            let camera = self.controller.pov_camera();
+            let mode = if camera.walk {
                 let (ground, mesh) = self.pov_ground();
                 format!(
                     "walk {:.0}u/s (ground {:.1}, {})",
-                    self.pov_camera.walk_speed,
+                    camera.walk_speed,
                     ground,
                     if mesh { "mesh" } else { "analytic" }
                 )
             } else {
-                format!("fly {:.0}u/s", self.pov_camera.speed)
+                format!("fly {:.0}u/s", camera.speed)
             };
             let buffers = organism_buffer_stats.map_or_else(
                 || String::from("gpu buffers pending"),
@@ -1944,16 +1457,6 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        // `WER_START=x,y`: spawn the player at a world position — jump
-        // straight to a scene of interest (a coast, a river) for debugging
-        // and measurements without flying there first.
-        if let Ok(v) = std::env::var("WER_START") {
-            if let Some((x, y)) = v.split_once(',') {
-                if let (Ok(x), Ok(y)) = (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
-                    self.world.player = (x, y);
-                }
-            }
-        }
         let size = window.inner_size();
         // The renderer gets a source of fresh surface targets (not a single
         // surface) so it can rebuild the swapchain if the platform loses it —
@@ -1969,22 +1472,23 @@ impl ApplicationHandler for App {
         log::info!(
             "world algorithm version {} | streaming {:?}",
             world_core::WORLD_ALGORITHM_VERSION,
-            self.world.map.config()
+            self.controller.world().map().config()
         );
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        // `WER_POV=1` starts directly in POV (plan §8.5).
-        if self.view_mode == ViewMode::Pov {
-            let ground = pov::entry_ground(&self.world.map, self.world.player);
-            self.pov_camera.enter_at(self.world.player, ground);
-            log::info!("starting in POV (WER_POV set), radius {}", self.pov_radius);
+        let notification = self.services.pov_availability(true);
+        self.controller.enqueue_service_notification(notification);
+        if std::env::var_os("WER_CPU_MAP").is_none() {
+            self.controller
+                .enqueue_action(ViewerAction::SetMapBackend(MapBackend::GpuAtlas));
         }
-        if self.pov_scale < 1.0 {
+        let pov_scale = self.controller.pov_state().render_scale;
+        if pov_scale < 1.0 {
             log::info!(
                 "POV render scale {} (WER_POV_SCALE): 3D rasterizes at {:.0}% of the window pixels",
-                self.pov_scale,
-                f64::from(self.pov_scale * self.pov_scale) * 100.0
+                pov_scale,
+                f64::from(pov_scale * pov_scale) * 100.0
             );
         }
         self.last_frame = Instant::now();
@@ -1993,8 +1497,10 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.input.enqueue_action(ViewerAction::RequestExit);
-                self.process_actions(event_loop);
+                self.controller.enqueue_action(ViewerAction::RequestExit);
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -2010,9 +1516,8 @@ impl ApplicationHandler for App {
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let event = self
-                    .winit_input
-                    .cursor_moved(position, self.view_mode.view_kind());
+                let focused = self.input_context().focused;
+                let event = self.winit_input.cursor_moved(position, focused);
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::CursorLeft { .. } => {
@@ -2020,15 +1525,14 @@ impl ApplicationHandler for App {
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if let Some(event) =
-                    self.winit_input
-                        .mouse_input(state, button, self.view_mode.view_kind())
-                {
+                let focused = self.input_context().focused;
+                if let Some(event) = self.winit_input.mouse_input(state, button, focused) {
                     self.handle_input_event(event, event_loop);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let event = self.winit_input.wheel(delta, self.view_mode.view_kind());
+                let focused = self.input_context().focused;
+                let event = self.winit_input.wheel(delta, focused);
                 self.handle_input_event(event, event_loop);
             }
             WindowEvent::KeyboardInput {
@@ -2368,14 +1872,6 @@ fn run_pov_script(script: &str) -> Result<(), String> {
 }
 
 /// "on"/"off" for toggle log lines.
-fn onoff(v: bool) -> &'static str {
-    if v {
-        "on"
-    } else {
-        "off"
-    }
-}
-
 /// Build the event loop, preferring X11 over Wayland under WSL.
 ///
 /// WSLg's Wayland compositor resets the client connection a few seconds after
@@ -2573,6 +2069,91 @@ mod preserve_lifecycle_tests {
         }
     }
 
+    #[derive(Debug)]
+    enum TestPreserveRemovalError {
+        MissingVaultRecord,
+        Persistence,
+    }
+
+    fn remove_effective_preserve<S: Storage>(
+        map: &mut RegionMap,
+        vault: &mut Vault<S>,
+        coord: RegionCoord,
+    ) -> Result<Option<(u64, String)>, TestPreserveRemovalError> {
+        let Some((id, _)) = map.effective_preserve(coord) else {
+            return Ok(None);
+        };
+        let Some(record) = vault.preserves().get(&id).cloned() else {
+            return Err(TestPreserveRemovalError::MissingVaultRecord);
+        };
+        let removed = vault
+            .remove_preserve(id)
+            .map_err(|_| TestPreserveRemovalError::Persistence)?;
+        assert!(removed);
+        for (region, _) in record.regions {
+            map.remove_preserve_contribution(id, region);
+        }
+        Ok(Some((id, record.name)))
+    }
+
+    #[derive(Debug)]
+    struct TestRouteRemovalOutcome {
+        removed: usize,
+        total: usize,
+        error: Option<VaultPersistenceError>,
+    }
+
+    fn remove_routes<S: Storage>(
+        vault: &mut Vault<S>,
+        tracker: &mut RouteTracker,
+    ) -> TestRouteRemovalOutcome {
+        let ids: Vec<_> = vault.routes().keys().copied().collect();
+        let total = ids.len();
+        let mut removed = 0;
+        let mut error = None;
+        for id in ids {
+            match vault.remove_route(id) {
+                Ok(true) => removed += 1,
+                Ok(false) => unreachable!("route id came from the vault"),
+                Err(found) => {
+                    error = Some(found);
+                    break;
+                }
+            }
+        }
+        tracker.retain(|id| vault.routes().contains_key(&id));
+        TestRouteRemovalOutcome {
+            removed,
+            total,
+            error,
+        }
+    }
+
+    struct TestVaultHook<S: Storage> {
+        vault: Vault<S>,
+    }
+
+    impl<S: Storage> WorldTickHook for TestVaultHook<S> {
+        fn before_world_update(&mut self, input: WorldPreUpdate<'_>) -> WorldServiceInput {
+            WorldServiceInput {
+                derived_anchors: if input.path_tracking && input.route_attraction {
+                    world_core::attraction_anchors(
+                        self.vault.routes().values(),
+                        input.traveler,
+                        input.budget.max_route_attraction_nodes,
+                    )
+                } else {
+                    Vec::new()
+                },
+                active_routes: if input.path_tracking {
+                    self.vault.routes().values().cloned().collect()
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+    }
+
     #[test]
     fn native_deletion_removes_effective_owner_and_reveals_successor() {
         let coord = RegionCoord::new(0, 0);
@@ -2652,7 +2233,7 @@ mod preserve_lifecycle_tests {
         control.fail_remove_call(0);
         assert!(matches!(
             remove_effective_preserve(&mut map, &mut vault, coord),
-            Err(PreserveRemovalError::Persistence(_))
+            Err(TestPreserveRemovalError::Persistence)
         ));
         assert!(vault.preserves().contains_key(&winner_id));
         assert_eq!(
@@ -2777,69 +2358,113 @@ mod preserve_lifecycle_tests {
             if reverse_explicit {
                 explicit.reverse();
             }
-            let mut world = World {
-                map: RegionMap::new(tier.stream_config()),
-                field: PossibilityField::default(),
-                anchors: Vec::new(),
-                bias: [0.0; POSSIBILITY_DIMS],
-                player: (0.0, 0.0),
-                last_player: (0.0, 0.0),
-                transition_mode: false,
-                vault: Some(vault),
-                vault_stats: VaultStats::default(),
-                vault_failure_logged: false,
-                recorder: None,
-                tracker: RouteTracker::new(),
-                path_tracking: false,
-                route_attraction: true,
-                executor: Box::new(world_runtime::InlineExecutor),
-                budget: tier.budget(),
-                tier,
+            let mut hook = TestVaultHook { vault };
+            let mut controller = ViewerController::new(ExplorationWorld::new(tier));
+            let tick = |controller: &mut ViewerController,
+                        hook: &mut TestVaultHook<FileStorage>| {
+                controller.tick(
+                    TickInput::default(),
+                    &world_runtime::InlineExecutor,
+                    hook,
+                    &viewer_host::controller::AnalyticGroundSampler,
+                )
             };
-            // Publish canonical organisms and establish the unsteered current
-            // before the same effective slice refreshes target and resonance.
+            // Publish canonical organisms and establish the unsteered current.
             for _ in 0..128 {
-                world.update();
-                if world.map.authoritative_realization_complete(world.player) {
+                tick(&mut controller, &mut hook);
+                if controller
+                    .world()
+                    .map()
+                    .authoritative_realization_complete((0.0, 0.0))
+                {
                     break;
                 }
             }
-            assert!(world.map.authoritative_realization_complete(world.player));
-            world.anchors = explicit;
-            world.path_tracking = true;
-            world.recorder = Some(RouteRecorder::new());
+            assert!(controller
+                .world()
+                .map()
+                .authoritative_realization_complete((0.0, 0.0)));
 
-            let vault = world.vault.as_ref().unwrap();
             let derived = world_core::attraction_anchors(
-                vault.routes().values(),
-                world.player,
-                world.budget.max_route_attraction_nodes,
+                hook.vault.routes().values(),
+                (0.0, 0.0),
+                controller.world().budget().max_route_attraction_nodes,
             );
             assert_eq!(derived.len(), 32);
             assert!(derived
                 .iter()
                 .all(|anchor| anchor.strength < world_core::route_pull(0)));
-            assert!(world_core::anchor_influence_profile(&derived, world.player)
+            assert!(world_core::anchor_influence_profile(&derived, (0.0, 0.0))
                 .into_iter()
                 .all(|pull| pull <= world_core::ROUTE_PULL_CAP));
-            let mut effective = world.anchors.clone();
+            let mut effective = explicit.clone();
             let explicit_only = world_core::anchor_set_signature(&effective);
             effective.extend(derived.iter().copied());
             let expected_signature = world_core::anchor_set_signature(&effective);
             assert_ne!(expected_signature, explicit_only);
 
-            let stats = world.update();
-            let resonance = world.map.resonance_at(world.player, &effective);
+            controller.enqueue_action(ViewerAction::SummonDiscoveries);
+            let load_request = tick(&mut controller, &mut hook)
+                .effects
+                .into_iter()
+                .find_map(|effect| match effect {
+                    ViewerEffect::LoadDiscoveries(id) => Some(id),
+                    _ => None,
+                })
+                .expect("summon emits a discovery-load request");
+            controller.enqueue_service_response(ServiceResponse {
+                sequence: ServiceResponseSequence(1),
+                request_id: load_request,
+                result: ServiceResponseResult::DiscoveriesLoaded(explicit),
+            });
+            controller.enqueue_action(ViewerAction::TogglePathTracking);
+            controller.enqueue_action(ViewerAction::ToggleRouteRecording);
+            let recorded = tick(&mut controller, &mut hook);
+            let stats = recorded.stats;
+            let world = controller.world();
+            let resonance = world.map().resonance_at((0.0, 0.0), &effective);
             assert!(!resonance.nodes.is_empty());
             assert!(resonance.anchor_compatibility < 1.0);
             assert_eq!(
                 stats.resonance_strength.to_bits(),
                 resonance.strength.to_bits()
             );
-            let coord = RegionCoord::from_world(world.player.0, world.player.1);
-            let target_bits = world.map.get(coord).unwrap().target.dims.map(f32::to_bits);
-            let (nodes, discoveries) = world.recorder.take().unwrap().finish();
-            assert_eq!(nodes.len(), 1);
+            let coord = RegionCoord::from_world(0.0, 0.0);
+            let target_bits = world
+                .map()
+                .get(coord)
+                .unwrap()
+                .target
+                .dims
+                .map(f32::to_bits);
+
+            for _ in 0..4 {
+                controller.tick(
+                    TickInput {
+                        dt_seconds: 0.1,
+                        input: InputFrame {
+                            map_axis: [1, 0],
+                            ..InputFrame::default()
+                        },
+                        platform: PlatformTelemetry::default(),
+                    },
+                    &world_runtime::InlineExecutor,
+                    &mut hook,
+                    &viewer_host::controller::AnalyticGroundSampler,
+                );
+            }
+            controller.enqueue_action(ViewerAction::ToggleRouteRecording);
+            let route_request = tick(&mut controller, &mut hook)
+                .effects
+                .into_iter()
+                .find_map(|effect| match effect {
+                    ViewerEffect::WriteRoute(request) => Some(request),
+                    _ => None,
+                })
+                .expect("finishing the recording emits its durable request");
+            let nodes = route_request.nodes;
+            let discoveries = route_request.discoveries;
+            assert!(nodes.len() >= 2);
             assert_eq!(nodes[0].anchor_sig, expected_signature);
             assert_eq!(
                 nodes[0].cost_q,
@@ -2873,7 +2498,8 @@ mod preserve_lifecycle_tests {
                 strength_bits,
             );
 
-            drop(world);
+            drop(controller);
+            drop(hook);
             std::fs::remove_dir_all(path).unwrap();
             image
         };
@@ -2950,6 +2576,81 @@ mod alignment_characterization_tests {
 
     fn option_f32_bits(value: Option<f32>) -> String {
         value.map_or_else(|| String::from("none"), |v| format!("{:08x}", v.to_bits()))
+    }
+
+    fn tick_controller(controller: &mut ViewerController, input: InputFrame) {
+        let mut hook = viewer_host::world::NoopWorldTickHook;
+        controller.tick(
+            TickInput {
+                dt_seconds: 0.0,
+                input,
+                platform: PlatformTelemetry::default(),
+            },
+            &InlineExecutor,
+            &mut hook,
+            &viewer_host::controller::AnalyticGroundSampler,
+        );
+    }
+
+    #[test]
+    fn native_adapter_controller_trace_matches_the_wasm_golden() {
+        let adapter = input::WinitInputAdapter::default();
+        let mut mapper = InputMapper::default();
+        let mut controller = ViewerController::new(ExplorationWorld::with_runtime(
+            StreamConfig {
+                near_radius: 0.0,
+                far_radius: 0.0,
+                load_radius: 0.0,
+                unload_radius: 1.0,
+                ..StreamConfig::default()
+            },
+            Budget::unlimited(),
+            ResourceTier::Low,
+        ));
+        controller.enqueue_service_notification(ServiceNotification::PovAvailability {
+            sequence: ServiceResponseSequence(1),
+            supported: true,
+            reason: None,
+        });
+
+        for key in [KeyCode::KeyW, KeyCode::Tab, KeyCode::KeyB] {
+            let event = adapter
+                .key_event(key, ElementState::Pressed, false)
+                .expect("trace key is supported by the native adapter");
+            assert!(mapper.handle_event(event, controller.input_context(true)));
+            for action in mapper.drain_actions() {
+                controller.enqueue_action(action);
+            }
+        }
+
+        let preview = controller.input_context(true);
+        assert_eq!(preview.mode, PresentationMode::Pov);
+        assert_eq!(preview.focused, ViewKind::Pov);
+        mapper.set_context(preview);
+        let input = mapper.take_frame();
+        assert_eq!(input.map_axis, [0, 0]);
+        assert_eq!(input.pov_axis, [0, 1, 0]);
+        let mut hook = viewer_host::world::NoopWorldTickHook;
+        let output = controller.tick(
+            TickInput {
+                dt_seconds: 0.1,
+                input,
+                platform: PlatformTelemetry::default(),
+            },
+            &InlineExecutor,
+            &mut hook,
+            &viewer_host::controller::AnalyticGroundSampler,
+        );
+
+        assert_eq!(output.update_serial, 1);
+        assert_eq!(output.mode, PresentationMode::Pov);
+        assert_eq!(output.focused, ViewKind::Pov);
+        assert_eq!(
+            format!("[{:.3},{:.3}]", output.traveler.0, output.traveler.1),
+            "[-0.000,4.000]"
+        );
+        assert_eq!(output.travel, 4.0);
+        assert!(!output.pov.shadow_ao);
     }
 
     #[test]
@@ -3149,7 +2850,7 @@ mod alignment_characterization_tests {
     }
 
     /// A semantic Map/POV trace through the production winit adapter, shared
-    /// mapper, and typed App reducer. It freezes held movement, diagonal
+    /// mapper, and shared controller reducer. It freezes held movement, diagonal
     /// normalization, one-shot repeat suppression, fractional wheels, and
     /// primary-held POV look without retaining a second binding authority.
     #[test]
@@ -3158,9 +2859,17 @@ mod alignment_characterization_tests {
         let dt = 0.1f64;
         let mut adapter = input::WinitInputAdapter::default();
         let mut mapper = InputMapper::default();
-        let mut app = App::new(true, ResourceTier::Low);
-        app.channel = Channel::Composite;
-        app.pov_toggles.shadow_ao = true;
+        let mut controller = ViewerController::new(ExplorationWorld::with_runtime(
+            StreamConfig {
+                near_radius: 0.0,
+                far_radius: 0.0,
+                load_radius: 0.0,
+                unload_radius: 1.0,
+                ..StreamConfig::default()
+            },
+            Budget::unlimited(),
+            ResourceTier::Low,
+        ));
 
         assert!(send_key(
             &adapter,
@@ -3229,7 +2938,7 @@ mod alignment_characterization_tests {
         let first_actions: Vec<_> = mapper.drain_actions().collect();
         let first_action = first_actions == [ViewerAction::CycleMapChannel];
         for action in first_actions {
-            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+            controller.apply_action(action);
         }
         assert!(send_key(
             &adapter,
@@ -3245,7 +2954,7 @@ mod alignment_characterization_tests {
             "map one-shot=KeyV first={} repeat={} channel={}",
             first_action,
             !repeat_actions.is_empty(),
-            app.channel.name()
+            controller.map_preferences().channel.name()
         )
         .unwrap();
 
@@ -3269,7 +2978,7 @@ mod alignment_characterization_tests {
         let first_notches = wheel_steps(&actions);
         let mut map_steps = first_notches;
         for action in actions {
-            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+            controller.apply_action(action);
         }
         let remainder = map_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(map_steps);
         writeln!(
@@ -3288,7 +2997,7 @@ mod alignment_characterization_tests {
         let second_notches = wheel_steps(&actions);
         map_steps += second_notches;
         for action in actions {
-            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+            controller.apply_action(action);
         }
         let remainder = map_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(map_steps);
         writeln!(
@@ -3307,7 +3016,7 @@ mod alignment_characterization_tests {
         let reverse_notches = wheel_steps(&actions);
         map_steps += reverse_notches;
         for action in actions {
-            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+            controller.apply_action(action);
         }
         let remainder = map_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(map_steps);
         writeln!(
@@ -3317,15 +3026,22 @@ mod alignment_characterization_tests {
         )
         .unwrap();
 
+        controller.enqueue_service_notification(ServiceNotification::PovAvailability {
+            sequence: ServiceResponseSequence(1),
+            supported: true,
+            reason: None,
+        });
+        controller.enqueue_action(ViewerAction::SetPresentation(PresentationMode::Pov));
+        tick_controller(&mut controller, InputFrame::default());
         mapper.set_context(context(PresentationMode::Pov));
         let pov_frame = mapper.take_frame();
         let strafe = f64::from(pov_frame.pov_axis[0]);
         let forward = f64::from(pov_frame.pov_axis[1]);
         let vertical = f64::from(pov_frame.pov_axis[2]);
-        let mut pov_delta = app.pov_camera.forward() * forward
-            + app.pov_camera.right() * strafe
+        let mut pov_delta = controller.pov_camera().forward() * forward
+            + controller.pov_camera().right() * strafe
             + glam::DVec3::Z * vertical;
-        pov_delta = pov_delta.normalize() * (app.pov_camera.speed * dt);
+        pov_delta = pov_delta.normalize() * (controller.pov_camera().speed * dt);
         writeln!(
             &mut actual,
             "pov held=KeyD+KeyW axis={:016x},{:016x},{:016x} delta={:016x},{:016x},{:016x}",
@@ -3349,14 +3065,20 @@ mod alignment_characterization_tests {
         let event = adapter.cursor_moved(PhysicalPosition::new(112.0, 92.0), ViewKind::Pov);
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
         let drag = mapper.take_frame().look_delta;
-        app.pov_camera.look(drag[0], drag[1]);
+        tick_controller(
+            &mut controller,
+            InputFrame {
+                look_delta: drag,
+                ..InputFrame::default()
+            },
+        );
         writeln!(
             &mut actual,
             "pov drag delta={:016x},{:016x} yaw={:08x} pitch={:08x}",
             drag[0].to_bits(),
             drag[1].to_bits(),
-            app.pov_camera.yaw.to_bits(),
-            app.pov_camera.pitch.to_bits()
+            controller.pov_camera().yaw.to_bits(),
+            controller.pov_camera().pitch.to_bits()
         )
         .unwrap();
         let event = adapter
@@ -3370,8 +3092,8 @@ mod alignment_characterization_tests {
             &mut actual,
             "pov move-released look={} yaw={:08x} pitch={:08x}",
             after_release,
-            app.pov_camera.yaw.to_bits(),
-            app.pov_camera.pitch.to_bits()
+            controller.pov_camera().yaw.to_bits(),
+            controller.pov_camera().pitch.to_bits()
         )
         .unwrap();
         let event = adapter
@@ -3396,7 +3118,7 @@ mod alignment_characterization_tests {
         let first_actions: Vec<_> = mapper.drain_actions().collect();
         let pov_first = first_actions == [ViewerAction::TogglePovShadowAo];
         for action in first_actions {
-            assert_eq!(app.apply_action(action), NativeActionEffect::None);
+            controller.apply_action(action);
         }
         assert!(send_key(
             &adapter,
@@ -3412,7 +3134,7 @@ mod alignment_characterization_tests {
             "pov one-shot=KeyB first={} repeat={} shadow-ao={}",
             pov_first,
             !repeat_actions.is_empty(),
-            app.pov_toggles.shadow_ao
+            controller.pov_toggles().shadow_ao
         )
         .unwrap();
 
@@ -3429,7 +3151,7 @@ mod alignment_characterization_tests {
             &mut actual,
             "pov wheel-pixel=20 notches={pov_first_wheel} remainder={:016x} speed={:016x}",
             remainder.to_bits(),
-            app.pov_camera.speed.to_bits()
+            controller.pov_camera().speed.to_bits()
         )
         .unwrap();
         pov_pixels += 25.0;
@@ -3440,15 +3162,19 @@ mod alignment_characterization_tests {
         assert!(mapper.handle_event(event, context(PresentationMode::Pov)));
         let pov_second_wheel = mapper.take_frame().wheel_steps;
         pov_steps += pov_second_wheel;
-        for _ in 0..pov_second_wheel.max(0) {
-            app.pov_camera.scroll_speed(true);
-        }
+        tick_controller(
+            &mut controller,
+            InputFrame {
+                wheel_steps: pov_second_wheel,
+                ..InputFrame::default()
+            },
+        );
         let remainder = pov_pixels / WHEEL_PIXELS_PER_NOTCH - f64::from(pov_steps);
         writeln!(
             &mut actual,
             "pov wheel-pixel=25 notches={pov_second_wheel} remainder={:016x} speed={:016x}",
             remainder.to_bits(),
-            app.pov_camera.speed.to_bits()
+            controller.pov_camera().speed.to_bits()
         )
         .unwrap();
 

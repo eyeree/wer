@@ -3,8 +3,10 @@
 
 use std::fmt;
 
-use world_core::{AnchorKind, PossibilityDomain};
-use world_runtime::ResourceTier;
+use world_core::{
+    Anchor, AnchorKind, PossibilityDomain, PossibilitySignature, RegionCoord, RouteNode,
+};
+use world_runtime::{ResourceTier, SessionSnapshotOwnedInput};
 
 use crate::layout::{PresentationMode, ViewKind};
 use crate::map::{Channel, MapBackend, MapOverlay};
@@ -924,6 +926,58 @@ pub struct DebugCaptureRequest {
     pub focused: ViewKind,
 }
 
+/// Complete durable-discovery request produced by the shared reducer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiscoveryWriteRequest {
+    /// Correlates the returned record id or failure.
+    pub request_id: ServiceRequestId,
+    /// Bit-exact live anchor to quantize at the persistence boundary.
+    pub anchor: Anchor,
+    /// Habitat signature seed under the captured anchor.
+    pub signature_seed: u64,
+}
+
+/// Typed preserve mutation. The shared controller determines whether the
+/// traveler is removing an effective owner or creating a new pinned set; a
+/// platform service only persists that exact operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreserveMutation {
+    /// Persist and then apply a new preserve over settled regions.
+    Create {
+        /// Quantized possibility bucket for every covered region.
+        regions: Vec<(RegionCoord, PossibilitySignature)>,
+    },
+    /// Remove the effective immutable preserve owner.
+    Remove {
+        /// Content-derived record id selected by the runtime overlap rule.
+        id: u64,
+    },
+}
+
+/// Correlated preserve service request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreserveRequest {
+    pub request_id: ServiceRequestId,
+    pub mutation: PreserveMutation,
+}
+
+/// Completed expedition ready for durable record construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteWriteRequest {
+    pub request_id: ServiceRequestId,
+    pub nodes: Vec<RouteNode>,
+    pub discoveries: Vec<u64>,
+}
+
+/// Action-ordered durable session request. Every world value is captured when
+/// `SaveSession` is reduced; a later platform effect must not re-read newer
+/// controller state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionWriteRequest {
+    pub request_id: ServiceRequestId,
+    pub snapshot: SessionSnapshotOwnedInput,
+}
+
 /// Effects requiring a capability owned by a platform shell.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewerEffect {
@@ -932,9 +986,24 @@ pub enum ViewerEffect {
     /// Write a file-bound diagnostic capture.
     WriteDebugCapture(DebugCaptureRequest),
     /// Persist the current shared session snapshot.
-    PersistSession(ServiceRequestId),
+    PersistSession(Box<SessionWriteRequest>),
     /// Load a session through platform storage.
     LoadSession(ServiceRequestId),
+    /// Persist the last anchor as a named discovery.
+    WriteDiscovery(DiscoveryWriteRequest),
+    /// Load retained discoveries for conversion to shared anchors.
+    LoadDiscoveries(ServiceRequestId),
+    /// Persist a create/remove preserve operation.
+    MutatePreserve(PreserveRequest),
+    /// Persist one completed expedition.
+    WriteRoute(RouteWriteRequest),
+    /// Remove every retained route.
+    ClearRoutes(ServiceRequestId),
+    /// Notify route services that path tracking changed.
+    ConfigurePathTracking {
+        request_id: ServiceRequestId,
+        enabled: bool,
+    },
     /// Open a platform atlas importer.
     OpenAtlasImport(ServiceRequestId),
     /// Download/write an atlas bundle.
@@ -954,6 +1023,8 @@ pub enum ViewerEffect {
     SelectMapBackend(MapBackend),
     /// Run resource-tier benchmarking.
     RunTierBenchmark,
+    /// Request a live resource-tier change from the platform scheduler.
+    ConfigureResourceTier(ResourceTier),
     /// Surface a non-fatal warning through the common panel.
     ReportWarning(ViewerWarning),
 }

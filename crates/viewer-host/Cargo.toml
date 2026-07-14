@@ -11,5 +11,6 @@ description = "Platform-neutral viewer input, presentation, inspection, and cont
 workspace = true
 
 [dependencies]
+pov-host = { path = "../pov-host" }
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }

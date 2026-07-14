@@ -15,8 +15,20 @@ pub mod map;
 pub mod panel;
 pub mod world;
 
-pub use action::{ViewerAction, ViewerEffect};
+pub use action::{
+    DiscoveryWriteRequest, PreserveMutation, PreserveRequest, RouteWriteRequest, ServiceRequestId,
+    SessionWriteRequest, ViewerAction, ViewerEffect,
+};
+pub use controller::{
+    AnalyticGroundSampler, CapturePreferences, GroundSample, LoadedSession, MapPreferences,
+    PovGroundSampler, PovStateSnapshot, PresentationDirty, ServiceNotification, ServiceResponse,
+    ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewerController,
+};
 pub use inspect::{CellInfo, CursorInfo, EcologyInfo, HoverInfo, OrganismInfo};
 pub use layout::{PixelRect, PresentationMode, ViewKind, ViewLayout};
 pub use map::{Channel, MapDecor, MapOverlay, Overlays};
 pub use panel::{InfoPanelModel, PanelFieldId, PlatformTelemetry};
+pub use world::{
+    ExplorationWorld, NoopWorldTickHook, TravelerState, WorldPostUpdate, WorldPreUpdate,
+    WorldServiceInput, WorldTickHook, WorldTickOutput,
+};
