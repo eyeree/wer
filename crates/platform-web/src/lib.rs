@@ -7,7 +7,14 @@
 //! Phase 7. Phase 2 grew the shell only by two parity exports: the lithology
 //! seed and a drainage routing sample (phase-2-plan.md §12.5).
 
-use viewer_host::PresentationMode;
+#[cfg(target_arch = "wasm32")]
+use viewer_host::input::{ButtonPhase, Modifiers, PhysicalKey, PointerButton, WheelDelta};
+use viewer_host::{
+    action::{ServiceRequestId, ViewerEffect, WorkerBackend, ACTION_DESCRIPTORS},
+    input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent},
+    map::{Channel, MapBackend, Overlays},
+    PresentationMode, ViewKind, ViewerAction,
+};
 use world_core::{
     anchor::{
         anchor_set_signature, bound_target, domain_mask, project_plausible, steer, Anchor,
@@ -349,21 +356,21 @@ pub fn route_attraction_sample() -> u64 {
 /// the presentation-only subset of the native shell's channel list the web
 /// toolbar exposes, painted from the shared `world_runtime::mapcolor` table
 /// so both viewers show the identical false-color world.
-const MAP_CHANNELS: [&str; 14] = [
-    "composite",
-    "elevation",
-    "geology",
-    "temperature",
-    "moisture",
-    "river",
-    "wetness",
-    "soil",
-    "biome",
-    "vegetation",
-    "herbivore",
-    "predator",
-    "diversity",
-    "species",
+const WEB_MAP_CHANNELS: [Channel; 14] = [
+    Channel::Composite,
+    Channel::Elevation,
+    Channel::Geology,
+    Channel::Temperature,
+    Channel::Moisture,
+    Channel::River,
+    Channel::Wetness,
+    Channel::Soil,
+    Channel::Biome,
+    Channel::Vegetation,
+    Channel::Herbivore,
+    Channel::Predator,
+    Channel::Diversity,
+    Channel::DominantSpecies,
 ];
 
 /// Settle passes for a fresh window: fresh regions snap to target at load,
@@ -378,7 +385,9 @@ struct WebAppState {
     world_pos: (f64, f64),
     possibility: PossibilityVector,
     target: PossibilityVector,
-    active_channel: u8,
+    active_channel: Channel,
+    zoom: u32,
+    overlays: Overlays,
     /// The real streamed world window (phase-7-plan.md §4.1 milestone 2):
     /// the same `RegionMap` the native shell drives, settled inline —
     /// wasm has no threads here, and ADR 0018 makes the settled state
@@ -426,11 +435,11 @@ struct WebAppState {
     pending_writes: u32,
     storage_failures: u32,
     record_count: u32,
-    session_snapshot: Option<String>,
     renderer: &'static str,
     view_mode: PresentationMode,
+    focused_view: ViewKind,
+    split_ratio: f32,
     pov_supported: bool,
-    pointer_lock: bool,
     /// POV motion mode (`pov:walk` toggles walk ↔ fly), mirroring the native
     /// shell's `F` key.
     pov_walk: bool,
@@ -451,7 +460,22 @@ struct WebAppState {
     device_losses: u32,
     warnings: Vec<String>,
     executor_parallelism: usize,
-    last_command: String,
+    last_action: &'static str,
+    next_request_id: u64,
+    effects: Vec<ViewerEffect>,
+}
+
+/// Browser-owned raw-event adapter around the platform-neutral mapper.
+///
+/// DOM controls and physical input both enter the mapper's one ordered action
+/// queue. The driver samples one typed [`InputFrame`] only after reducing all
+/// queued actions, matching the ordering contract in the alignment plan.
+#[derive(Debug, Default)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+struct BrowserViewerDriver {
+    mapper: InputMapper,
+    surface_focused: bool,
+    dirty: bool,
 }
 
 impl Default for WebAppState {
@@ -463,7 +487,9 @@ impl Default for WebAppState {
             world_pos: (0.0, 0.0),
             possibility: PossibilityVector::neutral(),
             target: PossibilityVector::neutral(),
-            active_channel: 0,
+            active_channel: Channel::Composite,
+            zoom: 1,
+            overlays: Overlays::default(),
             half_regions: (cfg.load_radius / REGION_SIZE).ceil() as i32,
             map: RegionMap::new(cfg),
             field: PossibilityField::default(),
@@ -488,11 +514,11 @@ impl Default for WebAppState {
             pending_writes: 0,
             storage_failures: 0,
             record_count: 0,
-            session_snapshot: None,
             renderer: "cpu-fallback",
             view_mode: PresentationMode::Map,
+            focused_view: ViewKind::Map,
+            split_ratio: 0.5,
             pov_supported: false,
-            pointer_lock: false,
             pov_walk: false,
             pov_shadow_ao: true,
             pov_detail_normals: true,
@@ -503,7 +529,9 @@ impl Default for WebAppState {
             device_losses: 0,
             warnings: Vec::new(),
             executor_parallelism: InlineExecutor.parallelism(),
-            last_command: String::new(),
+            last_action: "",
+            next_request_id: 1,
+            effects: Vec::new(),
         }
     }
 }
@@ -533,38 +561,17 @@ impl WebAppState {
         state
     }
 
-    fn update(&mut self, dt_ms: f64, input: &str) {
+    fn update(&mut self, dt_ms: f64, input: InputFrame) {
         self.frame_index = self.frame_index.wrapping_add(1);
         // The native shell's movement contract (main.rs `apply_movement`):
         // 500 world units/sec, Shift sprint x4, diagonals normalized, dt
         // clamped to 100ms so a hitch never teleports the player.
         const PLAYER_SPEED: f64 = 500.0;
         let dt = (dt_ms / 1000.0).clamp(0.0, 0.1);
-        let mut dx = 0.0;
-        let mut dy = 0.0;
-        if input.contains("\"move_x\":1") {
-            dx += 1.0;
-        }
-        if input.contains("\"move_x\":-1") {
-            dx -= 1.0;
-        }
-        if input.contains("\"move_y\":1") {
-            dy += 1.0;
-        }
-        if input.contains("\"move_y\":-1") {
-            dy -= 1.0;
-        }
         let last = self.world_pos;
-        let len = f64::hypot(dx, dy);
-        if len > 0.0 {
-            let sprint = if input.contains("\"sprint\":true") {
-                4.0
-            } else {
-                1.0
-            };
-            let step = PLAYER_SPEED * sprint * dt / len;
-            self.world_pos.0 += dx * step;
-            self.world_pos.1 += dy * step;
+        if let Some((dx, dy)) = input.map_movement_delta(PLAYER_SPEED, dt) {
+            self.world_pos.0 += dx;
+            self.world_pos.1 += dy;
         }
         // Travel is the per-frame displacement that fuels convergence
         // (ADR 0006), exactly as the native `WorldState::update` computes it.
@@ -596,18 +603,17 @@ impl WebAppState {
     fn pov_step(
         &mut self,
         dt_ms: f64,
-        input: &str,
+        input: InputFrame,
     ) -> (Vec<renderer::TerrainChunkUpload>, Vec<u64>, bool) {
         self.frame_index = self.frame_index.wrapping_add(1);
         let dt = (dt_ms / 1000.0).clamp(0.0, 0.1);
-        let look_dx = json_number(input, "look_dx").unwrap_or(0.0);
-        let look_dy = json_number(input, "look_dy").unwrap_or(0.0);
+        let [look_dx, look_dy] = input.look_delta;
         if look_dx != 0.0 || look_dy != 0.0 {
             self.pov_camera.look(look_dx, look_dy);
         }
         // Wheel notches adjust the active mode's speed (the native POV
         // wheel behavior).
-        let wheel = json_number(input, "wheel").unwrap_or(0.0) as i32;
+        let wheel = input.wheel_steps;
         for _ in 0..wheel.abs() {
             self.pov_camera.scroll_speed(wheel > 0);
         }
@@ -619,23 +625,23 @@ impl WebAppState {
             self.pov_camera.forward()
         };
         let mut mv = glam::DVec3::ZERO;
-        if input.contains("\"move_y\":1") {
+        if input.pov_axis[1] > 0 {
             mv += forward;
         }
-        if input.contains("\"move_y\":-1") {
+        if input.pov_axis[1] < 0 {
             mv -= forward;
         }
-        if input.contains("\"move_x\":1") {
+        if input.pov_axis[0] > 0 {
             mv += self.pov_camera.right();
         }
-        if input.contains("\"move_x\":-1") {
+        if input.pov_axis[0] < 0 {
             mv -= self.pov_camera.right();
         }
         if !walk {
-            if input.contains("\"move_z\":1") {
+            if input.pov_axis[2] > 0 {
                 mv.z += 1.0;
             }
-            if input.contains("\"move_z\":-1") {
+            if input.pov_axis[2] < 0 {
                 mv.z -= 1.0;
             }
         }
@@ -701,83 +707,191 @@ impl WebAppState {
         self.last_stats = stats;
     }
 
-    fn apply_command(&mut self, command: &str) {
-        self.last_command.clear();
-        self.last_command.push_str(command);
-        if command.contains("channel:composite") {
-            self.active_channel = 0;
-        } else if command.contains("\"id\":\"channel\"") {
-            // The channel select (phase-7-plan.md §3.3): value names index
-            // the shared MAP_CHANNELS table.
-            if let Some(index) = MAP_CHANNELS
-                .iter()
-                .position(|name| command.contains(&format!("\"value\":\"{name}\"")))
-            {
-                self.active_channel = index as u8;
+    /// Apply one exact semantic action. Both the shared input mapper and DOM
+    /// controls feed this reducer through [`BrowserViewerDriver`]; platform
+    /// adapters never interpret action ids or mutate viewer state directly.
+    fn apply_action(&mut self, action: ViewerAction) {
+        const NUDGE_STEP: f32 = 0.05;
+        const MAX_ZOOM: u32 = 16;
+
+        self.last_action = action.id().as_str();
+        match action {
+            ViewerAction::SetPresentation(mode) => self.set_presentation(mode),
+            ViewerAction::TogglePrimaryView => match self.view_mode {
+                PresentationMode::Map => self.set_presentation(PresentationMode::Pov),
+                PresentationMode::Pov => self.set_presentation(PresentationMode::Map),
+                PresentationMode::Split => {
+                    self.focused_view = match self.focused_view {
+                        ViewKind::Map => ViewKind::Pov,
+                        ViewKind::Pov => ViewKind::Map,
+                    };
+                }
+            },
+            ViewerAction::FocusView(view) => self.focused_view = view,
+            ViewerAction::SetSplitRatio(ratio) => self.split_ratio = ratio.clamp(0.1, 0.9),
+            ViewerAction::NudgePossibility { domain, direction } => {
+                let direction = match direction {
+                    viewer_host::action::NudgeDirection::Up => 1.0,
+                    viewer_host::action::NudgeDirection::Down => -1.0,
+                };
+                let value = &mut self.bias[domain.index()];
+                *value = (*value + direction * NUDGE_STEP).clamp(-1.0, 1.0);
+                self.settled = false;
             }
-        } else if command.contains("toggle:refinement") {
-            self.refinement_enabled = !self.refinement_enabled;
-            self.target.set(PossibilityDomain::Aesthetics, 0.625);
-        } else if command.contains("toggle:compose") {
-            self.compose_enabled = !self.compose_enabled;
-            self.target.set(PossibilityDomain::Planetary, 0.5625);
-        } else if command.contains("renderer:webgpu") {
-            self.set_renderer_webgpu();
-        } else if command.contains("renderer:device-lost") {
-            self.set_renderer_cpu();
-            self.device_losses = self.device_losses.saturating_add(1);
-            self.warnings
-                .push(String::from("WebGPU device lost; CPU map fallback active"));
-        } else if command.contains("renderer:cpu") {
-            self.set_renderer_cpu();
-        } else if command.contains("worker:inline") {
-            self.worker_mode = "inline";
-            self.worker_backlog = 0;
-            self.workers = 1;
-        } else if command.contains("worker:workers") {
-            self.worker_mode = "workers";
-            self.workers = 2;
-        } else if command.contains("worker:shared") {
-            self.worker_mode = "shared-memory";
-            self.workers = 2;
-        } else if command.contains("worker:cancel-storm") {
-            self.worker_backlog = 0;
-            self.cancellations = self.cancellations.saturating_add(8);
-            self.stale_results = self.stale_results.saturating_add(3);
-        } else if command.contains("storage:enable") {
-            self.storage = "indexeddb";
-        } else if command.contains("storage:disable") {
-            self.storage = "memory";
-        } else if command.contains("storage:save") {
-            self.pending_writes = self.pending_writes.saturating_add(1);
-            self.record_count = self.record_count.saturating_add(1);
-            self.session_snapshot = Some(self.snapshot_json());
-            self.pending_writes = self.pending_writes.saturating_sub(1);
-        } else if command.contains("storage:reload") {
-            if self.session_snapshot.is_none() {
-                self.storage_failures = self.storage_failures.saturating_add(1);
+            ViewerAction::ResetPossibilityBias => {
+                self.bias = [0.0; POSSIBILITY_DIMS];
+                self.settled = false;
             }
-        } else if command.contains("storage:reset") {
-            self.record_count = 0;
-            self.session_snapshot = None;
-        } else if command.contains("storage:import") {
-            self.record_count = self.record_count.saturating_add(1);
-        } else if command.contains("\"tier\":\"mid\"") || command.contains("\"value\":\"mid\"") {
-            self.set_tier(ResourceTier::Mid);
-        } else if command.contains("\"tier\":\"high\"") || command.contains("\"value\":\"high\"") {
-            self.set_tier(ResourceTier::High);
-        } else if command.contains("\"tier\":\"low\"") || command.contains("\"value\":\"low\"") {
-            self.set_tier(ResourceTier::Low);
-        } else if command.contains("tier:benchmark") {
-            self.benchmark_ms = 1.0 + self.workers as f32;
-        } else if command.contains("mode:pov") {
-            if self.pov_supported {
+            ViewerAction::CycleMapChannel => {
+                let index = WEB_MAP_CHANNELS
+                    .iter()
+                    .position(|channel| *channel == self.active_channel)
+                    .unwrap_or(0);
+                self.active_channel = WEB_MAP_CHANNELS[(index + 1) % WEB_MAP_CHANNELS.len()];
+            }
+            ViewerAction::SetMapChannel(channel) => {
+                if WEB_MAP_CHANNELS.contains(&channel) {
+                    self.active_channel = channel;
+                } else {
+                    self.warn_once("This map channel lands with the shared map presenter");
+                }
+            }
+            ViewerAction::ToggleOverlay(overlay) => {
+                let enabled = !self.overlays.enabled(overlay);
+                self.overlays.set(overlay, enabled);
+            }
+            ViewerAction::ZoomIn => self.zoom = (self.zoom * 2).min(MAX_ZOOM),
+            ViewerAction::ZoomOut => self.zoom = (self.zoom / 2).max(1),
+            ViewerAction::ToggleGpuCompose => {
+                self.compose_enabled = !self.compose_enabled;
+                self.target.set(PossibilityDomain::Planetary, 0.5625);
+            }
+            ViewerAction::ToggleRefinement => {
+                self.refinement_enabled = !self.refinement_enabled;
+                self.target.set(PossibilityDomain::Aesthetics, 0.625);
+            }
+            ViewerAction::ToggleWalk => {
+                self.pov_walk = !self.pov_walk;
+                let (ground, _) = pov_host::walk_ground(
+                    &self.pov_chunks,
+                    &self.map,
+                    (self.pov_camera.pos.x, self.pov_camera.pos.y),
+                );
+                self.pov_camera.set_walk(self.pov_walk, ground);
+            }
+            ViewerAction::TogglePovShadowAo => self.pov_shadow_ao = !self.pov_shadow_ao,
+            ViewerAction::TogglePovDetailNormals => {
+                self.pov_detail_normals = !self.pov_detail_normals;
+            }
+            ViewerAction::TogglePovWater => self.pov_water = !self.pov_water,
+            ViewerAction::SetPovRenderScale(scale) => {
+                self.pov_render_scale = if scale <= 0.25 {
+                    0.25
+                } else if scale <= 0.5 {
+                    0.5
+                } else {
+                    1.0
+                };
+            }
+            ViewerAction::SetResourceTier(tier) => self.set_tier(tier),
+            ViewerAction::SetWorkerBackend(WorkerBackend::Inline) => {
+                self.worker_mode = "inline";
+                self.worker_backlog = 0;
+                self.workers = 1;
+            }
+            ViewerAction::SetWorkerBackend(backend) => {
+                self.effects
+                    .push(ViewerEffect::ConfigureWorkerBackend(backend));
+                self.warn_once("Worker execution is unavailable; inline execution remains active");
+            }
+            ViewerAction::CancelSupersededJobs => {
+                self.effects.push(ViewerEffect::CancelSupersededJobs);
+                self.warn_once("No browser worker queue is active");
+            }
+            ViewerAction::SetMapBackend(MapBackend::Cpu) => self.compose_enabled = false,
+            ViewerAction::SetMapBackend(MapBackend::GpuAtlas) => {
+                if self.pov_supported {
+                    self.compose_enabled = true;
+                } else {
+                    self.warn_once("GPU map composition is unavailable; CPU map remains active");
+                }
+            }
+            ViewerAction::SetStorageEnabled(enabled) => {
+                self.storage = if enabled { "indexeddb" } else { "memory" };
+            }
+            ViewerAction::SaveSession => {
+                let request = self.next_request();
+                self.effects.push(ViewerEffect::PersistSession(request));
+                self.warn_once("Session persistence is not connected to the browser vault yet");
+            }
+            ViewerAction::LoadSession => {
+                let request = self.next_request();
+                self.effects.push(ViewerEffect::LoadSession(request));
+                self.warn_once("Session loading is not connected to the browser vault yet");
+            }
+            ViewerAction::ResetLocalVault => {
+                self.effects.push(ViewerEffect::ResetLocalVault);
+                self.warn_once("Vault reset is unavailable until browser persistence is connected");
+            }
+            ViewerAction::RequestAtlasImport => {
+                let request = self.next_request();
+                self.effects.push(ViewerEffect::OpenAtlasImport(request));
+                self.warn_once("Atlas import is not connected to a browser file picker yet");
+            }
+            ViewerAction::RequestAtlasExport => {
+                let request = self.next_request();
+                self.effects
+                    .push(ViewerEffect::DownloadAtlasBundle(request));
+                self.warn_once("Atlas export is not connected to browser bundle encoding yet");
+            }
+            ViewerAction::RequestTierBenchmark => {
+                self.effects.push(ViewerEffect::RunTierBenchmark);
+            }
+            ViewerAction::RequestDebugDump => {
+                self.warn_once("Browser debug capture is unavailable in this runtime scaffold");
+            }
+            ViewerAction::RequestExit => {
+                self.warn_once("The browser host does not support the Exit action");
+            }
+            ViewerAction::DropAnchor(_)
+            | ViewerAction::CaptureAnchor
+            | ViewerAction::CycleCaptureCategory
+            | ViewerAction::ToggleCapturePolarity
+            | ViewerAction::ClearAnchors
+            | ViewerAction::ToggleTransitionMode
+            | ViewerAction::RecordLastAnchor
+            | ViewerAction::SummonDiscoveries
+            | ViewerAction::TogglePreserve
+            | ViewerAction::TogglePathTracking
+            | ViewerAction::ToggleRouteRecording
+            | ViewerAction::ToggleRouteAttraction
+            | ViewerAction::ClearRoutes => {
+                self.warn_once("This exploration action lands with the shared controller");
+            }
+        }
+    }
+
+    fn next_request(&mut self) -> ServiceRequestId {
+        let request = ServiceRequestId(self.next_request_id);
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        request
+    }
+
+    fn warn_once(&mut self, warning: &str) {
+        if !self.warnings.iter().any(|entry| entry == warning) {
+            self.warnings.push(String::from(warning));
+        }
+    }
+
+    fn set_presentation(&mut self, mode: PresentationMode) {
+        match mode {
+            PresentationMode::Map => {
+                self.view_mode = PresentationMode::Map;
+                self.focused_view = ViewKind::Map;
+            }
+            PresentationMode::Pov if self.pov_supported => {
                 self.view_mode = PresentationMode::Pov;
-                // Entering POV places the camera at eye level over the
-                // player (native `toggle_view_mode`); re-entering with walk
-                // still on grounds immediately instead of ramping down.
-                // `entry_ground` falls back analytically before the first
-                // settle, so no eager settle is forced here.
+                self.focused_view = ViewKind::Pov;
                 let ground = pov_host::entry_ground(&self.map, self.world_pos);
                 self.pov_camera.enter_at(self.world_pos, ground);
                 if self.pov_camera.walk {
@@ -788,43 +902,15 @@ impl WebAppState {
                     );
                     self.pov_camera.snap_to_ground(ground);
                 }
-            } else {
-                self.view_mode = PresentationMode::Map;
-                self.warnings.push(String::from(
-                    "POV renderer unavailable; staying in map mode",
-                ));
             }
-        } else if command.contains("mode:map") {
-            self.view_mode = PresentationMode::Map;
-            self.pointer_lock = false;
-        } else if command.contains("pov:pointer-lock") {
-            self.pointer_lock = self.pov_supported;
-        } else if command.contains("pov:walk") {
-            // The native `F` toggle: entering walk snaps the eye to the
-            // ground under the camera.
-            self.pov_walk = !self.pov_walk;
-            let (ground, _) = pov_host::walk_ground(
-                &self.pov_chunks,
-                &self.map,
-                (self.pov_camera.pos.x, self.pov_camera.pos.y),
-            );
-            self.pov_camera.set_walk(self.pov_walk, ground);
-        } else if command.contains("pov:toggle-baked") {
-            self.pov_shadow_ao = !self.pov_shadow_ao;
-        } else if command.contains("pov:toggle-detail") {
-            self.pov_detail_normals = !self.pov_detail_normals;
-        } else if command.contains("pov:toggle-water") {
-            self.pov_water = !self.pov_water;
-        } else if command.contains("pov:scale") {
-            // The native WER_POV_SCALE ladder, as a select (the `tier`
-            // pattern): full/half/quarter canvas resolution for the 3D pass.
-            self.pov_render_scale = if command.contains("\"value\":\"quarter\"") {
-                0.25
-            } else if command.contains("\"value\":\"half\"") {
-                0.5
-            } else {
-                1.0
-            };
+            PresentationMode::Pov => {
+                self.view_mode = PresentationMode::Map;
+                self.focused_view = ViewKind::Map;
+                self.warn_once("POV renderer unavailable; staying in map mode");
+            }
+            PresentationMode::Split => {
+                self.warn_once("Split presentation lands in the multi-view renderer milestone");
+            }
         }
     }
 
@@ -844,12 +930,21 @@ impl WebAppState {
     fn set_renderer_cpu(&mut self) {
         self.renderer = "cpu-fallback";
         self.pov_supported = false;
-        self.pointer_lock = false;
-        if self.view_mode == PresentationMode::Pov {
+        if matches!(
+            self.view_mode,
+            PresentationMode::Pov | PresentationMode::Split
+        ) {
             self.view_mode = PresentationMode::Map;
+            self.focused_view = ViewKind::Map;
             self.warnings
                 .push(String::from("POV requires WebGPU; returned to map mode"));
         }
+    }
+
+    fn renderer_lost(&mut self) {
+        self.set_renderer_cpu();
+        self.device_losses = self.device_losses.saturating_add(1);
+        self.warn_once("WebGPU device lost; CPU map fallback active");
     }
 
     fn set_tier(&mut self, tier: ResourceTier) {
@@ -915,6 +1010,14 @@ impl WebAppState {
 
     fn snapshot_json(&self) -> String {
         let region = self.region();
+        let active_channel = WEB_MAP_CHANNELS
+            .iter()
+            .position(|channel| *channel == self.active_channel)
+            .unwrap_or(0);
+        let focused = match self.focused_view {
+            ViewKind::Map => "map",
+            ViewKind::Pov => "pov",
+        };
         format!(
             concat!(
                 "{{",
@@ -925,17 +1028,18 @@ impl WebAppState {
                 "\"target\":{},",
                 "\"active_channel\":{},",
                 "\"channel\":\"{}\",",
+                "\"zoom\":{},",
                 "\"cache\":{{\"regions\":1,\"bytes\":0}},",
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
                 "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
-                "\"view\":{{\"mode\":\"{}\",\"pov_supported\":{},\"pointer_lock\":{},",
+                "\"view\":{{\"mode\":\"{}\",\"focused\":\"{}\",\"split_ratio\":{:.3},\"pov_supported\":{},",
                 "\"pov\":{{\"motion\":\"{}\",\"shadow_ao\":{},\"detail_normals\":{},\"water\":{},\"render_scale\":{:.2}}}}},",
                 "\"tier\":{{\"name\":\"{}\",\"runtime\":\"{}\",\"cache_ceiling_mb\":{},\"benchmark_ms\":{:.3}}},",
                 "\"bias\":{},",
                 "\"stats\":{},",
                 "\"settle_hash\":\"{:#018x}\",",
-                "\"last_command\":\"{}\",",
+                "\"last_action\":\"{}\",",
                 "\"warnings\":[{}]",
                 "}}"
             ),
@@ -946,8 +1050,9 @@ impl WebAppState {
             region.y,
             vector_json(self.possibility),
             vector_json(self.target),
-            self.active_channel,
-            MAP_CHANNELS[usize::from(self.active_channel)],
+            active_channel,
+            self.active_channel.id(),
+            self.zoom,
             self.worker_mode,
             self.executor_parallelism,
             self.workers,
@@ -963,8 +1068,9 @@ impl WebAppState {
             self.refinement_enabled,
             self.device_losses,
             self.view_mode.as_str(),
+            focused,
+            self.split_ratio,
             self.pov_supported,
-            self.pointer_lock,
             if self.pov_walk { "walk" } else { "fly" },
             self.pov_shadow_ao,
             self.pov_detail_normals,
@@ -977,7 +1083,7 @@ impl WebAppState {
             bias_json(&self.bias),
             self.stats_json(),
             self.settle_hash(),
-            json_escape(&self.last_command),
+            self.last_action,
             self.warnings
                 .iter()
                 .map(|warning| format!("\"{}\"", json_escape(warning)))
@@ -1118,7 +1224,7 @@ impl WebAppState {
             "{{\"kind\":\"rgba8\",\"renderer\":\"{}\",\"width\":{side},\"height\":{side},\"resolution\":{},\"channel\":\"{}\"}}",
             self.renderer,
             self.map.config().field_resolution,
-            MAP_CHANNELS[usize::from(self.active_channel)]
+            self.active_channel.id()
         )
     }
 
@@ -1133,7 +1239,7 @@ impl WebAppState {
         let side = self.map_side();
         let mut pixels = vec![0u8; side * side * 4];
         let center = RegionCoord::from_world(self.world_pos.0, self.world_pos.1);
-        let channel = MAP_CHANNELS[usize::from(self.active_channel)];
+        let channel = self.active_channel.id();
 
         for row_region in 0..=(2 * self.half_regions) {
             // Row 0 is the northernmost (max y) region.
@@ -1232,7 +1338,7 @@ impl WebAppState {
                     "herbivore" => scalar(tile(CHANNEL_HERBIVORE), &mapcolor::herbivore_color),
                     "predator" => scalar(tile(CHANNEL_PREDATOR), &mapcolor::predator_color),
                     "diversity" => scalar(tile(CHANNEL_DIVERSITY), &mapcolor::diversity_color),
-                    "species" => match self.map.dominant_species_id(coord, cx, cy) {
+                    "dominant" => match self.map.dominant_species_id(coord, cx, cy) {
                         Some(id) => mapcolor::species_color(id),
                         None => missing(),
                     },
@@ -1254,7 +1360,7 @@ impl WebAppState {
                     },
                 };
                 // Region grid, on by default like the native shell.
-                if cx == 0 || cy == 0 {
+                if self.overlays.grid && (cx == 0 || cy == 0) {
                     rgb = mapcolor::lerp_rgb(rgb, [0, 0, 0], 0.35);
                 }
 
@@ -1271,15 +1377,113 @@ impl WebAppState {
     }
 }
 
-/// Extract a numeric field from a flat JSON object string — the facade's
-/// serde-free input contract (matching the `contains` command parsing).
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn json_number(input: &str, key: &str) -> Option<f64> {
-    let pattern = format!("\"{key}\":");
-    let start = input.find(&pattern)? + pattern.len();
-    let rest = &input[start..];
-    let end = rest.find([',', '}']).unwrap_or(rest.len());
-    rest[..end].trim().parse().ok()
+impl BrowserViewerDriver {
+    fn context(&self, state: &WebAppState) -> InputContext {
+        InputContext {
+            mode: state.view_mode,
+            focused: state.focused_view,
+            surface_focused: self.surface_focused,
+        }
+    }
+
+    fn handle(&mut self, state: &WebAppState, event: NormalizedInputEvent) -> bool {
+        let handled = self.mapper.handle_event(event, self.context(state));
+        self.dirty |= handled;
+        handled
+    }
+
+    fn enqueue_action(&mut self, action: ViewerAction) {
+        self.mapper.enqueue_action(action);
+        self.dirty = true;
+    }
+
+    fn set_surface_focus(&mut self, state: &WebAppState, focused: bool) {
+        self.surface_focused = focused;
+        if !focused {
+            self.mapper.clear_held_state();
+        }
+        self.mapper.set_context(self.context(state));
+        self.dirty = true;
+    }
+
+    fn take_frame(&mut self, state: &mut WebAppState) -> InputFrame {
+        let actions = self.mapper.drain_actions().collect::<Vec<_>>();
+        for action in actions {
+            state.apply_action(action);
+            self.mapper.set_context(self.context(state));
+        }
+        let frame = self.mapper.take_frame();
+        self.dirty = false;
+        frame
+    }
+
+    fn needs_frame(&self) -> bool {
+        self.dirty || self.mapper.has_continuous_input()
+    }
+
+    fn has_continuous_input(&self) -> bool {
+        self.mapper.has_continuous_input()
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn action_descriptors_json() -> String {
+    format!(
+        "[{}]",
+        ACTION_DESCRIPTORS
+            .iter()
+            .map(|descriptor| format!(
+                "{{\"id\":\"{}\",\"label\":\"{}\",\"help\":\"{}\"}}",
+                descriptor.id.as_str(),
+                json_escape(descriptor.label),
+                json_escape(descriptor.help),
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn effects_json(effects: Vec<ViewerEffect>) -> String {
+    let effects = effects
+        .into_iter()
+        .map(|effect| match effect {
+            ViewerEffect::Exit => String::from("{\"kind\":\"exit\"}"),
+            ViewerEffect::WriteDebugCapture(request) => format!(
+                "{{\"kind\":\"debug-capture\",\"request\":{}}}",
+                request.request_id.0
+            ),
+            ViewerEffect::PersistSession(request) => {
+                format!("{{\"kind\":\"persist-session\",\"request\":{}}}", request.0)
+            }
+            ViewerEffect::LoadSession(request) => {
+                format!("{{\"kind\":\"load-session\",\"request\":{}}}", request.0)
+            }
+            ViewerEffect::OpenAtlasImport(request) => {
+                format!("{{\"kind\":\"open-atlas\",\"request\":{}}}", request.0)
+            }
+            ViewerEffect::DownloadAtlasBundle(request) => {
+                format!("{{\"kind\":\"download-atlas\",\"request\":{}}}", request.0)
+            }
+            ViewerEffect::ConfigureWorkerBackend(_) => {
+                String::from("{\"kind\":\"configure-workers\"}")
+            }
+            ViewerEffect::CancelSupersededJobs => String::from("{\"kind\":\"cancel-jobs\"}"),
+            ViewerEffect::ConfigureStorage { enabled } => {
+                format!("{{\"kind\":\"configure-storage\",\"enabled\":{enabled}}}")
+            }
+            ViewerEffect::ResetLocalVault => String::from("{\"kind\":\"reset-vault\"}"),
+            ViewerEffect::SelectMapBackend(_) => String::from("{\"kind\":\"select-map-backend\"}"),
+            ViewerEffect::RunTierBenchmark => String::from("{\"kind\":\"benchmark\"}"),
+            ViewerEffect::ReportWarning(warning) => format!(
+                "{{\"kind\":\"warning\",\"message\":\"{}\"}}",
+                json_escape(&warning.message)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{effects}]")
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -1328,6 +1532,14 @@ mod wasm {
         /// device acquisition is async on WebGPU — JS awaits [`pov_init`]
         /// once, then per-frame calls stay synchronous.
         static POV_RENDERER: RefCell<Option<renderer::Renderer>> = const { RefCell::new(None) };
+    }
+
+    fn parse_view(value: &str) -> Result<super::ViewKind, JsValue> {
+        match value {
+            "map" => Ok(super::ViewKind::Map),
+            "pov" => Ok(super::ViewKind::Pov),
+            _ => Err(JsValue::from_str("view must be exactly `map` or `pov`")),
+        }
     }
 
     /// Bring up the shared 3D renderer over the given canvas
@@ -1452,13 +1664,15 @@ mod wasm {
         super::route_attraction_sample()
     }
 
-    /// Phase 7 browser application facade. JS sends batched commands/input and
-    /// reads compact JSON snapshots, keeping DOM/browser APIs out of neutral
-    /// crates and avoiding per-field wasm calls in the frame loop.
+    /// Phase 7 browser application facade. JS forwards primitive raw events
+    /// and exact action ids; the shared mapper produces typed frame intent and
+    /// ordered actions before this facade updates presentation state. Compact
+    /// snapshots keep DOM/browser APIs out of neutral crates.
     #[wasm_bindgen]
     #[derive(Debug)]
     pub struct WebApp {
         state: super::WebAppState,
+        driver: super::BrowserViewerDriver,
         shutdown: bool,
     }
 
@@ -1472,18 +1686,192 @@ mod wasm {
             let config = config.as_string().unwrap_or_default();
             Ok(WebApp {
                 state: super::WebAppState::new(&config),
+                driver: super::BrowserViewerDriver::default(),
                 shutdown: false,
             })
         }
 
-        /// Advance the browser facade by one batched input update.
-        pub fn update(&mut self, dt_ms: f64, input: JsValue) -> Result<JsValue, JsValue> {
+        /// Advance Map mode from the mapper's one typed frame sample.
+        pub fn update(&mut self, dt_ms: f64) -> Result<JsValue, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
-            self.state
-                .update(dt_ms, &input.as_string().unwrap_or_default());
+            let input = self.driver.take_frame(&mut self.state);
+            self.state.update(dt_ms, input);
             Ok(JsValue::from_str(&self.state.snapshot_json()))
+        }
+
+        /// Queue one exact descriptor id and optional payload. DOM controls
+        /// use this same ordered mapper queue as keyboard and pointer input.
+        pub fn action(&mut self, id: String, value: Option<String>) -> Result<(), JsValue> {
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            let action = super::ViewerAction::decode_exact(&id, value.as_deref())
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            self.driver.enqueue_action(action);
+            Ok(())
+        }
+
+        /// Descriptor metadata used to validate toolbar markup at startup.
+        pub fn action_descriptors(&self) -> String {
+            super::action_descriptors_json()
+        }
+
+        /// Translate an exact `KeyboardEvent.code` transition.
+        #[allow(clippy::too_many_arguments)]
+        pub fn key_event(
+            &mut self,
+            code: String,
+            pressed: bool,
+            repeat: bool,
+            shift: bool,
+            control: bool,
+            alt: bool,
+            super_key: bool,
+        ) -> bool {
+            let Some(key) = super::PhysicalKey::from_dom_code(&code) else {
+                return false;
+            };
+            let event = super::NormalizedInputEvent::Key {
+                key,
+                phase: if pressed {
+                    super::ButtonPhase::Pressed
+                } else {
+                    super::ButtonPhase::Released
+                },
+                repeat,
+                modifiers: super::Modifiers {
+                    shift,
+                    control,
+                    alt,
+                    super_key,
+                },
+            };
+            self.driver.handle(&self.state, event)
+        }
+
+        /// Translate one pointer position in physical canvas pixels.
+        pub fn pointer_move(
+            &mut self,
+            pointer: u32,
+            x: f64,
+            y: f64,
+            view: String,
+        ) -> Result<bool, JsValue> {
+            let view = parse_view(&view)?;
+            self.driver.handle(
+                &self.state,
+                super::NormalizedInputEvent::PointerMoved {
+                    pointer: u64::from(pointer),
+                    position: [x, y],
+                    view,
+                },
+            );
+            Ok(self.driver.has_continuous_input())
+        }
+
+        /// Translate one pointer-button transition.
+        pub fn pointer_button(
+            &mut self,
+            pointer: u32,
+            button: u16,
+            pressed: bool,
+            x: f64,
+            y: f64,
+            view: String,
+        ) -> Result<bool, JsValue> {
+            let view = parse_view(&view)?;
+            let button = match button {
+                0 => super::PointerButton::Primary,
+                1 => super::PointerButton::Auxiliary,
+                2 => super::PointerButton::Secondary,
+                3 => super::PointerButton::Other(3),
+                4 => super::PointerButton::Other(4),
+                other => super::PointerButton::Other(other),
+            };
+            Ok(self.driver.handle(
+                &self.state,
+                super::NormalizedInputEvent::PointerButton {
+                    pointer: u64::from(pointer),
+                    button,
+                    phase: if pressed {
+                        super::ButtonPhase::Pressed
+                    } else {
+                        super::ButtonPhase::Released
+                    },
+                    position: [x, y],
+                    view,
+                },
+            ))
+        }
+
+        /// End a pointer gesture after DOM `pointercancel` or lost capture.
+        pub fn pointer_cancel(&mut self, pointer: u32) -> bool {
+            self.driver.handle(
+                &self.state,
+                super::NormalizedInputEvent::PointerCancelled {
+                    pointer: u64::from(pointer),
+                },
+            )
+        }
+
+        /// Translate a unit-preserving vertical wheel delta.
+        pub fn wheel(&mut self, delta: f64, lines: bool, view: String) -> Result<bool, JsValue> {
+            let view = parse_view(&view)?;
+            Ok(self.driver.handle(
+                &self.state,
+                super::NormalizedInputEvent::Wheel {
+                    delta: if lines {
+                        super::WheelDelta::Lines(delta)
+                    } else {
+                        super::WheelDelta::Pixels(delta)
+                    },
+                    view,
+                },
+            ))
+        }
+
+        /// Track whether a canvas, rather than a form control, owns focus.
+        pub fn surface_focus(&mut self, focused: bool) {
+            self.driver.set_surface_focus(&self.state, focused);
+        }
+
+        /// Clear every held gesture on browser/window focus loss.
+        pub fn host_focus(&mut self, focused: bool) {
+            self.driver.handle(
+                &self.state,
+                super::NormalizedInputEvent::FocusChanged { focused },
+            );
+        }
+
+        /// Whether held input or queued work needs another animation frame.
+        pub fn needs_frame(&self) -> bool {
+            self.driver.needs_frame()
+        }
+
+        /// Drain typed platform effects after the action frame is reduced.
+        pub fn take_effects(&mut self) -> String {
+            super::effects_json(std::mem::take(&mut self.state.effects))
+        }
+
+        /// Accept the completed synchronous browser benchmark measurement.
+        pub fn benchmark_result(&mut self, milliseconds: f64) {
+            self.state.benchmark_ms = milliseconds.max(0.0) as f32;
+        }
+
+        /// Report that the browser has a usable WebGPU presentation path.
+        pub fn renderer_available(&mut self) {
+            self.state.set_renderer_webgpu();
+        }
+
+        /// Report device loss/initialization failure without forging an action.
+        pub fn renderer_lost(&mut self) {
+            self.state.renderer_lost();
+            self.driver.mapper.clear_held_state();
+            self.driver
+                .mapper
+                .set_context(self.driver.context(&self.state));
         }
 
         /// Return the CPU map header (size, channel, renderer) as JSON. The
@@ -1508,17 +1896,6 @@ mod wasm {
             Ok(self.state.compose_map())
         }
 
-        /// Apply one normalized command from the shared browser command
-        /// registry.
-        pub fn apply_command(&mut self, command: JsValue) -> Result<JsValue, JsValue> {
-            if self.shutdown {
-                return Err(JsValue::from_str("WebApp is shut down"));
-            }
-            self.state
-                .apply_command(&command.as_string().unwrap_or_default());
-            Ok(JsValue::from_str(&self.state.snapshot_json()))
-        }
-
         /// Return the most recent structured snapshot as JSON.
         pub fn info_snapshot(&self) -> Result<JsValue, JsValue> {
             Ok(JsValue::from_str(&self.state.snapshot_json()))
@@ -1538,21 +1915,19 @@ mod wasm {
         /// by [`pov_init`]. Returns a small JSON status; `rendered:false`
         /// means the renderer is missing or the surface failed — the caller
         /// should fall back to map mode after repeated failures.
-        pub fn pov_frame(&mut self, dt_ms: f64, input: JsValue) -> Result<JsValue, JsValue> {
+        pub fn pov_frame(&mut self, dt_ms: f64, time_seconds: f64) -> Result<JsValue, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
+            let input = self.driver.take_frame(&mut self.state);
             if self.state.view_mode != super::PresentationMode::Pov {
                 return Ok(JsValue::from_str("{\"active\":false,\"rendered\":false}"));
             }
-            let input = input.as_string().unwrap_or_default();
-            let (uploads, removes, organisms_changed) = self.state.pov_step(dt_ms, &input);
+            let (uploads, removes, organisms_changed) = self.state.pov_step(dt_ms, input);
             let organism_upload = organisms_changed.then(|| self.state.pov_organisms.upload());
             // The water-wobble clock, wrapped at the shader period like the
             // native shell so f32 never loses phase precision.
-            let time = super::json_number(&input, "time")
-                .unwrap_or(0.0)
-                .rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
+            let time = time_seconds.rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
             let rendered = POV_RENDERER.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let Some(renderer) = slot.as_mut() else {
@@ -1617,6 +1992,78 @@ mod wasm {
     }
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_input_tests {
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::wasm::WebApp;
+
+    fn snapshot(app: &WebApp) -> String {
+        app.info_snapshot()
+            .expect("snapshot")
+            .as_string()
+            .expect("string snapshot")
+    }
+
+    #[wasm_bindgen_test]
+    fn exact_actions_and_dom_keys_share_the_wasm_boundary() {
+        let mut button = WebApp::new(JsValue::from_str("{}")).expect("web app");
+        button.surface_focus(true);
+        button
+            .action(String::from("toggle-refinement"), None)
+            .expect("exact pulse action");
+        button.update(0.0).expect("button frame");
+        assert!(snapshot(&button).contains("\"refinement\":true"));
+        assert!(button
+            .action(String::from("Toggle-Refinement"), None)
+            .is_err());
+        assert!(button
+            .action(
+                String::from("toggle-refinement"),
+                Some(String::from("ignored"))
+            )
+            .is_err());
+
+        let mut keyboard = WebApp::new(JsValue::from_str("{}")).expect("web app");
+        keyboard.surface_focus(true);
+        assert!(keyboard.key_event(
+            String::from("Period"),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(keyboard.key_event(
+            String::from("Period"),
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+        ));
+        keyboard.update(0.0).expect("key frame");
+        assert!(snapshot(&keyboard).contains("\"refinement\":true"));
+        assert!(!keyboard.key_event(
+            String::from("period"),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+
+        keyboard.surface_focus(false);
+        assert!(!keyboard.key_event(String::from("Tab"), true, false, false, false, false, false,));
+        keyboard.update(0.0).expect("toolbar-focus frame");
+        assert!(snapshot(&keyboard).contains("\"view\":{\"mode\":\"map\""));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Native side of the parity guarantee: the exact functions the wasm module
@@ -1675,18 +2122,157 @@ mod tests {
         assert_eq!(forward, super::canonical_anchor_signature_sample());
     }
 
+    fn attribute_values<'a>(source: &'a str, attribute: &str) -> Vec<&'a str> {
+        let needle = format!("{attribute}=\"");
+        source
+            .split(&needle)
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"').map(|(value, _)| value))
+            .collect()
+    }
+
+    #[test]
+    fn browser_controls_and_help_use_registered_action_ids() {
+        let index = include_str!("../web/index.html");
+        let help = include_str!("../web/help/index.html");
+        let controls = attribute_values(index, "data-action");
+        let documented = attribute_values(help, "data-help-action");
+        assert!(!controls.is_empty());
+        for id in &controls {
+            assert!(
+                viewer_host::action::action_descriptor(id).is_some(),
+                "unknown browser control action {id}"
+            );
+            assert!(documented.contains(id), "browser help omits control {id}");
+        }
+        for descriptor in viewer_host::action::ACTION_DESCRIPTORS {
+            assert!(
+                documented.contains(&descriptor.id.as_str()),
+                "browser help omits descriptor {}",
+                descriptor.id.as_str()
+            );
+        }
+        for id in documented {
+            assert!(
+                viewer_host::action::action_descriptor(id).is_some(),
+                "help documents unknown action {id}"
+            );
+        }
+        let app = include_str!("../web/assets/app.js");
+        assert!(!app.contains("MOVE_KEYS"));
+        assert!(!app.contains("POV_MOVE"));
+        assert!(!app.contains("requestPointerLock"));
+    }
+
+    #[test]
+    fn browser_button_and_key_paths_share_one_mapper_queue() {
+        use viewer_host::input::{ButtonPhase, Modifiers, NormalizedInputEvent, PhysicalKey};
+
+        let mut button_state = super::WebAppState::default();
+        let mut button_driver = super::BrowserViewerDriver::default();
+        button_driver.set_surface_focus(&button_state, true);
+        button_driver.enqueue_action(viewer_host::ViewerAction::ToggleRefinement);
+        let _ = button_driver.take_frame(&mut button_state);
+
+        let mut key_state = super::WebAppState::default();
+        let mut key_driver = super::BrowserViewerDriver::default();
+        key_driver.set_surface_focus(&key_state, true);
+        assert!(key_driver.handle(
+            &key_state,
+            NormalizedInputEvent::Key {
+                key: PhysicalKey::Period,
+                phase: ButtonPhase::Pressed,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            },
+        ));
+        let _ = key_driver.take_frame(&mut key_state);
+
+        assert!(button_state.refinement_enabled);
+        assert_eq!(
+            button_state.refinement_enabled,
+            key_state.refinement_enabled
+        );
+        assert_eq!(button_state.last_action, key_state.last_action);
+    }
+
+    #[test]
+    fn browser_surface_focus_and_primary_drag_are_mapper_owned() {
+        use viewer_host::input::{
+            ButtonPhase, Modifiers, NormalizedInputEvent, PhysicalKey, PointerButton,
+        };
+
+        let mut state = super::WebAppState::new("{\"webgpu\":true}");
+        state.apply_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
+        let mut driver = super::BrowserViewerDriver::default();
+        driver.set_surface_focus(&state, false);
+        assert!(!driver.handle(
+            &state,
+            NormalizedInputEvent::Key {
+                key: PhysicalKey::Tab,
+                phase: ButtonPhase::Pressed,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            },
+        ));
+        assert_eq!(state.view_mode, viewer_host::PresentationMode::Pov);
+
+        driver.set_surface_focus(&state, true);
+        driver.handle(
+            &state,
+            NormalizedInputEvent::PointerMoved {
+                pointer: 7,
+                position: [10.0, 20.0],
+                view: viewer_host::ViewKind::Pov,
+            },
+        );
+        assert_eq!(driver.take_frame(&mut state).look_delta, [0.0, 0.0]);
+        assert!(driver.handle(
+            &state,
+            NormalizedInputEvent::PointerButton {
+                pointer: 7,
+                button: PointerButton::Primary,
+                phase: ButtonPhase::Pressed,
+                position: [10.0, 20.0],
+                view: viewer_host::ViewKind::Pov,
+            },
+        ));
+        assert!(driver.handle(
+            &state,
+            NormalizedInputEvent::PointerMoved {
+                pointer: 7,
+                position: [14.0, 17.0],
+                view: viewer_host::ViewKind::Pov,
+            },
+        ));
+        assert_eq!(driver.take_frame(&mut state).look_delta, [4.0, -3.0]);
+        driver.handle(
+            &state,
+            NormalizedInputEvent::PointerCancelled { pointer: 7 },
+        );
+        assert!(!driver.take_frame(&mut state).primary_drag);
+    }
+
     #[test]
     fn web_app_snapshot_tracks_inline_state() {
         let mut app = super::WebAppState::new("{\"tier\":\"mid\"}");
-        app.update(16.666_667, "{\"move_x\":1}");
-        app.apply_command("{\"id\":\"toggle:refinement\"}");
+        app.update(
+            16.666_667,
+            viewer_host::input::InputFrame {
+                map_axis: [1, 0],
+                ..viewer_host::input::InputFrame::default()
+            },
+        );
+        app.apply_action(viewer_host::ViewerAction::ToggleRefinement);
         let snapshot = app.snapshot_json();
         assert!(snapshot.contains("\"tier\":{\"name\":\"WebMid\""));
         assert!(snapshot.contains("\"region\":[0,0]"));
         assert!(snapshot.contains("\"executor\":{\"mode\":\"inline\""));
         assert!(snapshot.contains("\"renderer\":{\"mode\":\"cpu-fallback\""));
         assert!(snapshot.contains("\"settle_hash\":\"0x"));
-        assert!(snapshot.contains("\"last_command\":\"{\\\"id\\\":\\\"toggle:refinement\\\"}\""));
+        assert!(snapshot.contains("\"last_action\":\"toggle-refinement\""));
     }
 
     /// A small settle-able window so the map tests stay fast (the viz.rs
@@ -1712,18 +2298,37 @@ mod tests {
         // main.rs `apply_movement`: 500 u/s, sprint x4, normalized
         // diagonals, dt clamped to 100ms.
         let mut app = super::WebAppState::default();
-        app.update(16.666_667, "{\"move_x\":1}");
+        app.update(
+            16.666_667,
+            viewer_host::input::InputFrame {
+                map_axis: [1, 0],
+                ..viewer_host::input::InputFrame::default()
+            },
+        );
         assert!((app.world_pos.0 - 500.0 / 60.0).abs() < 0.01);
         assert_eq!(app.world_pos.1, 0.0);
 
         let mut diagonal = super::WebAppState::default();
-        diagonal.update(1000.0, "{\"move_x\":1,\"move_y\":1}");
+        diagonal.update(
+            1000.0,
+            viewer_host::input::InputFrame {
+                map_axis: [1, 1],
+                ..viewer_host::input::InputFrame::default()
+            },
+        );
         let expected = 500.0 * 0.1 / std::f64::consts::SQRT_2;
         assert!((diagonal.world_pos.0 - expected).abs() < 1e-9);
         assert!((diagonal.world_pos.1 - expected).abs() < 1e-9);
 
         let mut sprint = super::WebAppState::default();
-        sprint.update(16.666_667, "{\"move_x\":-1,\"sprint\":true}");
+        sprint.update(
+            16.666_667,
+            viewer_host::input::InputFrame {
+                map_axis: [-1, 0],
+                sprint: true,
+                ..viewer_host::input::InputFrame::default()
+            },
+        );
         assert!((sprint.world_pos.0 + 4.0 * 500.0 / 60.0).abs() < 0.05);
     }
 
@@ -1734,10 +2339,17 @@ mod tests {
         // Sprint east; budgeted per-frame updates must keep the streamed
         // window following the player (the native streaming contract).
         for _ in 0..40 {
-            app.update(100.0, "{\"move_x\":1,\"sprint\":true}");
+            app.update(
+                100.0,
+                viewer_host::input::InputFrame {
+                    map_axis: [1, 0],
+                    sprint: true,
+                    ..viewer_host::input::InputFrame::default()
+                },
+            );
         }
         for _ in 0..5 {
-            app.update(100.0, "{}");
+            app.update(100.0, viewer_host::input::InputFrame::default());
         }
         let center = world_core::RegionCoord::from_world(app.world_pos.0, app.world_pos.1);
         assert!(app.world_pos.0 >= 8000.0 - 1e-6);
@@ -1835,11 +2447,19 @@ mod tests {
         let mut app = small_window_app();
         app.compose_map();
         app.set_renderer_webgpu();
-        app.apply_command("{\"id\":\"mode:pov\"}");
+        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
         assert_eq!(app.view_mode, super::PresentationMode::Pov);
 
         let before = app.pov_camera.pos;
-        let (uploads, _, _) = app.pov_step(100.0, "{\"move_y\":1,\"time\":0}");
+        let (uploads, _, _) = app.pov_step(
+            100.0,
+            viewer_host::input::InputFrame {
+                pov_axis: [0, 1, 0],
+                ..viewer_host::input::InputFrame::default()
+            },
+        );
         assert!(
             !app.pov_chunks.is_empty(),
             "chunks meshed around the camera"
@@ -1852,14 +2472,27 @@ mod tests {
         assert!(moved.length() > 0.0, "fly movement advanced the camera");
 
         let yaw = app.pov_camera.yaw;
-        app.pov_step(16.0, "{\"look_dx\":100,\"look_dy\":0}");
+        app.pov_step(
+            16.0,
+            viewer_host::input::InputFrame {
+                look_delta: [100.0, 0.0],
+                primary_drag: true,
+                ..viewer_host::input::InputFrame::default()
+            },
+        );
         assert_ne!(app.pov_camera.yaw, yaw, "look input turns the camera");
 
         // Walk mode grounds the camera and keeps it grounded while moving.
-        app.apply_command("{\"id\":\"pov:walk\"}");
+        app.apply_action(viewer_host::ViewerAction::ToggleWalk);
         assert!(app.pov_camera.walk);
         for _ in 0..30 {
-            app.pov_step(100.0, "{\"move_y\":1,\"time\":0}");
+            app.pov_step(
+                100.0,
+                viewer_host::input::InputFrame {
+                    pov_axis: [0, 1, 0],
+                    ..viewer_host::input::InputFrame::default()
+                },
+            );
         }
         let (ground, _) = pov_host::walk_ground(
             &app.pov_chunks,
@@ -1873,14 +2506,18 @@ mod tests {
     }
 
     #[test]
-    fn channel_commands_change_the_painted_channel() {
+    fn channel_actions_change_the_painted_channel() {
         let mut app = small_window_app();
         let composite = app.compose_map();
-        app.apply_command("{\"id\":\"channel\",\"value\":\"elevation\"}");
+        app.apply_action(viewer_host::ViewerAction::SetMapChannel(
+            viewer_host::Channel::Elevation,
+        ));
         assert!(app.cpu_map_json().contains("\"channel\":\"elevation\""));
         let elevation = app.compose_map();
         assert_ne!(composite, elevation, "channels paint differently");
-        app.apply_command("{\"id\":\"channel:composite\"}");
+        app.apply_action(viewer_host::ViewerAction::SetMapChannel(
+            viewer_host::Channel::Composite,
+        ));
         assert!(app.cpu_map_json().contains("\"channel\":\"composite\""));
         assert_eq!(app.compose_map(), composite);
     }
@@ -1889,7 +2526,7 @@ mod tests {
     fn renderer_device_loss_falls_back_to_cpu() {
         let mut app = super::WebAppState::new("{\"webgpu\":true}");
         assert!(app.snapshot_json().contains("\"mode\":\"webgpu-atlas\""));
-        app.apply_command("renderer:device-lost");
+        app.renderer_lost();
         let snapshot = app.snapshot_json();
         assert!(snapshot.contains("\"mode\":\"cpu-fallback\""));
         assert!(snapshot.contains("\"device_losses\":1"));
@@ -1897,27 +2534,35 @@ mod tests {
     }
 
     #[test]
-    fn worker_modes_preserve_settle_hash() {
+    fn unavailable_worker_modes_do_not_claim_async_success() {
         let mut app = super::WebAppState::default();
         let inline = app.settle_hash();
-        app.apply_command("worker:workers");
+        app.apply_action(viewer_host::ViewerAction::SetWorkerBackend(
+            viewer_host::action::WorkerBackend::Workers,
+        ));
         assert_eq!(inline, app.settle_hash());
-        app.apply_command("worker:shared");
-        assert_eq!(inline, app.settle_hash());
-        app.apply_command("worker:cancel-storm");
         let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"mode\":\"shared-memory\""));
-        assert!(snapshot.contains("\"cancellations\":8"));
-        assert!(snapshot.contains("\"stale_results\":3"));
+        assert!(snapshot.contains("\"mode\":\"inline\""));
+        assert!(snapshot.contains("Worker execution is unavailable"));
+        assert!(matches!(
+            app.effects.as_slice(),
+            [viewer_host::ViewerEffect::ConfigureWorkerBackend(
+                viewer_host::action::WorkerBackend::Workers
+            )]
+        ));
     }
 
     #[test]
     fn tier_changes_preserve_settle_hash() {
         let mut app = super::WebAppState::default();
         let low = app.settle_hash();
-        app.apply_command("{\"value\":\"mid\"}");
+        app.apply_action(viewer_host::ViewerAction::SetResourceTier(
+            world_runtime::ResourceTier::Mid,
+        ));
         assert_eq!(low, app.settle_hash());
-        app.apply_command("{\"value\":\"high\"}");
+        app.apply_action(viewer_host::ViewerAction::SetResourceTier(
+            world_runtime::ResourceTier::High,
+        ));
         assert_eq!(low, app.settle_hash());
         let snapshot = app.snapshot_json();
         assert!(snapshot.contains("\"runtime\":\"high\""));
@@ -1925,25 +2570,34 @@ mod tests {
     }
 
     #[test]
-    fn storage_save_reload_preserves_settle_hash() {
+    fn storage_actions_wait_for_platform_completion() {
         let mut app = super::WebAppState::default();
-        app.update(16.0, "{\"move_x\":1}");
+        app.update(
+            16.0,
+            viewer_host::input::InputFrame {
+                map_axis: [1, 0],
+                ..viewer_host::input::InputFrame::default()
+            },
+        );
         let before = app.settle_hash();
-        app.apply_command("storage:enable");
-        app.apply_command("storage:save");
-        app.apply_command("storage:reload");
+        app.apply_action(viewer_host::ViewerAction::SetStorageEnabled(true));
+        app.apply_action(viewer_host::ViewerAction::SaveSession);
+        app.apply_action(viewer_host::ViewerAction::LoadSession);
         let snapshot = app.snapshot_json();
         assert_eq!(before, app.settle_hash());
         assert!(snapshot.contains("\"mode\":\"indexeddb\""));
-        assert!(snapshot.contains("\"records\":1"));
+        assert!(snapshot.contains("\"records\":0"));
         assert!(snapshot.contains("\"failures\":0"));
+        assert_eq!(app.effects.len(), 2);
     }
 
     #[test]
     fn unavailable_pov_keeps_map_mode() {
         let mut app = super::WebAppState::default();
         let before = app.settle_hash();
-        app.apply_command("mode:pov");
+        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
         let snapshot = app.snapshot_json();
         assert_eq!(before, app.settle_hash());
         assert!(snapshot.contains("\"view\":{\"mode\":\"map\""));
@@ -1957,44 +2611,48 @@ mod tests {
         // return to map mode cleanly instead of stranding the viewer.
         let mut app = super::WebAppState::new("{\"webgpu\":true}");
         let before = app.settle_hash();
-        app.apply_command("mode:pov");
-        app.apply_command("pov:pointer-lock");
+        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
         let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"view\":{\"mode\":\"pov\",\"pov_supported\":true"));
-        assert!(snapshot.contains("\"pointer_lock\":true"));
-        app.apply_command("renderer:device-lost");
+        assert!(snapshot.contains("\"view\":{\"mode\":\"pov\",\"focused\":\"pov\""));
+        assert!(!snapshot.contains("pointer_lock"));
+        app.renderer_lost();
         let snapshot = app.snapshot_json();
-        assert!(snapshot.contains("\"view\":{\"mode\":\"map\",\"pov_supported\":false"));
-        assert!(snapshot.contains("\"pointer_lock\":false"));
+        assert!(snapshot.contains("\"view\":{\"mode\":\"map\",\"focused\":\"map\""));
         assert!(snapshot.contains("POV requires WebGPU; returned to map mode"));
         // Recovery re-opens the gate without touching world identity.
-        app.apply_command("renderer:webgpu");
-        app.apply_command("mode:pov");
+        app.set_renderer_webgpu();
+        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
         assert!(app.snapshot_json().contains("\"view\":{\"mode\":\"pov\""));
         assert_eq!(before, app.settle_hash());
     }
 
     #[test]
-    fn pov_config_commands_are_presentation_only() {
+    fn pov_config_actions_are_presentation_only() {
         // The native POV surface mirrored in the browser (walk, the B/N/V
         // diagnostic toggles, the render scale) is derived presentation:
-        // every command leaves the settle hash untouched.
+        // every action leaves the settle hash untouched.
         let mut app = super::WebAppState::new("{\"webgpu\":true}");
-        app.apply_command("mode:pov");
+        app.apply_action(viewer_host::ViewerAction::SetPresentation(
+            viewer_host::PresentationMode::Pov,
+        ));
         let before = app.settle_hash();
-        app.apply_command("pov:walk");
-        app.apply_command("pov:toggle-baked");
-        app.apply_command("pov:toggle-detail");
-        app.apply_command("pov:toggle-water");
-        app.apply_command("{\"id\":\"pov:scale\",\"value\":\"half\"}");
+        app.apply_action(viewer_host::ViewerAction::ToggleWalk);
+        app.apply_action(viewer_host::ViewerAction::TogglePovShadowAo);
+        app.apply_action(viewer_host::ViewerAction::TogglePovDetailNormals);
+        app.apply_action(viewer_host::ViewerAction::TogglePovWater);
+        app.apply_action(viewer_host::ViewerAction::SetPovRenderScale(0.5));
         let snapshot = app.snapshot_json();
         assert_eq!(before, app.settle_hash());
         assert!(snapshot.contains(
             "\"pov\":{\"motion\":\"walk\",\"shadow_ao\":false,\"detail_normals\":false,\
              \"water\":false,\"render_scale\":0.50}"
         ));
-        app.apply_command("pov:walk");
-        app.apply_command("{\"id\":\"pov:scale\",\"value\":\"full\"}");
+        app.apply_action(viewer_host::ViewerAction::ToggleWalk);
+        app.apply_action(viewer_host::ViewerAction::SetPovRenderScale(1.0));
         let snapshot = app.snapshot_json();
         assert!(snapshot.contains("\"motion\":\"fly\""));
         assert!(snapshot.contains("\"render_scale\":1.00"));

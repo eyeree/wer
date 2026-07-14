@@ -587,18 +587,11 @@ impl Hud {
         cur.rule(self);
 
         cur.line(self, "KEYS", HEADER);
-        for (keys, action) in [
-            ("WASD 1-8 Z", "move, bias, reset"),
-            ("E / Q / C", "anchors, clear"),
-            ("T Y K", "categ,polar,capture"),
-            ("R", "transition mode"),
-            ("H J U Del", "paths: on,rec,attr,clr"),
-            ("V G N X M", "channel,overlays"),
-            ("scroll", "zoom (organism info)"),
-        ] {
+        for row in crate::input::NATIVE_HELP_ROWS {
+            debug_assert!(!row.binding_ids.is_empty());
             let row_y = cur.y;
-            self.text(cur.x, row_y, keys, KEY);
-            self.text(cur.x + 13 * 8 * SCALE, row_y, action, LABEL);
+            self.text(cur.x, row_y, row.keys, KEY);
+            self.text(cur.x + 13 * 8 * SCALE, row_y, row.action, LABEL);
             cur.y += LINE_HEIGHT;
         }
     }
