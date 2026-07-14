@@ -60,8 +60,14 @@ pub struct GpuMapParams {
     /// Channel selector (must be one of the GPU-supported channels; the
     /// shell falls back to the CPU composer otherwise).
     pub channel: u32,
-    /// Draw the region grid.
-    pub grid: bool,
+    /// Integer magnification about the map center. The shader applies this
+    /// transform to the field and sparse-overlay coordinates together so GPU
+    /// composition matches the canonical CPU presenter's center crop.
+    pub zoom: u32,
+    /// Width used when the canonical presenter rasterized grid lines into the
+    /// sparse overlay, in source map-cell units. This remains projection
+    /// metadata only: the GPU shader must not synthesize a second grid.
+    pub grid_thickness_cells: f32,
     /// Refinement octaves (0..=3 used).
     pub refine: [RefineOctaveParams; 3],
     /// How many refinement octaves are active.
@@ -90,9 +96,9 @@ struct MapParamsRaw {
     side_cells: f32,
     atlas_tiles_x: u32,
     channel: u32,
-    grid: u32,
     refine_octave_count: u32,
-    _pad: u32,
+    zoom: f32,
+    grid_thickness_cells: f32,
     refine: [RefineOctaveRaw; 3],
 }
 
@@ -436,9 +442,9 @@ impl GpuMap {
             side_cells: (span * params.resolution as i32) as f32,
             atlas_tiles_x: self.tiles_x,
             channel: params.channel,
-            grid: u32::from(params.grid),
             refine_octave_count: params.refine_count,
-            _pad: 0,
+            zoom: params.zoom.max(1) as f32,
+            grid_thickness_cells: params.grid_thickness_cells.max(1.0),
             refine,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&raw));
@@ -451,5 +457,207 @@ impl GpuMap {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Convert an encoded-space WGSL palette result through the final sRGB
+    /// attachment quantization. The shader converts to linear before writing;
+    /// the sRGB target converts back, so this is the observable byte.
+    fn attachment_byte(encoded: f32) -> u8 {
+        (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    fn wgsl_rgb8(rgb: [f32; 3]) -> [f32; 3] {
+        rgb.map(|component| component / 255.0)
+    }
+
+    fn wgsl_lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+        let t = t.clamp(0.0, 1.0);
+        std::array::from_fn(|index| a[index] + (b[index] - a[index]) * t)
+    }
+
+    /// Rust transcription of WGSL `elevation_color`, intentionally using
+    /// normalized floats until attachment quantization like the shader.
+    fn wgsl_elevation_reference(elevation: f32) -> [u8; 3] {
+        let encoded = if elevation < 0.0 {
+            wgsl_lerp(
+                wgsl_rgb8([8.0, 16.0, 64.0]),
+                wgsl_rgb8([70.0, 130.0, 190.0]),
+                (1.0 + elevation / 600.0).clamp(0.0, 1.0),
+            )
+        } else {
+            let t = (elevation / 900.0).clamp(0.0, 1.0);
+            if t < 0.5 {
+                wgsl_lerp(
+                    wgsl_rgb8([70.0, 120.0, 60.0]),
+                    wgsl_rgb8([140.0, 120.0, 80.0]),
+                    t * 2.0,
+                )
+            } else {
+                wgsl_lerp(
+                    wgsl_rgb8([140.0, 120.0, 80.0]),
+                    wgsl_rgb8([245.0, 245.0, 245.0]),
+                    (t - 0.5) * 2.0,
+                )
+            }
+        };
+        encoded.map(attachment_byte)
+    }
+
+    /// Rust transcription of WGSL `soil_color` through attachment bytes.
+    fn wgsl_soil_reference(depth: f32, fertility: f32) -> [u8; 3] {
+        let hue = wgsl_lerp(
+            wgsl_rgb8([190.0, 170.0, 130.0]),
+            wgsl_rgb8([80.0, 60.0, 30.0]),
+            fertility,
+        );
+        let brightness = 0.35 + 0.65 * depth;
+        hue.map(|component| attachment_byte(component * brightness))
+    }
+
+    fn assert_palette_close(label: &str, shader: [u8; 3], canonical: [u8; 3]) {
+        // WGSL keeps palette interpolation in f32 until an sRGB attachment
+        // rounds to unorm8; the canonical CPU ramp truncates intermediate
+        // byte blends. Two bytes covers only those quantization differences.
+        const MAX_BYTE_ERROR: u8 = 2;
+        for component in 0..3 {
+            assert!(
+                shader[component].abs_diff(canonical[component]) <= MAX_BYTE_ERROR,
+                "{label} component {component}: shader={} canonical={} tolerance={MAX_BYTE_ERROR}",
+                shader[component],
+                canonical[component],
+            );
+        }
+    }
+
+    #[test]
+    fn map_uniform_layout_stays_wgsl_compatible() {
+        assert_eq!(core::mem::size_of::<RefineOctaveRaw>(), 48);
+        assert_eq!(core::mem::offset_of!(MapParamsRaw, channel), 16);
+        assert_eq!(core::mem::offset_of!(MapParamsRaw, refine_octave_count), 20);
+        assert_eq!(core::mem::offset_of!(MapParamsRaw, zoom), 24);
+        assert_eq!(
+            core::mem::offset_of!(MapParamsRaw, grid_thickness_cells),
+            28
+        );
+        assert_eq!(core::mem::offset_of!(MapParamsRaw, refine), 32);
+        assert_eq!(core::mem::size_of::<MapParamsRaw>(), 176);
+    }
+
+    #[test]
+    fn shader_has_no_independent_grid_composition() {
+        assert!(!SHADER_COMPOSE_MAP.contains("grid: u32"));
+        assert!(!SHADER_COMPOSE_MAP.contains("params.grid"));
+        assert!(SHADER_COMPOSE_MAP.contains("grid_thickness_cells: f32"));
+        assert!(SHADER_COMPOSE_MAP.contains("textureLoad(overlay"));
+    }
+
+    #[test]
+    fn gpu_zoom_uses_the_cpu_center_crop_transform() {
+        let side = 15.0f32;
+        let center = side * 0.5;
+        for zoom in [1.0f32, 2.0, 4.0, 8.0, 16.0] {
+            for output in 0..15 {
+                let uv = (output as f32 + 0.5) / side;
+                let gpu = (uv * side - center) / zoom + center;
+                let cpu = (output as f32 + 0.5 - center) / zoom + center;
+                assert_eq!(gpu.to_bits(), cpu.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_palette_and_overlay_math_round_trips_through_srgb_target() {
+        fn decode(encoded: f32) -> f32 {
+            if encoded <= 0.04045 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn encode(linear: f32) -> f32 {
+            if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            }
+        }
+
+        for byte in [0u8, 8, 18, 64, 127, 190, 245, 255] {
+            let encoded = f32::from(byte) / 255.0;
+            let presented = (encode(decode(encoded)) * 255.0).round() as u8;
+            assert_eq!(presented, byte);
+        }
+        for (base, overlay, alpha) in [(24u8, 255u8, 0.6f32), (190, 0, 0.35)] {
+            let cpu_encoded =
+                (f32::from(base) * (1.0 - alpha) + f32::from(overlay) * alpha) / 255.0;
+            let gpu_presented = encode(decode(cpu_encoded));
+            assert!((gpu_presented - cpu_encoded).abs() < 1.0e-6);
+        }
+        assert!(SHADER_COMPOSE_MAP.contains("srgb_to_linear(rgb)"));
+    }
+
+    #[test]
+    fn wgsl_palette_reference_tracks_canonical_mapcolor() {
+        // These source assertions bind the Rust transcription above to the
+        // actual WGSL constants, branch thresholds, and channel dispatch. A
+        // palette edit in either representation must update this parity test.
+        for required in [
+            "const SEA_LEVEL: f32 = 0.0;",
+            "if e < SEA_LEVEL {",
+            "rgb8(8.0, 16.0, 64.0)",
+            "rgb8(70.0, 130.0, 190.0)",
+            "clamp(1.0 + e / 600.0, 0.0, 1.0)",
+            "let t = clamp(e / 900.0, 0.0, 1.0);",
+            "if t < 0.5 {",
+            "rgb8(70.0, 120.0, 60.0)",
+            "rgb8(140.0, 120.0, 80.0)",
+            "rgb8(245.0, 245.0, 245.0)",
+            "fn soil_color(depth: f32, fertility: f32)",
+            "rgb8(190.0, 170.0, 130.0)",
+            "rgb8(80.0, 60.0, 30.0)",
+            "0.35 + 0.65 * depth",
+            "case 1u: { if have_base { rgb = elevation_color(elev); }",
+            "case 6u: { if (presence & 0xC0u) == 0xC0u { rgb = soil_color(p1.z, p1.w); }",
+        ] {
+            assert!(
+                SHADER_COMPOSE_MAP.contains(required),
+                "WGSL palette contract lost `{required}`"
+            );
+        }
+
+        for (label, elevation) in [
+            ("deep water", -1_200.0),
+            ("water ramp floor", -600.0),
+            ("shallow water", -60.0),
+            ("shore land", 0.0),
+            ("low land", 225.0),
+            ("rock transition", 450.0),
+            ("snow ramp", 675.0),
+            ("snow cap", 900.0),
+        ] {
+            assert_palette_close(
+                label,
+                wgsl_elevation_reference(elevation),
+                world_runtime::mapcolor::elevation_color(elevation),
+            );
+        }
+
+        for (label, depth, fertility) in [
+            ("thin sterile soil", 0.0, 0.0),
+            ("thin fertile soil", 0.2, 0.8),
+            ("medium mixed soil", 0.65, 0.35),
+            ("deep fertile soil", 1.0, 1.0),
+        ] {
+            assert_palette_close(
+                label,
+                wgsl_soil_reference(depth, fertility),
+                world_runtime::mapcolor::soil_color(depth, fertility),
+            );
+        }
     }
 }

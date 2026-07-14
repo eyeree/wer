@@ -2,10 +2,11 @@
 // (phase-6-plan.md §6.5) — the first render-graph node.
 //
 // Fullscreen pass over the map viewport: screen position → virtual map cell →
-// window region → atlas slot → channel texels → false color (transcribing the
-// CPU composer's palettes in `viz.rs`), plus optional refinement octaves that
-// continue the terrain gradient-noise spectrum above FIELD_RES per *screen*
-// pixel, using the same integer-hash gradient scheme as `world-core`
+// window region → atlas slot → channel texels → false color (matching the
+// canonical presenter in `viewer_host::map` and per-cell palette values in
+// `world_runtime::mapcolor`), plus optional refinement octaves that continue
+// the terrain gradient-noise spectrum above FIELD_RES per *screen* pixel,
+// using the same integer-hash gradient scheme as `world-core`
 // (`splitmix64`/`mix` re-implemented over u32 pairs below).
 //
 // ADR 0017: everything computed here is derived presentation. Nothing is read
@@ -39,9 +40,9 @@ struct MapParams {
     atlas_tiles_x: u32,  // atlas slots per row
     // Presentation.
     channel: u32,
-    grid: u32,
     refine_octave_count: u32,
-    _pad: u32,
+    zoom: f32,
+    grid_thickness_cells: f32,
     refine: array<RefineOctave, 3>,
 }
 
@@ -60,7 +61,8 @@ struct MapParams {
 @group(0) @binding(5) var plane3: texture_2d<f32>;
 // Integer plane: rg16uint (biome id, dominant species index).
 @group(0) @binding(6) var ints: texture_2d<u32>;
-// CPU-drawn sparse overlay (routes, rings, organisms, markers), map-cell res.
+// CPU-drawn sparse overlay (ordered grid, routes, rings, organisms, markers),
+// map-cell resolution.
 @group(0) @binding(7) var overlay: texture_2d<f32>;
 
 // --- 64-bit integer hashing over u32 pairs (lo, hi) ------------------------
@@ -198,7 +200,7 @@ fn refinement_delta(px: f32, py: f32) -> f32 {
     return delta;
 }
 
-// --- palettes (transcribed from viz.rs) ------------------------------------
+// --- palettes (matching viewer_host::map/world_runtime::mapcolor) ----------
 
 fn lerp_rgb(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
     return mix(a, b, clamp(t, 0.0, 1.0));
@@ -206,6 +208,25 @@ fn lerp_rgb(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
 
 fn rgb8(r: f32, g: f32, b: f32) -> vec3<f32> {
     return vec3<f32>(r, g, b) / 255.0;
+}
+
+// CPU palettes and sparse overlays compose in sRGB byte space. The render
+// target is itself sRGB, so decode exactly once after every encoded-space
+// palette/overlay operation; the attachment then re-encodes to the same
+// visible bytes as the canonical CPU texture path.
+fn srgb_to_linear_channel(encoded: f32) -> f32 {
+    if encoded <= 0.04045 {
+        return encoded / 12.92;
+    }
+    return pow((encoded + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_to_linear(encoded: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        srgb_to_linear_channel(encoded.r),
+        srgb_to_linear_channel(encoded.g),
+        srgb_to_linear_channel(encoded.b),
+    );
 }
 
 const SEA_LEVEL: f32 = 0.0;
@@ -279,7 +300,7 @@ fn biome_color(id: u32) -> vec3<f32> {
 }
 
 // Species tint: signature(seed) -> species_seed -> splitmix64 -> vivid color
-// (transcribing viz.rs `species_color` + the world-core seed folds).
+// (matching `viewer_host::map::species_color` + the world-core seed folds).
 fn species_color(temperature: f32, moisture: f32, fertility: f32, biome: u32, index: u32) -> vec3<f32> {
     // HabitatSignature banding (habitat.rs `band`).
     let tband = min(u32(clamp((temperature + 20.0) / 60.0, 0.0, 1.0) * 6.0), 5u);
@@ -331,8 +352,12 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let side = params.side_cells;
-    let px = in.uv.x * side; // fractional map-cell coords, row 0 = north
-    let py = in.uv.y * side;
+    // Canonical center zoom: identical source-space transform for the field,
+    // refinement, and sparse overlay. Row 0 remains north.
+    let center = side * 0.5;
+    let zoom = max(params.zoom, 1.0);
+    let px = (in.uv.x * side - center) / zoom + center;
+    let py = (in.uv.y * side - center) / zoom + center;
     let res = u32(params.resolution);
     let cellx = u32(px);
     let celly = u32(py);
@@ -404,18 +429,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 default: { rgb = missing_color(cx, cy); }
             }
 
-            if params.grid != 0u && (cx == 0u || cy == 0u) {
-                rgb = lerp_rgb(rgb, vec3<f32>(0.0), 0.35);
-            }
         }
     }
 
     // CPU-drawn sparse overlay on top (nearest texel — cell-crisp like the
     // CPU path).
     let osize = textureDimensions(overlay);
-    let opix = vec2<i32>(vec2<f32>(f32(osize.x), f32(osize.y)) * in.uv);
+    let opix = vec2<i32>(i32(px), i32(py));
     let over = textureLoad(overlay, clamp(opix, vec2<i32>(0), vec2<i32>(osize) - 1), 0);
     rgb = mix(rgb, over.rgb, over.a);
 
-    return vec4<f32>(rgb, 1.0);
+    return vec4<f32>(srgb_to_linear(rgb), 1.0);
 }

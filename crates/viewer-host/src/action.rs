@@ -797,14 +797,9 @@ impl ViewerAction {
             "set-map-channel" => Channel::from_id(required()?)
                 .map(Self::SetMapChannel)
                 .ok_or(InvalidValue),
-            "toggle-overlay" => match required()? {
-                "grid" => Ok(Self::ToggleOverlay(MapOverlay::Grid)),
-                "rings" => Ok(Self::ToggleOverlay(MapOverlay::Rings)),
-                "pinned-flash" => Ok(Self::ToggleOverlay(MapOverlay::PinnedFlash)),
-                "organisms" => Ok(Self::ToggleOverlay(MapOverlay::Organisms)),
-                "discovered" => Ok(Self::ToggleOverlay(MapOverlay::Discovered)),
-                _ => Err(InvalidValue),
-            },
+            "toggle-overlay" => MapOverlay::from_id(required()?)
+                .map(Self::ToggleOverlay)
+                .ok_or(InvalidValue),
             "zoom-in" => pulse(value, Self::ZoomIn),
             "zoom-out" => pulse(value, Self::ZoomOut),
             "toggle-gpu-compose" => pulse(value, Self::ToggleGpuCompose),

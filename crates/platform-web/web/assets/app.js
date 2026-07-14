@@ -13,6 +13,9 @@ let wasmMod;
 // The canvas placement of the last drawn map image (letterboxed, square
 // source), so cursor picking inverts the exact draw transform.
 let mapViewport;
+let mapScratch;
+let mapScratchContext;
+let mapImageData;
 
 const write = (name, value, cls) => {
   const node = fields.get(name);
@@ -78,36 +81,30 @@ const drawBootCanvas = () => {
   ctx.fillText("Browser runtime boot", 18, 30);
 };
 
-// The view magnification (native main.rs: mouse wheel, powers of two up to
-// the shared reducer's cap). Presentation-only, exactly like native `magnify()` — a
-// nearest-neighbor center crop that reveals no data beyond the field
-// resolution.
+// The view magnification is composed by the canonical Rust presenter. JS only
+// reports it and blits the already transformed source pixels.
 let zoom = 1;
-// The last composed frame, kept so wheel zoom redraws without recomposing.
-let lastMapFrame;
 
-// Blit the composed RGBA window onto the canvas, preserving the source's
-// square aspect (letterboxed) so regions stay square like the native viewer.
-// At zoom > 1 only the center 1/zoom block is drawn (the native center crop).
+// Blit the canonical RGBA window onto the canvas, preserving its square
+// aspect. Zoom and every overlay have already been transformed together.
 const drawCpuMap = (header, pixels) => {
   const canvas = document.getElementById("world-canvas");
   const ctx = canvas.getContext("2d");
-  if (!ctx || header.kind !== "rgba8") return;
-  lastMapFrame = { header, pixels };
-  const source = new ImageData(
-    new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength),
-    header.width,
-    header.height,
-  );
-  const scratch = document.createElement("canvas");
-  scratch.width = header.width;
-  scratch.height = header.height;
-  const scratchCtx = scratch.getContext("2d");
-  scratchCtx.putImageData(source, 0, 0);
-  const sw = header.width / zoom;
-  const sh = header.height / zoom;
-  const sx = (header.width - sw) / 2;
-  const sy = (header.height - sh) / 2;
+  if (!ctx || header.kind !== "rgba8") return false;
+  if (!mapScratch || mapScratch.width !== header.width || mapScratch.height !== header.height) {
+    mapScratch = document.createElement("canvas");
+    mapScratch.width = header.width;
+    mapScratch.height = header.height;
+    mapScratchContext = mapScratch.getContext("2d");
+    mapImageData = mapScratchContext?.createImageData(header.width, header.height);
+  }
+  if (!mapScratchContext || !mapImageData) return false;
+  mapImageData.data.set(pixels);
+  mapScratchContext.putImageData(mapImageData, 0, 0);
+  const sw = header.width;
+  const sh = header.height;
+  const sx = 0;
+  const sy = 0;
   const scale = Math.min(canvas.width / sw, canvas.height / sh);
   const dw = sw * scale;
   const dh = sh * scale;
@@ -129,7 +126,8 @@ const drawCpuMap = (header, pixels) => {
   ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = "#0b0d0f";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(scratch, sx, sy, sw, sh, dx, dy, dw, dh);
+  ctx.drawImage(mapScratch, sx, sy, sw, sh, dx, dy, dw, dh);
+  return true;
 };
 
 // Report WebGPU availability. Returns whether the atlas/POV renderer path
@@ -146,6 +144,54 @@ const probeWebGpu = () => {
   return false;
 };
 
+// Build map controls from the Rust descriptor registry. The DOM supplies
+// containers and styling only; channel/overlay ids, labels, groups, and order
+// have one authority in viewer_host::map.
+const installMapControls = ({ channels, overlays }) => {
+  const channelSelect = document.querySelector('[data-generated="map-channels"]');
+  if (channelSelect) {
+    channelSelect.replaceChildren();
+    const groups = new Map();
+    for (const descriptor of channels) {
+      let group = groups.get(descriptor.group);
+      if (!group) {
+        group = document.createElement("optgroup");
+        group.label = descriptor.group_label;
+        groups.set(descriptor.group, group);
+        channelSelect.append(group);
+      }
+      const option = document.createElement("option");
+      option.value = descriptor.id;
+      option.textContent = descriptor.label;
+      group.append(option);
+    }
+  }
+
+  const overlayHost = document.querySelector('[data-generated="map-overlays"]');
+  if (overlayHost) {
+    overlayHost.replaceChildren();
+    const groups = new Map();
+    for (const descriptor of overlays) {
+      let group = groups.get(descriptor.group);
+      if (!group) {
+        group = document.createElement("span");
+        group.className = "map-control-group";
+        group.setAttribute("aria-label", descriptor.group_label);
+        groups.set(descriptor.group, group);
+        overlayHost.append(group);
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.action = "toggle-overlay";
+      button.dataset.value = descriptor.id;
+      button.dataset.overlayKey = descriptor.id.replaceAll("-", "_");
+      button.setAttribute("aria-pressed", "false");
+      button.textContent = descriptor.label;
+      group.append(button);
+    }
+  }
+};
+
 const initWasm = async () => {
   try {
     const mod = await import("../generated/platform_web.js");
@@ -156,6 +202,7 @@ const initWasm = async () => {
     for (const descriptor of JSON.parse(app.action_descriptors())) {
       registeredActions.add(descriptor.id);
     }
+    installMapControls(JSON.parse(app.map_descriptors()));
     for (const control of document.querySelectorAll("[data-action]")) {
       if (!registeredActions.has(control.dataset.action)) {
         appendDiagnostic(`unregistered-action:${control.dataset.action}`);
@@ -168,7 +215,9 @@ const initWasm = async () => {
     write("origin-hash", `origin ${hex}`, "ok");
     appendDiagnostic(`origin_feature_hash=${hex}`);
     document.body.dataset.originFeatureHash = hex;
-    updateSnapshot(JSON.parse(app.info_snapshot()));
+    const snapshot = JSON.parse(app.info_snapshot());
+    updateSnapshot(snapshot);
+    syncViewMode(snapshot, "cpu");
     // The first shared frame performs the first and only world update. Map
     // presentation is read-only and waits for that frame instead of secretly
     // settling the world from `map_pixels`.
@@ -203,16 +252,17 @@ const initBenchmark = () => {
 
 const renderMap = () => {
   const app = window.__werApp;
-  if (!app) return;
+  if (!app) return false;
   const header = JSON.parse(app.render_cpu_map());
   const t0 = performance.now();
   const pixels = app.map_pixels();
   const t1 = performance.now();
-  drawCpuMap(header, pixels);
+  const presented = drawCpuMap(header, pixels);
   const t2 = performance.now();
   perf.composeMs = t1 - t0;
   perf.presentMs = t2 - t1;
   perf.uploadKb = pixels.byteLength / 1024;
+  return presented;
 };
 
 // Mirror the wasm snapshot into the toolbar so toggles visibly register:
@@ -221,7 +271,7 @@ const renderMap = () => {
 const syncControls = (snapshot) => {
   const pov = snapshot.view.pov;
   const pressed = {
-    "toggle-gpu-compose": snapshot.renderer.compose,
+    "toggle-gpu-compose": snapshot.map.backend === "gpu-atlas",
     "toggle-refinement": snapshot.renderer.refinement,
     "toggle-walk": pov.motion === "walk",
     "toggle-pov-shadow-ao": pov.shadow_ao,
@@ -231,6 +281,9 @@ const syncControls = (snapshot) => {
   for (const [action, state] of Object.entries(pressed)) {
     const control = document.querySelector(`button[data-action="${action}"]`);
     if (control) control.setAttribute("aria-pressed", String(state));
+  }
+  for (const control of document.querySelectorAll('button[data-action="toggle-overlay"]')) {
+    control.setAttribute("aria-pressed", String(snapshot.map.overlays[control.dataset.overlayKey]));
   }
   for (const control of document.querySelectorAll('button[data-action="set-presentation"]')) {
     control.setAttribute("aria-pressed", String(control.dataset.value === snapshot.view.mode));
@@ -259,6 +312,7 @@ const updateSnapshot = (snapshot) => {
   zoom = snapshot.zoom;
   write("zoom", `x${zoom}`);
   write("webgpu-status", `${snapshot.renderer.mode} / refine ${snapshot.renderer.refinement}`);
+  write("map-decor-status", snapshot.map.decor_status.replaceAll("-", " "));
   const pov = snapshot.view.pov;
   write(
     "view",
@@ -267,7 +321,6 @@ const updateSnapshot = (snapshot) => {
       : `map${snapshot.view.pov_supported ? "" : " / pov unavailable"}`,
   );
   syncControls(snapshot);
-  syncViewMode(snapshot);
 };
 
 const dispatchAction = (id, value = "") => {
@@ -302,7 +355,7 @@ const initializePovRenderer = async () => {
   povEntering = true;
   try {
     const canvas = povCanvas();
-    await wasmMod.pov_init(canvas, canvas.width, canvas.height);
+    await wasmMod.viewer_renderer_init(canvas, canvas.width, canvas.height);
   } catch (error) {
     povEntering = false;
     appendDiagnostic(`pov init failed: ${String(error)}`);
@@ -378,7 +431,17 @@ const viewerFrame = (now) => {
   }
   perf.updateMs = performance.now() - t0;
   updateSnapshot(snapshot);
-  if (snapshot.view.mode !== "pov" && frame.map_dirty) renderMap();
+  syncViewMode(snapshot, frame.map.path);
+  let mapPresented = false;
+  if (frame.map.active && frame.map.path === "cpu") {
+    mapPresented = frame.map_dirty ? renderMap() : mapViewport !== undefined;
+  } else if (frame.map.active && frame.map.path === "gpu-atlas") {
+    mapPresented = frame.map.gpu_submitted;
+  }
+  window.__mapStatus = { ...frame.map, presented: mapPresented };
+  if (frame.map.active && frame.map.path === "gpu-atlas") {
+    perf.uploadKb = frame.map.upload_bytes / 1024;
+  }
   handleEffects();
   perf.frames += 1;
   if (now - perf.lastRoll >= 1000) {
@@ -395,12 +458,17 @@ const scheduleFrame = () => {
 
 // Keep the canvas swap and frame loop in lockstep with the facade's view
 // mode, whatever changed it (button, Tab key, device loss).
-const syncViewMode = (snapshot) => {
+const syncViewMode = (snapshot, mapPath = "cpu") => {
   const wantPov = snapshot.view.mode === "pov";
   if (wantPov && !povActive) {
     enterPov();
   } else if (!wantPov && povActive) {
     exitPov();
+  }
+  if (!wantPov) {
+    const gpuMap = mapPath === "gpu-atlas";
+    document.getElementById("world-canvas").hidden = gpuMap;
+    povCanvas().hidden = !gpuMap;
   }
 };
 
@@ -458,17 +526,15 @@ setInterval(() => {
   updatePanelStats(JSON.parse(app.info_snapshot()));
 }, PANEL_REFRESH_MS);
 
-for (const control of document.querySelectorAll("button[data-action]")) {
-  control.addEventListener("click", () => {
-    dispatchAction(control.dataset.action, control.dataset.value ?? "");
-  });
-}
+document.querySelector(".toolbar")?.addEventListener("click", (event) => {
+  const control = event.target.closest("button[data-action]");
+  if (control) dispatchAction(control.dataset.action, control.dataset.value ?? "");
+});
 
-for (const control of document.querySelectorAll("select[data-action]")) {
-  control.addEventListener("change", () => {
-    dispatchAction(control.dataset.action, control.value);
-  });
-}
+document.querySelector(".toolbar")?.addEventListener("change", (event) => {
+  const control = event.target.closest("select[data-action]");
+  if (control) dispatchAction(control.dataset.action, control.value);
+});
 
 window.addEventListener("keydown", (event) => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
@@ -521,7 +587,8 @@ const canvasPoint = (canvas, event) => {
 };
 
 for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
-  const view = canvas.dataset.viewKind;
+  const routedView = () =>
+    canvas === povCanvas() && lastSnapshot?.view.mode !== "pov" ? "map" : canvas.dataset.viewKind;
   canvas.addEventListener("focus", () => window.__werApp?.surface_focus(true));
   canvas.addEventListener("blur", () => window.__werApp?.surface_focus(false));
   canvas.addEventListener("pointerdown", (event) => {
@@ -529,7 +596,7 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     if (!app) return;
     canvas.focus();
     const [x, y] = canvasPoint(canvas, event);
-    const handled = app.pointer_button(event.pointerId, event.button, true, x, y, view);
+    const handled = app.pointer_button(event.pointerId, event.button, true, x, y, routedView());
     if (event.button === 0) canvas.setPointerCapture(event.pointerId);
     if (handled) event.preventDefault();
     scheduleFrame();
@@ -538,13 +605,13 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
     const app = window.__werApp;
     if (!app) return;
     const [x, y] = canvasPoint(canvas, event);
-    if (app.pointer_move(event.pointerId, x, y, view)) scheduleFrame();
+    if (app.pointer_move(event.pointerId, x, y, routedView())) scheduleFrame();
   });
   canvas.addEventListener("pointerup", (event) => {
     const app = window.__werApp;
     if (!app) return;
     const [x, y] = canvasPoint(canvas, event);
-    const handled = app.pointer_button(event.pointerId, event.button, false, x, y, view);
+    const handled = app.pointer_button(event.pointerId, event.button, false, x, y, routedView());
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     if (handled) event.preventDefault();
     scheduleFrame();
@@ -568,26 +635,24 @@ for (const canvas of document.querySelectorAll("canvas[data-view-kind]")) {
         event.deltaMode === WheelEvent.DOM_DELTA_PAGE
           ? -event.deltaY * canvas.height
           : -event.deltaY;
-      if (app.wheel(delta, lines, view)) event.preventDefault();
+      if (app.wheel(delta, lines, routedView())) event.preventDefault();
       scheduleFrame();
     },
     { passive: false },
   );
 }
 
-document.getElementById("world-canvas").addEventListener("pointermove", (event) => {
+const updateMapHover = (event) => {
   const canvas = event.currentTarget;
-  if (!mapViewport || !lastSnapshot) {
+  if (!mapViewport || !lastSnapshot || lastSnapshot.view.mode !== "map" || canvas.hidden) {
     write("cursor", "none");
     return;
   }
-  // Invert the draw transform: canvas point -> map pixel -> world position
-  // (8 world units per composed pixel, player at the window center).
+  // Invert only the canvas letterbox here. Rust owns zoom and world
+  // projection through the same MapComposer that produced these pixels.
   const rect = canvas.getBoundingClientRect();
   const px = ((event.clientX - rect.left) / rect.width) * canvas.width;
   const py = ((event.clientY - rect.top) / rect.height) * canvas.height;
-  // Inverting the crop makes picking zoom-invariant, like the native
-  // `pixel_to_world`.
   const mx = mapViewport.sx + ((px - mapViewport.dx) / mapViewport.dw) * mapViewport.sw;
   const my = mapViewport.sy + ((py - mapViewport.dy) / mapViewport.dh) * mapViewport.sh;
   if (
@@ -599,18 +664,24 @@ document.getElementById("world-canvas").addEventListener("pointermove", (event) 
     write("cursor", "none");
     return;
   }
-  const REGION_SIZE = 256;
-  const res = mapViewport.resolution;
-  const cell = REGION_SIZE / res;
-  const [rx, ry] = lastSnapshot.region;
-  const half = (mapViewport.width / res - 1) / 2;
-  const west = (rx - half) * REGION_SIZE;
-  const north = (ry + half + 1) * REGION_SIZE;
-  const wx = west + mx * cell;
-  const wy = north - my * cell;
-  write("cursor", `${Math.round(wx)}, ${Math.round(wy)}`);
+  const world = JSON.parse(window.__werApp.map_world_at(mx, my));
+  if (!world) {
+    write("cursor", "none");
+    return;
+  }
+  const [wx, wy] = world;
+  const organism = JSON.parse(window.__werApp.map_organism_at(mx, my));
+  write(
+    "cursor",
+    organism
+      ? `${organism.id} @ ${Math.round(organism.world[0])}, ${Math.round(organism.world[1])}`
+      : `${Math.round(wx)}, ${Math.round(wy)}`,
+  );
   inspectCursor(wx, wy);
-});
+};
+
+document.getElementById("world-canvas").addEventListener("pointermove", updateMapHover);
+document.getElementById("pov-canvas").addEventListener("pointermove", updateMapHover);
 
 // The native CURSOR readout, throttled: hovering samples the settled cell
 // through the cache-read-only `inspect` export at most every 100ms.

@@ -11,6 +11,11 @@ description = "Platform-neutral viewer input, presentation, inspection, and cont
 workspace = true
 
 [dependencies]
+log.workspace = true
 pov-host = { path = "../pov-host" }
+renderer = { path = "../renderer" }
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }
+
+[dev-dependencies]
+sha2.workspace = true

@@ -26,7 +26,13 @@ pub use controller::{
 };
 pub use inspect::{CellInfo, CursorInfo, EcologyInfo, HoverInfo, OrganismInfo};
 pub use layout::{PixelRect, PresentationMode, ViewKind, ViewLayout};
-pub use map::{Channel, MapDecor, MapOverlay, Overlays};
+pub use map::{
+    map_pixel_hash, pick_organism, Channel, ChannelDescriptor, MapBackend, MapBackendFallback,
+    MapDecor, MapDescriptorGroup, MapLayer, MapLayerDescriptor, MapOverlay, MapOverlayDescriptor,
+    MapPresenterUpdate, MapProjection, MapRenderPacket, MapRenderRequest, Overlays, PreparedCpuMap,
+    PreparedGpuMap, PreparedMapSource, CHANNEL_DESCRIPTORS, MAP_LAYER_DESCRIPTORS,
+    MAP_LAYER_SEQUENCE, MAP_OVERLAY_DESCRIPTORS, ORGANISM_PICK_ZOOM,
+};
 pub use panel::{InfoPanelModel, PanelFieldId, PlatformTelemetry};
 pub use world::{
     ExplorationWorld, NoopWorldTickHook, TravelerState, WorldPostUpdate, WorldPreUpdate,
