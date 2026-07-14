@@ -6,15 +6,17 @@ that assumes you will edit code.
 
 ## What this project is
 
-The **Infinite World Exploration Game** — a native Rust engine (with a planned
-browser/WebAssembly/WebGPU target) for an exploration game built around
+The **Infinite World Exploration Game** — a native and browser
+Rust/WebAssembly/WebGPU engine for an exploration game built around
 *continuous travel through possibility space*. The design vision is in
 [`docs/Infinite_World_Exploration_Project_Overview.md`](./docs/Infinite_World_Exploration_Project_Overview.md);
-the phased technical plan is in [`implementation-plan.md`](docs/plans/prototype/implementation-plan.mdimplementation-plan.md).
+the phased technical plan is in
+[`implementation-plan.md`](docs/plans/prototype/implementation-plan.md).
 
-The repository has landed the Phase 7 static browser runtime scaffold on top of
+The repository has landed the Phase 7 static browser viewer/runtime slice on top of
 **Phase 6** (performance and scale, see
-[`phase-6-plan.md`](phase-6-plan.md)), built on the landed Phase 2–5 stacks.
+[`phase-6-plan.md`](docs/plans/prototype/phase-6-plan.md)), built on the landed
+Phase 2–5 stacks.
 Phase 2 is a nine-layer declared dependency graph — terrain, geology,
 macro drainage, climate, hydrology, soils, biome, vegetation, and **ecology
 (L8)** — with dependency-hash staleness (ADR 0008), topological cost-budgeted
@@ -47,7 +49,7 @@ optimization phase, and it changes **no generated output for any input**:
 `WORLD_ALGORITHM_VERSION` stays at 2, every `algorithm_revision` stays 0, and
 zero golden fixtures were re-blessed. It adds the measurement layer (per-pass
 timings behind the `pass-timing` feature, the committed
-[`docs/perf-baseline.md`](docs/perf-baseline.md) ledger), the **LaneExecutor**
+[`perf-baseline.md`](docs/plans/prototype/perf-baseline.md) ledger), the **LaneExecutor**
 (three priority lanes + cancellation tokens, hosted in `tools::executor` so
 the harnesses drive the production scheduler; `rayon` is gone; `wer --inline`
 is the A/B), the **tile pool** and byte-capacity **cache ceilings** with
@@ -72,7 +74,19 @@ wasm facade snapshots, real CPU map composition from the streamed `RegionMap`
 parity with the native shell, and a `web-signoff` harness. POV mode hosts the
 shared 3D renderer (`crates/pov-host` + `crates/renderer`) on a WebGPU canvas,
 with device-loss/unsupported fallbacks returning to map mode. Browser
-networking and accounts still do not exist.
+world jobs still use `InlineExecutor`; the Worker is a capability/ping probe,
+IndexedDB is opened only as a capability probe, and vault/session effects are
+reported unavailable. Browser networking and accounts still do not exist.
+
+Native and browser viewer behavior is aligned by `crates/viewer-host` (ADR
+0028): normalized input and one binding/action registry feed one traveler and
+one `RegionMap` update, while Map, POV, and fixed-ratio Split are presentation
+panes of that same post-update state. `viewer-host` also owns Map composition
+and atlas preparation, layout/focus, CPU-authoritative Map/POV inspection, and
+the semantic information-panel document. The shells retain only environment
+adapters, services, surface/panel rendering, and lifecycle/recovery. The
+renderer records every visible pane in one surface acquire/submit/present and
+still exposes no live readback.
 
 Post-Phase-6 Improvement A.8 deliberately changes Terrain and Drainage output
 under their layer-local version boundary: `WORLD_ALGORITHM_VERSION` remains 2,
@@ -95,9 +109,9 @@ pinned `wasm-bindgen-test` 0.3.76 / `wasm-pack` 0.13.1 (ADR 0027).
 
 ```sh
 # Build & run the native app shell. In the app, F12 writes a debug dump —
-# a screenshot of the active view (map or 3D POV) plus state.txt (player/
-# camera pose, steering, telemetry, dep-hash chain, vault counters) — to
-# ./dump/<UTC datetime>/, for diagnosing problems after the fact.
+# screenshot.ppm plus state.txt for Map, POV, or Split (mode/focus/panes,
+# traveler/camera/hover, steering, telemetry, dep hashes, vault counters) —
+# to ./dump/<UTC datetime>/, for diagnosing problems after the fact.
 cargo run --bin wer
 
 # Deterministic inspector: world position -> region + origin feature hash.
@@ -122,8 +136,8 @@ cargo run --release --bin wer-scale          # add --report for the baseline tab
 # Run everything, including the determinism golden fixtures.
 cargo test --workspace
 
-# Keep the platform-neutral crates + web shell compiling for the browser.
-cargo check -p world-core -p world-runtime -p platform-web --target wasm32-unknown-unknown
+# Keep the shared runtime/viewer + web shell compiling for the browser.
+cargo check -p world-core -p world-runtime -p viewer-host -p platform-web --target wasm32-unknown-unknown
 wasm-pack test --node crates/platform-web
 
 # Format & lint exactly as CI does.
@@ -140,6 +154,10 @@ CLI:
 cargo run --bin web-build     # rebuild target/web-dist (wasm + assets)
 cargo run --bin web-serve     # serve at http://localhost:8080/
 agent-browser open http://localhost:8080/
+
+# Automated functional and local tier/mode diagnostics (starts its own server).
+cargo run --bin web-signoff -- --assert-layout
+cargo run --bin web-signoff -- --profile-alignment
 ```
 
 For anything **WebGL/WebGPU** (the map atlas, POV terrain), know the
@@ -150,9 +168,12 @@ environment's traps before trusting a screenshot:
   itself worth testing). And in headless Chrome, WebGPU canvas content does
   **not composite into screenshots**: a white/black canvas in a capture is
   an artifact, not a rendering bug. Verify headless runs functionally
-  instead — `window.__povStatus` (the last POV frame's status JSON:
-  `rendered`, camera, chunk counts), the info panel, and the diagnostics
-  log.
+  instead. `window.__viewerCharacterization()` reports layout, focus, tier,
+  backing sizes, panel cadence, and frame/tick counters;
+  `window.__mapStatus`, `window.__povStatus`, and
+  `window.__rendererFrameStatus` expose the latest Map, POV, and one-surface
+  frame diagnostics. Check those values, the information panel, and the
+  diagnostics log rather than GPU pixels.
 - **For real, visible GPU output, drive the Windows Chrome over CDP** (WSL2
   localhost forwarding reaches it in both directions):
 
@@ -175,6 +196,9 @@ environment's traps before trusting a screenshot:
   render was the missing-sRGB-view symptom: WebGPU canvases refuse sRGB
   *swapchain* formats, so the renderer routes through an sRGB **view**
   format — see `render_format` in `crates/renderer/src/lib.rs`).
+  Use `split:/tmp/native-split.ppm` in the same script to capture the shared
+  fixed-ratio Map + POV + panel/focus layout; `WER_TIER=low|mid|high` applies
+  to `--screenshot`, `snap:`, and `split:` (default Low).
 - A SwiftShader WebGPU adapter is available in WSL headless Chrome via
   `--enable-unsafe-webgpu --enable-unsafe-swiftshader
   --use-webgpu-adapter=swiftshader` (launch your own Chrome with
@@ -184,27 +208,31 @@ environment's traps before trusting a screenshot:
 **Before you consider a change done, it must pass what CI runs** (see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `fmt --check`, `clippy`,
 `check`, and `test` on the whole workspace natively, plus a `wasm32` `cargo
-check` of `world-core`, `world-runtime`, and `platform-web`, followed by the
-Node wasm parity suite. **CI sets
+check` of `world-core`, `world-runtime`, `viewer-host`, and `platform-web`,
+followed by the Node wasm parity suite. **CI sets
 `RUSTFLAGS: -D warnings`, so any warning fails the build** — treat clippy
 warnings and unused-code warnings as errors. Run clippy locally the same way if
 in doubt: `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`.
 
 ## Crate architecture and the boundary rule
 
-The workspace is split into **platform-neutral** and **platform-specific** crates
-so core simulation/generation compiles for native *and* `wasm32` from the start
-(see [ADR 0002](docs/adr/0002-workspace-crate-boundaries.md)).
+The authoritative world crates are **platform-neutral**. Cross-platform viewer
+and rendering crates compile for native and `wasm32`; winit, DOM, storage, and
+executor APIs stay at platform boundaries. `renderer` has the narrow
+wasm-specific `HtmlCanvasElement` surface adapter needed by `wgpu` (see
+[ADR 0002](docs/adr/0002-workspace-crate-boundaries.md) and
+[ADR 0028](docs/adr/0028-shared-viewer-host-and-one-world-multi-view.md)).
 
 | Crate | Kind | Responsibility |
 |-------|------|----------------|
 | `crates/world-core` | neutral lib | Deterministic hashing, coordinates, possibility space. Pure computation. |
 | `crates/world-runtime` | neutral lib | Region lifecycle + abstract `Storage` / `TaskExecutor` traits. |
-| `crates/renderer` | platform lib | wgpu/WGSL renderer (clear-screen only for now). |
-| `crates/pov-host` | platform lib | Shared 3D POV host: fly/walk camera, pure terrain mesher, chunk scheduling — one implementation for the native and browser shells. |
-| `crates/platform-native` | bin `wer` | winit window + event loop; native services. |
-| `crates/platform-web` | cdylib+rlib | wasm-bindgen smoke shell; grows into the browser runtime. |
-| `crates/tools` | bin `wer-inspect` | Inspectors, validators, replay tools. |
+| `crates/renderer` | cross-platform GPU lib | wgpu/WGSL device and surfaces; Map atlas and POV passes recorded as one Map/POV/Split frame. No live readback. |
+| `crates/pov-host` | cross-platform presentation lib | Fly/walk camera, pure terrain/organism presentation geometry, chunk scheduling, and CPU-side POV picking. |
+| `crates/viewer-host` | environment-neutral viewer lib | Normalized input/actions, one-traveler controller, layout/focus, Map composer/atlas, inspection, and semantic panel model. No environment APIs. |
+| `crates/platform-native` | bin `wer` | Thin winit adapter plus native storage/executor, bitmap panel, debug capture, and lifecycle. |
+| `crates/platform-web` | cdylib+rlib + static shell | Thin wasm/DOM adapter, streamed viewer runtime, capability probes, DOM panel, canvas lifecycle, and recovery; execution remains inline and vault effects unavailable. |
+| `crates/tools` | command-line bins | Inspectors, validators, replay/sign-off harnesses, web build/serve tooling, lane executor, and native storage. |
 
 **The rule that must not be broken:** the neutral crates (`world-core`,
 `world-runtime`) may **not** touch the filesystem, spawn threads, open sockets,
@@ -215,6 +243,10 @@ crate. Anything platform-specific they need is expressed as a trait here
 direction flows one way: platform crates depend on neutral crates, never the
 reverse. This is enforced by review and by the wasm CI job — if you add a native
 dependency to a neutral crate, the `wasm32` check will break.
+`viewer-host` has the parallel ADR 0028 rule: it may depend on the world,
+renderer, and POV crates, but must not touch winit, DOM/browser APIs,
+filesystems, sockets, or platform thread creation. `renderer` must never depend
+back on `viewer-host`.
 
 ## Determinism — the core invariant
 

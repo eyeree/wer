@@ -1,6 +1,6 @@
 # Native/Web Viewer Alignment Refactoring Plan
 
-**Status:** Proposed
+**Status:** Implemented — 2026-07-14
 
 This plan aligns the native and browser viewers around one shared viewer host,
 one input/action contract, one map presentation implementation, and one
@@ -1221,6 +1221,14 @@ cargo run --bin web-build
 cargo run --bin web-signoff
 ```
 
+With `agent-browser` available, also run the functional and local diagnostics
+extensions:
+
+```sh
+cargo run --bin web-signoff -- --assert-layout
+cargo run --bin web-signoff -- --profile-alignment
+```
+
 Also run the phase sign-off harnesses because shared controller/input changes
 can alter which existing world inputs are supplied even though generation math
 is unchanged:
@@ -1238,10 +1246,13 @@ Run representative native capture/manual checks:
 cargo run --bin wer
 cargo run --bin wer -- --screenshot /tmp/aligned-map.ppm composite 0 0 1
 cargo run --release --bin wer -- --pov-script "pos:0,0; mouse:-60,100; snap:/tmp/aligned-pov.ppm"
+cargo run --release --bin wer -- --pov-script "size:1024x768; pos:0,0; split:/tmp/aligned-split.ppm"
 ```
 
-Add a deterministic Split capture command/script form during implementation and
-include it here once the final CLI syntax is chosen.
+Repeat the capture commands with `WER_TIER=low`, `mid`, and `high`. Multiple
+same-target `snap:` or `split:` instructions in one script retain the
+file-bound capture resources, making zero steady-state terrain/organism upload
+traffic directly observable without adding a live readback API.
 
 ## 9. Risks and mitigations
 
@@ -1295,66 +1306,66 @@ include it here once the final CLI syntax is chosen.
 
 ### Architecture
 
-- [ ] A new ADR records shared viewer ownership and the one-world multi-view
+- [x] A new ADR records shared viewer ownership and the one-world multi-view
       rule.
-- [ ] `viewer-host` contains no environment API and compiles natively and for
+- [x] `viewer-host` contains no environment API and compiles natively and for
       wasm.
-- [ ] Platform shells are thin adapters/services/renderers rather than separate
+- [x] Platform shells are thin adapters/services/renderers rather than separate
       viewer implementations.
-- [ ] There is one controller tick, map composer, atlas packer, inspection
+- [x] There is one controller tick, map composer, atlas packer, inspection
       builder, panel model, and binding registry.
-- [ ] Renderer presents all visible views in one surface frame and exposes no
+- [x] Renderer presents all visible views in one surface frame and exposes no
       live readback.
 
 ### Input and functionality
 
-- [ ] Native and web raw traces emit the same semantic actions.
-- [ ] Web buttons enter the same ordered reducer as keys.
-- [ ] One-shot repeats, blur/focus loss, wheel accumulation, and held axes have
+- [x] Native and web raw traces emit the same semantic actions.
+- [x] Web buttons enter the same ordered reducer as keys.
+- [x] One-shot repeats, blur/focus loss, wheel accumulation, and held axes have
       shared tested behavior.
-- [ ] POV look requires the primary button on both platforms.
-- [ ] All current native gameplay/view actions are representable and exposed in
+- [x] POV look requires the primary button on both platforms.
+- [x] All current native gameplay/view actions are representable and exposed in
       web where the required backend capability exists.
-- [ ] Help/control metadata cannot drift from the binding registry.
+- [x] Help/control metadata cannot drift from the binding registry.
 
 ### Map
 
-- [ ] Native and web use the same CPU composer and GPU atlas preparation.
-- [ ] Web shows organisms and the complete available overlay/channel set.
-- [ ] Compose/refinement/zoom controls affect the renderer they report.
-- [ ] Map cells remain square, the map stays inside its pane, and grid lines
+- [x] Native and web use the same CPU composer and GPU atlas preparation.
+- [x] Web shows organisms and the complete available overlay/channel set.
+- [x] Compose/refinement/zoom controls affect the renderer they report.
+- [x] Map cells remain square, the map stays inside its pane, and grid lines
       remain visible at supported reductions.
-- [ ] Desktop browser body/canvas overflow and fixed-backing-store defects are
+- [x] Desktop browser body/canvas overflow and fixed-backing-store defects are
       covered by automated assertions.
 
 ### Information and picking
 
-- [ ] One semantic model supplies native bitmap and web DOM panels.
-- [ ] The panel is visible in Map, POV, and Split on both platforms.
-- [ ] Desktop web information uses three columns or an equivalently measured
+- [x] One semantic model supplies native bitmap and web DOM panels.
+- [x] The panel is visible in Map, POV, and Split on both platforms.
+- [x] Desktop web information uses three columns or an equivalently measured
       horizontal layout, with a tested narrow collapse.
-- [ ] Map and POV terrain/organism hover use shared data and report the same
+- [x] Map and POV terrain/organism hover use shared data and report the same
       fields.
-- [ ] POV ray results agree with resident terrain triangles and rendered
+- [x] POV ray results agree with resident terrain triangles and rendered
       organism primitives without GPU readback.
 
 ### Split view
 
-- [ ] Map, POV, and fixed-ratio Split are available in native and supported web
+- [x] Map, POV, and fixed-ratio Split are available in native and supported web
       environments.
-- [ ] Clicking a pane changes visible focus and routes keyboard/wheel input.
-- [ ] Both panes follow one traveler and one post-update world state.
-- [ ] Split performs one world update and one surface present per frame.
-- [ ] POV loss cleanly returns to Map without losing world state.
-- [ ] Adjustable ratio remains optional and cannot block the fixed-ratio exit
+- [x] Clicking a pane changes visible focus and routes keyboard/wheel input.
+- [x] Both panes follow one traveler and one post-update world state.
+- [x] Split performs one world update and one surface present per frame.
+- [x] POV loss cleanly returns to Map without losing world state.
+- [x] Adjustable ratio remains optional and cannot block the fixed-ratio exit
       criterion.
 
 ### Verification and versioning
 
-- [ ] Focused input/map/panel/picking/layout/renderer tests pass.
-- [ ] Browser desktop/narrow/DPR/fallback/Split sign-off passes.
-- [ ] Full fmt, warning-denying clippy, workspace check/test, wasm check, Node
+- [x] Focused input/map/panel/picking/layout/renderer tests pass.
+- [x] Browser desktop/narrow/DPR/fallback/Split sign-off passes.
+- [x] Full fmt, warning-denying clippy, workspace check/test, wasm check, Node
       wasm parity, static build, and web sign-off pass.
-- [ ] Phase harnesses remain green.
-- [ ] `WORLD_ALGORITHM_VERSION`, layer revisions, record format, and generation
+- [x] Phase harnesses remain green.
+- [x] `WORLD_ALGORITHM_VERSION`, layer revisions, record format, and generation
       determinism fixtures are unchanged.

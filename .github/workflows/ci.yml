@@ -59,6 +59,8 @@ jobs:
         run: cargo check -p world-core --target wasm32-unknown-unknown
       - name: check world-runtime (wasm32)
         run: cargo check -p world-runtime --target wasm32-unknown-unknown
+      - name: check viewer-host (wasm32)
+        run: cargo check -p viewer-host --target wasm32-unknown-unknown
       - name: check platform-web (wasm32)
         run: cargo check -p platform-web --target wasm32-unknown-unknown
       - name: execute parity probes in Node

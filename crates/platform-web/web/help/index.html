@@ -18,89 +18,47 @@
     <main class="doc-page">
       <h1>Browser Help</h1>
       <p>
-        The browser shell runs as static files. It keeps generated world state in
-        memory until IndexedDB storage lands, and it never talks to a server.
+        The browser shell runs as static files and never talks to a game server.
+        It starts with in-memory viewer state; the IndexedDB status is a browser
+        capability probe, not a claim that correlated vault operations are wired.
       </p>
       <h2>Controls</h2>
+      <p data-help-status aria-live="polite">Loading the shared control registry…</p>
       <table>
         <thead>
-          <tr><th>Command</th><th>Key</th><th>Control</th></tr>
+          <tr><th>Action</th><th>Default binding</th><th>Scope</th></tr>
         </thead>
-        <tbody>
-          <tr data-help-action="set-presentation"><td>Show Map, POV, or Split</td><td>none</td><td>View buttons</td></tr>
-          <tr data-help-action="toggle-primary-view"><td>Toggle Map/POV or move Split focus</td><td>Tab on a view surface</td><td>none</td></tr>
-          <tr data-help-action="focus-view"><td>Route view-scoped input to a pane</td><td>Primary click / Split Tab</td><td>none</td></tr>
-          <tr data-help-action="set-split-ratio"><td>Set the Map share in Split</td><td>none</td><td>future divider</td></tr>
-          <tr data-help-action="nudge-possibility"><td>Nudge a possibility domain</td><td>1–8; Shift reverses</td><td>none</td></tr>
-          <tr data-help-action="reset-possibility-bias"><td>Reset manual possibility bias</td><td>Z</td><td>none</td></tr>
-          <tr data-help-action="drop-anchor"><td>Drop an Emphasize or Suppress anchor</td><td>E / Q</td><td>none</td></tr>
-          <tr data-help-action="capture-anchor"><td>Capture traits under the traveler</td><td>K</td><td>none</td></tr>
-          <tr data-help-action="cycle-capture-category"><td>Cycle capture trait category</td><td>T</td><td>none</td></tr>
-          <tr data-help-action="toggle-capture-polarity"><td>Toggle capture polarity</td><td>Y</td><td>none</td></tr>
-          <tr data-help-action="clear-anchors"><td>Remove active anchors</td><td>C</td><td>none</td></tr>
-          <tr data-help-action="toggle-transition-mode"><td>Toggle deliberate transition movement</td><td>R</td><td>none</td></tr>
-          <tr data-help-action="save-session"><td>Persist the current session</td><td>O</td><td>Save button</td></tr>
-          <tr data-help-action="load-session"><td>Load the persisted session</td><td>L</td><td>none</td></tr>
-          <tr data-help-action="record-last-anchor"><td>Persist the last anchor as a discovery</td><td>B</td><td>none</td></tr>
-          <tr data-help-action="summon-discoveries"><td>Summon retained discoveries</td><td>I</td><td>none</td></tr>
-          <tr data-help-action="toggle-preserve"><td>Toggle a preserve at the traveler</td><td>P</td><td>none</td></tr>
-          <tr data-help-action="toggle-path-tracking"><td>Toggle path tracking</td><td>H</td><td>none</td></tr>
-          <tr data-help-action="toggle-route-recording"><td>Toggle route recording</td><td>J</td><td>none</td></tr>
-          <tr data-help-action="toggle-route-attraction"><td>Toggle route attraction</td><td>U</td><td>none</td></tr>
-          <tr data-help-action="clear-routes"><td>Clear retained routes</td><td>Delete</td><td>none</td></tr>
-          <tr data-help-action="cycle-map-channel"><td>Advance the visible map channel</td><td>V</td><td>none</td></tr>
-          <tr data-help-action="set-map-channel"><td>Select an exact map channel</td><td>none</td><td>Channel select</td></tr>
-          <tr data-help-action="toggle-overlay"><td>Toggle a map overlay</td><td>F / G / N / X / M</td><td>none</td></tr>
-          <tr data-help-action="zoom-in"><td>Increase map magnification</td><td>Wheel up</td><td>none</td></tr>
-          <tr data-help-action="zoom-out"><td>Decrease map magnification</td><td>Wheel down</td><td>none</td></tr>
-          <tr data-help-action="toggle-gpu-compose"><td>Toggle GPU atlas map composition</td><td>,</td><td>Compose button</td></tr>
-          <tr data-help-action="toggle-refinement"><td>Toggle map refinement</td><td>.</td><td>Refine button</td></tr>
-          <tr data-help-action="toggle-walk"><td>Toggle POV walk/fly movement</td><td>F in POV</td><td>Walk button</td></tr>
-          <tr data-help-action="toggle-pov-shadow-ao"><td>Toggle POV shadows and ambient occlusion</td><td>B in POV</td><td>Shadows/AO button</td></tr>
-          <tr data-help-action="toggle-pov-detail-normals"><td>Toggle POV detail normals</td><td>N in POV</td><td>Detail button</td></tr>
-          <tr data-help-action="toggle-pov-water"><td>Toggle POV water passes</td><td>V in POV</td><td>Water button</td></tr>
-          <tr data-help-action="set-pov-render-scale"><td>Set POV internal render scale</td><td>none</td><td>POV scale select</td></tr>
-          <tr data-help-action="set-resource-tier"><td>Select a resource tier</td><td>none</td><td>Tier select</td></tr>
-          <tr data-help-action="request-tier-benchmark"><td>Run the resource-tier benchmark</td><td>none</td><td>startup service</td></tr>
-          <tr data-help-action="set-worker-backend"><td>Select task execution strategy</td><td>none</td><td>Worker select</td></tr>
-          <tr data-help-action="cancel-superseded-jobs"><td>Cancel work superseded by newer requests</td><td>none</td><td>runtime service</td></tr>
-          <tr data-help-action="set-map-backend"><td>Select CPU or GPU atlas map rendering</td><td>none</td><td>runtime service</td></tr>
-          <tr data-help-action="set-storage-enabled"><td>Enable or disable platform storage</td><td>none</td><td>automatic storage detection</td></tr>
-          <tr data-help-action="reset-local-vault"><td>Reset platform-local vault data</td><td>none</td><td>Reset button</td></tr>
-          <tr data-help-action="request-atlas-import"><td>Open a platform atlas importer</td><td>none</td><td>Import button</td></tr>
-          <tr data-help-action="request-atlas-export"><td>Export an atlas bundle</td><td>none</td><td>Export button</td></tr>
-          <tr data-help-action="request-debug-dump"><td>Capture presentation diagnostics</td><td>F12</td><td>none</td></tr>
-          <tr data-help-action="request-exit"><td>Exit where the host supports it</td><td>Escape</td><td>none</td></tr>
-        </tbody>
+        <tbody data-generated-help></tbody>
       </table>
       <p>
-        POV keys follow the same mode gate as the native shell: <code>F</code>,
-        <code>B</code>, and <code>N</code> act only while in POV mode, and
-        <code>Tab</code> toggles between map and POV. POV mode itself requires
-        WebGPU — there is no CPU 3D fallback; losing the device returns the
-        viewer to map mode with a warning.
+        Map, POV, and Split use the same bindings as the native shell. In Split,
+        click a pane to focus it; view-scoped keys and the wheel route only to
+        that pane. <code>Tab</code> swaps Split focus when a view surface owns
+        keyboard focus, or toggles Map/POV in a single-view presentation. POV
+        look requires holding the primary button while dragging.
       </p>
       <h2>Feature Tiers</h2>
       <p>
-        WebLow favors small caches and inline execution, WebMid targets ordinary
-        desktop browsers, and WebHigh enables larger visible windows and
-        refinement where supported. Startup benchmarking records generation and
-        frame-pacing signals for diagnostics. Tiers change budgets and
-        presentation only.
+        Low favors small caches, Mid expands the working set, and High permits
+        the largest presentation density. The shipped browser starts on Low;
+        selecting another tier emits a typed host request and never changes
+        generated identities. Add <code>?tier=low</code>, <code>?tier=mid</code>,
+        or <code>?tier=high</code> to start a diagnostics run at an exact tier.
       </p>
       <h2>Storage</h2>
       <p>
-        IndexedDB is used when the browser allows it. The app stores sparse
-        vault/session records only, never generated terrain, organisms, or
-        renderer output. Export/import remains file based and server-free.
+        The adapter opens an IndexedDB probe and reports its status, but session,
+        discovery, preserve, route, and atlas effects currently return a typed
+        unavailable result and keep the viewer on its in-memory state. Generated
+        terrain, organisms, and renderer output are never persisted.
       </p>
       <h2>Browser Requirements</h2>
       <p>
         WebGPU is optional. When available, the browser selects the WebGPU atlas
         presentation path; device loss or unsupported adapters fall back to the
-        CPU-composed map without changing world state. Workers and shared memory
-        can run in inline, worker-pool, or shared-memory worker-pool modes. The
-        inline path remains the deterministic fallback.
+        CPU-composed map without changing world state. The current worker module
+        is a capability/lifecycle probe and the shared controller still ticks the
+        inline executor; worker-pool selection remains typed scaffold state.
       </p>
       <h2>POV Mode</h2>
       <p>
@@ -118,5 +76,6 @@
         simulation are outside Phase 7.
       </p>
     </main>
+    <script type="module" src="../assets/help.js"></script>
   </body>
 </html>

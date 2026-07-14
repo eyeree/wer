@@ -1,12 +1,14 @@
 //! `renderer` — the wgpu-backed presentation layer.
 //!
-//! Phase 1 owns the GPU device, queue, and surface, and presents a single
-//! CPU-composed debug map texture per frame (phase-1-plan.md section 10) — the
-//! cheapest visualization that makes chunk replacement obvious. It is
-//! deliberately thin; the terrain/ecology render graph, clipmaps, and GPU
-//! field refinement (implementation-plan.md sections 12.2 and 17) will be
-//! built on top of this foundation, and the clear-only path stays for shells
-//! that draw nothing.
+//! The renderer owns the GPU device, queue, and surface plus the final
+//! presentation transaction: one acquired frame can contain Map, POV, or both
+//! in Split, followed by the shared information surface and focus decoration.
+//! Map accepts either shell-composed CPU pixels or the delta-uploaded region
+//! atlas with derived WGSL refinement (ADR 0017); POV renders pane-sized
+//! terrain, water, organisms, and shadows before blitting into its destination
+//! rectangle. `viewer-host` remains the authority for semantic state and exact
+//! physical layout. The live renderer exposes no readback; diagnostic POV
+//! pixels use the explicitly file-bound capture path from ADR 0021.
 //!
 //! The crate stays WebGPU-compatible: it targets `wgpu` (which maps to native
 //! Vulkan/Metal/DX and to WebGPU in the browser) and uses only WGSL shaders.

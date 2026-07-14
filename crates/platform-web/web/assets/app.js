@@ -264,7 +264,11 @@ const initWasm = async () => {
     const mod = await import("../generated/platform_web.js");
     await mod.default();
     wasmMod = mod;
-    const app = new mod.WebApp(JSON.stringify({ tier: "auto", storage: false }));
+    const requestedTier = new URL(window.location.href).searchParams.get("tier") ?? "auto";
+    if (!["auto", "low", "mid", "high"].includes(requestedTier)) {
+      throw new Error(`tier query must be auto, low, mid, or high; received ${requestedTier}`);
+    }
+    const app = new mod.WebApp(JSON.stringify({ tier: requestedTier, storage: false }));
     window.__werApp = app;
     applySharedLayout(
       JSON.parse(app.resize_surface(surfaceBacking.width, surfaceBacking.height)),
@@ -1091,6 +1095,7 @@ window.__viewerCharacterization = () => {
       ? {
           mode: lastPresentation.renderer.mode,
           compose: lastPresentation.map.backend,
+          zoom: lastPresentation.map.zoom,
           refinement: lastPresentation.map.refinement,
           viewMode: lastPresentation.view.mode,
           focusedView: lastPresentation.view.focused,
@@ -1101,6 +1106,14 @@ window.__viewerCharacterization = () => {
           frameStatus: window.__rendererFrameStatus ?? null,
         }
       : null,
+    performance: {
+      tier: lastPresentation?.tier.runtime ?? null,
+      fps: perf.fps,
+      updateMs: perf.updateMs,
+      composeMs: perf.composeMs,
+      presentMs: perf.presentMs,
+      uploadKib: perf.uploadKib,
+    },
   };
 };
 

@@ -1,17 +1,19 @@
 //! The `F12` debug dump: write a snapshot of the running shell into
-//! `./dump/<UTC datetime>/` — a screenshot of the active presentation (map
-//! or POV) plus `state.txt`, a plain-text report of everything useful for
-//! diagnosing a problem after the fact: player/camera state (position, yaw,
-//! pitch, and the forward vector in POV), steering and anchors, frame
-//! telemetry, the cell under the player, the covering region's
+//! `./dump/<UTC datetime>/` — a screenshot of the active Map, POV, or Split
+//! presentation plus `state.txt`, a plain-text report of everything useful
+//! for diagnosing a problem after the fact: mode, focus, exact pane/layout
+//! rectangles, focused hover, traveler/camera state (position, yaw, pitch,
+//! and the forward vector in POV), steering and anchors, frame telemetry, the
+//! cell under the player, the covering region's
 //! dependency-hash chain (ADR 0008), the vault counters, and the `WER_*`
 //! environment.
 //!
 //! Debug output only, never an input. The map screenshot re-runs the CPU
 //! composer (the headless `--screenshot` path) so the pixels are faithful
-//! even while the GPU-composed map is active; the POV screenshot goes
-//! through the offscreen [`renderer::pov::PovCapture`] (ADR 0021) — the
-//! live renderer still exposes no readback of any kind (ADR 0017). The
+//! even while the GPU-composed map is active; each visible POV pane goes
+//! through the offscreen [`renderer::pov::PovCapture`] (ADR 0021), and Split
+//! plus the panel is assembled with the same shared layout used live. The live
+//! renderer still exposes no readback of any kind (ADR 0017). The
 //! wall-clock directory name is presentation-only and never an identity
 //! (ADR 0003 posture); nothing written here feeds back into world state,
 //! hashing, or persistence.
@@ -20,18 +22,28 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use viewer_host::inspect::{pick_map_organism_info, sample_cell};
-use viewer_host::layout::{PixelRect, PresentationMode};
+use viewer_host::layout::{PixelRect, PresentationMode, ViewKind};
 use viewer_host::map::MapBackend;
 use viewer_host::panel::PanelDocument;
 use world_core::layer::layer_decl;
 use world_core::PossibilityDomain;
 use world_runtime::Pass;
 
-use crate::pov::{self, PovChunkManager, PovOrganismManager};
-use crate::{App, NativeMapRects, CLEAR_COLOR};
+use pov_host::{self as pov, PovChunkManager, PovOrganismManager};
+
+use crate::{App, NativeFrameRects, CLEAR_COLOR};
 
 /// The linear [`CLEAR_COLOR`] encoded for an sRGB screenshot target.
 const CLEAR_RGBA8: [u8; 4] = [39, 39, 56, 255];
+/// Same final-pass focus color as `renderer::Renderer`.
+const FOCUS_RGBA8: [u8; 4] = [72, 190, 255, 255];
+const FOCUS_THICKNESS: u32 = 3;
+
+#[derive(Debug, Clone, Copy)]
+struct RgbaImage<'a> {
+    pixels: &'a [u8],
+    size: (u32, u32),
+}
 
 fn rgba_len(width: u32, height: u32) -> Result<usize, String> {
     usize::try_from(u64::from(width) * u64::from(height) * 4)
@@ -96,32 +108,134 @@ fn blit_rgba(
     Ok(())
 }
 
-fn compose_pov_surface(
+/// Assemble a file-bound Map/POV/Split diagnostic surface from CPU Map bytes,
+/// an ADR 0021 offscreen POV capture, and the native rasterization of the one
+/// shared panel document. Destination rectangles come only from the live
+/// [`NativeFrameRects`] resolver used by rendering and picking.
+fn compose_debug_surface(
     surface_size: (u32, u32),
-    rectangles: NativeMapRects,
-    pov_rgba: &[u8],
-    panel_rgba: &[u8],
-    panel_size: (u32, u32),
+    rectangles: NativeFrameRects,
+    map: Option<RgbaImage<'_>>,
+    pov: Option<RgbaImage<'_>>,
+    panel: RgbaImage<'_>,
 ) -> Result<Vec<u8>, String> {
     let mut rgba = vec![0; rgba_len(surface_size.0, surface_size.1)?];
     for pixel in rgba.chunks_exact_mut(4) {
         pixel.copy_from_slice(&CLEAR_RGBA8);
     }
+    match (map, rectangles.views.map_content) {
+        (Some(image), Some(destination)) => blit_rgba(
+            &mut rgba,
+            surface_size,
+            image.pixels,
+            image.size,
+            destination,
+        )?,
+        (None, None) => {}
+        _ => return Err(String::from("Map image and shared layout disagree")),
+    }
+    match (pov, rectangles.views.pov_pane) {
+        (Some(image), Some(destination)) => blit_rgba(
+            &mut rgba,
+            surface_size,
+            image.pixels,
+            image.size,
+            destination,
+        )?,
+        (None, None) => {}
+        _ => return Err(String::from("POV image and shared layout disagree")),
+    }
     blit_rgba(
         &mut rgba,
         surface_size,
-        pov_rgba,
-        (rectangles.map.width, rectangles.map.height),
-        rectangles.map,
-    )?;
-    blit_rgba(
-        &mut rgba,
-        surface_size,
-        panel_rgba,
-        panel_size,
+        panel.pixels,
+        panel.size,
         rectangles.panel,
     )?;
+
+    if rectangles.views.mode == PresentationMode::Split {
+        let focused = rectangles
+            .views
+            .focus_border(rectangles.views.focused)
+            .ok_or_else(|| String::from("Split focus has no visible pane"))?;
+        paint_border(
+            &mut rgba,
+            surface_size,
+            focused,
+            FOCUS_THICKNESS,
+            FOCUS_RGBA8,
+        )?;
+    }
     Ok(rgba)
+}
+
+pub(crate) fn compose_capture_surface(
+    surface_size: (u32, u32),
+    rectangles: NativeFrameRects,
+    map: Option<(&[u8], (u32, u32))>,
+    pov: Option<(&[u8], (u32, u32))>,
+    panel: (&[u8], (u32, u32)),
+) -> Result<Vec<u8>, String> {
+    compose_debug_surface(
+        surface_size,
+        rectangles,
+        map.map(|(pixels, size)| RgbaImage { pixels, size }),
+        pov.map(|(pixels, size)| RgbaImage { pixels, size }),
+        RgbaImage {
+            pixels: panel.0,
+            size: panel.1,
+        },
+    )
+}
+
+fn paint_border(
+    destination: &mut [u8],
+    destination_size: (u32, u32),
+    rectangle: PixelRect,
+    thickness: u32,
+    color: [u8; 4],
+) -> Result<(), String> {
+    if destination.len() != rgba_len(destination_size.0, destination_size.1)?
+        || !PixelRect::new(0, 0, destination_size.0, destination_size.1).contains_rect(rectangle)
+    {
+        return Err(String::from("focus border is outside the debug surface"));
+    }
+    let thickness = thickness.min(rectangle.width).min(rectangle.height);
+    for y in rectangle.y..rectangle.bottom() {
+        for x in rectangle.x..rectangle.right() {
+            let on_border = x - rectangle.x < thickness
+                || rectangle.right() - x <= thickness
+                || y - rectangle.y < thickness
+                || rectangle.bottom() - y <= thickness;
+            if on_border {
+                let offset = usize::try_from(
+                    (u64::from(y) * u64::from(destination_size.0) + u64::from(x)) * 4,
+                )
+                .map_err(|_| String::from("focus pixel offset exceeds address space"))?;
+                destination[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rect_text(rect: Option<PixelRect>) -> String {
+    rect.map_or_else(
+        || String::from("<hidden>"),
+        |rect| {
+            format!(
+                "x={} y={} width={} height={}",
+                rect.x, rect.y, rect.width, rect.height
+            )
+        },
+    )
+}
+
+const fn view_name(view: ViewKind) -> &'static str {
+    match view {
+        ViewKind::Map => "map",
+        ViewKind::Pov => "pov",
+    }
 }
 
 /// Encode an RGBA8 buffer as binary PPM (P6, alpha dropped) — the repo's
@@ -228,12 +342,7 @@ impl App {
     fn write_debug_dump_into(&mut self, base: &Path) -> Result<PathBuf, String> {
         let dir = create_dump_dir(base, unix_seconds())?;
         let panel = self.debug_panel_document();
-        let screenshot = match self.controller.layout().mode {
-            PresentationMode::Map | PresentationMode::Split => {
-                self.dump_map_screenshot(&dir, &panel)
-            }
-            PresentationMode::Pov => self.dump_pov_screenshot(&dir, &panel),
-        };
+        let screenshot = self.dump_aligned_screenshot(&dir, &panel);
         let report = self
             .dump_report(&screenshot, &panel)
             .map_err(|e| format!("format report: {e}"))?;
@@ -245,56 +354,116 @@ impl App {
         Ok(dir)
     }
 
-    /// The map screenshot: the live CPU compose path (`frame`'s non-GPU
-    /// branch), forced regardless of the GPU toggle so the dump is the full
-    /// composed map + panel, not the GPU path's sparse overlay strip. The
-    /// panel's cursor readout is pinned at the player, like `--screenshot`.
-    fn dump_map_screenshot(&mut self, dir: &Path, panel: &PanelDocument) -> Result<String, String> {
-        let decor = self.build_decor();
-        let preferences = self.controller.map_preferences();
-        let traveler = self.controller.world().traveler().position;
-        self.composer.set_zoom(preferences.zoom);
-        self.composer.compose(
-            self.controller.world().map(),
-            traveler,
-            preferences.channel,
-            preferences.overlays,
-            self.controller.world().anchors(),
-            &decor,
-        );
-        let (width, height) = self.hud.size();
-        let pixels = self.hud.compose(self.composer.pixels(), &panel.sections);
-        write_ppm(&dir.join("screenshot.ppm"), pixels, width, height)?;
-        Ok(format!(
-            "screenshot.ppm ({width}x{height} map+panel, CPU-composed, channel {}, zoom x{})",
-            preferences.channel.name(),
-            preferences.zoom
-        ))
-    }
-
-    /// The POV screenshot: an offscreen [`renderer::pov::PovCapture`] at the
-    /// live POV-pane size, composed with the same shared panel and fitted
-    /// rectangles used by the surface (ADR 0021). The live renderer's chunks
-    /// cannot be read back, so a fresh chunk manager re-meshes the ring inline
-    /// against the live, already-settled map — meshing is deterministic, so
-    /// this shows exactly what the window shows (the `--pov-script` snap loop).
-    fn dump_pov_screenshot(&mut self, dir: &Path, panel: &PanelDocument) -> Result<String, String> {
-        let (width, height) = self
+    fn debug_frame_rects(&self) -> Option<((u32, u32), NativeFrameRects)> {
+        let surface_size = self
             .renderer
             .as_ref()
             .map_or((1024, 768), renderer::Renderer::size);
         let (source_width, source_height) = self.hud.size();
-        let panel_width = source_width
-            .checked_sub(source_height)
-            .ok_or_else(|| String::from("native panel source is narrower than its map"))?;
-        let rectangles = NativeMapRects::resolve(
-            PixelRect::new(0, 0, width, height),
+        let panel_width = source_width.checked_sub(source_height)?;
+        NativeFrameRects::resolve(
+            PixelRect::new(0, 0, surface_size.0, surface_size.1),
             source_height,
             panel_width,
+            self.controller.layout(),
         )
-        .ok_or_else(|| String::from("surface is too small for POV and information panel"))?;
-        let pov_width = rectangles.map.width;
-        let pov_height = rectangles.map.height;
+        .map(|rectangles| (surface_size, rectangles))
+    }
+
+    /// Capture the current presentation with the same physical rectangles as
+    /// the live surface. Map pixels intentionally use the shared CPU composer
+    /// so they remain inspectable even while GPU atlas composition is active;
+    /// POV pixels come only from a file-bound offscreen capture (ADR 0021).
+    fn dump_aligned_screenshot(
+        &mut self,
+        dir: &Path,
+        panel: &PanelDocument,
+    ) -> Result<String, String> {
+        let ((width, height), rectangles) = self
+            .debug_frame_rects()
+            .ok_or_else(|| String::from("surface is too small for views and information panel"))?;
+        let mode = rectangles.views.mode;
+        let preferences = self.controller.map_preferences();
+
+        let map_rgba = if mode == PresentationMode::Pov {
+            None
+        } else {
+            let decor = self.build_decor();
+            let traveler = self.controller.world().traveler().position;
+            self.composer.set_zoom(preferences.zoom);
+            self.composer.compose(
+                self.controller.world().map(),
+                traveler,
+                preferences.channel,
+                preferences.overlays,
+                self.controller.world().anchors(),
+                &decor,
+            );
+            Some(self.composer.pixels().to_vec())
+        };
+
+        let (pov_rgba, pov_note) = match rectangles.views.pov_pane {
+            Some(pane) => {
+                let (pixels, note) = self.capture_pov((pane.width, pane.height))?;
+                (Some(pixels), Some(note))
+            }
+            None => (None, None),
+        };
+        let (panel_rgba, panel_width, panel_height) = {
+            let (pixels, panel_width, panel_height, _) =
+                self.hud.panel_image_for(panel.revision, &panel.sections);
+            (pixels.to_vec(), panel_width, panel_height)
+        };
+        let map = map_rgba.as_deref().map(|pixels| RgbaImage {
+            pixels,
+            size: (self.composer.side(), self.composer.side()),
+        });
+        let pov = pov_rgba
+            .as_deref()
+            .zip(rectangles.views.pov_pane)
+            .map(|(pixels, pane)| RgbaImage {
+                pixels,
+                size: (pane.width, pane.height),
+            });
+        let rgba = compose_debug_surface(
+            (width, height),
+            rectangles,
+            map,
+            pov,
+            RgbaImage {
+                pixels: &panel_rgba,
+                size: (panel_width, panel_height),
+            },
+        )?;
+        write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
+
+        let mut details = format!(
+            "screenshot.ppm ({width}x{height} {}+panel, focus {}, map {}, POV {})",
+            mode.as_str(),
+            view_name(rectangles.views.focused),
+            rect_text(rectangles.views.map_content),
+            rect_text(rectangles.views.pov_pane),
+        );
+        if mode != PresentationMode::Pov {
+            write!(
+                details,
+                "; CPU Map channel {}, zoom x{}",
+                preferences.channel.name(),
+                preferences.zoom
+            )
+            .expect("writing to String cannot fail");
+        }
+        if let Some(note) = pov_note {
+            write!(details, "; {note}").expect("writing to String cannot fail");
+        }
+        Ok(details)
+    }
+
+    /// Offscreen POV pane used by both POV-only and Split dumps. The live
+    /// renderer exposes no readback; a fresh deterministic mesh/organism ring
+    /// is uploaded into [`renderer::pov::PovCapture`] for this file only.
+    fn capture_pov(&self, size: (u32, u32)) -> Result<(Vec<u8>, String), String> {
+        let (pov_width, pov_height) = size;
         let mut cap = renderer::pov::PovCapture::new(pov_width, pov_height)
             .map_err(|e| format!("pov capture init: {e}"))?;
         let camera = self.controller.pov_camera();
@@ -348,24 +517,17 @@ impl App {
             CLEAR_COLOR,
             self.controller.pov_state().render_scale,
         );
-        let (panel_rgba, panel_source_width, panel_source_height, _) =
-            self.hud.panel_image_for(panel.revision, &panel.sections);
-        let rgba = compose_pov_surface(
-            (width, height),
-            rectangles,
-            &pov_rgba,
-            panel_rgba,
-            (panel_source_width, panel_source_height),
-        )?;
-        write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
         let counts = organisms.counters();
-        Ok(format!(
-            "screenshot.ppm ({width}x{height} POV+panel, {pov_width}x{pov_height} offscreen POV pane, {} chunks meshed, {} organisms drawn / {} published / {} waiting for ground; {} distance-culled)",
-            chunks.len(),
-            counts.drawn(),
-            counts.published,
-            counts.waiting_for_ground,
-            counts.distance_culled,
+        Ok((
+            pov_rgba,
+            format!(
+                "{pov_width}x{pov_height} offscreen POV, {} chunks meshed, {} organisms drawn / {} published / {} waiting for ground; {} distance-culled",
+                chunks.len(),
+                counts.drawn(),
+                counts.published,
+                counts.waiting_for_ground,
+                counts.distance_culled,
+            ),
         ))
     }
 
@@ -424,14 +586,50 @@ impl App {
             PresentationMode::Split => "split (map + POV)",
         };
         writeln!(s, "mode              : {mode}")?;
-        let surface = self.renderer.as_ref().map_or_else(
-            || String::from("<no renderer>"),
-            |r| {
-                let (w, h) = r.size();
-                format!("{w}x{h}")
-            },
-        );
-        writeln!(s, "surface           : {surface}")?;
+        writeln!(s, "mode_id           : {}", layout.mode.as_str())?;
+        writeln!(s, "focused           : {}", view_name(layout.focused))?;
+        writeln!(s, "split_ratio       : {:.3}", layout.split_ratio)?;
+        if let Some(((width, height), rectangles)) = self.debug_frame_rects() {
+            writeln!(s, "surface           : {width}x{height}")?;
+            writeln!(
+                s,
+                "combined_rect     : {}",
+                rect_text(Some(rectangles.combined))
+            )?;
+            writeln!(
+                s,
+                "view_deck_rect    : {}",
+                rect_text(Some(rectangles.view_deck))
+            )?;
+            writeln!(
+                s,
+                "map_pane_rect     : {}",
+                rect_text(rectangles.views.map_pane)
+            )?;
+            writeln!(
+                s,
+                "map_content_rect  : {}",
+                rect_text(rectangles.views.map_content)
+            )?;
+            writeln!(
+                s,
+                "pov_pane_rect     : {}",
+                rect_text(rectangles.views.pov_pane)
+            )?;
+            writeln!(
+                s,
+                "panel_rect        : {}",
+                rect_text(Some(rectangles.panel))
+            )?;
+            writeln!(
+                s,
+                "focus_border_rect : {}",
+                rect_text(rectangles.views.focus_border(rectangles.views.focused))
+            )?;
+        } else {
+            writeln!(s, "surface           : <layout unavailable>")?;
+        }
+        writeln!(s, "hover             : {:?}", panel.model.hover)?;
         writeln!(s, "tier              : {}", self.tier.name())?;
         writeln!(s, "workers           : {}", self.executor.parallelism())?;
         writeln!(
@@ -454,6 +652,7 @@ impl App {
         let player = traveler.position;
         let (region, feature) = tools::probe_world_position(player.0, player.1);
         writeln!(s, "[position]")?;
+        writeln!(s, "traveler_world    : ({:.3}, {:.3})", player.0, player.1)?;
         writeln!(s, "player_world      : ({:.3}, {:.3})", player.0, player.1)?;
         writeln!(
             s,
@@ -740,21 +939,43 @@ mod tests {
     }
 
     #[test]
-    fn pov_dump_surface_keeps_camera_pane_panel_and_letterbox_disjoint() {
-        let surface_size = (11, 7);
-        let rectangles =
-            NativeMapRects::resolve(PixelRect::new(0, 0, 11, 7), 2, 2).expect("visible panes");
-        let pov_pixel = [180, 40, 20, 255];
+    fn split_dump_keeps_both_views_panel_focus_and_letterbox_disjoint() {
+        let surface_size = (31, 11);
+        let rectangles = NativeFrameRects::resolve(
+            PixelRect::new(0, 0, surface_size.0, surface_size.1),
+            8,
+            4,
+            viewer_host::layout::ViewLayout {
+                mode: PresentationMode::Split,
+                focused: ViewKind::Map,
+                split_ratio: 0.5,
+            },
+        )
+        .expect("visible panes");
+        let map_pixel = [180, 40, 20, 255];
+        let pov_pixel = [40, 180, 20, 255];
         let panel_pixel = [20, 80, 180, 255];
-        let pov_rgba = pov_pixel.repeat(
-            usize::try_from(u64::from(rectangles.map.width) * u64::from(rectangles.map.height))
-                .expect("test pane area fits"),
-        );
-        let panel_rgba = panel_pixel.repeat(4);
+        let map_rgba = map_pixel.repeat(64);
+        let pov_rgba = pov_pixel.repeat(64);
+        let panel_rgba = panel_pixel.repeat(32);
 
-        let composed =
-            compose_pov_surface(surface_size, rectangles, &pov_rgba, &panel_rgba, (2, 2))
-                .expect("valid POV composition");
+        let composed = compose_debug_surface(
+            surface_size,
+            rectangles,
+            Some(RgbaImage {
+                pixels: &map_rgba,
+                size: (8, 8),
+            }),
+            Some(RgbaImage {
+                pixels: &pov_rgba,
+                size: (8, 8),
+            }),
+            RgbaImage {
+                pixels: &panel_rgba,
+                size: (4, 8),
+            },
+        )
+        .expect("valid Split composition");
 
         let (letterbox_x, letterbox_y) = (0..surface_size.1)
             .find_map(|y| {
@@ -763,26 +984,45 @@ mod tests {
                     .map(|x| (x, y))
             })
             .expect("aspect mismatch leaves letterbox pixels");
-        assert_eq!(pixel(&composed, 11, letterbox_x, letterbox_y), CLEAR_RGBA8);
+        assert_eq!(
+            pixel(&composed, surface_size.0, letterbox_x, letterbox_y),
+            CLEAR_RGBA8
+        );
         assert_eq!(
             pixel(
                 &composed,
-                11,
-                rectangles.map.x + rectangles.map.width / 2,
-                rectangles.map.y + rectangles.map.height / 2,
+                surface_size.0,
+                rectangles.views.map_pane.unwrap().x + rectangles.views.map_pane.unwrap().width / 2,
+                rectangles.views.map_pane.unwrap().y
+                    + rectangles.views.map_pane.unwrap().height / 2,
+            ),
+            map_pixel
+        );
+        assert_eq!(
+            pixel(
+                &composed,
+                surface_size.0,
+                rectangles.views.pov_pane.unwrap().x + rectangles.views.pov_pane.unwrap().width / 2,
+                rectangles.views.pov_pane.unwrap().y
+                    + rectangles.views.pov_pane.unwrap().height / 2,
             ),
             pov_pixel
         );
         assert_eq!(
             pixel(
                 &composed,
-                11,
+                surface_size.0,
                 rectangles.panel.x + rectangles.panel.width / 2,
                 rectangles.panel.y + rectangles.panel.height / 2,
             ),
             panel_pixel
         );
-        assert_eq!(rectangles.map.right(), rectangles.panel.x);
+        let map_pane = rectangles.views.map_pane.unwrap();
+        assert_eq!(
+            pixel(&composed, surface_size.0, map_pane.x, map_pane.y),
+            FOCUS_RGBA8
+        );
+        assert_eq!(rectangles.view_deck.right(), rectangles.panel.x);
     }
 
     #[test]
@@ -822,9 +1062,15 @@ mod tests {
         let report = std::fs::read_to_string(dir.join("state.txt")).expect("state.txt");
         for section in [
             "player_world",
+            "traveler_world",
             "[information_panel]",
             "view.mode",
             "[view]",
+            "mode_id           : map",
+            "focused           : map",
+            "map_pane_rect",
+            "panel_rect",
+            "hover             :",
             "[pov_camera]",
             "forward",
             "[steering]",
@@ -836,6 +1082,46 @@ mod tests {
         }
         assert!(report.contains("CellInfo {"));
         assert!(report.contains("organism within one cell:"));
+
+        // The state report follows the controller's aligned Split mode and
+        // focus and records the exact same pane rectangles as composition.
+        let available = app.services.pov_availability(true);
+        app.controller.enqueue_service_notification(available);
+        app.controller
+            .enqueue_action(viewer_host::ViewerAction::SetPresentation(
+                PresentationMode::Split,
+            ));
+        app.controller
+            .enqueue_action(viewer_host::ViewerAction::FocusView(ViewKind::Pov));
+        let split_tick = app.controller.tick(
+            viewer_host::controller::TickInput {
+                dt_seconds: 0.0,
+                input: viewer_host::input::InputFrame::default(),
+                platform: viewer_host::panel::PlatformTelemetry::default(),
+            },
+            &world_runtime::InlineExecutor,
+            &mut app.services,
+            &viewer_host::AnalyticGroundSampler,
+        );
+        app.last_tick_output = Some(split_tick);
+        let split_panel = app.debug_panel_document();
+        let split_report = app
+            .dump_report(&Ok(String::from("split fixture")), &split_panel)
+            .expect("format Split report");
+        for field in [
+            "mode_id           : split",
+            "focused           : pov",
+            "map_pane_rect     : x=",
+            "map_content_rect  : x=",
+            "pov_pane_rect     : x=",
+            "focus_border_rect : x=",
+            "hover             :",
+        ] {
+            assert!(
+                split_report.contains(field),
+                "Split report is missing {field:?}"
+            );
+        }
 
         // Diagnostic sampling is independent of presentation hover. Even a
         // sky/missing-geometry POV hover must leave the F12 report's player

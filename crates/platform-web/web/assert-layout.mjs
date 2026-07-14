@@ -506,6 +506,162 @@ try {
       fallback.warning?.includes("device lost"),
     `post-loss CPU Map/panel state did not survive: ${JSON.stringify(fallback)}`,
   );
+
+  // Exercise the production DOM adapter with real CDP pointer/keyboard input
+  // plus a DOM WheelEvent (agent-browser 0.26 does not target canvas wheel
+  // events). Direct facade calls above isolate reducer invariants; these events
+  // prove canvas focus, DPR conversion, wheel, capture, and RAF scheduling.
+  evaluate(`(() => {
+    for (let index = 0; index < 8; index += 1) window.__werApp.action("zoom-out");
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "F24" }));
+    return true;
+  })()`);
+  agent(["wait", "--fn", "window.__viewerCharacterization().renderer.zoom === 1"]);
+  const mapInputPoint = evaluate(`(() => {
+    const view = window.__viewerCharacterization();
+    const canvas = document.getElementById("world-canvas");
+    const box = canvas.getBoundingClientRect();
+    const map = view.canvases.mapViewport;
+    return {
+      x: Math.round(box.left + ((map.dx + map.dw / 2) / canvas.width) * box.width),
+      y: Math.round(box.top + ((map.dy + map.dh / 2) / canvas.height) * box.height),
+      physical: [map.dx + map.dw / 2, map.dy + map.dh / 2],
+      center: JSON.parse(window.__werApp.map_world_at(map.dx + map.dw / 2, map.dy + map.dh / 2)),
+      serial: window.__mapStatus.update_serial,
+    };
+  })()`);
+  agent(["mouse", "move", String(mapInputPoint.x), String(mapInputPoint.y)]);
+  agent(["mouse", "down", "left"]);
+  agent(["mouse", "up", "left"]);
+  evaluate(`document.getElementById("world-canvas").dispatchEvent(
+    new WheelEvent("wheel", { clientX: ${mapInputPoint.x}, clientY: ${mapInputPoint.y}, deltaY: -80, deltaMode: WheelEvent.DOM_DELTA_PIXEL, bubbles: true, cancelable: true })
+  )`);
+  agent(["wait", "--fn", "window.__viewerCharacterization().renderer.zoom === 4"]);
+  const zoom4 = evaluate(`(() => {
+    const view = window.__viewerCharacterization();
+    const map = view.canvases.mapViewport;
+    return {
+      center: JSON.parse(window.__werApp.map_world_at(map.dx + map.dw / 2, map.dy + map.dh / 2)),
+      serial: window.__mapStatus.update_serial,
+      zoom: view.renderer.zoom,
+    };
+  })()`);
+  evaluate(`document.getElementById("world-canvas").dispatchEvent(
+    new WheelEvent("wheel", { clientX: ${mapInputPoint.x}, clientY: ${mapInputPoint.y}, deltaY: -80, deltaMode: WheelEvent.DOM_DELTA_PIXEL, bubbles: true, cancelable: true })
+  )`);
+  agent(["wait", "--fn", "window.__viewerCharacterization().renderer.zoom === 16"]);
+  const zoom16 = evaluate(`(() => {
+    const view = window.__viewerCharacterization();
+    const map = view.canvases.mapViewport;
+    return {
+      center: JSON.parse(window.__werApp.map_world_at(map.dx + map.dw / 2, map.dy + map.dh / 2)),
+      serial: window.__mapStatus.update_serial,
+      zoom: view.renderer.zoom,
+    };
+  })()`);
+  assert(
+    zoom4.zoom === 4 &&
+      zoom16.zoom === 16 &&
+      zoom4.serial > mapInputPoint.serial &&
+      zoom16.serial > zoom4.serial &&
+      closeEnough(zoom4.center[0], mapInputPoint.center[0], 1e-8) &&
+      closeEnough(zoom4.center[1], mapInputPoint.center[1], 1e-8) &&
+      closeEnough(zoom16.center[0], mapInputPoint.center[0], 1e-8) &&
+      closeEnough(zoom16.center[1], mapInputPoint.center[1], 1e-8),
+    `real Map wheel input did not preserve the 1/4/16 center: ${JSON.stringify({ mapInputPoint, zoom4, zoom16 })}`,
+  );
+
+  evaluate(`(() => {
+    window.__werApp.renderer_available();
+    return true;
+  })()`);
+  agent(["click", 'button[data-action="set-presentation"][data-value="split"]']);
+  agent([
+    "wait",
+    "--fn",
+    'window.__viewerCharacterization().renderer.viewMode === "split" && document.getElementById("pov-canvas").hidden === false',
+  ]);
+  const povInputPoint = evaluate(`(() => {
+    const view = window.__viewerCharacterization();
+    const canvas = document.getElementById("pov-canvas");
+    const box = canvas.getBoundingClientRect();
+    const pane = view.canvases.sharedLayout.pov_pane;
+    return {
+      x: Math.round(box.left + ((pane[0] + pane[2] / 2) / canvas.width) * box.width),
+      y: Math.round(box.top + ((pane[1] + pane[3] / 2) / canvas.height) * box.height),
+    };
+  })()`);
+  const beforeHover = evaluate(`({
+    serial: window.__mapStatus.update_serial,
+    orientation: window.__povStatus.orientation,
+  })`);
+  agent(["mouse", "move", String(povInputPoint.x), String(povInputPoint.y)]);
+  agent(["mouse", "move", String(povInputPoint.x + 24), String(povInputPoint.y + 12)]);
+  agent(["wait", "--fn", `window.__mapStatus.update_serial > ${beforeHover.serial}`]);
+  const afterHover = evaluate(`({
+    serial: window.__mapStatus.update_serial,
+    orientation: window.__povStatus.orientation,
+  })`);
+  agent(["mouse", "down", "left"]);
+  agent(["mouse", "up", "left"]);
+  agent(["wait", "--fn", `window.__mapStatus.update_serial > ${afterHover.serial}`]);
+  const afterClick = evaluate(`({
+    serial: window.__mapStatus.update_serial,
+    orientation: window.__povStatus.orientation,
+    focused: window.__viewerCharacterization().renderer.focusedView,
+  })`);
+  agent(["mouse", "down", "left"]);
+  agent(["mouse", "move", String(povInputPoint.x + 70), String(povInputPoint.y + 42)]);
+  agent(["mouse", "up", "left"]);
+  agent(["wait", "--fn", `window.__mapStatus.update_serial > ${afterClick.serial}`]);
+  const afterDrag = evaluate(`({
+    serial: window.__mapStatus.update_serial,
+    orientation: window.__povStatus.orientation,
+    focused: window.__viewerCharacterization().renderer.focusedView,
+  })`);
+  assert(
+    JSON.stringify(beforeHover.orientation) === JSON.stringify(afterHover.orientation) &&
+      JSON.stringify(afterHover.orientation) === JSON.stringify(afterClick.orientation) &&
+      JSON.stringify(afterClick.orientation) !== JSON.stringify(afterDrag.orientation) &&
+      afterClick.focused === "pov" &&
+      afterDrag.focused === "pov",
+    `real POV pointer input bypassed or missed the primary-hold gate: ${JSON.stringify({ beforeHover, afterHover, afterClick, afterDrag })}`,
+  );
+  agent(["press", "Tab"]);
+  agent([
+    "wait",
+    "--fn",
+    'window.__viewerCharacterization().renderer.viewMode === "split" && window.__viewerCharacterization().renderer.focusedView === "map"',
+  ]);
+
+  const helpUrl = new URL("help/", url).href;
+  agent(["open", helpUrl]);
+  agent(["wait", "--fn", 'document.body.dataset.helpReady === "true"']);
+  const generatedHelp = evaluate(`(() => {
+    const rows = Array.from(document.querySelectorAll("[data-generated-help] [data-help-action]"));
+    const ids = rows.map((row) => row.dataset.helpAction);
+    return {
+      ready: document.body.dataset.helpReady,
+      rows: rows.length,
+      unique: new Set(ids).size,
+      allComplete: rows.every(
+        (row) =>
+          row.children.length === 3 &&
+          row.children[0].textContent.trim().length > 0 &&
+          row.children[1].textContent.trim().length > 0 &&
+          ["global", "focused view", "map", "pov"].includes(row.children[2].textContent.trim()),
+      ),
+      status: document.querySelector("[data-help-status]")?.textContent ?? "",
+    };
+  })()`);
+  assert(
+    generatedHelp.ready === "true" &&
+      generatedHelp.rows > 0 &&
+      generatedHelp.unique === generatedHelp.rows &&
+      generatedHelp.allComplete &&
+      generatedHelp.status.includes(`${generatedHelp.rows} actions`),
+    `browser help did not render the shared action/binding registry: ${JSON.stringify(generatedHelp)}`,
+  );
 } finally {
   try {
     agent(["close"]);

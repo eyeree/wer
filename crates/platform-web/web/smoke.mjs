@@ -8,11 +8,13 @@ const required = [
   "docs/world-model.html",
   "assets/app.css",
   "assets/app.js",
+  "assets/help.js",
   "assets/benchmark.js",
   "assets/storage.js",
   "assets/worker.js",
   "assets/manifest.json",
   "assert-layout.mjs",
+  "assert-diagnostics.mjs",
   "baselines/native-web-alignment-m0-layout.json",
   "generated/platform_web.js",
   "generated/platform_web_bg.wasm",
@@ -213,10 +215,20 @@ for (const heading of ["World Model", "Possibility", "Terrain"]) {
 }
 
 const help = await readFile(join(dist, "help/index.html"), "utf8");
-for (const match of html.matchAll(/data-action="([^"]+)"/g)) {
-  if (!help.includes(`data-help-action="${match[1]}"`)) {
-    throw new Error(`help page missing action ${match[1]}`);
-  }
+const helpScript = await readFile(join(dist, "assets/help.js"), "utf8");
+if (
+  !help.includes("data-generated-help") ||
+  !help.includes('../assets/help.js') ||
+  !helpScript.includes("viewer_action_descriptors()") ||
+  !helpScript.includes("row.dataset.helpAction = descriptor.id")
+) {
+  throw new Error("help route does not build rows from the shared action/binding descriptors");
+}
+if (help.includes("data-help-action=")) {
+  throw new Error("help route retains a hand-maintained action registry");
+}
+if (!app.includes('searchParams.get("tier")') || !app.includes('["auto", "low", "mid", "high"]')) {
+  throw new Error("app.js does not validate exact startup-tier diagnostics input");
 }
 
 JSON.parse(await readFile(join(dist, "assets/manifest.json"), "utf8"));

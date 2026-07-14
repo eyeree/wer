@@ -12,6 +12,10 @@
 //! and renderer-loss fallback gates without changing that immutable
 //! pre-alignment evidence. The headless route asserts state and explicit
 //! capability/loss hooks; it never treats unavailable GPU pixels as evidence.
+//! Pass `--profile-alignment` to run a bounded Low/Mid/High by Map/POV/Split
+//! diagnostics matrix. It records local wall-clock/adapter telemetry and gates
+//! steady-state scheduling/cache properties, never performance thresholds or
+//! headless WebGPU pixels.
 //! The default sign-off remains browserless so CI does not require that local
 //! debugging tool.
 
@@ -58,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .args(["run", "--bin", "web-build"]))?;
         }
         BrowserAction::Assert => assert_layout(&root)?,
+        BrowserAction::Profile => profile_alignment(&root)?,
     }
     run(Command::new("node")
         .current_dir(&root)
@@ -70,6 +75,7 @@ enum BrowserAction {
     None,
     Record(PathBuf),
     Assert,
+    Profile,
 }
 
 fn browser_action(root: &Path) -> Result<BrowserAction, Box<dyn std::error::Error>> {
@@ -81,6 +87,12 @@ fn browser_action(root: &Path) -> Result<BrowserAction, Box<dyn std::error::Erro
                 return Err("unexpected arguments after --assert-layout".into());
             }
             Ok(BrowserAction::Assert)
+        }
+        Some("--profile-alignment") => {
+            if args.next().is_some() {
+                return Err("unexpected arguments after --profile-alignment".into());
+            }
+            Ok(BrowserAction::Profile)
         }
         Some("--record-layout") => {
             let raw = args
@@ -112,6 +124,10 @@ fn browser_action(root: &Path) -> Result<BrowserAction, Box<dyn std::error::Erro
 
 fn assert_layout(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     run_browser_script(root, "assert-layout.mjs", &[])
+}
+
+fn profile_alignment(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    run_browser_script(root, "assert-diagnostics.mjs", &[])
 }
 
 fn capture_layout(root: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {

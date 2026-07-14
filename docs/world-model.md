@@ -1,18 +1,20 @@
 # The Infinite World Exploration World Model
 
-This document describes the world model implemented in this repository through
-Phase 6. It starts with a non-technical account, then gives a formal model, and
-finally walks through the algorithms and data structures component by
-component. The final section records implementation concerns and promising
-improvements found during review.
+This document describes the world model and its current native/browser viewer.
+It starts with a non-technical account, then gives a formal model, and finally
+walks through the algorithms and data structures component by component. The
+final section records implementation concerns and promising improvements found
+during review.
 
 The distinction between **implemented** and **planned** matters. The repository
 already contains a deterministic, streaming, top-down world prototype with
 environmental layers, aggregate ecology, procedural species, steering,
-persistence, routes, and a debug renderer. It does not yet contain the planned
-3D game renderer, moving or behaving organisms, a browser world runtime,
-networking, multiplayer, photography, or a community service. The debug map is
-the current playable shell, not merely a visualization of a finished 3D game.
+persistence, routes, a derived 3D POV renderer, and a static browser runtime.
+Native and browser expose aligned Map, POV, and side-by-side Split presentation
+over one traveler and one world update. The project does not yet contain moving
+or behaving organisms, networking, multiplayer, photography, or a community
+service. The current viewer is still a world-model prototype, not a finished
+game.
 
 ## 1. Non-technical overview
 
@@ -64,8 +66,10 @@ be exchanged in atlas bundles and merged without a central server.
 The current result is best understood as a rigorous world-model prototype. It
 machine-checks important cases of continuity, deterministic regeneration,
 incremental invalidation, ecological hierarchy, steering, sparse persistence,
-and scale-aware scheduling on a false-colour 2D map. The artistic and
-behavioral fidelity envisioned by the project overview remains future work.
+scale-aware scheduling, and aligned native/browser presentation. The shared
+viewer offers a false-colour Map, a derived terrain-and-organism POV, and Split
+without making either presentation authoritative. The artistic and behavioral
+fidelity envisioned by the project overview remains future work.
 
 ## 2. The abstract world model
 
@@ -1933,12 +1937,14 @@ resonance and convergence.
 
 ### 3.27 CPU-authoritative presentation
 
-The renderer is downstream of the model. The CPU
-[`MapComposer`](crates/platform-native/src/viz.rs) reads tiles and paints the
-deterministic false-colour map used by screenshots, headless tests, and the
-reference view. It can display individual environmental channels, biomes,
-species, ecology, influence, stability, discovered regions, routes, preserves,
-and organism markers.
+The viewer and renderer are downstream of the model. The shared CPU
+[`MapComposer`](../crates/viewer-host/src/map.rs) reads tiles and paints the
+deterministic false-colour map used by both shells, screenshots, and headless
+tests. It can display individual environmental channels, biomes, species,
+ecology, influence, stability, discovered regions, routes, preserves, and
+organism markers. The same crate owns atlas preparation, layout/focus,
+CPU-authoritative inspection, and the semantic information-panel document;
+native and web only render that document as bitmap pixels or DOM.
 
 The normal native path uses a GPU field atlas. Each region slot packs:
 
@@ -1955,9 +1961,11 @@ packing. Elevation and Slope share the Terrain dependency hash, so Elevation's
 existing upload provenance still observes every Terrain change without adding
 a fifth plane or shader selector.
 
-An `AtlasManager` assigns and recycles slots and uploads a region only when its
-presence/dependency key changes. A storage buffer maps visible window positions
-to slots. Sparse routes, rings, markers, and other overlays remain CPU-drawn.
+The shared
+[`AtlasManager`](../crates/viewer-host/src/atlas.rs) assigns and recycles slots
+and uploads a region only when its presence/dependency key changes. A storage
+buffer maps visible window positions to slots. Sparse routes, rings, markers,
+and other overlays remain CPU-drawn.
 The POV chunk manager extends that tile key with the 18 buckets of the exact
 owned Terrain halo snapshot passed to its mesh job. A neighbor P/G authority
 flip therefore supersedes completed or in-flight old-halo meshes immediately,
@@ -1965,14 +1973,24 @@ before corrected Terrain and downstream tiles integrate.
 
 The WGSL composition pass selects false-colour channels and can add up to three
 hashed-gradient refinement octaves above the 32-by-32 authoritative sampling
-rate. These details are display-only. The renderer exposes no readback method;
-no GPU result can become a generation input, identity, steering value,
-resonance value, or persistent record.
+rate. POV renders resident CPU terrain meshes and realized organism primitives.
+Map, POV, and Split are panes of one logical viewer frame: the shared controller
+computes travel and calls `RegionMap::update` once, then the renderer records
+all visible panes in one surface acquire/submit/present. These details are
+display-only. The renderer exposes no live readback method; no GPU result can
+become a generation input, identity, steering value, resonance value, or
+persistent record. ADR 0021's explicit file-bound headless capture is the only
+readback exception.
 
-The current web crate compiles the neutral code for `wasm32` and exposes parity
-probe functions. CI also executes every probe in Node through pinned
-`wasm-bindgen-test` 0.3.76 and `wasm-pack` 0.13.1. It does not run `RegionMap`,
-a worker executor, browser storage, or the renderer.
+The browser crate runs the streamed `RegionMap`, shared viewer/controller, CPU
+Map path, WebGPU Map/POV/Split renderer where available, and visible
+capability/loss fallbacks inside a static artifact. World jobs still use
+`InlineExecutor`; Worker and IndexedDB code currently probes availability only,
+and vault/session effects report that the browser service is unavailable. The
+crate also exposes deterministic parity probes. CI executes every probe in Node
+through pinned `wasm-bindgen-test` 0.3.76 and `wasm-pack` 0.13.1, while
+`web-signoff` exercises the built app's sizing, input, focus, panel, Split, and
+fallback behavior in a browser. Browser networking and accounts do not exist.
 
 ### 3.28 Verification surfaces
 
@@ -1984,6 +2002,11 @@ The repository uses several complementary checks:
 * same-platform SIMD-versus-scalar differential tests;
 * the continuity replay for pinned stability and bounded seams;
 * `wer-ledger` for declared invalidation precision;
+* focused `viewer-host` tests for the single binding/action authority,
+  Map/POV/Split focus and layout, one-traveler/one-update controller traces,
+  Map bytes and atlas deltas, CPU inspection, and stable panel documents;
+* focused `pov-host` and renderer tests for resident-geometry ray picking,
+  pane resource sizing, one-surface multi-view frame plans, and WGSL validity;
 * focused `world-runtime` recovery tests for tight macro and roster ceilings,
   every-layer stale-result rejection, settled-cell roster inspection,
   fail-closed canonical invalidation/repair, fixed cross-budget publication,
@@ -2001,6 +2024,8 @@ The repository uses several complementary checks:
 * native file-protocol tests for durable ancestor creation, temp-file write and
   synchronization, atomic rename, directory synchronization, not-found delete
   barriers, and every staged failure/retry boundary;
+* native Map/POV/Split debug-capture tests for aligned layout, focus, pane,
+  traveler/camera, hover, and information-panel reporting;
 * the Phase 3 ecology harness (run as an integration test) for diversity and
   trophic bounds;
 * `wer-anchor` for selective, coherent steering, resonance gating,
@@ -2013,7 +2038,12 @@ The repository uses several complementary checks:
   per-frame tight-versus-roomy regional-history equality under field pressure,
   field/pool plateaus, additive realization density, and exact Low/Mid/High
   canonical organism, anchored capture/resonance, actual route-record id/node,
-  and encoded-byte equality.
+  and encoded-byte equality; and
+* wasm tests plus `web-signoff --assert-layout` for typed action decoding,
+  controller traces, DPR/resize geometry, real input/focus routing, bounded
+  panel cadence, Map/POV/Split behavior, and WebGPU loss fallback; the local
+  `--profile-alignment` matrix adds Low/Mid/High structural/cache diagnostics
+  and informational wall-clock telemetry.
 
 Focused anchor tests exhaust all 720 permutations of an adversarial six-anchor
 multiset at center, partial-falloff, and zero-influence positions, comparing
@@ -2026,6 +2056,7 @@ duplicate-containing canonical-signature and quantized dense-route
 normalization probes and executes those plus fixed routing elevations and three
 complete macro topology folds in Node.
 
-CI formats, lints, checks, and tests the native workspace, compile-checks the
-three neutral/web crates for `wasm32-unknown-unknown`, and then runs the shared
-parity suite in Node as actual wasm.
+CI formats, lints, checks, and tests the native workspace, compile-checks
+`world-core`, `world-runtime`, `viewer-host`, and `platform-web` for
+`wasm32-unknown-unknown`, and then runs the shared parity suite in Node as
+actual wasm.

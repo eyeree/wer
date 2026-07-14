@@ -2544,11 +2544,16 @@ pub enum PovInstr {
     Settle(u32),
     /// `snap:path.ppm` — settle the chunk ring and write a snapshot.
     Snap(String),
+    /// `split:path.ppm` — settle once, then write the aligned Map + POV +
+    /// information-panel surface through the native headless adapter. The
+    /// POV pane still uses file-bound [`renderer::pov::PovCapture`]; this
+    /// instruction does not introduce live renderer readback (ADR 0021).
+    Split(String),
 }
 
 /// Parse a `--pov-script` instruction sequence: instructions separated by
 /// `;`, each `op` or `op:args` with comma-separated args, e.g.
-/// `"pos:300,-10; mouse:120,40; snap:a.ppm; move:200; settle; snap:b.ppm"`.
+/// `"pos:300,-10; mouse:120,40; snap:a.ppm; move:200; settle; split:b.ppm"`.
 pub fn parse_pov_script(script: &str) -> Result<Vec<PovInstr>, String> {
     let mut out = Vec::new();
     for raw in script.split(';') {
@@ -2633,6 +2638,12 @@ pub fn parse_pov_script(script: &str) -> Result<Vec<PovInstr>, String> {
                 }
                 PovInstr::Snap(String::from(args))
             }
+            "split" => {
+                if args.is_empty() {
+                    return Err(String::from("split wants a file path"));
+                }
+                PovInstr::Split(String::from(args))
+            }
             other => return Err(format!("unknown instruction {other:?}")),
         });
     }
@@ -2650,8 +2661,8 @@ pub fn parse_pov_script(script: &str) -> Result<Vec<PovInstr>, String> {
 /// the same toggle path as the live `F` key. `ground(x, y)` supplies the
 /// composed walk ground under a world position (the runner settles the world
 /// before sampling; tests pass a settled manager or a stub). Returns whether
-/// the instruction was camera-affecting; `size`/`pos`/`settle`/`snap` are
-/// the runner's concern and return false.
+/// the instruction was camera-affecting; `size`/`pos`/`settle`/`snap`/`split`
+/// are the runner's concern and return false.
 pub fn apply_camera_instr(
     camera: &mut PovCamera,
     instr: &PovInstr,
@@ -3632,7 +3643,7 @@ mod tests {
     #[test]
     fn pov_script_parses_the_documented_forms() {
         let script = "size:640x360; pos:300,-10; mouse:120,-40; snap:a.ppm; \
-                      move:200; move:0,-50,25; settle; settle:3; snap:b.ppm";
+                      move:200; move:0,-50,25; settle; settle:3; split:both.ppm; snap:b.ppm";
         let parsed = parse_pov_script(script).expect("valid script");
         assert_eq!(
             parsed,
@@ -3653,6 +3664,7 @@ mod tests {
                 },
                 PovInstr::Settle(8),
                 PovInstr::Settle(3),
+                PovInstr::Split(String::from("both.ppm")),
                 PovInstr::Snap(String::from("b.ppm")),
             ]
         );
@@ -3660,6 +3672,7 @@ mod tests {
         assert!(parse_pov_script("teleport:1,2").is_err());
         assert!(parse_pov_script("mouse:1").is_err());
         assert!(parse_pov_script("snap").is_err());
+        assert!(parse_pov_script("split").is_err());
         assert!(parse_pov_script("size:0x4").is_err());
     }
 
