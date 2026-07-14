@@ -9,11 +9,13 @@
 
 #[cfg(target_arch = "wasm32")]
 use viewer_host::input::{ButtonPhase, Modifiers, PhysicalKey, PointerButton, WheelDelta};
+use viewer_host::PreparedMapSource;
 use viewer_host::{
     action::{ServiceRequestId, ViewerEffect, WorkerBackend, ACTION_DESCRIPTORS},
+    atlas::{AtlasManager, RefinementRequest},
     controller::{GroundSample, PovGroundSampler},
     input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent},
-    map::Channel,
+    map::{Channel, MapBackend, MapComposer, MapDecor, MapRenderRequest},
     panel::{Severity, ViewerWarning},
     ExplorationWorld, NoopWorldTickHook, PlatformTelemetry, PresentationMode, ServiceNotification,
     ServiceResponse, ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput,
@@ -45,9 +47,9 @@ use world_runtime::stream::RegionMap;
 use world_runtime::task::{InlineExecutor, TaskExecutor};
 use world_runtime::tier::ResourceTier;
 use world_runtime::{
-    mapcolor, CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
-    CHANNEL_HERBIVORE, CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH,
-    CHANNEL_TEMPERATURE, CHANNEL_VEGETATION, CHANNEL_WETNESS,
+    CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE,
+    CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE,
+    CHANNEL_VEGETATION, CHANNEL_WETNESS,
 };
 
 /// Shared native/wasm parity expectations. The wasm integration suite imports
@@ -361,7 +363,10 @@ pub fn route_attraction_sample() -> u64 {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 struct BrowserHostState {
     controller: ViewerController,
-    half_regions: i32,
+    composer: MapComposer,
+    atlas: AtlasManager,
+    overlay_hash: Option<u64>,
+    prepared_cpu_key: Option<u64>,
     last_stats: world_runtime::FrameStats,
     regen_totals: [u64; world_core::layer::LAYER_COUNT as usize],
     pov_chunks: pov_host::PovChunkManager,
@@ -378,6 +383,9 @@ struct BrowserHostState {
     storage_failures: u32,
     record_count: u32,
     renderer: &'static str,
+    renderer_ready: bool,
+    force_cpu_map_redraw: bool,
+    gpu_map_retry_scheduled: bool,
     device_losses: u32,
     warnings: Vec<String>,
     pending_effects: Vec<ViewerEffect>,
@@ -408,6 +416,8 @@ struct BrowserFrame {
     removes: Vec<u64>,
     organisms_changed: bool,
     service_response_queued: bool,
+    presenter_needs_frame: bool,
+    presenter_dirty: bool,
 }
 
 struct BrowserGround<'a> {
@@ -462,11 +472,15 @@ impl Default for BrowserHostState {
     fn default() -> Self {
         let tier = ResourceTier::Low;
         let cfg = tier.stream_config();
+        let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
         Self {
             // Conservative shared defaults keep POV unavailable until an
             // actual renderer/device success notification reaches a tick.
             controller: ViewerController::new(ExplorationWorld::new(tier)),
-            half_regions: (cfg.load_radius / REGION_SIZE).ceil() as i32,
+            composer: MapComposer::new(half_regions, cfg.field_resolution),
+            atlas: AtlasManager::default(),
+            overlay_hash: None,
+            prepared_cpu_key: None,
             last_stats: world_runtime::FrameStats::default(),
             regen_totals: [0; world_core::layer::LAYER_COUNT as usize],
             pov_chunks: pov_host::PovChunkManager::new(),
@@ -483,6 +497,9 @@ impl Default for BrowserHostState {
             storage_failures: 0,
             record_count: 0,
             renderer: "cpu-fallback",
+            renderer_ready: false,
+            force_cpu_map_redraw: false,
+            gpu_map_retry_scheduled: false,
             device_losses: 0,
             warnings: Vec::new(),
             last_action: "",
@@ -504,9 +521,10 @@ impl BrowserHostState {
             ResourceTier::Low
         };
         let cfg = tier.stream_config();
+        let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
         let mut state = Self {
             controller: ViewerController::new(ExplorationWorld::new(tier)),
-            half_regions: (cfg.load_radius / REGION_SIZE).ceil() as i32,
+            composer: MapComposer::new(half_regions, cfg.field_resolution),
             ..Self::default()
         };
         if config.contains("\"storage\":true") {
@@ -538,6 +556,9 @@ impl BrowserHostState {
             &mut hook,
             &ground,
         );
+        let presenter_update = self
+            .composer
+            .update_for_tick(output.update_serial, self.controller.world().map());
         self.absorb_stats(output.stats);
         let mut unavailable = Vec::new();
         for effect in &output.effects {
@@ -579,6 +600,8 @@ impl BrowserHostState {
             removes,
             organisms_changed,
             service_response_queued: !unavailable.is_empty(),
+            presenter_needs_frame: presenter_update.flashing_regions > 0,
+            presenter_dirty: presenter_update.presentation_changed,
         }
     }
 
@@ -619,8 +642,24 @@ impl BrowserHostState {
     }
 
     fn set_renderer_webgpu(&mut self) {
-        self.renderer = "webgpu-atlas";
+        self.renderer_ready = true;
+        self.atlas = AtlasManager::default();
+        self.overlay_hash = None;
+        self.prepared_cpu_key = None;
+        self.gpu_map_retry_scheduled = false;
+        // Device readiness alone is not a claim that a GPU map was drawn.
+        self.renderer = "webgpu-ready";
         self.enqueue_pov_availability(true, None);
+    }
+
+    fn record_map_backend(&mut self, backend: MapBackend) -> bool {
+        let renderer = match backend {
+            MapBackend::Cpu => "cpu-fallback",
+            MapBackend::GpuAtlas => "webgpu-atlas",
+        };
+        let changed = self.renderer != renderer;
+        self.renderer = renderer;
+        changed
     }
 
     fn enqueue_pov_availability(&mut self, supported: bool, reason: Option<ViewerWarning>) {
@@ -657,7 +696,13 @@ impl BrowserHostState {
     /// Device loss changes platform renderer state immediately, then queues
     /// the shared capability/fallback transition for the next logical tick.
     fn renderer_lost(&mut self) {
+        self.renderer_ready = false;
         self.renderer = "cpu-fallback";
+        self.atlas = AtlasManager::default();
+        self.overlay_hash = None;
+        self.prepared_cpu_key = None;
+        self.force_cpu_map_redraw = true;
+        self.gpu_map_retry_scheduled = false;
         self.device_losses = self.device_losses.saturating_add(1);
         self.enqueue_pov_availability(
             false,
@@ -718,6 +763,8 @@ impl BrowserHostState {
                 "\"active_channel\":{},",
                 "\"channel\":\"{}\",",
                 "\"zoom\":{},",
+                "\"map\":{{\"backend\":\"{}\",\"decor_status\":\"browser-vault-unavailable\",",
+                "\"overlays\":{{\"grid\":{},\"rings\":{},\"pinned_flash\":{},\"organisms\":{},\"discovered\":{}}}}},",
                 "\"cache\":{{\"regions\":1,\"bytes\":0}},",
                 "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
                 "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
@@ -742,6 +789,15 @@ impl BrowserHostState {
             active_channel,
             map_preferences.channel.id(),
             map_preferences.zoom,
+            match map_preferences.backend {
+                MapBackend::Cpu => "cpu",
+                MapBackend::GpuAtlas => "gpu-atlas",
+            },
+            map_preferences.overlays.grid,
+            map_preferences.overlays.rings,
+            map_preferences.overlays.pinned_flash,
+            map_preferences.overlays.organisms,
+            map_preferences.overlays.discovered,
             self.worker_mode,
             InlineExecutor.parallelism(),
             self.workers,
@@ -753,7 +809,7 @@ impl BrowserHostState {
             self.storage_failures,
             self.record_count,
             self.renderer,
-            map_preferences.backend == viewer_host::map::MapBackend::GpuAtlas,
+            self.renderer == "webgpu-atlas",
             map_preferences.refinement,
             self.device_losses,
             layout.mode.as_str(),
@@ -902,12 +958,11 @@ impl BrowserHostState {
     /// Image edge length in pixels: one pixel per field cell across the
     /// `2·half+1` region window, exactly like the native composer.
     fn map_side(&self) -> usize {
-        (2 * self.half_regions + 1) as usize
-            * usize::from(self.controller.world().map().config().field_resolution)
+        self.composer.side() as usize
     }
 
     /// The CPU map header. The pixel payload travels separately through
-    /// [`BrowserHostState::compose_map`] as raw bytes — a Phase 7-4 window is
+    /// [`BrowserHostState::cpu_map_pixels`] as raw bytes — a Phase 7-4 window is
     /// hundreds of kilobytes, far too large for a number-per-byte JSON array.
     fn cpu_map_json(&self) -> String {
         let side = self.map_side();
@@ -920,151 +975,39 @@ impl BrowserHostState {
         )
     }
 
-    /// Compose the settled window into an RGBA8 image (row 0 = north), the
-    /// browser twin of the native `MapComposer` base pass: the same
-    /// `mapcolor` per-cell table over the same settled `RegionMap` channels,
-    /// plus the grid darkening and the player cross. Native-only overlays
-    /// (routes, preserves, organisms, pinned-flash) arrive with the vault
-    /// and realization steps of Phase 7.
-    fn compose_map(&self) -> Vec<u8> {
-        let side = self.map_side();
-        let mut pixels = vec![0u8; side * side * 4];
-        let traveler = self.controller.world().traveler().position;
-        let center = RegionCoord::from_world(traveler.0, traveler.1);
-        let channel = self.controller.map_preferences().channel.id();
-
-        for row_region in 0..=(2 * self.half_regions) {
-            // Row 0 is the northernmost (max y) region.
-            let ry = center.y + self.half_regions - row_region;
-            for col_region in 0..=(2 * self.half_regions) {
-                let rx = center.x - self.half_regions + col_region;
-                let coord = RegionCoord::new(rx, ry);
-                self.paint_region(
-                    &mut pixels,
-                    coord,
-                    channel,
-                    row_region as usize,
-                    col_region as usize,
-                );
-            }
+    /// Compose the canonical shared CPU map. Browser vault-derived decor is
+    /// currently an explicit empty source; realized organisms, grid, rings,
+    /// pinned flashes, and the player marker still use native's exact code.
+    fn cpu_map_pixels(&mut self) -> &[u8] {
+        let preferences = self.controller.map_preferences();
+        let world = self.controller.world();
+        let dirty_key = world.update_serial();
+        if self.prepared_cpu_key == Some(dirty_key) {
+            return self.composer.pixels();
         }
-
-        // The player cross (the native marker), drawn last so it stays
-        // visible over any channel. The window is centered on the player's
-        // *region*, so the marker sits at the player's own pixel, exactly
-        // like the native `draw_player_marker`.
-        let res = f64::from(self.controller.world().map().config().field_resolution);
-        let cell = REGION_SIZE / res;
-        let west = f64::from(center.x - self.half_regions) * REGION_SIZE;
-        let north = f64::from(center.y + self.half_regions + 1) * REGION_SIZE;
-        let player_px = ((traveler.0 - west) / cell) as i64;
-        let player_py = ((north - traveler.1) / cell) as i64;
-        for d in -3i64..=3 {
-            for (px, py) in [(player_px + d, player_py), (player_px, player_py + d)] {
-                if px >= 0 && py >= 0 && (px as usize) < side && (py as usize) < side {
-                    let offset = (py as usize * side + px as usize) * 4;
-                    pixels[offset..offset + 3].copy_from_slice(&[245, 245, 245]);
-                }
-            }
-        }
-        pixels
-    }
-
-    /// Paint one region's cells into the window image — the browser twin of
-    /// the native `paint_region`, restricted to the channels the web toolbar
-    /// exposes.
-    fn paint_region(
-        &self,
-        pixels: &mut [u8],
-        coord: RegionCoord,
-        channel: &str,
-        row_region: usize,
-        col_region: usize,
-    ) {
-        let map = self.controller.world().map();
-        let res = map.config().field_resolution;
-        let side = self.map_side();
-        let tiles = map.cache().get(coord);
-        let tile = |channel_index: usize| tiles.and_then(|t| t.channels[channel_index].as_deref());
-        let biome = tiles.and_then(|t| t.biome.as_deref());
-        let (origin_x, origin_y) = coord.origin();
-        let cell = REGION_SIZE / f64::from(res);
-
-        for cy in 0..res {
-            for cx in 0..res {
-                let scalar = |t: Option<&world_core::FieldTile<f32>>,
-                              paint: &dyn Fn(f32) -> [u8; 3]| {
-                    t.map(|t| paint(t.get(cx, cy)))
-                        .unwrap_or_else(|| mapcolor::missing_color(cx, cy))
-                };
-                let missing = || mapcolor::missing_color(cx, cy);
-                let world = || {
-                    (
-                        origin_x + (f64::from(cx) + 0.5) * cell,
-                        origin_y + (f64::from(cy) + 0.5) * cell,
-                    )
-                };
-                let mut rgb = match channel {
-                    "elevation" => scalar(tile(CHANNEL_ELEVATION), &mapcolor::elevation_color),
-                    "geology" => match tile(CHANNEL_HARDNESS) {
-                        Some(h) => {
-                            let (wx, wy) = world();
-                            mapcolor::geology_color(wx, wy, h.get(cx, cy))
-                        }
-                        None => missing(),
-                    },
-                    "temperature" => {
-                        scalar(tile(CHANNEL_TEMPERATURE), &mapcolor::temperature_color)
-                    }
-                    "moisture" => scalar(tile(CHANNEL_MOISTURE), &mapcolor::moisture_color),
-                    "river" => scalar(tile(CHANNEL_RIVER), &mapcolor::river_color),
-                    "wetness" => scalar(tile(CHANNEL_WETNESS), &mapcolor::wetness_color),
-                    "soil" => match (tile(CHANNEL_SOIL_DEPTH), tile(CHANNEL_FERTILITY)) {
-                        (Some(d), Some(f)) => mapcolor::soil_color(d.get(cx, cy), f.get(cx, cy)),
-                        _ => missing(),
-                    },
-                    "biome" => match biome {
-                        Some(b) => mapcolor::biome_color(Biome::from_id(b.get(cx, cy))),
-                        None => missing(),
-                    },
-                    "vegetation" => scalar(tile(CHANNEL_VEGETATION), &mapcolor::vegetation_color),
-                    "herbivore" => scalar(tile(CHANNEL_HERBIVORE), &mapcolor::herbivore_color),
-                    "predator" => scalar(tile(CHANNEL_PREDATOR), &mapcolor::predator_color),
-                    "diversity" => scalar(tile(CHANNEL_DIVERSITY), &mapcolor::diversity_color),
-                    "dominant" => match map.dominant_species_id(coord, cx, cy) {
-                        Some(id) => mapcolor::species_color(id),
-                        None => missing(),
-                    },
-                    // Composite (and any unknown name, defensively).
-                    _ => match (
-                        tile(CHANNEL_ELEVATION),
-                        biome,
-                        tile(CHANNEL_RIVER),
-                        tile(CHANNEL_WETNESS),
-                    ) {
-                        (Some(e), Some(b), Some(r), Some(w)) => mapcolor::composite_cell_color(
-                            e.get(cx, cy),
-                            Biome::from_id(b.get(cx, cy)),
-                            r.get(cx, cy),
-                            w.get(cx, cy),
-                            map.dominant_species_id(coord, cx, cy),
-                        ),
-                        _ => missing(),
-                    },
-                };
-                // Region grid, on by default like the native shell.
-                if self.controller.map_preferences().overlays.grid && (cx == 0 || cy == 0) {
-                    rgb = mapcolor::lerp_rgb(rgb, [0, 0, 0], 0.35);
-                }
-
-                // Cell (cx, cy) has cy growing north; image rows grow south.
-                let px = col_region * usize::from(res) + usize::from(cx);
-                let py = row_region * usize::from(res) + usize::from(res - 1 - cy);
-                let offset = (py * side + px) * 4;
-                pixels[offset] = rgb[0];
-                pixels[offset + 1] = rgb[1];
-                pixels[offset + 2] = rgb[2];
-                pixels[offset + 3] = 255;
+        let traveler = world.traveler().position;
+        self.composer.set_zoom(preferences.zoom);
+        let decor = MapDecor::default();
+        let packet = self.composer.prepare_render(
+            &mut self.atlas,
+            MapRenderRequest {
+                map: world.map(),
+                player: traveler,
+                channel: preferences.channel,
+                overlays: preferences.overlays,
+                anchors: world.anchors(),
+                decor: &decor,
+                requested_backend: MapBackend::Cpu,
+                gpu_available: false,
+                refinement: RefinementRequest::default(),
+                dirty_key,
+            },
+        );
+        self.prepared_cpu_key = Some(packet.dirty_key);
+        match packet.source {
+            PreparedMapSource::Cpu(cpu) => cpu.rgba,
+            PreparedMapSource::GpuAtlas(_) => {
+                unreachable!("an explicit CPU request must prepare canonical RGBA")
             }
         }
     }
@@ -1143,6 +1086,39 @@ fn action_descriptors_json() -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn map_descriptors_json() -> String {
+    let channels = viewer_host::CHANNEL_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            format!(
+                "{{\"id\":\"{}\",\"label\":\"{}\",\"group\":\"{}\",\"group_label\":\"{}\",\"order\":{}}}",
+                descriptor.id,
+                json_escape(descriptor.label),
+                descriptor.group.id(),
+                json_escape(descriptor.group.label()),
+                descriptor.order,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let overlays = viewer_host::MAP_OVERLAY_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            format!(
+                "{{\"id\":\"{}\",\"label\":\"{}\",\"group\":\"{}\",\"group_label\":\"{}\",\"order\":{}}}",
+                descriptor.id,
+                json_escape(descriptor.label),
+                descriptor.group.id(),
+                json_escape(descriptor.group.label()),
+                descriptor.order,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"channels\":[{channels}],\"overlays\":[{overlays}]}}")
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -1251,6 +1227,15 @@ fn json_escape(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// Claim the single automatic follow-up frame allowed for one run of failed
+/// GPU map submissions. A successful/CPU/device-reset path clears the flag.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn claim_gpu_map_retry(already_scheduled: &mut bool) -> bool {
+    let should_schedule = !*already_scheduled;
+    *already_scheduled = true;
+    should_schedule
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use std::cell::RefCell;
@@ -1261,11 +1246,12 @@ mod wasm {
     const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
 
     thread_local! {
-        /// The shared wgpu renderer over the POV canvas. A thread-local slot
+        /// The shared wgpu renderer over the GPU stage canvas. A thread-local slot
         /// (wasm is single-threaded) rather than a `WebApp` field because
-        /// device acquisition is async on WebGPU — JS awaits [`pov_init`]
+        /// device acquisition is async on WebGPU — JS awaits
+        /// [`viewer_renderer_init`]
         /// once, then per-frame calls stay synchronous.
-        static POV_RENDERER: RefCell<Option<renderer::Renderer>> = const { RefCell::new(None) };
+        static VIEWER_RENDERER: RefCell<Option<renderer::Renderer>> = const { RefCell::new(None) };
     }
 
     fn parse_view(value: &str) -> Result<super::ViewKind, JsValue> {
@@ -1281,18 +1267,18 @@ mod wasm {
     /// device loss (the old renderer is dropped and rebuilt). Rejects when
     /// no adapter/device is available — the caller falls back to map mode.
     #[wasm_bindgen]
-    pub async fn pov_init(
+    pub async fn viewer_renderer_init(
         canvas: web_sys::HtmlCanvasElement,
         width: u32,
         height: u32,
     ) -> Result<(), JsValue> {
-        if POV_RENDERER.with(|slot| slot.borrow().is_some()) {
+        if VIEWER_RENDERER.with(|slot| slot.borrow().is_some()) {
             return Ok(());
         }
         let built = renderer::Renderer::new(renderer::canvas_surface_source(canvas), width, height)
             .await
             .map_err(|err| JsValue::from_str(&format!("pov renderer init failed: {err}")))?;
-        POV_RENDERER.with(|slot| *slot.borrow_mut() = Some(built));
+        VIEWER_RENDERER.with(|slot| *slot.borrow_mut() = Some(built));
         Ok(())
     }
 
@@ -1440,12 +1426,123 @@ mod wasm {
             self.driver.synchronize_context(&self.state);
 
             let pov_active = frame.output.mode == super::PresentationMode::Pov;
+            let map_active = frame.output.mode == super::PresentationMode::Map;
+            let (prepared_map_backend, gpu_map_rendered, map_upload_bytes, schedule_map_retry) =
+                if map_active {
+                    VIEWER_RENDERER.with(|slot| {
+                        let mut slot = slot.borrow_mut();
+                        let gpu_available = self.state.renderer_ready && slot.is_some();
+                        let super::BrowserHostState {
+                            controller,
+                            composer,
+                            atlas,
+                            overlay_hash,
+                            prepared_cpu_key,
+                            gpu_map_retry_scheduled,
+                            ..
+                        } = &mut self.state;
+                        let world = controller.world();
+                        let traveler = world.traveler().position;
+                        let preferences = controller.map_preferences();
+                        composer.set_zoom(preferences.zoom);
+                        let decor = super::MapDecor::default();
+                        let packet = composer.prepare_render(
+                            atlas,
+                            super::MapRenderRequest {
+                                map: world.map(),
+                                player: traveler,
+                                channel: preferences.channel,
+                                overlays: preferences.overlays,
+                                anchors: world.anchors(),
+                                decor: &decor,
+                                requested_backend: preferences.backend,
+                                gpu_available,
+                                refinement: super::RefinementRequest {
+                                    enabled: preferences.refinement,
+                                    octave_count: 3,
+                                },
+                                dirty_key: frame.output.update_serial,
+                            },
+                        );
+                        let backend = packet.backend;
+                        let dirty_key = packet.dirty_key;
+                        match packet.source {
+                            super::PreparedMapSource::Cpu(cpu) => {
+                                debug_assert_eq!(
+                                    cpu.rgba.len(),
+                                    packet.projection.side as usize
+                                        * packet.projection.side as usize
+                                        * 4
+                                );
+                                *prepared_cpu_key = Some(dirty_key);
+                                *gpu_map_retry_scheduled = false;
+                                (backend, false, 0, false)
+                            }
+                            super::PreparedMapSource::GpuAtlas(gpu) => {
+                                *prepared_cpu_key = None;
+                                let overlay_changed = *overlay_hash != Some(gpu.overlay_hash);
+                                let renderer = slot.as_mut().expect(
+                                    "a prepared GPU packet requires an initialized renderer",
+                                );
+                                let result = renderer.render_map_gpu(
+                                    &gpu.params,
+                                    &gpu.slots,
+                                    &gpu.uploads,
+                                    overlay_changed.then_some(gpu.overlay_rgba),
+                                    None,
+                                    CLEAR_COLOR,
+                                );
+                                if let Some(bytes) = result {
+                                    *overlay_hash = Some(gpu.overlay_hash);
+                                    *gpu_map_retry_scheduled = false;
+                                    (backend, true, bytes, false)
+                                } else {
+                                    // The manager may have consumed delta keys
+                                    // before a failed surface submission. Reset it
+                                    // so a recovered renderer receives full tiles.
+                                    *atlas = super::AtlasManager::default();
+                                    *overlay_hash = None;
+                                    let schedule_retry =
+                                        super::claim_gpu_map_retry(gpu_map_retry_scheduled);
+                                    (backend, false, 0, schedule_retry)
+                                }
+                            }
+                        }
+                    })
+                } else {
+                    (super::MapBackend::Cpu, false, 0, false)
+                };
+            if schedule_map_retry {
+                // Surface Outdated/Lost is repaired by the failed acquire;
+                // request one bounded follow-up frame to present it without
+                // turning persistent Timeout/Occluded into a busy loop.
+                self.driver.dirty = true;
+            }
+            let (map_path, map_backend_changed) = if gpu_map_rendered {
+                (
+                    "gpu-atlas",
+                    self.state.record_map_backend(super::MapBackend::GpuAtlas),
+                )
+            } else {
+                (
+                    "cpu",
+                    map_active && self.state.record_map_backend(super::MapBackend::Cpu),
+                )
+            };
+            let force_cpu_map_redraw = std::mem::take(&mut self.state.force_cpu_map_redraw);
+            let map_dirty = frame.output.dirty.map
+                || frame.presenter_dirty
+                || map_backend_changed
+                || force_cpu_map_redraw
+                || (map_active
+                    && prepared_map_backend == super::MapBackend::GpuAtlas
+                    && !gpu_map_rendered);
             let organism_upload = frame
                 .organisms_changed
                 .then(|| self.state.pov_organisms.upload());
             let time = time_seconds.rem_euclid(f64::from(renderer::pov::WOBBLE_PERIOD)) as f32;
-            let rendered = pov_active
-                && POV_RENDERER.with(|slot| {
+            let pov_rendered = pov_active
+                && VIEWER_RENDERER.with(|slot| {
                     let mut slot = slot.borrow_mut();
                     let Some(renderer) = slot.as_mut() else {
                         return false;
@@ -1480,11 +1577,14 @@ mod wasm {
             let counters = self.state.pov_chunks.counters();
             let organism_counts = self.state.pov_organisms.counters();
             let snapshot = self.state.snapshot_json();
-            let needs_frame = frame.output.needs_frame || self.driver.needs_frame();
+            let needs_frame = frame.output.needs_frame
+                || frame.presenter_needs_frame
+                || self.driver.needs_frame();
             Ok(JsValue::from_str(&format!(
                 concat!(
                     "{{\"snapshot\":{},\"map_dirty\":{},\"needs_frame\":{},",
                     "\"update_serial\":{},\"travel\":{:.6},",
+                    "\"map\":{{\"active\":{},\"path\":\"{}\",\"gpu_submitted\":{},\"upload_bytes\":{}}},",
                     "\"pov\":{{\"active\":{},\"rendered\":{},",
                     "\"camera\":[{:.1},{:.1},{:.1}],",
                     "\"chunks\":{},\"meshed\":{},\"uploads\":{},",
@@ -1492,12 +1592,16 @@ mod wasm {
                     "\"waiting_for_ground\":{}}}}}}}"
                 ),
                 snapshot,
-                frame.output.dirty.map,
+                map_dirty,
                 needs_frame,
                 frame.output.update_serial,
                 frame.output.travel,
+                map_active,
+                map_path,
+                gpu_map_rendered,
+                map_upload_bytes,
                 pov_active,
-                rendered,
+                pov_rendered,
                 frame.output.pov.position[0],
                 frame.output.pov.position[1],
                 frame.output.pov.position[2],
@@ -1525,6 +1629,11 @@ mod wasm {
         /// Descriptor metadata used to validate toolbar markup at startup.
         pub fn action_descriptors(&self) -> String {
             super::action_descriptors_json()
+        }
+
+        /// Shared channel/overlay metadata used to build grouped map controls.
+        pub fn map_descriptors(&self) -> String {
+            super::map_descriptors_json()
         }
 
         /// Translate an exact `KeyboardEvent.code` transition.
@@ -1678,12 +1787,15 @@ mod wasm {
         /// initialization. A navigator capability probe must not call this.
         pub fn renderer_available(&mut self) {
             self.state.set_renderer_webgpu();
-            self.driver.dirty = true;
+            self.driver.enqueue_action(
+                &mut self.state,
+                super::ViewerAction::SetMapBackend(super::MapBackend::GpuAtlas),
+            );
         }
 
         /// Report device loss/initialization failure without forging an action.
         pub fn renderer_lost(&mut self) {
-            POV_RENDERER.with(|slot| {
+            VIEWER_RENDERER.with(|slot| {
                 slot.borrow_mut().take();
             });
             self.state.renderer_lost();
@@ -1697,8 +1809,9 @@ mod wasm {
         /// Return the CPU map header (size, channel, renderer) as JSON. The
         /// pixel payload comes from [`WebApp::map_pixels`] as raw bytes —
         /// the deterministic CPU-composed presentation of the settled window
-        /// (phase-7-plan.md §4.1 milestone 2); WebGPU atlas composition
-        /// remains a later presentation path.
+        /// (phase-7-plan.md §4.1 milestone 2). The browser selects this
+        /// canonical fallback whenever the shared WebGPU atlas path cannot
+        /// submit a frame.
         pub fn render_cpu_map(&self) -> Result<JsValue, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
@@ -1708,11 +1821,47 @@ mod wasm {
 
         /// Compose current cache state into RGBA8 bytes (row 0 = north).
         /// This is presentation-only and performs no world update.
-        pub fn map_pixels(&self) -> Result<Vec<u8>, JsValue> {
+        pub fn map_pixels(&mut self) -> Result<Vec<u8>, JsValue> {
             if self.shutdown {
                 return Err(JsValue::from_str("WebApp is shut down"));
             }
-            Ok(self.state.compose_map())
+            Ok(self.state.cpu_map_pixels().to_vec())
+        }
+
+        /// Invert a canonical composed-map source pixel through the same zoom
+        /// projection used to draw it. Returns `null` outside the map.
+        pub fn map_world_at(&self, pixel_x: f64, pixel_y: f64) -> Result<JsValue, JsValue> {
+            let traveler = self.state.controller.world().traveler().position;
+            let value = self
+                .state
+                .composer
+                .pixel_to_world(traveler, pixel_x, pixel_y)
+                .map_or_else(|| String::from("null"), |(x, y)| format!("[{x:.9},{y:.9}]"));
+            Ok(JsValue::from_str(&value))
+        }
+
+        /// Pick the shared realized-organism marker under a canonical map
+        /// source pixel. Identity is returned as a hex string so JavaScript
+        /// never rounds the stable `u64`.
+        pub fn map_organism_at(&self, pixel_x: f64, pixel_y: f64) -> Result<JsValue, JsValue> {
+            let world = self.state.controller.world();
+            let traveler = world.traveler().position;
+            let zoom = self.state.controller.map_preferences().zoom;
+            let value = self
+                .state
+                .composer
+                .pixel_to_world(traveler, pixel_x, pixel_y)
+                .and_then(|position| viewer_host::pick_organism(world.map(), position, zoom))
+                .map_or_else(
+                    || String::from("null"),
+                    |organism| {
+                        format!(
+                            "{{\"id\":\"{:#018x}\",\"world\":[{:.9},{:.9}]}}",
+                            organism.id, organism.world_pos.0, organism.world_pos.1
+                        )
+                    },
+                );
+            Ok(JsValue::from_str(&value))
         }
 
         /// Return the most recent structured snapshot as JSON.
@@ -1838,6 +1987,81 @@ mod wasm_input_tests {
         assert!(snapshot.contains("\"shadow_ao\":false"));
         assert!(snapshot.contains("\"world_pos\":[-0.000,4.000]"));
     }
+
+    #[wasm_bindgen_test]
+    fn wasm_map_pixels_use_the_shared_canonical_composer() {
+        let mut app = WebApp::new(JsValue::from_str("{}")).expect("web app");
+        let mut composite = Vec::new();
+        for frame in 0..64 {
+            app.frame(16.0, f64::from(frame) * 0.016)
+                .expect("settling frame");
+            composite = app.map_pixels().expect("canonical CPU map");
+            if composite
+                .chunks_exact(4)
+                .any(|pixel| pixel != &composite[0..4])
+            {
+                break;
+            }
+        }
+        assert!(!composite.is_empty());
+        assert!(composite.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(
+            composite
+                .chunks_exact(4)
+                .any(|pixel| pixel != &composite[0..4]),
+            "the actual wasm facade must compose the settled shared RegionMap"
+        );
+
+        let before_read = snapshot(&app);
+        let reread = app.map_pixels().expect("repeat canonical CPU map");
+        assert_eq!(
+            snapshot(&app),
+            before_read,
+            "presentation cannot tick the world"
+        );
+        assert_eq!(
+            reread, composite,
+            "an unchanged map reuses identical composition"
+        );
+
+        app.action(
+            String::from("set-map-channel"),
+            Some(String::from("elevation")),
+        )
+        .expect("typed shared channel action");
+        app.frame(0.0, 2.0).expect("channel frame");
+        assert_ne!(
+            app.map_pixels().expect("elevation CPU map"),
+            composite,
+            "the wasm facade must expose the shared channel selection"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn missing_gpu_surface_reports_and_redraws_the_cpu_fallback() {
+        let mut app = WebApp::new(JsValue::from_str("{}")).expect("web app");
+        app.renderer_available();
+        let frame = app
+            .frame(0.0, 0.0)
+            .expect("fallback frame")
+            .as_string()
+            .expect("frame JSON");
+        assert!(frame.contains("\"path\":\"cpu\""));
+        assert!(frame.contains("\"gpu_submitted\":false"));
+        assert!(frame.contains("\"map_dirty\":true"));
+        assert!(snapshot(&app).contains("\"mode\":\"cpu-fallback\""));
+        assert!(!app.map_pixels().expect("fallback pixels").is_empty());
+
+        app.renderer_lost();
+        let loss = app
+            .frame(0.0, 0.1)
+            .expect("device-loss fallback frame")
+            .as_string()
+            .expect("frame JSON");
+        assert!(loss.contains("\"path\":\"cpu\""));
+        assert!(loss.contains("\"gpu_submitted\":false"));
+        assert!(loss.contains("\"map_dirty\":true"));
+    }
 }
 
 #[cfg(test)]
@@ -1898,6 +2122,15 @@ mod tests {
         assert_eq!(forward, super::canonical_anchor_signature_sample());
     }
 
+    #[test]
+    fn failed_gpu_map_submission_gets_one_bounded_retry() {
+        let mut scheduled = false;
+        assert!(super::claim_gpu_map_retry(&mut scheduled));
+        assert!(!super::claim_gpu_map_retry(&mut scheduled));
+        scheduled = false;
+        assert!(super::claim_gpu_map_retry(&mut scheduled));
+    }
+
     fn attribute_values<'a>(source: &'a str, attribute: &str) -> Vec<&'a str> {
         let needle = format!("{attribute}=\"");
         source
@@ -1939,8 +2172,39 @@ mod tests {
         assert!(!app.contains("POV_MOVE"));
         assert!(!app.contains("requestPointerLock"));
         assert!(app.contains("app.frame(dt, now / 1000)"));
+        assert!(app.contains("app.map_descriptors()"));
+        assert!(app.contains("installMapControls"));
+        assert!(!app.contains("MAP_CHANNELS"));
+        assert!(!app.contains("paint_region"));
+        assert!(!app.contains("compose_map"));
         assert!(!app.contains("app.update("));
         assert!(!app.contains("app.pov_frame("));
+    }
+
+    #[test]
+    fn browser_map_controls_serialize_every_shared_descriptor_once() {
+        let descriptors = super::map_descriptors_json();
+        let expected =
+            viewer_host::CHANNEL_DESCRIPTORS.len() + viewer_host::MAP_OVERLAY_DESCRIPTORS.len();
+        assert_eq!(descriptors.matches("\"id\":").count(), expected);
+        for id in viewer_host::CHANNEL_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.id)
+            .chain(
+                viewer_host::MAP_OVERLAY_DESCRIPTORS
+                    .iter()
+                    .map(|descriptor| descriptor.id),
+            )
+        {
+            assert_eq!(
+                descriptors.matches(&format!("\"id\":\"{id}\"")).count(),
+                1,
+                "descriptor {id} must appear exactly once"
+            );
+        }
+        assert!(super::BrowserHostState::default()
+            .snapshot_json()
+            .contains("\"decor_status\":\"browser-vault-unavailable\""));
     }
 
     /// A small settle-able window so controller-integration tests stay fast.
@@ -1962,7 +2226,7 @@ mod tests {
         );
         super::BrowserHostState {
             controller: viewer_host::ViewerController::new(world),
-            half_regions: 1,
+            composer: viewer_host::map::MapComposer::new(1, 8),
             ..super::BrowserHostState::default()
         }
     }
@@ -2130,7 +2394,7 @@ mod tests {
         assert_eq!(state.controller.world().update_serial(), 2);
 
         let serial = state.controller.world().update_serial();
-        let _ = state.compose_map();
+        let _ = state.cpu_map_pixels();
         let _ = state.cpu_map_json();
         let _ = state.inspect_json(0.0, 0.0);
         let _ = state.snapshot_json();
@@ -2218,7 +2482,7 @@ mod tests {
         settle(&mut state);
         let serial = state.controller.world().update_serial();
         let side = state.map_side();
-        let pixels = state.compose_map();
+        let pixels = state.cpu_map_pixels();
 
         assert_eq!(side, 3 * 8);
         assert_eq!(pixels.len(), side * side * 4);
@@ -2240,7 +2504,7 @@ mod tests {
     fn controller_actions_drive_map_and_platform_effects() {
         let mut state = small_controller_app();
         settle(&mut state);
-        let composite = state.compose_map();
+        let composite = state.cpu_map_pixels().to_vec();
         state.enqueue_action(viewer_host::ViewerAction::SetMapChannel(
             viewer_host::Channel::Elevation,
         ));
@@ -2253,7 +2517,7 @@ mod tests {
             state.controller.map_preferences().channel,
             viewer_host::Channel::Elevation
         );
-        assert_ne!(state.compose_map(), composite);
+        assert_ne!(state.cpu_map_pixels(), composite);
         assert_eq!(state.storage, "memory");
         assert!(frame.output.effects.iter().any(|effect| matches!(
             effect,
@@ -2331,6 +2595,10 @@ mod tests {
         let serial = state.controller.world().update_serial();
 
         state.renderer_lost();
+        assert!(
+            state.force_cpu_map_redraw,
+            "GPU loss must invalidate an otherwise clean CPU fallback frame"
+        );
         assert_eq!(
             state.controller.layout().mode,
             viewer_host::PresentationMode::Pov,

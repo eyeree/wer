@@ -47,6 +47,20 @@ if (app.includes("app.pov_frame(") || app.includes("app.update(")) {
 if (!app.includes("render_cpu_map")) {
   throw new Error("app.js does not render the CPU map buffer");
 }
+if (!app.includes("app.map_descriptors()") || !app.includes("installMapControls")) {
+  throw new Error("app.js does not build map controls from shared descriptors");
+}
+for (const generated of ["map-channels", "map-overlays"]) {
+  if (!html.includes(`data-generated="${generated}"`)) {
+    throw new Error(`index.html does not expose generated ${generated} controls`);
+  }
+}
+if (app.includes("MAP_CHANNELS") || app.includes("paint_region") || app.includes("compose_map")) {
+  throw new Error("browser assets contain a second map implementation or channel registry");
+}
+if (!app.includes("gpu_submitted") || !app.includes("presented: mapPresented")) {
+  throw new Error("browser map status does not distinguish GPU submission from presentation");
+}
 if (!app.includes("renderer_available")) {
   throw new Error("app.js does not report WebGPU renderer availability");
 }

@@ -18,23 +18,9 @@
     <main class="app-shell" data-view="viewer">
       <section class="viewer">
         <div class="toolbar" aria-label="Viewer controls">
-          <select data-action="set-map-channel" aria-label="Map channel">
-            <option value="composite">Composite</option>
-            <option value="elevation">Elevation</option>
-            <option value="geology">Geology</option>
-            <option value="temperature">Temperature</option>
-            <option value="moisture">Moisture</option>
-            <option value="river">River</option>
-            <option value="wetness">Wetness</option>
-            <option value="soil">Soil</option>
-            <option value="biome">Biome</option>
-            <option value="vegetation">Vegetation</option>
-            <option value="herbivore">Herbivore</option>
-            <option value="predator">Predator</option>
-            <option value="diversity">Diversity</option>
-            <option value="dominant">Species</option>
-          </select>
-          <button type="button" data-action="toggle-gpu-compose" aria-pressed="true">Compose</button>
+          <select data-action="set-map-channel" data-generated="map-channels" aria-label="Map channel"></select>
+          <div class="map-overlay-controls" data-generated="map-overlays" aria-label="Map overlays"></div>
+          <button type="button" data-action="toggle-gpu-compose" aria-pressed="false">Compose</button>
           <button type="button" data-action="toggle-refinement" aria-pressed="false">Refine</button>
           <select data-action="set-resource-tier" aria-label="Resource tier">
             <option value="low">WebLow</option>
@@ -71,6 +57,7 @@
           <span data-field="wasm-status">Loading wasm</span>
           <span data-field="origin-hash">origin hash pending</span>
           <span data-field="webgpu-status">WebGPU probing</span>
+          <span data-field="map-decor-status">Map decor pending</span>
         </div>
       </section>
       <aside class="info-panel" aria-label="World information">

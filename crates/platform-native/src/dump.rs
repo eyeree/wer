@@ -27,7 +27,7 @@ use world_runtime::Pass;
 
 use crate::panel::PanelInfo;
 use crate::pov::{self, PovChunkManager, PovOrganismManager};
-use crate::{App, CLEAR_COLOR, ORGANISM_INFO_ZOOM};
+use crate::{App, CLEAR_COLOR};
 
 /// Encode an RGBA8 buffer as binary PPM (P6, alpha dropped) — the repo's
 /// image format everywhere (`--screenshot`, `--pov-script`, and the dump).
@@ -164,11 +164,8 @@ impl App {
             self.controller.world().anchors(),
             &decor,
         );
-        let organism = if preferences.zoom >= ORGANISM_INFO_ZOOM {
-            Self::pick_organism(self.controller.world().map(), traveler)
-        } else {
-            None
-        };
+        let organism =
+            Self::pick_organism(self.controller.world().map(), traveler, preferences.zoom);
         let world = self.controller.world();
         let capture = self.controller.capture_preferences();
         let info = PanelInfo {
@@ -492,7 +489,7 @@ impl App {
 
         writeln!(s, "[cell_at_player]")?;
         writeln!(s, "{:#?}", Self::sample_cursor(world.map(), player))?;
-        match Self::pick_organism(world.map(), player) {
+        match Self::pick_organism(world.map(), player, preferences.zoom) {
             Some(org) => writeln!(s, "organism within one cell: {org:#?}")?,
             None => writeln!(s, "organism within one cell: none")?,
         }

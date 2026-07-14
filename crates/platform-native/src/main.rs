@@ -77,7 +77,6 @@
 
 mod dump;
 mod executor;
-mod gpumap;
 mod input;
 mod panel;
 mod pov;
@@ -90,6 +89,7 @@ use renderer::{letterbox_viewport, Renderer};
 use viewer_host::action::{
     PreserveMutation, ServiceRequestId, ViewerAction, ViewerEffect, WorkerBackend,
 };
+use viewer_host::atlas::{AtlasManager, RefinementRequest};
 use viewer_host::controller::{
     GroundSample, LoadedSession, PovGroundSampler, ServiceNotification, ServiceResponse,
     ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewerController,
@@ -98,11 +98,12 @@ use viewer_host::controller::{
 use viewer_host::input::InputFrame;
 use viewer_host::input::{InputContext, InputMapper, NormalizedInputEvent};
 use viewer_host::layout::{PresentationMode, ViewKind};
-use viewer_host::map::MapBackend;
+use viewer_host::map::{MapBackend, MapRenderRequest, PreparedMapSource};
 use viewer_host::panel::{PlatformTelemetry, Severity, ViewerWarning};
 use viewer_host::world::{
     ExplorationWorld, WorldPostUpdate, WorldPreUpdate, WorldServiceInput, WorldTickHook,
 };
+use viewer_host::ORGANISM_PICK_ZOOM as ORGANISM_INFO_ZOOM;
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -127,7 +128,6 @@ use world_runtime::{
 use world_runtime::{RouteTracker, Storage, VaultPersistenceError};
 
 use executor::LaneExecutor;
-use gpumap::AtlasManager;
 use panel::{CursorInfo, EcologyInfo, Hud, OrganismInfo, PanelInfo, VaultInfo};
 use pov::{PovCamera, PovChunkManager, PovCounters, PovOrganismCounters, PovOrganismManager};
 use tools::FileStorage;
@@ -135,10 +135,6 @@ use viz::{Channel, MapComposer, MapDecor, Overlays};
 
 /// Letterbox color around the square map (linear RGBA).
 const CLEAR_COLOR: [f64; 4] = [0.02, 0.02, 0.04, 1.0];
-
-/// Zoom level at (and past) which hovering an organism marker shows that
-/// organism in the panel instead of the region info.
-const ORGANISM_INFO_ZOOM: u32 = 4;
 
 #[cfg(test)]
 const PLAYER_SPEED: f64 = viewer_host::world::MAP_MOVEMENT_SPEED;
@@ -974,16 +970,8 @@ impl App {
     /// nearest one within one field cell (a marker is one base-map pixel, i.e.
     /// one cell). Reads the transient near-field realization (phase-3-plan.md
     /// §7.6) — a debug readout, never a source of identity.
-    fn pick_organism(map: &RegionMap, world: (f64, f64)) -> Option<OrganismInfo> {
-        let cell = REGION_SIZE / f64::from(map.config().field_resolution);
-        let mut best: Option<(f64, &world_runtime::Organism)> = None;
-        for org in map.organisms() {
-            let d = f64::hypot(org.world_pos.0 - world.0, org.world_pos.1 - world.1);
-            if d <= cell && best.is_none_or(|(nearest, _)| d < nearest) {
-                best = Some((d, org));
-            }
-        }
-        best.map(|(_, org)| OrganismInfo {
+    fn pick_organism(map: &RegionMap, world: (f64, f64), zoom: u32) -> Option<OrganismInfo> {
+        viewer_host::pick_organism(map, world, zoom).map(|org| OrganismInfo {
             id: org.id,
             species: org.species,
             trophic: match org.trophic {
@@ -1103,6 +1091,8 @@ impl App {
             &ground,
         );
         let update_seconds = update_start.elapsed().as_secs_f64();
+        self.composer
+            .update_for_tick(output.update_serial, self.controller.world().map());
         let stats = output.stats;
         self.last_stats = stats;
         for (total, &count) in self
@@ -1135,43 +1125,39 @@ impl App {
             cursor_world.map(|world| Self::sample_cursor(self.controller.world().map(), world));
         // Zoomed in far enough, the cursor picks the organism marker under it
         // (the region info stays whenever no organism is under the mouse).
-        let organism = if output.map.zoom >= ORGANISM_INFO_ZOOM {
-            cursor_world.and_then(|world| Self::pick_organism(self.controller.world().map(), world))
-        } else {
-            None
-        };
+        let organism = cursor_world.and_then(|world| {
+            Self::pick_organism(self.controller.world().map(), world, output.map.zoom)
+        });
 
         let decor = self.build_decor();
-        let gpu_channel = gpumap::gpu_channel(output.map.channel);
-        // A zoomed view composes on the CPU: the GPU shader has no zoom
-        // transform, and the CPU path magnifies field and overlays together.
         self.composer.set_zoom(output.map.zoom);
-        let use_gpu = output.map.backend == MapBackend::GpuAtlas
-            && output.map.zoom == 1
-            && gpu_channel.is_some()
-            && self.renderer.is_some();
-        let compose_start = Instant::now();
-        if use_gpu {
-            // GPU path (phase-6-plan.md §6.5): CPU draws only the sparse
-            // overlay; the field false-color composes per screen pixel from
-            // the atlas.
-            self.composer.compose_overlays(
-                self.controller.world().map(),
-                output.traveler,
-                output.map.overlays,
-                &decor,
-            );
-        } else {
-            self.composer.compose(
-                self.controller.world().map(),
-                output.traveler,
-                output.map.channel,
-                output.map.overlays,
-                self.controller.world().anchors(),
-                &decor,
-            );
-        }
         let capture = self.controller.capture_preferences();
+        let vault = self.vault_panel_info();
+        let pinned_violations = self.composer.pinned_violations;
+        let compose_start = Instant::now();
+        let packet = {
+            let world = self.controller.world();
+            self.composer.prepare_render(
+                &mut self.atlas,
+                MapRenderRequest {
+                    map: world.map(),
+                    player: output.traveler,
+                    channel: output.map.channel,
+                    overlays: output.map.overlays,
+                    anchors: world.anchors(),
+                    decor: &decor,
+                    requested_backend: output.map.backend,
+                    gpu_available: self.renderer.is_some(),
+                    refinement: RefinementRequest {
+                        enabled: output.map.refinement,
+                        octave_count: 3,
+                    },
+                    dirty_key: output.update_serial,
+                },
+            )
+        };
+        let use_gpu = packet.backend == MapBackend::GpuAtlas;
+        let prepared_pixel_hash = packet.pixel_hash;
         let world = self.controller.world();
         let info = PanelInfo {
             fps: self.fps,
@@ -1190,7 +1176,7 @@ impl App {
             rosters: world.map().roster_cache().len(),
             organisms: world.map().organism_count(),
             jobs_in_flight: world.map().jobs_in_flight(),
-            pinned_violations: self.composer.pinned_violations,
+            pinned_violations,
             channel: output.map.channel,
             player: output.traveler,
             bias: world.bias(),
@@ -1198,69 +1184,63 @@ impl App {
             capture_category: capture.category.name(),
             capture_polarity: capture.polarity,
             transition_mode: world.transition_mode(),
-            vault: self.vault_panel_info(),
+            vault,
             zoom: output.map.zoom,
             cursor,
             organism,
         };
         let mut upload_bytes = 0u64;
-        let (compose_seconds, render_seconds) = if use_gpu {
-            // Delta uploads: only regions whose dependency-hash key changed,
-            // plus the overlay/panel strips only when their bytes changed.
-            let (panel_w, panel_h) = {
-                let (panel, w, h) = self.hud.panel_image(&info);
-                let hash = hash_bytes(panel);
-                let changed = hash != self.panel_hash;
-                self.panel_hash = hash;
-                (changed.then_some(w).map(|w| (w, h)), (w, h))
-            };
-            let _ = panel_h;
-            let overlay_hash = hash_bytes(self.composer.pixels());
-            let overlay_changed = overlay_hash != self.overlay_hash;
-            self.overlay_hash = overlay_hash;
+        let (compose_seconds, render_seconds) = match packet.source {
+            PreparedMapSource::GpuAtlas(gpu) => {
+                // Delta uploads: only regions whose dependency-hash key
+                // changed, plus overlay/panel strips whose shared pixel hash
+                // changed.
+                let (panel_hash, panel_w) = {
+                    let (panel, width, height) = self.hud.panel_image(&info);
+                    let hash = hash_bytes(panel);
+                    let changed = hash != self.panel_hash;
+                    (hash, changed.then_some((width, height)))
+                };
+                debug_assert_eq!(prepared_pixel_hash, gpu.overlay_hash);
+                let overlay_changed = prepared_pixel_hash != self.overlay_hash;
 
-            let center = RegionCoord::from_world(output.traveler.0, output.traveler.1);
-            let half = self.composer.half_regions();
-            let res = world.map().config().field_resolution;
-            let (slots, uploads) = self.atlas.sync(world.map(), center, half, res);
-            let (west, north) = (
-                f64::from(center.x - half) * REGION_SIZE,
-                f64::from(center.y + half + 1) * REGION_SIZE,
-            );
-            let (refine, refine_count) = if output.map.refinement {
-                gpumap::refinement_octaves(west, north, res, 3)
-            } else {
-                (Default::default(), 0)
-            };
-            let params = renderer::GpuMapParams {
-                half_regions: half,
-                resolution: u32::from(res),
-                channel: gpu_channel.expect("use_gpu checked"),
-                grid: output.map.overlays.grid,
-                refine,
-                refine_count,
-            };
-            let compose_seconds = compose_start.elapsed().as_secs_f64();
-            let render_start = Instant::now();
-            if let Some(renderer) = self.renderer.as_mut() {
-                let overlay = overlay_changed.then(|| self.composer.pixels());
-                let panel = panel_w.map(|(w, h)| (self.hud.panel_pixels(), w, h));
-                if let Some(bytes) =
-                    renderer.render_map_gpu(&params, &slots, &uploads, overlay, panel, CLEAR_COLOR)
-                {
-                    upload_bytes = bytes;
+                let compose_seconds = compose_start.elapsed().as_secs_f64();
+                let render_start = Instant::now();
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let overlay = overlay_changed.then_some(gpu.overlay_rgba);
+                    let panel =
+                        panel_w.map(|(width, height)| (self.hud.panel_pixels(), width, height));
+                    if let Some(bytes) = renderer.render_map_gpu(
+                        &gpu.params,
+                        &gpu.slots,
+                        &gpu.uploads,
+                        overlay,
+                        panel,
+                        CLEAR_COLOR,
+                    ) {
+                        self.panel_hash = panel_hash;
+                        self.overlay_hash = prepared_pixel_hash;
+                        upload_bytes = bytes;
+                    } else {
+                        // Atlas keys were consumed while preparing this packet;
+                        // retry a complete upload after surface recovery.
+                        self.atlas = AtlasManager::default();
+                        self.panel_hash = 0;
+                        self.overlay_hash = 0;
+                    }
                 }
+                (compose_seconds, render_start.elapsed().as_secs_f64())
             }
-            (compose_seconds, render_start.elapsed().as_secs_f64())
-        } else {
-            let (width, height) = self.hud.size();
-            let pixels = self.hud.compose(self.composer.pixels(), &info);
-            let compose_seconds = compose_start.elapsed().as_secs_f64();
-            let render_start = Instant::now();
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.render_map(pixels, width, height, CLEAR_COLOR);
+            PreparedMapSource::Cpu(cpu) => {
+                let (width, height) = self.hud.size();
+                let pixels = self.hud.compose(cpu.rgba, &info);
+                let compose_seconds = compose_start.elapsed().as_secs_f64();
+                let render_start = Instant::now();
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.render_map(pixels, width, height, CLEAR_COLOR);
+                }
+                (compose_seconds, render_start.elapsed().as_secs_f64())
             }
-            (compose_seconds, render_start.elapsed().as_secs_f64())
         };
 
         self.update_telemetry(
@@ -1611,6 +1591,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> R
     let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
     let mut composer = MapComposer::new(half_regions, cfg.field_resolution);
     composer.set_zoom(zoom);
+    composer.update_for_tick(1, &map);
     let overlays = Overlays {
         grid: false,
         rings: false,
@@ -1623,7 +1604,7 @@ fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> R
     // The organism readout, exactly as the live cursor picks it (the
     // "cursor" sits at the given position).
     let organism = if zoom >= ORGANISM_INFO_ZOOM {
-        let picked = App::pick_organism(&map, pos);
+        let picked = App::pick_organism(&map, pos, zoom);
         match &picked {
             Some(o) => log::info!(
                 "picked organism {:#018x} ({} at {:.0}, {:.0})",
@@ -2746,7 +2727,7 @@ mod alignment_characterization_tests {
             .copied()
             .expect("settled characterization map has organisms");
         let cursor = App::sample_cursor(&map, source.world_pos);
-        let organism = App::pick_organism(&map, source.world_pos)
+        let organism = App::pick_organism(&map, source.world_pos, ORGANISM_INFO_ZOOM)
             .expect("sampling at a rendered organism selects an organism");
         assert_eq!(organism.id, source.id);
         assert_eq!(organism.species, source.species);
