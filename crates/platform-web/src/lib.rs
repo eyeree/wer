@@ -1568,7 +1568,6 @@ mod wasm {
                     &self.state.pov_camera,
                     w as f32 / h.max(1) as f32,
                     self.state.pov_radius,
-                    CLEAR_COLOR,
                     time,
                     pov_host::PovToggles {
                         shadow_ao: self.state.pov_shadow_ao,

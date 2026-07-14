@@ -27,6 +27,11 @@ pub const SHADER_POV_WATER: &str = include_str!("../shaders/pov_water.wgsl");
 /// points use the same transform, so caster and visible silhouettes agree.
 pub const SHADER_POV_ORGANISM: &str = include_str!("../shaders/pov_organism.wgsl");
 
+/// The analytic sky shader: a fullscreen far-plane triangle shading the
+/// pixels no geometry claimed — gradient, sun at the frame's light
+/// direction, procedural clouds. Derived presentation only (ADR 0017).
+pub const SHADER_POV_SKY: &str = include_str!("../shaders/pov_sky.wgsl");
+
 /// The water wobble's time period in seconds (3d-phase-3-plan.md §4.3). The
 /// shell wraps its clock at this period before filling
 /// [`PovFrameParams::time`]; every wobble frequency in `pov_water.wgsl` is an
@@ -268,6 +273,17 @@ pub struct PovFrameParams {
     /// Draw the sea plane and river overlays at all (off skips the blended
     /// passes entirely — fill-rate diagnostic).
     pub water: bool,
+    /// Inverse of [`Self::view_proj`], computed by the shell (it owns glam).
+    /// Translation-free like `view_proj`, so unprojecting a far-plane NDC
+    /// point yields the sky's world-space view ray directly.
+    pub sky_inv_view_proj: [[f32; 4]; 4],
+    /// Linear-light sky gradient anchor overhead...
+    pub sky_zenith: [f32; 3],
+    /// ...and at the horizon. The shell also passes this as [`Self::fog_color`]
+    /// so fogged geometry dissolves into the sky.
+    pub sky_horizon: [f32; 3],
+    /// Cloud coverage in `[0, 1]`; 0 skips the cloud noise entirely.
+    pub sky_cloud_cover: f32,
 }
 
 /// std140-compatible mirror of the WGSL `PovParams`.
@@ -293,6 +309,19 @@ struct PovParamsRaw {
     /// `(shadow/AO on, detail normals on, reserved, reserved)` — the WGSL
     /// `toggles` vec4; 1.0/0.0 flags for the live diagnostic switches.
     toggles: [f32; 4],
+}
+
+/// std140-compatible mirror of the WGSL `SkyParams` (`pov_sky.wgsl`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyParamsRaw {
+    inv_view_proj: [[f32; 4]; 4],
+    sun_dir: [f32; 3],
+    cloud_cover: f32,
+    zenith: [f32; 3],
+    _pad0: f32,
+    horizon: [f32; 3],
+    _pad1: f32,
 }
 
 /// Organism-only uniform. Unlike chunk geometry, instances remain absolute
@@ -902,6 +931,13 @@ pub(crate) struct Pov {
     /// camera-centered quad. Blended, depth-write off, cull-off (the camera
     /// may stand on the sea floor and look up).
     sea_pipeline: wgpu::RenderPipeline,
+    /// Sky pipeline: a fullscreen far-plane triangle, depth-tested LessEqual
+    /// with writes off, so it shades exactly the pixels no geometry claimed.
+    /// Drawn after the opaque passes and before the translucent water ones
+    /// (water must blend over sky, and water never writes depth).
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_uniform: wgpu::Buffer,
+    sky_bind_group: wgpu::BindGroup,
     organism_pipelines: OrganismPipelines,
     frame_uniform: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
@@ -1410,6 +1446,80 @@ impl Pov {
             cache: None,
         });
 
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pov-sky-shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_POV_SKY.into()),
+        });
+        let sky_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pov-sky-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pov-sky-layout"),
+            bind_group_layouts: &[Some(&sky_bgl)],
+            immediate_size: 0,
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pov-sky-pipeline"),
+            layout: Some(&sky_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_sky"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            // The triangle sits exactly on the far plane (NDC z = 1), equal
+            // to the cleared depth: LessEqual passes only where the opaque
+            // passes left the depth untouched, writes stay off.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sky_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pov-sky-uniform"),
+            size: core::mem::size_of::<SkyParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pov-sky-bind-group"),
+            layout: &sky_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sky_uniform.as_entire_binding(),
+            }],
+        });
+
         let organism_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pov-organism-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER_POV_ORGANISM.into()),
@@ -1544,6 +1654,9 @@ impl Pov {
             terrain_shadow_pipeline,
             overlay_pipeline,
             sea_pipeline,
+            sky_pipeline,
+            sky_uniform,
+            sky_bind_group,
             organism_pipelines,
             frame_uniform,
             frame_bind_group,
@@ -1883,6 +1996,17 @@ impl Pov {
         };
         queue.write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&raw));
 
+        let sky_raw = SkyParamsRaw {
+            inv_view_proj: frame.sky_inv_view_proj,
+            sun_dir: frame.sun_dir,
+            cloud_cover: frame.sky_cloud_cover,
+            zenith: frame.sky_zenith,
+            _pad0: 0.0,
+            horizon: frame.sky_horizon,
+            _pad1: 0.0,
+        };
+        queue.write_buffer(&self.sky_uniform, 0, bytemuck::bytes_of(&sky_raw));
+
         let (camera_hi, camera_lo) = split_position(frame.camera_pos);
         let organism_raw = OrganismParamsRaw {
             view_proj: frame.view_proj,
@@ -1945,7 +2069,8 @@ impl Pov {
     }
 
     /// Record the fixed 3D-4 order: directional depth, then opaque terrain,
-    /// boxes, spheres, translucent river overlays, and finally sea.
+    /// boxes, spheres, the sky (exactly the depth-untouched pixels), then
+    /// translucent river overlays, and finally sea.
     pub(crate) fn draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -2077,6 +2202,14 @@ impl Pov {
                 0..self.sphere_instances.state.count,
             );
         }
+        // The sky, after every opaque pass and before every translucent one:
+        // LessEqual at far-plane depth shades only the pixels still at the
+        // cleared 1.0, and the depth-write-off water passes that follow can
+        // then blend over it (drawn later, the sky would stamp the sea out,
+        // since the sea leaves depth at 1.0).
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_bind_group(0, &self.sky_bind_group, &[]);
+        pass.draw(0..3, 0..1);
         // The water passes can be skipped wholesale (the `V` diagnostic
         // toggle): no blended fill, no wobble — terrain only.
         if !water {
@@ -2621,6 +2754,13 @@ mod tests {
         assert_eq!(core::mem::offset_of!(PovParamsRaw, water), 240);
         assert_eq!(core::mem::offset_of!(PovParamsRaw, shadow), 256);
         assert_eq!(core::mem::offset_of!(PovParamsRaw, toggles), 272);
+
+        assert_eq!(core::mem::size_of::<SkyParamsRaw>(), 112);
+        assert_eq!(core::mem::offset_of!(SkyParamsRaw, inv_view_proj), 0);
+        assert_eq!(core::mem::offset_of!(SkyParamsRaw, sun_dir), 64);
+        assert_eq!(core::mem::offset_of!(SkyParamsRaw, cloud_cover), 76);
+        assert_eq!(core::mem::offset_of!(SkyParamsRaw, zenith), 80);
+        assert_eq!(core::mem::offset_of!(SkyParamsRaw, horizon), 96);
 
         assert_eq!(core::mem::size_of::<OrganismParamsRaw>(), 240);
         assert_eq!(core::mem::offset_of!(OrganismParamsRaw, view_proj), 0);

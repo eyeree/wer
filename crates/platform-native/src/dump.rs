@@ -255,7 +255,6 @@ impl App {
             &self.pov_camera,
             aspect,
             self.pov_radius,
-            CLEAR_COLOR,
             0.0,
             self.pov_toggles,
             shadow,

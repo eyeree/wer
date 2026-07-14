@@ -19,7 +19,7 @@ pub use gpumap::{GpuMap, GpuMapParams, MapTileUpload, RefineOctaveParams};
 pub use pov::{
     PovFrameParams, PovOrganismBufferStats, PovOrganismInstance, PovOrganismUpload, PovVertex,
     TerrainChunkUpload, DETAIL_OCTAVES, POV_ORGANISM_INSTANCE_BYTES, SHADER_POV_ORGANISM,
-    SHADER_POV_TERRAIN, SHADER_POV_WATER,
+    SHADER_POV_SKY, SHADER_POV_TERRAIN, SHADER_POV_WATER,
 };
 
 /// The debug-map presentation shader (fullscreen textured triangle).

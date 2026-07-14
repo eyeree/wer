@@ -54,6 +54,36 @@ const SPACING: f64 = REGION_SIZE / POV_MESH_RES as f64;
 /// contrast — the definition the near-noon sun washed out entirely.
 pub const SUN_DIR: [f32; 3] = [0.840_446, 0.420_223, -0.342_020_14];
 
+/// Presentation-grade sky description handed to the renderer's sky pass
+/// (derived presentation only, ADR 0017). For now a fixed "earth standard"
+/// day; eventually the world model (climate, time of day) derives this the
+/// way it derives every other presentation input. The sun needs no field
+/// here — the sky pass places it at [`SUN_DIR`], so sky and lighting agree
+/// by construction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PovSky {
+    /// Linear-light zenith color.
+    pub zenith: [f32; 3],
+    /// Linear-light horizon color. Doubles as the frame's fog color, so
+    /// fogged geometry dissolves into the sky at the fog limit.
+    pub horizon: [f32; 3],
+    /// Cloud coverage in `[0, 1]`; 0 is a clear sky.
+    pub cloud_cover: f32,
+}
+
+impl PovSky {
+    /// A temperate clear day with a few fair-weather clouds. Colors are
+    /// linear-light (the render target is sRGB-encoded on write).
+    #[must_use]
+    pub const fn earth_standard() -> Self {
+        Self {
+            zenith: [0.065, 0.21, 0.65],
+            horizon: [0.48, 0.63, 0.86],
+            cloud_cover: 0.30,
+        }
+    }
+}
+
 /// Extra sample ring around the 65×65 vertex lattice for the
 /// central-difference normals (plan §6.3).
 const GRID_MARGIN: usize = 1;
@@ -535,9 +565,10 @@ fn fit_shadow_matrix(
 
 /// The per-frame renderer parameters for the camera at `radius` regions
 /// (plan §4): fog from `0.55·R` to `0.95·R` with `R = (radius + 0.5) ·
-/// REGION_SIZE`, fog color = the clear color so geometry dissolves into sky,
-/// the fixed sun ([`SUN_DIR`]) and hemisphere ambients tuned so flat ground
-/// roughly matches the 2D palette's value range.
+/// REGION_SIZE`, fog color = the sky's horizon color so geometry dissolves
+/// into the sky pass, the fixed sun ([`SUN_DIR`]) and hemisphere ambients
+/// tuned so flat ground roughly matches the 2D palette's value range. The
+/// sky itself is [`PovSky::earth_standard`] until the world model drives it.
 ///
 /// `time` is the water-wobble clock in seconds, already wrapped by the
 /// caller at `renderer::pov::WOBBLE_PERIOD` (3d-phase-3-plan.md §7.1);
@@ -549,15 +580,16 @@ pub fn frame_params(
     camera: &PovCamera,
     aspect: f32,
     radius: i32,
-    clear: [f64; 4],
     time: f32,
     toggles: PovToggles,
     shadow: PovShadowFrame,
 ) -> PovFrameParams {
     let reach = (f64::from(radius) + 0.5) * REGION_SIZE;
     let sun = glam::Vec3::from_array(SUN_DIR);
+    let sky = PovSky::earth_standard();
+    let view_proj = camera.view_proj(aspect);
     PovFrameParams {
-        view_proj: camera.view_proj(aspect),
+        view_proj,
         light_view_proj: shadow.light_view_proj,
         camera_pos: [camera.pos.x, camera.pos.y, camera.pos.z],
         sun_dir: [sun.x, sun.y, sun.z],
@@ -568,9 +600,17 @@ pub fn frame_params(
         shadow_ao: toggles.shadow_ao,
         detail_normals: toggles.detail_normals,
         water: toggles.water,
-        fog_color: [clear[0] as f32, clear[1] as f32, clear[2] as f32],
+        fog_color: sky.horizon,
         fog_start: (0.55 * reach) as f32,
         fog_end: pov_fog_end(radius) as f32,
+        // A perspective view-projection is always invertible; translation is
+        // absent from both directions, so this unprojects NDC to view rays.
+        sky_inv_view_proj: glam::Mat4::from_cols_array_2d(&view_proj)
+            .inverse()
+            .to_cols_array_2d(),
+        sky_zenith: sky.zenith,
+        sky_horizon: sky.horizon,
+        sky_cloud_cover: sky.cloud_cover,
         // Near the 3D-1 fill values: flat ground now sits at ~0.75 of full
         // exposure (sun 0.41 + sky fill) instead of the old ~1.05 — the
         // original tuning overexposed flat ground, clipping every
@@ -2987,7 +3027,6 @@ mod tests {
             &cam,
             1.5,
             3,
-            [0.1, 0.2, 0.3, 1.0],
             7.25,
             PovToggles::default(),
             PovShadowFrame::disabled(),
@@ -3003,7 +3042,6 @@ mod tests {
             &cam,
             1.5,
             3,
-            [0.0; 4],
             0.0,
             PovToggles {
                 shadow_ao: false,
