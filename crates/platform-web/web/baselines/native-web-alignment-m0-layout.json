@@ -1,0 +1,382 @@
+{
+  "schema": "native-web-alignment-layout-characterization-v1",
+  "purpose": "Milestone 0 pre-alignment geometry evidence; known overflow/stretch defects are intentionally recorded, not accepted behavior.",
+  "gpuPixelsCaptured": false,
+  "cases": [
+    {
+      "name": "1280x720@1",
+      "requested": {
+        "width": 1280,
+        "height": 720,
+        "dpr": 1
+      },
+      "measured": {
+        "boxes": {
+          "appShell": {
+            "bottom": 720,
+            "height": 664,
+            "right": 1265,
+            "width": 1265,
+            "x": 0,
+            "y": 56
+          },
+          "canvasHost": {
+            "bottom": 676,
+            "height": 533,
+            "right": 945,
+            "width": 945,
+            "x": 0,
+            "y": 143
+          },
+          "infoPanel": {
+            "bottom": 720,
+            "height": 664,
+            "right": 1265,
+            "width": 320,
+            "x": 945,
+            "y": 56
+          },
+          "statusBar": {
+            "bottom": 720,
+            "height": 44,
+            "right": 945,
+            "width": 945,
+            "x": 0,
+            "y": 676
+          },
+          "toolbar": {
+            "bottom": 143,
+            "height": 87,
+            "right": 945,
+            "width": 945,
+            "x": 0,
+            "y": 56
+          },
+          "viewer": {
+            "bottom": 720,
+            "height": 664,
+            "right": 945,
+            "width": 945,
+            "x": 0,
+            "y": 56
+          }
+        },
+        "canvases": {
+          "map": {
+            "backing": {
+              "height": 540,
+              "width": 960
+            },
+            "css": {
+              "bottom": 676,
+              "height": 533,
+              "right": 945,
+              "width": 945,
+              "x": 0,
+              "y": 143
+            },
+            "hidden": false
+          },
+          "mapViewport": {
+            "dh": 540,
+            "dw": 540,
+            "dx": 210,
+            "dy": 0,
+            "height": 800,
+            "resolution": 32,
+            "sh": 800,
+            "sw": 800,
+            "sx": 0,
+            "sy": 0,
+            "width": 800
+          },
+          "pov": {
+            "backing": {
+              "height": 540,
+              "width": 960
+            },
+            "css": {
+              "bottom": 0,
+              "height": 0,
+              "right": 0,
+              "width": 0,
+              "x": 0,
+              "y": 0
+            },
+            "hidden": true
+          }
+        },
+        "document": {
+          "clientHeight": 720,
+          "clientWidth": 1265,
+          "scrollHeight": 720,
+          "scrollWidth": 1265
+        },
+        "renderer": {
+          "compose": true,
+          "domStatus": "webgpu-atlas / refine false",
+          "mode": "webgpu-atlas",
+          "povStatus": null,
+          "povSupported": true,
+          "refinement": false,
+          "viewMode": "map"
+        },
+        "viewport": {
+          "dpr": 1,
+          "height": 720,
+          "width": 1280
+        }
+      }
+    },
+    {
+      "name": "900x700@1",
+      "requested": {
+        "width": 900,
+        "height": 700,
+        "dpr": 1
+      },
+      "measured": {
+        "boxes": {
+          "appShell": {
+            "bottom": 700,
+            "height": 644,
+            "right": 900,
+            "width": 900,
+            "x": 0,
+            "y": 56
+          },
+          "canvasHost": {
+            "bottom": 656,
+            "height": 436,
+            "right": 580,
+            "width": 580,
+            "x": 0,
+            "y": 220
+          },
+          "infoPanel": {
+            "bottom": 700,
+            "height": 644,
+            "right": 900,
+            "width": 320,
+            "x": 580,
+            "y": 56
+          },
+          "statusBar": {
+            "bottom": 700,
+            "height": 44,
+            "right": 580,
+            "width": 580,
+            "x": 0,
+            "y": 656
+          },
+          "toolbar": {
+            "bottom": 220,
+            "height": 164,
+            "right": 580,
+            "width": 580,
+            "x": 0,
+            "y": 56
+          },
+          "viewer": {
+            "bottom": 700,
+            "height": 644,
+            "right": 580,
+            "width": 580,
+            "x": 0,
+            "y": 56
+          }
+        },
+        "canvases": {
+          "map": {
+            "backing": {
+              "height": 540,
+              "width": 960
+            },
+            "css": {
+              "bottom": 656,
+              "height": 436,
+              "right": 580,
+              "width": 580,
+              "x": 0,
+              "y": 220
+            },
+            "hidden": false
+          },
+          "mapViewport": {
+            "dh": 540,
+            "dw": 540,
+            "dx": 210,
+            "dy": 0,
+            "height": 800,
+            "resolution": 32,
+            "sh": 800,
+            "sw": 800,
+            "sx": 0,
+            "sy": 0,
+            "width": 800
+          },
+          "pov": {
+            "backing": {
+              "height": 540,
+              "width": 960
+            },
+            "css": {
+              "bottom": 0,
+              "height": 0,
+              "right": 0,
+              "width": 0,
+              "x": 0,
+              "y": 0
+            },
+            "hidden": true
+          }
+        },
+        "document": {
+          "clientHeight": 700,
+          "clientWidth": 900,
+          "scrollHeight": 700,
+          "scrollWidth": 900
+        },
+        "renderer": {
+          "compose": true,
+          "domStatus": "webgpu-atlas / refine false",
+          "mode": "webgpu-atlas",
+          "povStatus": null,
+          "povSupported": true,
+          "refinement": false,
+          "viewMode": "map"
+        },
+        "viewport": {
+          "dpr": 1,
+          "height": 700,
+          "width": 900
+        }
+      }
+    },
+    {
+      "name": "700x700@1",
+      "requested": {
+        "width": 700,
+        "height": 700,
+        "dpr": 1
+      },
+      "measured": {
+        "boxes": {
+          "appShell": {
+            "bottom": 1911,
+            "height": 1839,
+            "right": 685,
+            "width": 685,
+            "x": 0,
+            "y": 72
+          },
+          "canvasHost": {
+            "bottom": 588,
+            "height": 391,
+            "right": 685,
+            "width": 685,
+            "x": 0,
+            "y": 197
+          },
+          "infoPanel": {
+            "bottom": 1911,
+            "height": 1279,
+            "right": 685,
+            "width": 685,
+            "x": 0,
+            "y": 632
+          },
+          "statusBar": {
+            "bottom": 632,
+            "height": 44,
+            "right": 685,
+            "width": 685,
+            "x": 0,
+            "y": 588
+          },
+          "toolbar": {
+            "bottom": 197,
+            "height": 125,
+            "right": 685,
+            "width": 685,
+            "x": 0,
+            "y": 72
+          },
+          "viewer": {
+            "bottom": 632,
+            "height": 560,
+            "right": 685,
+            "width": 685,
+            "x": 0,
+            "y": 72
+          }
+        },
+        "canvases": {
+          "map": {
+            "backing": {
+              "height": 540,
+              "width": 960
+            },
+            "css": {
+              "bottom": 588,
+              "height": 391,
+              "right": 685,
+              "width": 685,
+              "x": 0,
+              "y": 197
+            },
+            "hidden": false
+          },
+          "mapViewport": {
+            "dh": 540,
+            "dw": 540,
+            "dx": 210,
+            "dy": 0,
+            "height": 800,
+            "resolution": 32,
+            "sh": 800,
+            "sw": 800,
+            "sx": 0,
+            "sy": 0,
+            "width": 800
+          },
+          "pov": {
+            "backing": {
+              "height": 540,
+              "width": 960
+            },
+            "css": {
+              "bottom": 0,
+              "height": 0,
+              "right": 0,
+              "width": 0,
+              "x": 0,
+              "y": 0
+            },
+            "hidden": true
+          }
+        },
+        "document": {
+          "clientHeight": 700,
+          "clientWidth": 685,
+          "scrollHeight": 1911,
+          "scrollWidth": 685
+        },
+        "renderer": {
+          "compose": true,
+          "domStatus": "webgpu-atlas / refine false",
+          "mode": "webgpu-atlas",
+          "povStatus": null,
+          "povSupported": true,
+          "refinement": false,
+          "viewMode": "map"
+        },
+        "viewport": {
+          "dpr": 1,
+          "height": 700,
+          "width": 700
+        }
+      }
+    }
+  ]
+}

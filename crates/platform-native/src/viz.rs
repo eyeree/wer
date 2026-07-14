@@ -823,9 +823,35 @@ impl MapComposer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use world_core::{PossibilityField, POSSIBILITY_DIMS, SEA_LEVEL};
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use world_core::{
+        bound_target, domain_mask, AnchorKind, AnchorSource, PossibilityDomain, PossibilityField,
+        POSSIBILITY_DIMS, SEA_LEVEL,
+    };
     use world_runtime::mapcolor::composite_color;
     use world_runtime::{Budget, InlineExecutor, StreamConfig};
+
+    const ALL_CHANNELS: [Channel; 18] = [
+        Channel::Composite,
+        Channel::Elevation,
+        Channel::Geology,
+        Channel::Temperature,
+        Channel::Moisture,
+        Channel::River,
+        Channel::Wetness,
+        Channel::Soil,
+        Channel::Biome,
+        Channel::Vegetation,
+        Channel::Herbivore,
+        Channel::Predator,
+        Channel::Diversity,
+        Channel::DominantSpecies,
+        Channel::Influence,
+        Channel::Stability,
+        Channel::Revision,
+        Channel::Residual,
+    ];
 
     /// A small fully-settled window (the `gpumap.rs` test fixture).
     fn settled_map() -> RegionMap {
@@ -853,6 +879,319 @@ mod tests {
             );
         }
         map
+    }
+
+    fn no_overlays() -> Overlays {
+        Overlays {
+            grid: false,
+            rings: false,
+            pinned_flash: false,
+            organisms: false,
+            discovered: false,
+        }
+    }
+
+    fn fixture_anchor() -> Anchor {
+        let mask = domain_mask(&[
+            PossibilityDomain::Climate,
+            PossibilityDomain::Hydrology,
+            PossibilityDomain::Ecology,
+        ]);
+        Anchor {
+            world_pos: (256.0, -128.0),
+            target: bound_target(mask, 0.82),
+            mask,
+            kind: AnchorKind::Emphasize,
+            strength: 0.7,
+            falloff_radius: 2_400.0,
+            source: AnchorSource::Manual,
+        }
+    }
+
+    fn rgba_digest(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        hex
+    }
+
+    fn compose_digest(map: &RegionMap, overlays: Overlays, decor: &MapDecor) -> String {
+        let player = (0.0, 0.0);
+        let mut composer = MapComposer::new(1, 8);
+        rgba_digest(composer.compose(
+            map,
+            player,
+            Channel::Composite,
+            overlays,
+            &[fixture_anchor()],
+            decor,
+        ))
+    }
+
+    fn compose_channel_digest(map: &RegionMap, channel: Channel) -> String {
+        let player = (0.0, 0.0);
+        let mut composer = MapComposer::new(1, 8);
+        rgba_digest(composer.compose(
+            map,
+            player,
+            channel,
+            no_overlays(),
+            &[fixture_anchor()],
+            &MapDecor::default(),
+        ))
+    }
+
+    fn compose_after_detected_pinned_change(
+        map: &mut RegionMap,
+        overlays: Overlays,
+        decor: &MapDecor,
+    ) -> String {
+        let player = (0.0, 0.0);
+        let center = RegionCoord::from_world(player.0, player.1);
+        let mut composer = MapComposer::new(1, 8);
+        composer.compose(
+            map,
+            player,
+            Channel::Composite,
+            no_overlays(),
+            &[fixture_anchor()],
+            &MapDecor::default(),
+        );
+        assert_eq!(composer.pinned_violations, 0);
+
+        let before = map.get(center).expect("settled center");
+        assert_eq!(before.stability, 1.0);
+        let before_revision = before.revision;
+        let mut signature = world_core::PossibilitySignature::of(before.current);
+        let bucket = &mut signature.buckets[PossibilityDomain::Aesthetics.index()];
+        *bucket = if *bucket == 0 {
+            world_core::POSSIBILITY_QUANT - 1
+        } else {
+            0
+        };
+        map.apply_preserve_contribution(0xA11E_0000_0000_0001, center, signature);
+        let after = map.get(center).expect("preserved center stays resident");
+        assert_eq!(after.stability, 1.0);
+        assert_eq!(after.revision, before_revision + 1);
+
+        let digest = rgba_digest(composer.compose(
+            map,
+            player,
+            Channel::Composite,
+            overlays,
+            &[fixture_anchor()],
+            decor,
+        ));
+        assert_eq!(composer.pinned_violations, 1);
+        let unchanged = rgba_digest(composer.compose(
+            map,
+            player,
+            Channel::Composite,
+            overlays,
+            &[fixture_anchor()],
+            decor,
+        ));
+        assert_eq!(composer.pinned_violations, 1);
+        assert_eq!(
+            digest, unchanged,
+            "an unchanged frame must not double-count"
+        );
+        digest
+    }
+
+    /// Milestone 0 extraction guard for the complete native CPU presentation.
+    ///
+    /// GPU pixels are deliberately absent (ADR 0017). The fixture pins SHA-256
+    /// digests of the complete RGBA byte streams for all native channels and
+    /// for each overlay/decor layer, including an organism-bearing settled
+    /// window. Later moves to `viewer-host` must reproduce these bytes unless a
+    /// separately identified layout/grid change intentionally supersedes one.
+    #[test]
+    fn native_cpu_map_characterization() {
+        let map = settled_map();
+        assert!(
+            map.organism_count() > 0,
+            "the characterization window must exercise realized organisms"
+        );
+        let player = (0.0, 0.0);
+        let anchors = [fixture_anchor()];
+        let mut actual = String::from("native-cpu-map-characterization-v1\n");
+        writeln!(&mut actual, "rgba8 24 24 2304").unwrap();
+        writeln!(&mut actual, "organisms {}", map.organism_count()).unwrap();
+
+        for channel in ALL_CHANNELS {
+            writeln!(
+                &mut actual,
+                "channel {:<12} {}",
+                channel.name(),
+                compose_channel_digest(&map, channel)
+            )
+            .unwrap();
+        }
+
+        // A fully settled default field legitimately makes both diagnostic
+        // channels black. Record active examples too, so their extraction is
+        // protected by visible bytes rather than only by an enum dispatch.
+        let mut pinned = no_overlays();
+        pinned.pinned_flash = true;
+        let mut revision_map = settled_map();
+        let pinned_digest =
+            compose_after_detected_pinned_change(&mut revision_map, pinned, &MapDecor::default());
+        let center = RegionCoord::from_world(player.0, player.1);
+        let before = revision_map.get(center).expect("preserved center");
+        let mut second_signature = world_core::PossibilitySignature::of(before.current);
+        let bucket = &mut second_signature.buckets[PossibilityDomain::Behavior.index()];
+        *bucket = if *bucket == 0 {
+            world_core::POSSIBILITY_QUANT - 1
+        } else {
+            0
+        };
+        let before_revision = before.revision;
+        revision_map.apply_preserve_contribution(0xA11E_0000_0000_0001, center, second_signature);
+        assert_eq!(
+            revision_map.get(center).expect("preserved center").revision,
+            before_revision + 1
+        );
+        let active_revision = compose_channel_digest(&revision_map, Channel::Revision);
+        assert_ne!(
+            active_revision,
+            compose_channel_digest(&map, Channel::Revision),
+            "active revision fixture must contain visible churn"
+        );
+        writeln!(&mut actual, "channel revision+    {active_revision}").unwrap();
+
+        let mut residual_map = settled_map();
+        residual_map.update(
+            player,
+            0.0,
+            &PossibilityField::default(),
+            &anchors,
+            &[0.0; POSSIBILITY_DIMS],
+            &Budget::unlimited(),
+            &InlineExecutor,
+            false,
+        );
+        let residual_state = residual_map.get(center).expect("retargeted center");
+        assert!(
+            residual_state
+                .current
+                .dims
+                .iter()
+                .zip(residual_state.target.dims)
+                .any(|(current, target)| current.to_bits() != target.to_bits()),
+            "active residual fixture must not already be converged"
+        );
+        let active_residual = compose_channel_digest(&residual_map, Channel::Residual);
+        assert_ne!(
+            active_residual,
+            compose_channel_digest(&map, Channel::Residual),
+            "active residual fixture must contain visible error"
+        );
+        writeln!(&mut actual, "channel residual+    {active_residual}").unwrap();
+
+        let mut player_composer = MapComposer::new(1, 8);
+        let player_pixels = player_composer
+            .compose(
+                &map,
+                player,
+                Channel::Composite,
+                no_overlays(),
+                &anchors,
+                &MapDecor::default(),
+            )
+            .to_vec();
+        let base = rgba_digest(&player_pixels);
+        writeln!(&mut actual, "overlay player       {base}").unwrap();
+        let player_px = (16 * 24 + 8) * 4;
+        assert_eq!(&player_pixels[player_px..player_px + 3], &[255, 40, 40]);
+        assert_eq!(
+            &player_pixels[player_px + 4..player_px + 7],
+            &[255, 255, 255]
+        );
+
+        let mut grid = no_overlays();
+        grid.grid = true;
+        let grid_digest = compose_digest(&map, grid, &MapDecor::default());
+        assert_ne!(grid_digest, base, "grid fixture must alter visible pixels");
+        writeln!(&mut actual, "overlay grid         {}", grid_digest).unwrap();
+
+        let mut rings = no_overlays();
+        rings.rings = true;
+        let rings_digest = compose_digest(&map, rings, &MapDecor::default());
+        assert_ne!(rings_digest, base, "ring fixture must alter visible pixels");
+        writeln!(&mut actual, "overlay rings        {}", rings_digest).unwrap();
+
+        assert_ne!(
+            pinned_digest, base,
+            "pinned flash must alter visible pixels"
+        );
+        writeln!(&mut actual, "overlay pinned-flash {}", pinned_digest).unwrap();
+
+        let mut organisms = no_overlays();
+        organisms.organisms = true;
+        let organism_digest = compose_digest(&map, organisms, &MapDecor::default());
+        assert_ne!(
+            organism_digest, base,
+            "organism markers must alter the fixture"
+        );
+        writeln!(&mut actual, "overlay organisms    {organism_digest}").unwrap();
+
+        let center = RegionCoord::from_world(player.0, player.1);
+        let discovered_decor = MapDecor {
+            seen: Some([center].into_iter().collect()),
+            ..MapDecor::default()
+        };
+        let mut discovered = no_overlays();
+        discovered.discovered = true;
+        let discovered_digest = compose_digest(&map, discovered, &discovered_decor);
+        assert_ne!(
+            discovered_digest, base,
+            "discovery dimming fixture must alter visible pixels"
+        );
+        writeln!(&mut actual, "overlay discovered   {}", discovered_digest).unwrap();
+
+        let route_decor = MapDecor {
+            routes: vec![(vec![(-700.0, 700.0), (300.0, 850.0), (900.0, -500.0)], 7)],
+            ..MapDecor::default()
+        };
+        let route_digest = compose_digest(&map, no_overlays(), &route_decor);
+        assert_ne!(
+            route_digest, base,
+            "route fixture must alter visible pixels"
+        );
+        writeln!(&mut actual, "overlay route        {}", route_digest).unwrap();
+
+        let preserve_decor = MapDecor {
+            preserves: [RegionCoord::new(-1, 1)].into_iter().collect(),
+            ..MapDecor::default()
+        };
+        let preserve_digest = compose_digest(&map, no_overlays(), &preserve_decor);
+        assert_ne!(
+            preserve_digest, base,
+            "preserve fixture must alter visible pixels"
+        );
+        writeln!(&mut actual, "overlay preserve     {}", preserve_digest).unwrap();
+
+        let combined_decor = MapDecor {
+            seen: discovered_decor.seen,
+            preserves: preserve_decor.preserves,
+            routes: route_decor.routes,
+        };
+        let mut combined_map = settled_map();
+        let combined_digest = compose_after_detected_pinned_change(
+            &mut combined_map,
+            Overlays::default(),
+            &combined_decor,
+        );
+        assert_ne!(combined_digest, base);
+        writeln!(&mut actual, "overlay combined     {}", combined_digest).unwrap();
+
+        assert_eq!(
+            actual.trim_end(),
+            include_str!("../tests/fixtures/native_map_characterization.txt").trim_end()
+        );
     }
 
     #[test]

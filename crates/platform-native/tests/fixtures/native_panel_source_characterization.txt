@@ -1,0 +1,28 @@
+native-panel-source-characterization-v1
+cursor.world 4053d05450000000 40404744a0000000
+cursor.region 0 0
+cursor.status ready
+cursor.stability 3f800000
+cursor.revision 0
+cursor.elevation 4256e516
+cursor.temperature 3fc45147
+cursor.moisture 3ebd6aa9
+cursor.hardness 3f03d3e2
+cursor.river 00000000
+cursor.wetness 3e5ac554
+cursor.soil-depth 3f00c5f2
+cursor.fertility 3e8cff6c
+cursor.vegetation 3e8537d3
+cursor.canopy 40ddb6d2
+cursor.biome taiga
+ecology.roster-size 8
+ecology.dominant d3a8f04ef7874415
+ecology.trophic 3 3 0 1 1
+ecology.pressure 3bb6424c 00000000 3f52ba36
+organism.id 03087c3d4bf590b7
+organism.slot 0
+organism.cell 2 1
+organism.species 2eb2cbe2ec383555
+organism.trophic herbivore
+organism.world 4053d05450000000 40404744a0000000
+organism.expressed 3f198c12 3f4034b5 3dadb99a 3c49afb0 3ef710d1

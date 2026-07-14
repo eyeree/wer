@@ -1,0 +1,15 @@
+native-input-characterization-v1
+map held=KeyW axis=0000000000000000,3ff0000000000000 delta=0000000000000000,4049000000000000
+map held=KeyD+KeyW axis=3fe6a09e667f3bcc,3fe6a09e667f3bcc delta=4041ad7bc01366b7,4041ad7bc01366b7
+map one-shot=KeyV first=true repeat=false channel=elevation
+map wheel-pixel=15 notches=0 remainder=3fd8000000000000
+map wheel-pixel=30 notches=1 remainder=3fc0000000000000
+map wheel-pixel=-50 notches=-1 remainder=bfc0000000000000
+pov held=KeyD+KeyW axis=3ff0000000000000,3ff0000000000000,0000000000000000 delta=4006a09e55e72f6b,4006a09e77174821,0000000000000000
+pov move-unheld look=false
+pov drag delta=4028000000000000,c020000000000000 yaw=3fc538d1 pitch=3ca3d70a
+pov move-released look=false yaw=3fc538d1 pitch=3ca3d70a
+pov move-cancelled look=false
+pov one-shot=KeyB first=true repeat=false shadow-ao=false
+pov wheel-pixel=20 notches=0 remainder=3fe0000000000000 speed=4044000000000000
+pov wheel-pixel=25 notches=1 remainder=3fc0000000000000 speed=404e000000000000
