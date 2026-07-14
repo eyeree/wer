@@ -57,6 +57,26 @@ pub struct SurfaceViewport {
     pub height: u32,
 }
 
+/// Optional new pixels for the shell-owned POV information texture.
+#[derive(Debug, Clone, Copy)]
+pub struct PovInformationUpload<'a> {
+    /// sRGB-encoded RGBA8 pixels in row-major order.
+    pub rgba: &'a [u8],
+    /// Source texture width.
+    pub width: u32,
+    /// Source texture height.
+    pub height: u32,
+}
+
+/// One shell-owned information surface composed after the POV pass.
+#[derive(Debug, Clone, Copy)]
+pub struct PovInformationSurface<'a> {
+    /// Replacement pixels, or `None` to retain the existing texture.
+    pub upload: Option<PovInformationUpload<'a>>,
+    /// Exact destination on the presentation surface.
+    pub viewport: SurfaceViewport,
+}
+
 impl SurfaceViewport {
     /// Construct an exact physical viewport.
     #[must_use]
@@ -90,6 +110,37 @@ impl SurfaceViewport {
             1.0,
         );
     }
+}
+
+fn scale_viewport(
+    viewport: SurfaceViewport,
+    source: (u32, u32),
+    destination: (u32, u32),
+) -> SurfaceViewport {
+    debug_assert!(source.0 > 0 && source.1 > 0);
+    debug_assert!(destination.0 > 0 && destination.1 > 0);
+    let scale_edge = |edge: u32, source: u32, destination: u32| {
+        ((u64::from(edge) * u64::from(destination) + u64::from(source) / 2) / u64::from(source))
+            as u32
+    };
+    let scale_axis = |start: u32, length: u32, source: u32, destination: u32| {
+        // Rounding both edges can collapse a small but valid pane at a low
+        // render scale. Keep at least one destination pixel: WebGPU rejects a
+        // zero-area viewport, and one pixel is the faithful lower bound.
+        let scaled_start = scale_edge(start, source, destination).min(destination - 1);
+        let scaled_end = scale_edge(start + length, source, destination)
+            .max(scaled_start + 1)
+            .min(destination);
+        (scaled_start, scaled_end)
+    };
+    let (left, right) = scale_axis(viewport.x, viewport.width, source.0, destination.0);
+    let (top, bottom) = scale_axis(viewport.y, viewport.height, source.1, destination.1);
+    SurfaceViewport::new(
+        left,
+        top,
+        right.saturating_sub(left),
+        bottom.saturating_sub(top),
+    )
 }
 
 /// The present mode for the surface: FIFO (vsync) by default — the Phase 6
@@ -405,11 +456,14 @@ pub struct Renderer {
     /// swapchain must stay non-sRGB and the encode happens through a view
     /// format instead.
     render_format: wgpu::TextureFormat,
+    /// Observed platform-surface loss events. Each event attempts recreation;
+    /// timeouts, occlusion, and resize races do not increment this diagnostic
+    /// counter.
+    surface_losses: u32,
     debug_map: DebugMapPipeline,
     /// Second blit pipeline for the HUD panel strip in the GPU-map path.
     panel_blit: DebugMapPipeline,
-    /// Third blit pipeline for the small POV HUD chip (FPS counter), drawn
-    /// pixel-exact in the top-right corner after the POV pass.
+    /// Third blit pipeline for the shell-owned POV information surface.
     pov_hud_blit: DebugMapPipeline,
     /// The Phase 6 atlas-composed map path (phase-6-plan.md §6.5), built
     /// lazily on the first GPU-mode frame.
@@ -428,6 +482,20 @@ impl fmt::Debug for Renderer {
 }
 
 impl Renderer {
+    /// Exact swapchain format selected for this platform surface. Kept as a
+    /// display string so viewer telemetry does not expose a graphics-API type
+    /// across the renderer boundary.
+    #[must_use]
+    pub fn surface_format_name(&self) -> String {
+        format!("{:?}", self.config.format)
+    }
+
+    /// Number of platform-surface loss events observed by this renderer.
+    #[must_use]
+    pub const fn surface_losses(&self) -> u32 {
+        self.surface_losses
+    }
+
     /// Bring up the renderer for a window of the given pixel size.
     ///
     /// `source` must return a fresh surface target for the same window each
@@ -535,6 +603,7 @@ impl Renderer {
             queue,
             config,
             render_format,
+            surface_losses: 0,
             debug_map,
             panel_blit,
             pov_hud_blit,
@@ -616,6 +685,7 @@ impl Renderer {
                 // The underlying platform surface is gone (compositor
                 // restart, WSLg hiccup). Reconfiguring a dead surface is a
                 // validation error — build a new one instead.
+                self.surface_losses = self.surface_losses.saturating_add(1);
                 self.recreate_surface();
                 None
             }
@@ -1033,15 +1103,18 @@ impl Renderer {
     /// other entry points. No readback, no API that could ever produce one
     /// (ADR 0017).
     ///
-    /// `hud` is an optional small RGBA8 chip (image, width, height) blitted
-    /// pixel-exact into the top-right corner after the POV pass — the shell's
-    /// FPS counter. World-agnostic like every upload: the renderer just
-    /// draws the image it is handed.
+    /// `pov_viewport` is the exact pane used for both projection and raster;
+    /// opaque information pixels never cover the camera's center.
+    ///
+    /// `information` is an optional RGBA8 surface plus exact destination. Its
+    /// inner upload is tri-state: `Some` replaces the texture, `None` retains
+    /// and redraws the existing texture, and the outer `None` draws no panel.
     ///
     /// `pov_scale` (already clamped by the shell, `WER_POV_SCALE`) renders
     /// the POV pass at a fraction of the surface resolution and stretches it
     /// up with a linear blit — on a software rasterizer fragment cost is CPU
-    /// cost, so 0.5 cuts the raster bill ~4×. The HUD chip stays full-res.
+    /// cost, so 0.5 cuts the raster bill ~4×. The information surface is
+    /// composed at the destination viewport's full resolution.
     #[allow(clippy::too_many_arguments)] // Upload tri-state stays explicit at the renderer boundary.
     pub fn render_pov(
         &mut self,
@@ -1050,9 +1123,24 @@ impl Renderer {
         removes: &[u64],
         organisms: Option<&PovOrganismUpload>,
         clear: [f64; 4],
-        hud: Option<(&[u8], u32, u32)>,
+        pov_viewport: SurfaceViewport,
+        information: Option<PovInformationSurface<'_>>,
         pov_scale: f32,
     ) -> bool {
+        let surface_size = (self.config.width, self.config.height);
+        if !pov_viewport.is_contained_by(surface_size.0, surface_size.1)
+            || information.is_some_and(|information| {
+                !information
+                    .viewport
+                    .is_contained_by(surface_size.0, surface_size.1)
+            })
+        {
+            log::error!(
+                "POV/information viewports {pov_viewport:?}/{:?} escape surface {surface_size:?}",
+                information.map(|information| information.viewport)
+            );
+            return false;
+        }
         if self.pov.is_none() {
             self.pov = Some(pov::Pov::new(&self.device, &self.queue, self.render_format));
             log::info!(
@@ -1063,6 +1151,11 @@ impl Renderer {
         }
         let scaled_active = pov_scale < 1.0;
         let (rw, rh) = pov::Pov::render_size(self.config.width, self.config.height, pov_scale);
+        let draw_viewport = if scaled_active {
+            scale_viewport(pov_viewport, surface_size, (rw, rh))
+        } else {
+            pov_viewport
+        };
         let pov = self.pov.as_mut().expect("just ensured");
         pov.ensure_depth(&self.device, rw, rh);
         pov.ensure_shadow(&self.device, frame.shadow_resolution);
@@ -1089,6 +1182,7 @@ impl Renderer {
                 pov.draw(
                     &mut encoder,
                     target,
+                    draw_viewport,
                     &draws,
                     clear,
                     frame.water,
@@ -1099,6 +1193,7 @@ impl Renderer {
                 pov.draw(
                     &mut encoder,
                     &view,
+                    draw_viewport,
                     &draws,
                     clear,
                     frame.water,
@@ -1106,17 +1201,24 @@ impl Renderer {
                 );
             }
         }
-        // The HUD chip: a second tiny pass loading the POV result and
-        // blitting the image into the top-right corner, pixel-exact.
-        if let Some((rgba, w, h)) = hud {
-            self.pov_hud_blit
-                .upload(&self.device, &self.queue, rgba, w, h);
-            if let Some((_, bind_group, w, h)) = self.pov_hud_blit.texture.as_ref() {
+        // The information surface: a second pass loading the POV result and
+        // blitting the shell-owned bitmap into its exact shared viewport.
+        if let Some(information) = information {
+            if let Some(upload) = information.upload {
+                self.pov_hud_blit.upload(
+                    &self.device,
+                    &self.queue,
+                    upload.rgba,
+                    upload.width,
+                    upload.height,
+                );
+            }
+            if let Some((_, bind_group, _, _)) = self.pov_hud_blit.texture.as_ref() {
                 let (sw, sh) = (self.config.width, self.config.height);
-                const PAD: u32 = 8;
-                if *w + PAD <= sw && *h + PAD <= sh {
+                let viewport = information.viewport;
+                if viewport.is_contained_by(sw, sh) {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("pov-hud-chip"),
+                        label: Some("pov-information-surface"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
                             resolve_target: None,
@@ -1131,14 +1233,7 @@ impl Renderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_viewport(
-                        (sw - w - PAD) as f32,
-                        PAD as f32,
-                        *w as f32,
-                        *h as f32,
-                        0.0,
-                        1.0,
-                    );
+                    viewport.set(&mut pass);
                     pass.set_pipeline(&self.pov_hud_blit.pipeline);
                     pass.set_bind_group(0, bind_group, &[]);
                     pass.draw(0..3, 0..1);
@@ -1159,7 +1254,7 @@ impl Renderer {
 
 #[cfg(test)]
 mod viewport_tests {
-    use super::SurfaceViewport;
+    use super::{scale_viewport, SurfaceViewport};
 
     #[test]
     fn physical_viewport_containment_handles_edges_odds_and_overflow() {
@@ -1168,5 +1263,52 @@ mod viewport_tests {
         assert!(!SurfaceViewport::new(0, 0, 0, 10).is_contained_by(901, 701));
         assert!(!SurfaceViewport::new(900, 700, 2, 1).is_contained_by(901, 701));
         assert!(!SurfaceViewport::new(u32::MAX, 0, 2, 1).is_contained_by(901, 701));
+    }
+
+    #[test]
+    fn reduced_resolution_viewport_preserves_shared_edges_and_containment() {
+        let surface = (901, 701);
+        let reduced = (451, 351);
+        let left = scale_viewport(SurfaceViewport::new(37, 19, 337, 663), surface, reduced);
+        let right = scale_viewport(SurfaceViewport::new(374, 19, 490, 663), surface, reduced);
+
+        assert!(left.is_contained_by(reduced.0, reduced.1));
+        assert!(right.is_contained_by(reduced.0, reduced.1));
+        assert_eq!(left.x + left.width, right.x);
+        assert_eq!(left.y, right.y);
+        assert_eq!(left.height, right.height);
+    }
+
+    #[test]
+    fn full_surface_viewport_scales_to_full_render_target() {
+        assert_eq!(
+            scale_viewport(
+                SurfaceViewport::new(0, 0, 1280, 721),
+                (1280, 721),
+                (640, 361),
+            ),
+            SurfaceViewport::new(0, 0, 640, 361)
+        );
+    }
+
+    #[test]
+    fn every_nonempty_interval_stays_nonempty_when_reduced() {
+        for source in 1..=12 {
+            for destination in 1..=12 {
+                for start in 0..source {
+                    for length in 1..=source - start {
+                        let scaled = scale_viewport(
+                            SurfaceViewport::new(start, start, length, length),
+                            (source, source),
+                            (destination, destination),
+                        );
+                        assert!(
+                            scaled.is_contained_by(destination, destination),
+                            "{start}+{length}/{source} -> {scaled:?} in {destination}",
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -19,15 +19,110 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use viewer_host::layout::PresentationMode;
+use viewer_host::inspect::{pick_map_organism_info, sample_cell};
+use viewer_host::layout::{PixelRect, PresentationMode};
 use viewer_host::map::MapBackend;
+use viewer_host::panel::PanelDocument;
 use world_core::layer::layer_decl;
 use world_core::PossibilityDomain;
 use world_runtime::Pass;
 
-use crate::panel::PanelInfo;
 use crate::pov::{self, PovChunkManager, PovOrganismManager};
-use crate::{App, CLEAR_COLOR};
+use crate::{App, NativeMapRects, CLEAR_COLOR};
+
+/// The linear [`CLEAR_COLOR`] encoded for an sRGB screenshot target.
+const CLEAR_RGBA8: [u8; 4] = [39, 39, 56, 255];
+
+fn rgba_len(width: u32, height: u32) -> Result<usize, String> {
+    usize::try_from(u64::from(width) * u64::from(height) * 4)
+        .map_err(|_| format!("RGBA dimensions {width}x{height} exceed address space"))
+}
+
+/// Nearest-neighbor RGBA blit used only to assemble file-bound debug pixels.
+fn blit_rgba(
+    destination: &mut [u8],
+    destination_size: (u32, u32),
+    source: &[u8],
+    source_size: (u32, u32),
+    rectangle: PixelRect,
+) -> Result<(), String> {
+    let (destination_width, destination_height) = destination_size;
+    let (source_width, source_height) = source_size;
+    if destination.len() != rgba_len(destination_width, destination_height)? {
+        return Err(String::from(
+            "destination RGBA length does not match dimensions",
+        ));
+    }
+    if source.len() != rgba_len(source_width, source_height)? {
+        return Err(String::from("source RGBA length does not match dimensions"));
+    }
+    if source_width == 0
+        || source_height == 0
+        || rectangle.width == 0
+        || rectangle.height == 0
+        || rectangle.right() > destination_width
+        || rectangle.bottom() > destination_height
+    {
+        return Err(String::from(
+            "RGBA blit rectangle or source is empty/out of bounds",
+        ));
+    }
+
+    for destination_y in 0..rectangle.height {
+        let source_y = u32::try_from(
+            (2 * u64::from(destination_y) + 1) * u64::from(source_height)
+                / (2 * u64::from(rectangle.height)),
+        )
+        .map_err(|_| String::from("source row exceeds u32"))?;
+        for destination_x in 0..rectangle.width {
+            let source_x = u32::try_from(
+                (2 * u64::from(destination_x) + 1) * u64::from(source_width)
+                    / (2 * u64::from(rectangle.width)),
+            )
+            .map_err(|_| String::from("source column exceeds u32"))?;
+            let source_offset = usize::try_from(
+                (u64::from(source_y) * u64::from(source_width) + u64::from(source_x)) * 4,
+            )
+            .map_err(|_| String::from("source pixel offset exceeds address space"))?;
+            let x = rectangle.x + destination_x;
+            let y = rectangle.y + destination_y;
+            let destination_offset =
+                usize::try_from((u64::from(y) * u64::from(destination_width) + u64::from(x)) * 4)
+                    .map_err(|_| String::from("destination pixel offset exceeds address space"))?;
+            destination[destination_offset..destination_offset + 4]
+                .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+    Ok(())
+}
+
+fn compose_pov_surface(
+    surface_size: (u32, u32),
+    rectangles: NativeMapRects,
+    pov_rgba: &[u8],
+    panel_rgba: &[u8],
+    panel_size: (u32, u32),
+) -> Result<Vec<u8>, String> {
+    let mut rgba = vec![0; rgba_len(surface_size.0, surface_size.1)?];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&CLEAR_RGBA8);
+    }
+    blit_rgba(
+        &mut rgba,
+        surface_size,
+        pov_rgba,
+        (rectangles.map.width, rectangles.map.height),
+        rectangles.map,
+    )?;
+    blit_rgba(
+        &mut rgba,
+        surface_size,
+        panel_rgba,
+        panel_size,
+        rectangles.panel,
+    )?;
+    Ok(rgba)
+}
 
 /// Encode an RGBA8 buffer as binary PPM (P6, alpha dropped) — the repo's
 /// image format everywhere (`--screenshot`, `--pov-script`, and the dump).
@@ -132,12 +227,15 @@ impl App {
 
     fn write_debug_dump_into(&mut self, base: &Path) -> Result<PathBuf, String> {
         let dir = create_dump_dir(base, unix_seconds())?;
+        let panel = self.debug_panel_document();
         let screenshot = match self.controller.layout().mode {
-            PresentationMode::Map | PresentationMode::Split => self.dump_map_screenshot(&dir),
-            PresentationMode::Pov => self.dump_pov_screenshot(&dir),
+            PresentationMode::Map | PresentationMode::Split => {
+                self.dump_map_screenshot(&dir, &panel)
+            }
+            PresentationMode::Pov => self.dump_pov_screenshot(&dir, &panel),
         };
         let report = self
-            .dump_report(&screenshot)
+            .dump_report(&screenshot, &panel)
             .map_err(|e| format!("format report: {e}"))?;
         let path = dir.join("state.txt");
         std::fs::write(&path, report).map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -151,7 +249,7 @@ impl App {
     /// branch), forced regardless of the GPU toggle so the dump is the full
     /// composed map + panel, not the GPU path's sparse overlay strip. The
     /// panel's cursor readout is pinned at the player, like `--screenshot`.
-    fn dump_map_screenshot(&mut self, dir: &Path) -> Result<String, String> {
+    fn dump_map_screenshot(&mut self, dir: &Path, panel: &PanelDocument) -> Result<String, String> {
         let decor = self.build_decor();
         let preferences = self.controller.map_preferences();
         let traveler = self.controller.world().traveler().position;
@@ -164,42 +262,8 @@ impl App {
             self.controller.world().anchors(),
             &decor,
         );
-        let organism =
-            Self::pick_organism(self.controller.world().map(), traveler, preferences.zoom);
-        let world = self.controller.world();
-        let capture = self.controller.capture_preferences();
-        let info = PanelInfo {
-            fps: self.fps,
-            update_ms: self.update_ms,
-            compose_ms: self.compose_ms,
-            render_ms: self.render_ms,
-            upload_kb: self.upload_kb,
-            gpu_compose: false,
-            tier: self.tier.name(),
-            cache_ceiling_bytes: world.map().config().max_field_cache_bytes,
-            pass_ms: self.pass_ms,
-            workers: self.executor.parallelism(),
-            stats: self.last_stats,
-            regen_totals: &self.regen_totals,
-            macro_tiles: world.map().macro_cache().len(),
-            rosters: world.map().roster_cache().len(),
-            organisms: world.map().organism_count(),
-            jobs_in_flight: world.map().jobs_in_flight(),
-            pinned_violations: self.composer.pinned_violations,
-            channel: preferences.channel,
-            player: traveler,
-            bias: world.bias(),
-            anchors: world.anchors(),
-            capture_category: capture.category.name(),
-            capture_polarity: capture.polarity,
-            transition_mode: world.transition_mode(),
-            vault: self.vault_panel_info(),
-            zoom: preferences.zoom,
-            cursor: Some(Self::sample_cursor(world.map(), traveler)),
-            organism,
-        };
         let (width, height) = self.hud.size();
-        let pixels = self.hud.compose(self.composer.pixels(), &info);
+        let pixels = self.hud.compose(self.composer.pixels(), &panel.sections);
         write_ppm(&dir.join("screenshot.ppm"), pixels, width, height)?;
         Ok(format!(
             "screenshot.ppm ({width}x{height} map+panel, CPU-composed, channel {}, zoom x{})",
@@ -209,16 +273,29 @@ impl App {
     }
 
     /// The POV screenshot: an offscreen [`renderer::pov::PovCapture`] at the
-    /// window size (ADR 0021). The live renderer's chunks cannot be read
-    /// back, so a fresh chunk manager re-meshes the ring inline against the
-    /// live, already-settled map — meshing is deterministic, so this shows
-    /// exactly what the window shows (the `--pov-script` snap loop).
-    fn dump_pov_screenshot(&self, dir: &Path) -> Result<String, String> {
+    /// live POV-pane size, composed with the same shared panel and fitted
+    /// rectangles used by the surface (ADR 0021). The live renderer's chunks
+    /// cannot be read back, so a fresh chunk manager re-meshes the ring inline
+    /// against the live, already-settled map — meshing is deterministic, so
+    /// this shows exactly what the window shows (the `--pov-script` snap loop).
+    fn dump_pov_screenshot(&mut self, dir: &Path, panel: &PanelDocument) -> Result<String, String> {
         let (width, height) = self
             .renderer
             .as_ref()
             .map_or((1024, 768), renderer::Renderer::size);
-        let mut cap = renderer::pov::PovCapture::new(width, height)
+        let (source_width, source_height) = self.hud.size();
+        let panel_width = source_width
+            .checked_sub(source_height)
+            .ok_or_else(|| String::from("native panel source is narrower than its map"))?;
+        let rectangles = NativeMapRects::resolve(
+            PixelRect::new(0, 0, width, height),
+            source_height,
+            panel_width,
+        )
+        .ok_or_else(|| String::from("surface is too small for POV and information panel"))?;
+        let pov_width = rectangles.map.width;
+        let pov_height = rectangles.map.height;
+        let mut cap = renderer::pov::PovCapture::new(pov_width, pov_height)
             .map_err(|e| format!("pov capture init: {e}"))?;
         let camera = self.controller.pov_camera();
         let map = self.controller.world().map();
@@ -248,7 +325,7 @@ impl App {
             pov::pov_fog_end(self.pov_radius),
         );
         cap.apply(&[], &[], organisms_changed.then(|| organisms.upload()));
-        let aspect = width as f32 / height.max(1) as f32;
+        let aspect = pov_width as f32 / pov_height.max(1) as f32;
         // Time-frozen like every capture (3d-phase-3-plan.md §4.3), with the
         // live diagnostic toggles applied so the dump shows what the window
         // shows.
@@ -267,15 +344,24 @@ impl App {
             self.controller.pov_toggles(),
             shadow,
         );
-        let rgba = cap.snapshot_at_scale(
+        let pov_rgba = cap.snapshot_at_scale(
             &params,
             CLEAR_COLOR,
             self.controller.pov_state().render_scale,
         );
+        let (panel_rgba, panel_source_width, panel_source_height, _) =
+            self.hud.panel_image_for(panel.revision, &panel.sections);
+        let rgba = compose_pov_surface(
+            (width, height),
+            rectangles,
+            &pov_rgba,
+            panel_rgba,
+            (panel_source_width, panel_source_height),
+        )?;
         write_ppm(&dir.join("screenshot.ppm"), &rgba, width, height)?;
         let counts = organisms.counters();
         Ok(format!(
-            "screenshot.ppm ({width}x{height} POV, offscreen capture, {} chunks meshed, {} organisms drawn / {} published / {} waiting for ground; {} distance-culled)",
+            "screenshot.ppm ({width}x{height} POV+panel, {pov_width}x{pov_height} offscreen POV pane, {} chunks meshed, {} organisms drawn / {} published / {} waiting for ground; {} distance-culled)",
             chunks.len(),
             counts.drawn(),
             counts.published,
@@ -286,7 +372,11 @@ impl App {
 
     /// The `state.txt` body. Plain text, one `[section]` per concern, stable
     /// `key : value` lines — grep-friendly for humans and agents alike.
-    fn dump_report(&self, screenshot: &Result<String, String>) -> Result<String, std::fmt::Error> {
+    fn dump_report(
+        &self,
+        screenshot: &Result<String, String>,
+        panel: &PanelDocument,
+    ) -> Result<String, std::fmt::Error> {
         let mut s = String::new();
         let now = unix_seconds();
         writeln!(s, "wer debug dump")?;
@@ -310,6 +400,16 @@ impl App {
         match screenshot {
             Ok(desc) => writeln!(s, "screenshot        : {desc}")?,
             Err(err) => writeln!(s, "screenshot        : FAILED: {err}")?,
+        }
+        writeln!(s)?;
+
+        writeln!(s, "[information_panel]")?;
+        writeln!(s, "schema_version    : {}", panel.schema_version)?;
+        writeln!(s, "revision          : {}", panel.revision)?;
+        for section in &panel.sections {
+            for field in section.fields.iter().filter(|field| field.visible) {
+                writeln!(s, "{} : {}", field.id.as_str(), field.value)?;
+            }
         }
         writeln!(s)?;
 
@@ -337,7 +437,7 @@ impl App {
         writeln!(s, "workers           : {}", self.executor.parallelism())?;
         writeln!(
             s,
-            "gpu_compose       : {} (the dump screenshot is always CPU-composed)",
+            "gpu_compose       : {} (map dump screenshots are always CPU-composed)",
             preferences.backend == MapBackend::GpuAtlas
         )?;
         writeln!(s, "refinement        : {}", preferences.refinement)?;
@@ -488,9 +588,9 @@ impl App {
         writeln!(s)?;
 
         writeln!(s, "[cell_at_player]")?;
-        writeln!(s, "{:#?}", Self::sample_cursor(world.map(), player))?;
-        match Self::pick_organism(world.map(), player, preferences.zoom) {
-            Some(org) => writeln!(s, "organism within one cell: {org:#?}")?,
+        writeln!(s, "{:#?}", sample_cell(world.map(), player))?;
+        match pick_map_organism_info(world.map(), player, preferences.zoom) {
+            Some(organism) => writeln!(s, "organism within one cell: {organism:#?}")?,
             None => writeln!(s, "organism within one cell: none")?,
         }
         writeln!(s)?;
@@ -612,6 +712,80 @@ impl App {
 mod tests {
     use super::*;
 
+    fn pixel(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let offset = usize::try_from((u64::from(y) * u64::from(width) + u64::from(x)) * 4)
+            .expect("test image offset fits");
+        rgba[offset..offset + 4]
+            .try_into()
+            .expect("complete test pixel")
+    }
+
+    #[test]
+    fn nearest_blit_samples_destination_pixel_centers() {
+        let source = [255, 0, 0, 255, 0, 255, 0, 255];
+        let mut destination = vec![0; rgba_len(5, 3).expect("test dimensions")];
+        blit_rgba(
+            &mut destination,
+            (5, 3),
+            &source,
+            (2, 1),
+            PixelRect::new(1, 1, 3, 1),
+        )
+        .expect("valid blit");
+
+        assert_eq!(pixel(&destination, 5, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(pixel(&destination, 5, 1, 1), [255, 0, 0, 255]);
+        assert_eq!(pixel(&destination, 5, 2, 1), [0, 255, 0, 255]);
+        assert_eq!(pixel(&destination, 5, 3, 1), [0, 255, 0, 255]);
+        assert_eq!(pixel(&destination, 5, 4, 2), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn pov_dump_surface_keeps_camera_pane_panel_and_letterbox_disjoint() {
+        let surface_size = (11, 7);
+        let rectangles =
+            NativeMapRects::resolve(PixelRect::new(0, 0, 11, 7), 2, 2).expect("visible panes");
+        let pov_pixel = [180, 40, 20, 255];
+        let panel_pixel = [20, 80, 180, 255];
+        let pov_rgba = pov_pixel.repeat(
+            usize::try_from(u64::from(rectangles.map.width) * u64::from(rectangles.map.height))
+                .expect("test pane area fits"),
+        );
+        let panel_rgba = panel_pixel.repeat(4);
+
+        let composed =
+            compose_pov_surface(surface_size, rectangles, &pov_rgba, &panel_rgba, (2, 2))
+                .expect("valid POV composition");
+
+        let (letterbox_x, letterbox_y) = (0..surface_size.1)
+            .find_map(|y| {
+                (0..surface_size.0)
+                    .find(|&x| !rectangles.combined.contains(x, y))
+                    .map(|x| (x, y))
+            })
+            .expect("aspect mismatch leaves letterbox pixels");
+        assert_eq!(pixel(&composed, 11, letterbox_x, letterbox_y), CLEAR_RGBA8);
+        assert_eq!(
+            pixel(
+                &composed,
+                11,
+                rectangles.map.x + rectangles.map.width / 2,
+                rectangles.map.y + rectangles.map.height / 2,
+            ),
+            pov_pixel
+        );
+        assert_eq!(
+            pixel(
+                &composed,
+                11,
+                rectangles.panel.x + rectangles.panel.width / 2,
+                rectangles.panel.y + rectangles.panel.height / 2,
+            ),
+            panel_pixel
+        );
+        assert_eq!(rectangles.map.right(), rectangles.panel.x);
+    }
+
     #[test]
     fn utc_names_match_known_instants() {
         // Fixtures cross-checked against `date -u`: the epoch, a century
@@ -649,6 +823,8 @@ mod tests {
         let report = std::fs::read_to_string(dir.join("state.txt")).expect("state.txt");
         for section in [
             "player_world",
+            "[information_panel]",
+            "view.mode",
             "[view]",
             "[pov_camera]",
             "forward",
@@ -659,6 +835,19 @@ mod tests {
         ] {
             assert!(report.contains(section), "report is missing {section:?}");
         }
+        assert!(report.contains("CellInfo {"));
+        assert!(report.contains("organism within one cell:"));
+
+        // Diagnostic sampling is independent of presentation hover. POV has
+        // no hover until M7, but its F12 report must still describe the player
+        // cell promised by this module's contract.
+        let mut no_hover_panel = app.debug_panel_document();
+        no_hover_panel.model.hover = viewer_host::inspect::HoverInfo::None;
+        let no_hover_report = app
+            .dump_report(&Ok(String::from("fixture")), &no_hover_panel)
+            .expect("format no-hover report");
+        assert!(no_hover_report.contains("CellInfo {"));
+        assert!(no_hover_report.contains("organism within one cell:"));
 
         let shot = std::fs::read(dir.join("screenshot.ppm")).expect("screenshot.ppm");
         assert!(shot.starts_with(b"P6\n"), "screenshot must be binary PPM");

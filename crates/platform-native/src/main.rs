@@ -1,4 +1,4 @@
-//! Native application shell for the Phase 1 continuity prototype
+//! Native application shell for Infinite World Exploration.
 //! (phase-1-plan.md sections 4.4 and 10, milestones M5–M6).
 //!
 //! Opens a window and drives the frame loop: player input moves through the
@@ -85,23 +85,29 @@ mod viz;
 use std::sync::Arc;
 use std::time::Instant;
 
-use renderer::{Renderer, SurfaceViewport};
+use renderer::{PovInformationSurface, PovInformationUpload, Renderer, SurfaceViewport};
 use viewer_host::action::{
     PreserveMutation, ServiceRequestId, ViewerAction, ViewerEffect, WorkerBackend,
 };
 use viewer_host::atlas::{AtlasManager, RefinementRequest};
 use viewer_host::controller::{
-    GroundSample, LoadedSession, PovGroundSampler, ServiceNotification, ServiceResponse,
-    ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewerController,
+    CapturePreferences, GroundSample, LoadedSession, PovGroundSampler, PresentationDirty,
+    ServiceNotification, ServiceResponse, ServiceResponseResult, ServiceResponseSequence,
+    TickInput, TickOutput, ViewerController,
 };
-#[cfg(test)]
 use viewer_host::input::InputFrame;
 use viewer_host::input::{InputContext, InputMapper, NormalizedInputEvent};
+use viewer_host::inspect::HoverInfo;
 use viewer_host::layout::{MapViewportProjection, PixelRect, PresentationMode, ViewKind};
 use viewer_host::map::{MapBackend, MapRenderRequest, PreparedMapSource};
-use viewer_host::panel::{PlatformTelemetry, Severity, ViewerWarning};
+use viewer_host::panel::{
+    build_panel_document, PanelBuildInput, PanelDocument, PanelDocumentCache, PanelDocumentKey,
+    PerformanceInfo, PersistenceInfo, PlatformTelemetry, RendererInfo, Severity,
+    StreamingSupplement, VaultInfo, ViewerWarning, WarningRegistry,
+};
 use viewer_host::world::{
-    ExplorationWorld, WorldPostUpdate, WorldPreUpdate, WorldServiceInput, WorldTickHook,
+    ExplorationWorld, NoopWorldTickHook, WorldPostUpdate, WorldPreUpdate, WorldServiceInput,
+    WorldTickHook,
 };
 use viewer_host::ORGANISM_PICK_ZOOM as ORGANISM_INFO_ZOOM;
 use winit::application::ApplicationHandler;
@@ -111,24 +117,19 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 #[cfg(test)]
 use world_core::{
-    bound_target, domain_mask, Anchor, AnchorSource, PossibilityDomain, PossibilitySignature,
+    bound_target, domain_mask, Anchor, AnchorKind, AnchorSource, PossibilityDomain,
+    PossibilitySignature,
 };
-use world_core::{
-    AnchorKind, Biome, PossibilityField, RegionCoord, Trophic, LAYER_COUNT, POSSIBILITY_DIMS,
-    REGION_SIZE,
-};
+use world_core::{PossibilityField, RegionCoord, LAYER_COUNT, POSSIBILITY_DIMS, REGION_SIZE};
 use world_runtime::{
     compare_session_runtime, stream_config_from_record, AdapterClass, Budget, FrameStats,
-    GenerationStatus, RegionMap, ResourceTier, SessionCompatibility, StreamConfig, TierInputs,
-    Vault, VaultStats, CHANNEL_CANOPY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS,
-    CHANNEL_MOISTURE, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE, CHANNEL_VEGETATION,
-    CHANNEL_WETNESS,
+    RegionMap, ResourceTier, SessionCompatibility, StreamConfig, TierInputs, Vault, VaultStats,
 };
 #[cfg(test)]
 use world_runtime::{RouteTracker, Storage, VaultPersistenceError};
 
 use executor::LaneExecutor;
-use panel::{CursorInfo, EcologyInfo, Hud, OrganismInfo, PanelInfo, VaultInfo};
+use panel::Hud;
 use pov::{PovCamera, PovChunkManager, PovCounters, PovOrganismCounters, PovOrganismManager};
 use tools::FileStorage;
 use viz::{Channel, MapComposer, MapDecor, Overlays};
@@ -242,6 +243,52 @@ mod native_map_rect_tests {
             PixelRect::new(0, 0, 1, 2),
         ] {
             assert_eq!(NativeMapRects::resolve(surface, 600, 300), None);
+        }
+    }
+
+    #[test]
+    fn pov_panel_upload_retries_after_failed_present_then_retains() {
+        let mut uploaded_revision = None;
+        let revision = 0x1234;
+        let dimensions = (840, 800);
+
+        assert_eq!(
+            commit_pov_panel_upload(&mut uploaded_revision, revision, dimensions, false),
+            0
+        );
+        assert_eq!(uploaded_revision, None, "failed present must leave a retry");
+        assert_eq!(
+            commit_pov_panel_upload(&mut uploaded_revision, revision, dimensions, true),
+            u64::from(dimensions.0) * u64::from(dimensions.1) * 4
+        );
+        assert_eq!(uploaded_revision, Some(revision));
+        assert_eq!(
+            commit_pov_panel_upload(&mut uploaded_revision, revision, dimensions, true),
+            0,
+            "unchanged panel retains its texture"
+        );
+    }
+
+    #[test]
+    fn pov_camera_center_and_aspect_come_from_the_uncovered_pane() {
+        for (width, height) in [(1280, 720), (901, 701), (509, 701)] {
+            let rects = NativeMapRects::resolve(
+                PixelRect::new(0, 0, width, height),
+                800,
+                panel::PANEL_WIDTH as u32,
+            )
+            .expect("visible POV and panel panes");
+            let center = (
+                rects.map.x + rects.map.width / 2,
+                rects.map.y + rects.map.height / 2,
+            );
+            assert!(rects.map.contains(center.0, center.1));
+            assert!(!rects.panel.contains(center.0, center.1));
+            assert_eq!(
+                rects.map.width as f32 / rects.map.height as f32,
+                1.0,
+                "POV projection uses the square physical pane"
+            );
         }
     }
 }
@@ -411,6 +458,148 @@ impl PovGroundSampler for NativeGroundSampler<'_> {
     }
 }
 
+/// Native invalidation and warning state around the shared panel cache.
+/// Wall-clock cadence remains a shell concern; model construction and all
+/// formatting remain in `viewer-host`.
+#[derive(Debug)]
+struct NativePanelState {
+    cache: PanelDocumentCache,
+    warnings: WarningRegistry,
+    state_revision: u64,
+    hover_revision: u64,
+    telemetry_revision: u64,
+    platform_revision: u64,
+    document_revision: u64,
+    last_state_frame: Option<u64>,
+    last_hover: HoverInfo,
+    last_renderer: RendererInfo,
+    last_persistence: PersistenceInfo,
+    last_streaming: StreamingSupplement,
+    last_warning_revision: u64,
+}
+
+impl Default for NativePanelState {
+    fn default() -> Self {
+        Self {
+            cache: PanelDocumentCache::default(),
+            warnings: WarningRegistry::default(),
+            state_revision: 0,
+            hover_revision: 0,
+            telemetry_revision: 0,
+            platform_revision: 0,
+            document_revision: 0,
+            last_state_frame: None,
+            last_hover: HoverInfo::None,
+            last_renderer: RendererInfo::default(),
+            last_persistence: PersistenceInfo::default(),
+            last_streaming: StreamingSupplement::default(),
+            last_warning_revision: 0,
+        }
+    }
+}
+
+impl NativePanelState {
+    fn retain_warning(&mut self, warning: ViewerWarning) {
+        self.warnings.upsert(warning);
+    }
+
+    fn telemetry_rolled(&mut self) {
+        self.telemetry_revision = self.telemetry_revision.saturating_add(1);
+    }
+
+    fn renderer_for_pov(
+        &self,
+        requested: MapBackend,
+        surface_format: Option<String>,
+        surface_losses: u32,
+    ) -> RendererInfo {
+        RendererInfo {
+            requested_map_backend: requested,
+            surface_format,
+            surface_losses,
+            ..self.last_renderer.clone()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn document(
+        &mut self,
+        tick: &TickOutput,
+        world: &ExplorationWorld,
+        hover: HoverInfo,
+        performance: PerformanceInfo,
+        streaming: StreamingSupplement,
+        persistence: PersistenceInfo,
+        renderer: RendererInfo,
+        capture: CapturePreferences,
+        split_ratio: f32,
+    ) -> PanelDocument {
+        let view_changed = self.cache.document().is_some_and(|document| {
+            let view = &document.model.view;
+            document.model.frame.traveler != tick.traveler
+                || view.mode != tick.mode
+                || view.focused != tick.focused
+                || view.map_channel != tick.map.channel
+                || view.map_zoom != tick.map.zoom
+                || view.map_overlays != tick.map.overlays
+                || view.map_refinement != tick.map.refinement
+                || view.camera != tick.pov.into()
+                || view.split_ratio != split_ratio
+        });
+        if (tick.dirty.panel || view_changed) && self.last_state_frame != Some(tick.frame) {
+            self.state_revision = self.state_revision.saturating_add(1);
+            self.last_state_frame = Some(tick.frame);
+        }
+        if hover != self.last_hover {
+            self.last_hover = hover.clone();
+            self.hover_revision = self.hover_revision.saturating_add(1);
+        }
+        if renderer != self.last_renderer
+            || persistence != self.last_persistence
+            || streaming != self.last_streaming
+        {
+            self.last_renderer = renderer.clone();
+            self.last_persistence = persistence.clone();
+            self.last_streaming = streaming;
+            self.platform_revision = self.platform_revision.saturating_add(1);
+        }
+        let warning_revision = self.warnings.revision();
+        if warning_revision != self.last_warning_revision {
+            self.last_warning_revision = warning_revision;
+            self.platform_revision = self.platform_revision.saturating_add(1);
+        }
+
+        let key = PanelDocumentKey {
+            state: self.state_revision,
+            hover: self.hover_revision,
+            telemetry: self.telemetry_revision,
+            platform: self.platform_revision,
+        };
+        let next_revision = self.document_revision.saturating_add(1);
+        let warnings = self.warnings.warnings();
+        let (document, built) = self.cache.get_or_build(key, || {
+            build_panel_document(PanelBuildInput {
+                tick,
+                world,
+                hover,
+                performance,
+                streaming,
+                persistence,
+                renderer,
+                capture,
+                warnings,
+                split_ratio,
+                revision: next_revision,
+            })
+        });
+        let document = document.clone();
+        if built {
+            self.document_revision = next_revision;
+        }
+        document
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -420,6 +609,11 @@ struct App {
     executor: Box<dyn world_runtime::TaskExecutor>,
     composer: MapComposer,
     hud: Hud,
+    /// One semantic document cache shared by Map, POV, screenshots, and dumps.
+    panel_state: NativePanelState,
+    /// Latest controller output, retained so an F12 effect in the same tick and
+    /// windowless dump tests use the canonical model builder.
+    last_tick_output: Option<TickOutput>,
     /// The detected (or overridden) resource tier (phase-6-plan.md §6.7).
     tier: ResourceTier,
     /// Atlas slot assignment + delta-upload keys for the GPU map.
@@ -441,13 +635,14 @@ struct App {
     pov_counters_last: PovCounters,
     /// Previous organism lifecycle totals for the POV telemetry delta line.
     pov_organism_counters_last: PovOrganismCounters,
-    /// The POV HUD chip (fps + frame-budget split), rebuilt only when the
-    /// displayed text changes: `(rgba, width, height, text it shows)`.
-    pov_fps_chip: Option<(Vec<u8>, u32, u32, String)>,
-    /// Content hashes of the last uploaded overlay/panel strips, so an
-    /// unchanged strip uploads nothing (steady-state upload ≈ 0, §6.5).
+    /// Content hashes of the last uploaded overlay strips, so an unchanged
+    /// strip uploads nothing (steady-state upload ≈ 0, §6.5).
     overlay_hashes: [u64; 2],
-    panel_hash: u64,
+    /// Shared-document revision last uploaded by the GPU-map panel pass.
+    panel_revision: Option<u64>,
+    /// Shared-document revision last uploaded for POV; `None` forces the
+    /// initial upload while unchanged frames retain the renderer texture.
+    pov_panel_revision: Option<u64>,
     /// Map hover in physical surface pixels, sampled from shared frame input.
     cursor_pos: Option<(f64, f64)>,
     /// Cumulative regenerated-tile counts per layer (panel telemetry).
@@ -486,6 +681,11 @@ struct App {
 
 impl App {
     fn new(inline: bool, tier: ResourceTier) -> Self {
+        // Native help remains descriptor-validated outside the bitmap panel;
+        // the M6 panel renderer no longer embeds or formats control rows.
+        debug_assert!(input::NATIVE_HELP_ROWS.iter().all(|row| {
+            !row.keys.is_empty() && !row.action.is_empty() && !row.binding_ids.is_empty()
+        }));
         let mut cfg = tier.stream_config();
         if let Some(mb) = std::env::var("WER_CACHE_MB")
             .ok()
@@ -532,6 +732,8 @@ impl App {
             tier,
             composer,
             hud,
+            panel_state: NativePanelState::default(),
+            last_tick_output: None,
             atlas: AtlasManager::default(),
             pov_chunks: PovChunkManager::new(),
             pov_organisms: PovOrganismManager::new(),
@@ -544,9 +746,9 @@ impl App {
             winit_input: input::WinitInputAdapter::default(),
             pov_counters_last: PovCounters::default(),
             pov_organism_counters_last: PovOrganismCounters::default(),
-            pov_fps_chip: None,
             overlay_hashes: [0; 2],
-            panel_hash: 0,
+            panel_revision: None,
+            pov_panel_revision: None,
             cursor_pos: None,
             regen_totals: [0; LAYER_COUNT as usize],
             last_stats: FrameStats::default(),
@@ -716,11 +918,14 @@ impl App {
                         );
                     }
                 }
-                ViewerEffect::ReportWarning(warning) => match warning.severity {
-                    Severity::Info => log::info!("{}: {}", warning.id, warning.message),
-                    Severity::Warning => log::warn!("{}: {}", warning.id, warning.message),
-                    Severity::Error => log::error!("{}: {}", warning.id, warning.message),
-                },
+                ViewerEffect::ReportWarning(warning) => {
+                    match warning.severity {
+                        Severity::Info => log::info!("{}: {}", warning.id, warning.message),
+                        Severity::Warning => log::warn!("{}: {}", warning.id, warning.message),
+                        Severity::Error => log::error!("{}: {}", warning.id, warning.message),
+                    }
+                    self.panel_state.retain_warning(warning);
+                }
             }
         }
     }
@@ -957,10 +1162,8 @@ impl App {
         }
     }
 
-    /// The panel's vault counters, shared by the live frame and the `F12`
-    /// debug dump.
-    fn vault_panel_info(&self) -> Option<VaultInfo> {
-        self.services.vault.as_ref().map(|v| VaultInfo {
+    fn persistence_info(&self) -> PersistenceInfo {
+        let vault = self.services.vault.as_ref().map(|v| VaultInfo {
             records: v.discoveries().len() + v.routes().len() + v.preserves().len(),
             dirty: v.dirty_records(),
             seen: v.seen_count(),
@@ -969,7 +1172,133 @@ impl App {
             persistence_retries: v
                 .active_persistence_issue()
                 .map_or(0, world_runtime::VaultIssue::occurrences),
-        })
+        });
+        PersistenceInfo {
+            mode: if vault.is_some() {
+                String::from("filesystem")
+            } else {
+                String::from("unavailable")
+            },
+            available: vault.is_some(),
+            vault,
+            pending_writes: 0,
+            failures: 0,
+            path_tracking: false,
+            route_recording: false,
+            route_attraction: false,
+        }
+    }
+
+    fn platform_telemetry(&self) -> PlatformTelemetry {
+        PlatformTelemetry {
+            present_ms: self.render_ms,
+            dom_updates: 0,
+            surface_format: self
+                .renderer
+                .as_ref()
+                .map(renderer::Renderer::surface_format_name),
+            executor_backend: if self.executor.parallelism() == 1 {
+                WorkerBackend::Inline
+            } else {
+                WorkerBackend::Workers
+            },
+            workers: self.executor.parallelism(),
+            storage_available: self.services.vault.is_some(),
+        }
+    }
+
+    fn panel_performance(&self) -> PerformanceInfo {
+        PerformanceInfo {
+            fps: self.fps,
+            update_ms: self.update_ms,
+            compose_ms: self.compose_ms,
+            present_ms: self.render_ms,
+            upload_kib_per_frame: self.upload_kb,
+            pass_ms: self.pass_ms,
+            dom_updates: 0,
+        }
+    }
+
+    fn streaming_supplement(&self, pinned_violations: u64) -> StreamingSupplement {
+        let map = self.controller.world().map();
+        StreamingSupplement {
+            regen_totals: self.regen_totals,
+            macro_tiles: map.macro_cache().len(),
+            rosters: map.roster_cache().len(),
+            organisms: map.organism_count(),
+            jobs_in_flight: map.jobs_in_flight(),
+            pinned_violations,
+        }
+    }
+
+    fn synthetic_tick_output(&self) -> TickOutput {
+        let layout = self.controller.layout();
+        TickOutput {
+            frame: 0,
+            update_serial: 0,
+            mode: layout.mode,
+            focused: layout.focused,
+            traveler: self.controller.world().traveler().position,
+            travel: 0.0,
+            stats: self.last_stats,
+            map: self.controller.map_preferences(),
+            pov: self.controller.pov_state(),
+            effects: Vec::new(),
+            platform: self.platform_telemetry(),
+            dirty: PresentationDirty {
+                map: false,
+                pov: false,
+                panel: true,
+            },
+            needs_frame: false,
+        }
+    }
+
+    fn panel_document_for(&mut self, hover: HoverInfo, renderer: RendererInfo) -> PanelDocument {
+        let tick = self
+            .last_tick_output
+            .clone()
+            .unwrap_or_else(|| self.synthetic_tick_output());
+        let performance = self.panel_performance();
+        let streaming = self.streaming_supplement(self.composer.pinned_violations);
+        let persistence = self.persistence_info();
+        let capture = self.controller.capture_preferences();
+        let split_ratio = self.controller.layout().split_ratio;
+        self.panel_state.document(
+            &tick,
+            self.controller.world(),
+            hover,
+            performance,
+            streaming,
+            persistence,
+            renderer,
+            capture,
+            split_ratio,
+        )
+    }
+
+    fn debug_panel_document(&mut self) -> PanelDocument {
+        let preferences = self.controller.map_preferences();
+        let hover = match self.controller.layout().mode {
+            PresentationMode::Map | PresentationMode::Split => viewer_host::map_hover(
+                self.controller.world().map(),
+                Some(self.controller.world().traveler().position),
+                preferences.zoom,
+            ),
+            PresentationMode::Pov => HoverInfo::None,
+        };
+        let surface_format = self
+            .renderer
+            .as_ref()
+            .map(renderer::Renderer::surface_format_name);
+        let surface_losses = self
+            .renderer
+            .as_ref()
+            .map_or(0, renderer::Renderer::surface_losses);
+        let renderer =
+            self.panel_state
+                .renderer_for_pov(preferences.backend, surface_format, surface_losses);
+        self.panel_document_for(hover, renderer)
     }
 
     /// The vault-derived map decorations for this frame (phase-5-plan.md
@@ -1021,83 +1350,6 @@ impl App {
             preserves,
             routes,
         }
-    }
-
-    /// Everything the panel shows for the map cell at `world`.
-    fn sample_cursor(map: &RegionMap, world: (f64, f64)) -> CursorInfo {
-        let coord = RegionCoord::from_world(world.0, world.1);
-        let (stability, revision, status) = match map.get(coord) {
-            Some(r) => (
-                r.stability,
-                r.revision,
-                match r.status {
-                    GenerationStatus::Unloaded => "unloaded",
-                    GenerationStatus::Generating => "generating",
-                    GenerationStatus::Ready => "ready",
-                },
-            ),
-            None => (0.0, 0, "not resident"),
-        };
-        let res = map.config().field_resolution;
-        let (ox, oy) = coord.origin();
-        let cell = REGION_SIZE / f64::from(res);
-        // Negative float→int casts saturate to 0, so the clamp is total.
-        let cx = (((world.0 - ox) / cell) as u16).min(res - 1);
-        let cy = (((world.1 - oy) / cell) as u16).min(res - 1);
-        let sample = |channel: usize| map.cache().channel(coord, channel).map(|t| t.get(cx, cy));
-        CursorInfo {
-            world,
-            region: (coord.x, coord.y),
-            stability,
-            revision,
-            status,
-            elevation: sample(CHANNEL_ELEVATION),
-            temperature: sample(CHANNEL_TEMPERATURE),
-            moisture: sample(CHANNEL_MOISTURE),
-            hardness: sample(CHANNEL_HARDNESS),
-            river: sample(CHANNEL_RIVER),
-            wetness: sample(CHANNEL_WETNESS),
-            soil_depth: sample(CHANNEL_SOIL_DEPTH),
-            fertility: sample(CHANNEL_FERTILITY),
-            vegetation: sample(CHANNEL_VEGETATION),
-            canopy: sample(CHANNEL_CANOPY),
-            biome: map
-                .cache()
-                .biome(coord)
-                .map(|t| Biome::from_id(t.get(cx, cy)).name()),
-            ecology: map.cell_ecology(coord, cx, cy).map(|e| EcologyInfo {
-                roster_size: e.roster.roster.species.len(),
-                dominant_id: e.dominant_id,
-                trophic_counts: e.trophic_counts,
-                herbivore: e.herbivore.unwrap_or(0.0),
-                predator: e.predator.unwrap_or(0.0),
-                diversity: e.diversity.unwrap_or(0.0),
-            }),
-        }
-    }
-
-    /// The realized organism whose marker sits under `world`, if any: the
-    /// nearest one within one field cell (a marker is one base-map pixel, i.e.
-    /// one cell). Reads the transient near-field realization (phase-3-plan.md
-    /// §7.6) — a debug readout, never a source of identity.
-    fn pick_organism(map: &RegionMap, world: (f64, f64), zoom: u32) -> Option<OrganismInfo> {
-        viewer_host::pick_organism(map, world, zoom).map(|org| OrganismInfo {
-            id: org.id,
-            species: org.species,
-            trophic: match org.trophic {
-                Trophic::Producer => "producer",
-                Trophic::Herbivore => "herbivore",
-                Trophic::Omnivore => "omnivore",
-                Trophic::Carnivore => "carnivore",
-                Trophic::Decomposer => "decomposer",
-            },
-            world: org.world_pos,
-            hue: org.expressed.hue,
-            luminance: org.expressed.luminance,
-            size: org.expressed.size,
-            activity: org.expressed.activity,
-            aggression: org.expressed.aggression,
-        })
     }
 
     /// Resolve this frame's native HUD rectangles and exact map projection.
@@ -1190,6 +1442,7 @@ impl App {
             self.compose_time_accum = 0.0;
             self.render_time_accum = 0.0;
             self.last_telemetry = Instant::now();
+            self.panel_state.telemetry_rolled();
         }
     }
 
@@ -1204,6 +1457,7 @@ impl App {
         self.input.set_context(context);
         let input = self.input.take_frame();
         self.cursor_pos = input.map_pointer.map(|point| (point[0], point[1]));
+        let platform = self.platform_telemetry();
         let update_start = Instant::now();
         let ground = NativeGroundSampler {
             chunks: &self.pov_chunks,
@@ -1212,18 +1466,7 @@ impl App {
             TickInput {
                 dt_seconds: dt,
                 input,
-                platform: PlatformTelemetry {
-                    present_ms: self.render_ms,
-                    dom_updates: 0,
-                    surface_format: None,
-                    executor_backend: if self.executor.parallelism() == 1 {
-                        WorkerBackend::Inline
-                    } else {
-                        WorkerBackend::Workers
-                    },
-                    workers: self.executor.parallelism(),
-                    storage_available: self.services.vault.is_some(),
-                },
+                platform,
             },
             self.executor.as_ref(),
             &mut self.services,
@@ -1252,7 +1495,9 @@ impl App {
                 context,
             );
         }
-        self.handle_effects(std::mem::take(&mut output.effects), event_loop);
+        let effects = std::mem::take(&mut output.effects);
+        self.last_tick_output = Some(output.clone());
+        self.handle_effects(effects, event_loop);
 
         if output.mode == PresentationMode::Pov {
             self.frame_pov(&output, update_seconds);
@@ -1265,19 +1510,17 @@ impl App {
             return;
         };
         let cursor_world = self.cursor_world_in(map_projection);
-        let cursor =
-            cursor_world.map(|world| Self::sample_cursor(self.controller.world().map(), world));
-        // Zoomed in far enough, the cursor picks the organism marker under it
-        // (the region info stays whenever no organism is under the mouse).
-        let organism = cursor_world.and_then(|world| {
-            Self::pick_organism(self.controller.world().map(), world, output.map.zoom)
-        });
+        let hover =
+            viewer_host::map_hover(self.controller.world().map(), cursor_world, output.map.zoom);
 
         let decor = self.build_decor();
         self.composer.set_zoom(output.map.zoom);
         let capture = self.controller.capture_preferences();
-        let vault = self.vault_panel_info();
         let pinned_violations = self.composer.pinned_violations;
+        let performance = self.panel_performance();
+        let streaming = self.streaming_supplement(pinned_violations);
+        let persistence = self.persistence_info();
+        let split_ratio = self.controller.layout().split_ratio;
         let compose_start = Instant::now();
         let packet = {
             let world = self.controller.world();
@@ -1301,52 +1544,41 @@ impl App {
                 },
             )
         };
-        let use_gpu = packet.backend == MapBackend::GpuAtlas;
         let prepared_pixel_hash = packet.pixel_hash;
         let map_side = packet.projection.side;
-        let world = self.controller.world();
-        let info = PanelInfo {
-            fps: self.fps,
-            update_ms: self.update_ms,
-            compose_ms: self.compose_ms,
-            render_ms: self.render_ms,
-            upload_kb: self.upload_kb,
-            gpu_compose: use_gpu,
-            tier: self.tier.name(),
-            cache_ceiling_bytes: world.map().config().max_field_cache_bytes,
-            pass_ms: self.pass_ms,
-            workers: self.executor.parallelism(),
-            stats,
-            regen_totals: &self.regen_totals,
-            macro_tiles: world.map().macro_cache().len(),
-            rosters: world.map().roster_cache().len(),
-            organisms: world.map().organism_count(),
-            jobs_in_flight: world.map().jobs_in_flight(),
-            pinned_violations,
-            channel: output.map.channel,
-            player: output.traveler,
-            bias: world.bias(),
-            anchors: world.anchors(),
-            capture_category: capture.category.name(),
-            capture_polarity: capture.polarity,
-            transition_mode: world.transition_mode(),
-            vault,
-            zoom: output.map.zoom,
-            cursor,
-            organism,
+        let renderer_info = RendererInfo {
+            requested_map_backend: packet.requested_backend,
+            effective_map_backend: packet.backend,
+            map_fallback: packet.fallback,
+            surface_format: output.platform.surface_format.clone(),
+            device_losses: 0,
+            surface_losses: self
+                .renderer
+                .as_ref()
+                .map_or(0, renderer::Renderer::surface_losses),
         };
+        let document = self.panel_state.document(
+            &output,
+            self.controller.world(),
+            hover,
+            performance,
+            streaming,
+            persistence,
+            renderer_info,
+            capture,
+            split_ratio,
+        );
         let mut upload_bytes = 0u64;
         let (compose_seconds, render_seconds) = match packet.source {
             PreparedMapSource::GpuAtlas(gpu) => {
                 // Delta uploads: only regions whose dependency-hash key
-                // changed, plus overlay/panel strips whose shared pixel hash
-                // changed.
-                let (panel_hash, panel_w) = {
-                    let (panel, width, height) = self.hud.panel_image(&info);
-                    let hash = hash_bytes(panel);
-                    let changed = hash != self.panel_hash;
-                    (hash, changed.then_some((width, height)))
-                };
+                // changed, plus overlay strips or a shared panel document
+                // whose semantic revision changed.
+                let (_, panel_width, panel_height, _) = self
+                    .hud
+                    .panel_image_for(document.revision, &document.sections);
+                let panel_w = (self.panel_revision != Some(document.revision))
+                    .then_some((panel_width, panel_height));
                 debug_assert_eq!(prepared_pixel_hash, gpu.overlay_hash);
                 let pre_grid_changed = gpu.pre_grid_hash != self.overlay_hashes[0];
                 let post_grid_changed = gpu.post_grid_hash != self.overlay_hashes[1];
@@ -1369,21 +1601,21 @@ impl App {
                         frame_rects.panel_viewport(),
                         CLEAR_COLOR,
                     ) {
-                        self.panel_hash = panel_hash;
+                        self.panel_revision = Some(document.revision);
                         self.overlay_hashes = [gpu.pre_grid_hash, gpu.post_grid_hash];
                         upload_bytes = bytes;
                     } else {
                         // Atlas keys were consumed while preparing this packet;
                         // retry a complete upload after surface recovery.
                         self.atlas = AtlasManager::default();
-                        self.panel_hash = 0;
+                        self.panel_revision = None;
                         self.overlay_hashes = [0; 2];
                     }
                 }
                 (compose_seconds, render_start.elapsed().as_secs_f64())
             }
             PreparedMapSource::Cpu(cpu) => {
-                let (panel, panel_width, panel_height) = self.hud.panel_image(&info);
+                let (panel, panel_width, panel_height) = self.hud.panel_image(&document.sections);
                 let compose_seconds = compose_start.elapsed().as_secs_f64();
                 let render_start = Instant::now();
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -1416,8 +1648,9 @@ impl App {
 
     /// The POV half of [`Self::frame`] (3d-phase-1-plan.md §8.1): sync the
     /// chunk lifecycle, build the frame parameters with glam, and present
-    /// through [`Renderer::render_pov`]. HUD, panel, and cursor info are
-    /// skipped in POV (design §2.1); the telemetry accumulators still run.
+    /// through [`Renderer::render_pov`]. The complete shared panel document is
+    /// built once and mounted as the POV information rail; M8 only changes how
+    /// the already-shared passes are planned.
     fn frame_pov(&mut self, output: &TickOutput, update_seconds: f64) {
         let mut stats = output.stats;
         let camera = self.controller.pov_camera();
@@ -1449,10 +1682,54 @@ impl App {
             mesh_start.elapsed().as_secs_f32() * 1000.0;
         self.last_stats = stats;
 
+        let mut panel_tick = output.clone();
+        panel_tick.stats = stats;
+        self.last_tick_output = Some(panel_tick.clone());
+        let surface_format = self
+            .renderer
+            .as_ref()
+            .map(renderer::Renderer::surface_format_name);
+        let surface_losses = self
+            .renderer
+            .as_ref()
+            .map_or(0, renderer::Renderer::surface_losses);
+        let renderer_info =
+            self.panel_state
+                .renderer_for_pov(output.map.backend, surface_format, surface_losses);
+        let performance = self.panel_performance();
+        let streaming = self.streaming_supplement(self.composer.pinned_violations);
+        let persistence = self.persistence_info();
+        let capture = self.controller.capture_preferences();
+        let split_ratio = self.controller.layout().split_ratio;
+        let document = self.panel_state.document(
+            &panel_tick,
+            self.controller.world(),
+            HoverInfo::None,
+            performance,
+            streaming,
+            persistence,
+            renderer_info,
+            capture,
+            split_ratio,
+        );
+
         let render_start = Instant::now();
         let mut organism_buffer_stats = None;
         if let Some(renderer) = self.renderer.as_mut() {
             let (w, h) = renderer.size();
+            let (panel_rgba, panel_width, panel_height, _) = self
+                .hud
+                .panel_image_for(document.revision, &document.sections);
+            let panel_changed = self.pov_panel_revision != Some(document.revision);
+            let Some(frame_rects) =
+                NativeMapRects::resolve(PixelRect::new(0, 0, w, h), panel_height, panel_width)
+            else {
+                return;
+            };
+            let pov_viewport = frame_rects.map_viewport();
+            let panel_viewport = frame_rects
+                .panel_viewport()
+                .expect("resolved native POV panel has a visible viewport");
             // The water-wobble clock (3d-phase-3-plan.md §7.1): wrapped at
             // the shader's period so f32 never loses phase precision.
             let time = self
@@ -1469,39 +1746,39 @@ impl App {
             );
             let params = pov::frame_params(
                 self.controller.pov_camera(),
-                w as f32 / h.max(1) as f32,
+                pov_viewport.width as f32 / pov_viewport.height.max(1) as f32,
                 self.pov_radius,
                 CLEAR_COLOR,
                 time,
                 self.controller.pov_toggles(),
                 shadow,
             );
-            // The corner HUD chip: fps plus the frame-budget split — `upd`
-            // is the world update, `gpu` is the whole render+present call —
-            // so a present-bound frame (the llvmpipe/WSLg regime, where
-            // window pixels dominate and shading toggles barely move fps)
-            // is visible at a glance. Rebuilt only when the once-per-second
-            // telemetry roll changes the text.
-            let text = format!(
-                "{:>4} fps  upd {:>5.1}ms  gpu {:>5.1}ms",
-                self.fps, self.update_ms, self.render_ms
-            );
-            if !matches!(&self.pov_fps_chip, Some((_, _, _, shown)) if *shown == text) {
-                let (rgba, cw, ch) = panel::hud_chip(&text);
-                self.pov_fps_chip = Some((rgba, cw, ch, text));
-            }
-            let hud = self
-                .pov_fps_chip
-                .as_ref()
-                .map(|(rgba, cw, ch, _)| (rgba.as_slice(), *cw, *ch));
-            renderer.render_pov(
+            // Keep the complete shared information surface mounted beside a
+            // projection-correct POV pane. Unchanged panel pixels retain the
+            // renderer texture and incur no upload.
+            let information = Some(PovInformationSurface {
+                upload: panel_changed.then_some(PovInformationUpload {
+                    rgba: panel_rgba,
+                    width: panel_width,
+                    height: panel_height,
+                }),
+                viewport: panel_viewport,
+            });
+            let rendered = renderer.render_pov(
                 &params,
                 &uploads,
                 &removes,
                 organism_upload,
                 CLEAR_COLOR,
-                hud,
+                pov_viewport,
+                information,
                 output.pov.render_scale,
+            );
+            upload_bytes += commit_pov_panel_upload(
+                &mut self.pov_panel_revision,
+                document.revision,
+                (panel_width, panel_height),
+                rendered,
             );
             organism_buffer_stats = renderer.pov_organism_stats();
             if let Some(buffers) = organism_buffer_stats {
@@ -1582,8 +1859,7 @@ impl ApplicationHandler for App {
             return; // already initialized (e.g. resume after suspend)
         }
 
-        let mut attributes = Window::default_attributes()
-            .with_title("Infinite World Exploration — Phase 1 continuity prototype");
+        let mut attributes = Window::default_attributes().with_title("Infinite World Exploration");
         // `WER_WINDOW=WxH`: fixed window size, for reproducible performance
         // measurements (fragment and present cost scale with pixel count on
         // a software rasterizer, so comparable numbers need a pinned size).
@@ -1703,21 +1979,20 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Order-stable content hash of a pixel strip, for skipping unchanged
-/// overlay/panel uploads (phase-6-plan.md §6.5).
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0x0DDB_1A5E_D0F0_0006;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        h = world_core::mix(
-            h,
-            u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")),
-        );
+/// Commit a POV information-texture upload only after the surface frame was
+/// actually drawn. A lost/occluded first frame must retry its initial upload;
+/// unchanged successful frames retain the texture and report zero bytes.
+fn commit_pov_panel_upload(
+    uploaded_revision: &mut Option<u64>,
+    current_revision: u64,
+    dimensions: (u32, u32),
+    rendered: bool,
+) -> u64 {
+    if !rendered || *uploaded_revision == Some(current_revision) {
+        return 0;
     }
-    for &b in chunks.remainder() {
-        h = world_core::mix(h, u64::from(b));
-    }
-    h
+    *uploaded_revision = Some(current_revision);
+    u64::from(dimensions.0) * u64::from(dimensions.1) * 4
 }
 
 /// Headless screenshot: settle the streaming window at `pos` and write the
@@ -1726,97 +2001,109 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// from the command line.
 fn run_screenshot(path: &str, channel: Channel, pos: (f64, f64), zoom: u32) -> Result<(), String> {
     let cfg = StreamConfig::default();
-    let field = PossibilityField::default();
-    let bias = [0.0f32; POSSIBILITY_DIMS];
-    let mut map = RegionMap::new(cfg);
+    let mut world = ExplorationWorld::with_runtime(cfg, Budget::unlimited(), ResourceTier::Low);
+    world.restore_traveler(pos, pos);
+    let mut controller = ViewerController::new(world);
+    let mut hook = NoopWorldTickHook;
+    let ground = viewer_host::AnalyticGroundSampler;
     // Unbudgeted warm-up with the inline executor: fully loaded and generated.
-    let mut stats = FrameStats::default();
+    let mut output = None;
     let mut regen_totals = [0u64; LAYER_COUNT as usize];
     for _ in 0..8 {
         // Zero travel: fresh regions snap to target at load, and regeneration
         // is not gated on movement, so the window still settles fully.
-        stats = map.update(
-            pos,
-            0.0,
-            &field,
-            &[],
-            &bias,
-            &Budget::unlimited(),
+        let tick = controller.tick(
+            TickInput {
+                dt_seconds: 0.0,
+                input: InputFrame::default(),
+                platform: PlatformTelemetry::default(),
+            },
             &world_runtime::InlineExecutor,
-            false,
+            &mut hook,
+            &ground,
         );
-        for (total, &count) in regen_totals.iter_mut().zip(&stats.regenerated_by_layer) {
+        for (total, &count) in regen_totals
+            .iter_mut()
+            .zip(&tick.stats.regenerated_by_layer)
+        {
             *total += count as u64;
         }
+        output = Some(tick);
     }
-
-    let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
-    let mut composer = MapComposer::new(half_regions, cfg.field_resolution);
-    composer.set_zoom(zoom);
-    composer.update_for_tick(1, &map);
-    let overlays = Overlays {
+    let mut output = output.expect("headless warm-up runs at least once");
+    output.map.channel = channel;
+    output.map.zoom = zoom;
+    output.map.backend = MapBackend::Cpu;
+    output.map.overlays = Overlays {
         grid: false,
         rings: false,
         pinned_flash: false,
         organisms: true,
         discovered: false,
     };
-    composer.compose(&map, pos, channel, overlays, &[], &MapDecor::default());
 
-    // The organism readout, exactly as the live cursor picks it (the
-    // "cursor" sits at the given position).
-    let organism = if zoom >= ORGANISM_INFO_ZOOM {
-        let picked = App::pick_organism(&map, pos, zoom);
-        match &picked {
-            Some(o) => log::info!(
-                "picked organism {:#018x} ({} at {:.0}, {:.0})",
-                o.id,
-                o.trophic,
-                o.world.0,
-                o.world.1
-            ),
-            None => log::info!("no organism within a cell of ({}, {})", pos.0, pos.1),
-        }
-        picked
-    } else {
-        None
-    };
-
-    // Include the info panel (cursor pinned at the given position) so HUD
-    // rendering is inspectable headlessly too.
-    let mut hud = Hud::new(composer.side() as usize);
-    let info = PanelInfo {
-        fps: 0,
-        update_ms: 0.0,
-        compose_ms: 0.0,
-        render_ms: 0.0,
-        upload_kb: 0.0,
-        gpu_compose: false,
-        tier: "low",
-        cache_ceiling_bytes: cfg.max_field_cache_bytes,
-        pass_ms: stats.pass_ms,
-        workers: 1,
-        stats,
-        regen_totals: &regen_totals,
-        macro_tiles: map.macro_cache().len(),
-        rosters: map.roster_cache().len(),
-        organisms: map.organism_count(),
-        jobs_in_flight: map.jobs_in_flight(),
-        pinned_violations: composer.pinned_violations,
+    let half_regions = (cfg.load_radius / REGION_SIZE).ceil() as i32;
+    let mut composer = MapComposer::new(half_regions, cfg.field_resolution);
+    composer.set_zoom(zoom);
+    let map = controller.world().map();
+    composer.update_for_tick(output.update_serial, map);
+    composer.compose(
+        map,
+        pos,
         channel,
-        player: pos,
-        bias: &bias,
-        anchors: &[],
-        capture_category: world_core::TraitCategory::Morphology.name(),
-        capture_polarity: AnchorKind::Emphasize,
-        transition_mode: false,
-        vault: None,
-        zoom,
-        cursor: Some(App::sample_cursor(&map, pos)),
-        organism,
-    };
+        output.map.overlays,
+        controller.world().anchors(),
+        &MapDecor::default(),
+    );
+
+    let hover = viewer_host::map_hover(map, Some(pos), zoom);
+    match &hover {
+        HoverInfo::Organism(organism) => {
+            log::info!(
+                "picked organism {:#018x} ({} at {:.0}, {:.0})",
+                organism.id,
+                organism.trophic.name(),
+                organism.world.0,
+                organism.world.1
+            );
+        }
+        HoverInfo::None | HoverInfo::Terrain(_) if zoom >= ORGANISM_INFO_ZOOM => {
+            log::info!("no organism within a cell of ({}, {})", pos.0, pos.1);
+        }
+        HoverInfo::None | HoverInfo::Terrain(_) => {}
+    }
+
+    let document = build_panel_document(PanelBuildInput {
+        tick: &output,
+        world: controller.world(),
+        hover,
+        performance: PerformanceInfo {
+            pass_ms: output.stats.pass_ms,
+            ..PerformanceInfo::default()
+        },
+        streaming: StreamingSupplement {
+            regen_totals,
+            macro_tiles: map.macro_cache().len(),
+            rosters: map.roster_cache().len(),
+            organisms: map.organism_count(),
+            jobs_in_flight: map.jobs_in_flight(),
+            pinned_violations: composer.pinned_violations,
+        },
+        persistence: PersistenceInfo::default(),
+        renderer: RendererInfo {
+            requested_map_backend: MapBackend::Cpu,
+            effective_map_backend: MapBackend::Cpu,
+            ..RendererInfo::default()
+        },
+        capture: controller.capture_preferences(),
+        warnings: &[],
+        split_ratio: controller.layout().split_ratio,
+        revision: 1,
+    });
+
+    let mut hud = Hud::new(composer.side() as usize);
     let (width, height) = hud.size();
-    let pixels = hud.compose(composer.pixels(), &info);
+    let pixels = hud.compose(composer.pixels(), &document.sections);
     dump::write_ppm(std::path::Path::new(path), pixels, width, height)?;
     log::info!(
         "wrote {width}x{height} {} map+panel at ({}, {}) to {path}",
@@ -2719,6 +3006,194 @@ mod alignment_characterization_tests {
         map
     }
 
+    #[test]
+    fn native_panel_cache_builds_for_map_and_pov_semantic_changes() {
+        let world = ExplorationWorld::with_runtime(
+            StreamConfig {
+                near_radius: 0.0,
+                far_radius: 0.0,
+                load_radius: 0.0,
+                unload_radius: 1.0,
+                ..StreamConfig::default()
+            },
+            Budget::unlimited(),
+            ResourceTier::Low,
+        );
+        let mut controller = ViewerController::new(world);
+        let mut hook = NoopWorldTickHook;
+        let mut tick = controller.tick(
+            TickInput {
+                dt_seconds: 0.0,
+                input: InputFrame::default(),
+                platform: PlatformTelemetry::default(),
+            },
+            &InlineExecutor,
+            &mut hook,
+            &viewer_host::AnalyticGroundSampler,
+        );
+        let mut panel = NativePanelState::default();
+        let map = panel.document(
+            &tick,
+            controller.world(),
+            HoverInfo::None,
+            PerformanceInfo::default(),
+            StreamingSupplement::default(),
+            PersistenceInfo::default(),
+            RendererInfo::default(),
+            controller.capture_preferences(),
+            controller.layout().split_ratio,
+        );
+        assert_eq!(map.model.view.mode, PresentationMode::Map);
+        assert_eq!(panel.cache.builds(), 1);
+
+        let repeated = panel.document(
+            &tick,
+            controller.world(),
+            HoverInfo::None,
+            PerformanceInfo::default(),
+            StreamingSupplement::default(),
+            PersistenceInfo::default(),
+            RendererInfo::default(),
+            controller.capture_preferences(),
+            controller.layout().split_ratio,
+        );
+        assert_eq!(repeated.revision, map.revision);
+        assert_eq!(panel.cache.builds(), 1);
+
+        tick.frame = tick.frame.saturating_add(1);
+        tick.mode = PresentationMode::Pov;
+        tick.focused = ViewKind::Pov;
+        tick.pov.supported = true;
+        tick.dirty.panel = true;
+        let pov = panel.document(
+            &tick,
+            controller.world(),
+            HoverInfo::None,
+            PerformanceInfo::default(),
+            StreamingSupplement::default(),
+            PersistenceInfo::default(),
+            RendererInfo::default(),
+            controller.capture_preferences(),
+            controller.layout().split_ratio,
+        );
+        assert_eq!(pov.model.view.mode, PresentationMode::Pov);
+        assert_eq!(panel.cache.builds(), 2);
+        assert_eq!(
+            map.sections
+                .iter()
+                .map(|section| section.id)
+                .collect::<Vec<_>>(),
+            pov.sections
+                .iter()
+                .map(|section| section.id)
+                .collect::<Vec<_>>()
+        );
+
+        tick.frame = tick.frame.saturating_add(1);
+        tick.dirty.panel = false;
+        tick.pov.yaw += 0.25;
+        let rotated = panel.document(
+            &tick,
+            controller.world(),
+            HoverInfo::None,
+            PerformanceInfo::default(),
+            StreamingSupplement::default(),
+            PersistenceInfo::default(),
+            RendererInfo::default(),
+            controller.capture_preferences(),
+            controller.layout().split_ratio,
+        );
+        assert_eq!(rotated.model.view.camera.yaw, tick.pov.yaw);
+        assert_eq!(panel.cache.builds(), 3);
+    }
+
+    #[test]
+    fn native_warning_registry_reaches_the_shared_document() {
+        let controller = ViewerController::default();
+        let tick = TickOutput {
+            frame: 1,
+            update_serial: 0,
+            mode: PresentationMode::Map,
+            focused: ViewKind::Map,
+            traveler: (0.0, 0.0),
+            travel: 0.0,
+            stats: FrameStats::default(),
+            map: controller.map_preferences(),
+            pov: controller.pov_state(),
+            effects: Vec::new(),
+            platform: PlatformTelemetry::default(),
+            dirty: PresentationDirty {
+                map: false,
+                pov: false,
+                panel: true,
+            },
+            needs_frame: false,
+        };
+        let mut panel = NativePanelState::default();
+        panel.retain_warning(ViewerWarning {
+            id: "native-test-warning",
+            message: String::from("retained warning"),
+            severity: Severity::Warning,
+        });
+        let document = panel.document(
+            &tick,
+            controller.world(),
+            HoverInfo::None,
+            PerformanceInfo::default(),
+            StreamingSupplement::default(),
+            PersistenceInfo::default(),
+            RendererInfo::default(),
+            controller.capture_preferences(),
+            controller.layout().split_ratio,
+        );
+        assert_eq!(document.model.warnings.len(), 1);
+        assert!(document.sections.iter().any(|section| {
+            section.fields.iter().any(|field| {
+                field.id.as_str() == "warnings.native-test-warning"
+                    && field.value == "retained warning"
+            })
+        }));
+
+        let fallback = panel.document(
+            &tick,
+            controller.world(),
+            HoverInfo::None,
+            PerformanceInfo::default(),
+            StreamingSupplement::default(),
+            PersistenceInfo::default(),
+            RendererInfo {
+                requested_map_backend: MapBackend::GpuAtlas,
+                effective_map_backend: MapBackend::Cpu,
+                map_fallback: Some(viewer_host::MapBackendFallback::GpuUnavailable),
+                surface_format: Some(String::from("Bgra8UnormSrgb")),
+                surface_losses: 1,
+                ..RendererInfo::default()
+            },
+            controller.capture_preferences(),
+            controller.layout().split_ratio,
+        );
+        let field = |id: &str| {
+            fallback
+                .sections
+                .iter()
+                .flat_map(|section| &section.fields)
+                .find(|field| field.id.as_str() == id)
+                .expect("renderer diagnostic field")
+        };
+        assert_eq!(field("runtime.surface-format").value, "Bgra8UnormSrgb");
+        assert_eq!(field("runtime.surface-losses").value, "1");
+        assert!(fallback
+            .model
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "renderer-map-fallback"));
+        assert!(fallback
+            .model
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "renderer-surface-loss"));
+    }
+
     fn option_f32_bits(value: Option<f32>) -> String {
         value.map_or_else(|| String::from("none"), |v| format!("{:08x}", v.to_bits()))
     }
@@ -2888,9 +3363,10 @@ mod alignment_characterization_tests {
             .min_by_key(|organism| (organism.id, organism.slot))
             .copied()
             .expect("settled characterization map has organisms");
-        let cursor = App::sample_cursor(&map, source.world_pos);
-        let organism = App::pick_organism(&map, source.world_pos, ORGANISM_INFO_ZOOM)
-            .expect("sampling at a rendered organism selects an organism");
+        let cursor = viewer_host::sample_cell(&map, source.world_pos);
+        let organism =
+            viewer_host::pick_map_organism_info(&map, source.world_pos, ORGANISM_INFO_ZOOM)
+                .expect("sampling at a rendered organism selects an organism");
         assert_eq!(organism.id, source.id);
         assert_eq!(organism.species, source.species);
         let ecology = cursor
@@ -2909,10 +3385,10 @@ mod alignment_characterization_tests {
         writeln!(
             &mut actual,
             "cursor.region {} {}",
-            cursor.region.0, cursor.region.1
+            cursor.region.x, cursor.region.y
         )
         .unwrap();
-        writeln!(&mut actual, "cursor.status {}", cursor.status).unwrap();
+        writeln!(&mut actual, "cursor.status {}", cursor.status.as_str()).unwrap();
         writeln!(
             &mut actual,
             "cursor.stability {:08x}",
@@ -2955,21 +3431,21 @@ mod alignment_characterization_tests {
         writeln!(
             &mut actual,
             "ecology.pressure {:08x} {:08x} {:08x}",
-            ecology.herbivore.to_bits(),
-            ecology.predator.to_bits(),
-            ecology.diversity.to_bits()
+            ecology.herbivore.expect("settled herbivore").to_bits(),
+            ecology.predator.expect("settled predator").to_bits(),
+            ecology.diversity.expect("settled diversity").to_bits()
         )
         .unwrap();
         writeln!(&mut actual, "organism.id {:016x}", organism.id).unwrap();
-        writeln!(&mut actual, "organism.slot {}", source.slot).unwrap();
+        writeln!(&mut actual, "organism.slot {}", organism.slot).unwrap();
         writeln!(
             &mut actual,
             "organism.cell {} {}",
-            source.cell.cx, source.cell.cy
+            organism.cell.cx, organism.cell.cy
         )
         .unwrap();
         writeln!(&mut actual, "organism.species {:016x}", organism.species).unwrap();
-        writeln!(&mut actual, "organism.trophic {}", organism.trophic).unwrap();
+        writeln!(&mut actual, "organism.trophic {}", organism.trophic.name()).unwrap();
         writeln!(
             &mut actual,
             "organism.world {:016x} {:016x}",

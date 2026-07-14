@@ -98,6 +98,70 @@ a {
   background: var(--panel);
 }
 
+.toolbar-group {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  border-left: 1px solid var(--line);
+  padding-left: 8px;
+}
+
+.toolbar-group:first-child {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.toolbar-group-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.toolbar-disclosure {
+  display: block;
+  position: relative;
+}
+
+.toolbar-disclosure summary {
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  background: var(--panel-2);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.toolbar-disclosure-controls {
+  display: flex;
+  position: absolute;
+  z-index: 4;
+  top: calc(100% + 6px);
+  left: 8px;
+  flex-wrap: wrap;
+  width: max-content;
+  max-width: min(520px, calc(100vw - 28px));
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--panel);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 35%);
+}
+
+.map-overlay-controls,
+.map-control-group {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 6px;
+}
+
 .status-bar {
   border-top: 1px solid var(--line);
   border-bottom: 0;
@@ -153,23 +217,45 @@ button[aria-pressed="true"] {
 }
 
 .info-panel {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   border-top: 1px solid var(--line);
-  padding: 16px;
   background: var(--panel);
 }
 
-.info-panel h1 {
-  margin: 0 0 16px;
-  font-size: 22px;
+.panel-columns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
-.info-panel h2 {
-  margin: 14px 0 8px;
+.panel-column {
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  border-left: 1px solid var(--line);
+  padding: 10px 12px 16px;
+}
+
+.panel-column:first-child {
+  border-left: 0;
+}
+
+.panel-section + .panel-section {
+  margin-top: 12px;
   padding-top: 10px;
   border-top: 1px solid var(--line);
+}
+
+.panel-section h2 {
+  margin: 0 0 8px;
   color: var(--muted);
   font-size: 12px;
   font-weight: 600;
@@ -177,29 +263,60 @@ button[aria-pressed="true"] {
   text-transform: uppercase;
 }
 
-.info-panel .regen-line {
-  margin: 0 0 8px;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-}
-
-.info-panel dl {
+.panel-section dl {
   display: grid;
-  grid-template-columns: 112px minmax(0, 1fr);
-  gap: 6px 12px;
-  margin: 0 0 12px;
+  grid-template-columns: minmax(96px, 36%) minmax(0, 1fr);
+  gap: 5px 10px;
+  margin: 0;
   font-size: 13px;
 }
 
-.info-panel dt {
-  color: var(--muted);
+.panel-field {
+  display: contents;
 }
 
-.info-panel dd {
+.panel-field[hidden] {
+  display: none;
+}
+
+.panel-field dt {
+  grid-column: 1;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.panel-field dd {
+  grid-column: 2;
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.panel-field[data-span="wide"] dd {
+  grid-column: 1 / -1;
+  padding-left: 8px;
+  border-left: 2px solid var(--line);
+}
+
+.panel-field[data-severity="warning"] dd {
+  color: var(--warn);
+}
+
+.panel-field[data-severity="error"] dd {
+  color: var(--err);
+}
+
+.platform-diagnostics {
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  background: #121519;
+}
+
+.platform-diagnostics summary {
+  min-height: 30px;
+  padding: 6px 12px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
 }
 
 pre {
@@ -212,12 +329,14 @@ pre {
   color: var(--muted);
 }
 
-/* The diagnostics log never grows the panel: fixed height, newest entries
-   scrolled into view, oldest entries pruned by app.js. */
-.info-panel pre[data-field="diagnostics"] {
-  height: 180px;
+/* The browser-only log is outside the shared information document and never
+   grows the dock: newest entries win and app.js prunes the bounded tail. */
+.platform-diagnostics pre[data-platform-field="diagnostics"] {
+  max-height: 120px;
   overflow-x: hidden;
   overflow-y: auto;
+  border-width: 1px 0 0;
+  border-radius: 0;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
   font-size: 12px;
@@ -318,9 +437,40 @@ pre {
     flex-wrap: wrap;
   }
 
+  .toolbar-disclosure-controls {
+    position: static;
+    width: auto;
+    max-width: 100%;
+    margin-top: 6px;
+    box-shadow: none;
+  }
+
   .info-panel {
+    display: block;
     border-top: 1px solid var(--line);
     max-height: none;
     overflow: visible;
+  }
+
+  .panel-columns {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
+  }
+
+  .panel-column {
+    min-width: 0;
+    overflow: visible;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+    scrollbar-gutter: auto;
+  }
+
+  .panel-column:first-child {
+    border-top: 0;
+  }
+
+  .panel-section dl {
+    grid-template-columns: minmax(92px, 34%) minmax(0, 1fr);
   }
 }

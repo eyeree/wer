@@ -85,7 +85,7 @@ impl RegionCoord {
 ///
 /// Local cell coordinates are integers so that per-cell feature indices are
 /// stable inputs to [`crate::feature_hash`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct LocalPos {
     /// Cell column within the region.
     pub cx: u16,

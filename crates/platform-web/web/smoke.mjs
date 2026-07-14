@@ -29,6 +29,23 @@ for (const url of ["./assets/app.css", "./assets/app.js", "./docs/world-model.ht
   }
 }
 
+if (html.includes("data-field=")) {
+  throw new Error("index.html retains the pre-M6 untyped panel field registry");
+}
+const panelColumns = Array.from(
+  html.matchAll(/data-panel-column="([^"]+)"/g),
+  (match) => match[1],
+);
+if (
+  panelColumns.length !== 3 ||
+  panelColumns.some((column, index) => column !== ["explorer", "world", "system"][index])
+) {
+  throw new Error("index.html must mount exactly the explorer/world/system panel columns");
+}
+if (!html.includes("data-panel-document") || !html.includes("data-platform-field=\"diagnostics\"")) {
+  throw new Error("index.html does not separate the shared panel from platform diagnostics");
+}
+
 const app = await readFile(join(dist, "assets/app.js"), "utf8");
 if (/https?:\/\//.test(app)) {
   throw new Error("app.js contains an external network URL");
@@ -53,6 +70,45 @@ if (!app.includes("new ResizeObserver") || !app.includes("window.devicePixelRati
 }
 if (!app.includes("app.resize_surface(width, height)")) {
   throw new Error("app.js does not send the physical content rectangle through shared layout");
+}
+if (!app.includes("app.panel_document(") || !app.includes("applyPanelDocument")) {
+  throw new Error("app.js does not bind the shared typed panel document");
+}
+if (!app.includes("PANEL_REFRESH_MS = 500") || !app.includes("requestPanelRefresh")) {
+  throw new Error("app.js does not cap normal panel refreshes at 500ms");
+}
+if (
+  !app.includes("window.__refreshPanelForTest = refreshPanel") ||
+  !app.includes('fieldId === "performance.dom-updates"')
+) {
+  throw new Error("app.js cannot prove a settled, observer-effect-free panel cadence");
+}
+for (const property of ["field.value", "field.severity", "field.visible"]) {
+  if (!app.includes(property)) {
+    throw new Error(`app.js does not incrementally bind shared ${property}`);
+  }
+}
+if (!app.includes("panelFields = new Map()") || !app.includes("dataset.panelField")) {
+  throw new Error("app.js does not preserve stable DOM nodes by panel field id");
+}
+if (!app.includes("app.map_hover(wx, wy)") || !app.includes("app.clear_hover()")) {
+  throw new Error("app.js does not route hover inspection through the shared sampler");
+}
+for (const legacy of [
+  "app.info_snapshot(",
+  "frame.snapshot",
+  "updatePanelStats",
+  "app.inspect(",
+  "app.map_organism_at(",
+  "const megabytes",
+  "const millis",
+]) {
+  if (app.includes(legacy)) {
+    throw new Error(`app.js retains legacy panel path ${legacy}`);
+  }
+}
+if (app.includes("panelRoot.replaceChildren") || app.includes("panelRoot.innerHTML")) {
+  throw new Error("app.js rebuilds the shared panel instead of updating stable nodes");
 }
 if (/canvas[^>]+(?:width|height)="\d+"/.test(html)) {
   throw new Error("index.html keeps a fixed canvas backing-size authority");
@@ -83,6 +139,9 @@ if (!app.includes("new Worker")) {
 if (!app.includes("openVault")) {
   throw new Error("app.js does not initialize browser storage");
 }
+if (!app.includes("storage_status(state.mode, state.failures)")) {
+  throw new Error("app.js does not inject browser storage capability into the shared panel");
+}
 if (!app.includes("runStartupBenchmark")) {
   throw new Error("app.js does not run startup benchmark");
 }
@@ -91,6 +150,21 @@ if (!html.includes('data-action="set-presentation" data-value="pov"')) {
 }
 if (!html.includes('data-action="set-presentation" data-value="split"')) {
   throw new Error("index.html does not expose Split mode control");
+}
+if (!html.includes("<summary>Exploration</summary>")) {
+  throw new Error("index.html does not expose the grouped Exploration controls");
+}
+for (const control of [
+  "capture-anchor",
+  "cycle-capture-category",
+  "toggle-capture-polarity",
+  "drop-anchor",
+  "toggle-transition-mode",
+  "clear-anchors",
+]) {
+  if (!html.includes(`data-action="${control}"`)) {
+    throw new Error(`index.html does not expose exploration control ${control}`);
+  }
 }
 for (const control of ["toggle-walk", "toggle-pov-shadow-ao", "toggle-pov-detail-normals", "toggle-pov-water", "set-pov-render-scale"]) {
   if (!html.includes(`data-action="${control}"`)) {
@@ -108,6 +182,20 @@ if (!app.includes("event.code") || !app.includes("event.repeat")) {
 }
 if (!app.includes("setPointerCapture") || !app.includes("pointercancel")) {
   throw new Error("app.js does not transport primary drag cancellation");
+}
+
+const css = await readFile(join(dist, "assets/app.css"), "utf8");
+if (!css.includes("grid-template-columns: repeat(3, minmax(0, 1fr))")) {
+  throw new Error("app.css does not define the three-column desktop information dock");
+}
+if (!css.includes(".panel-column") || !css.includes("overflow-y: auto")) {
+  throw new Error("app.css does not give each desktop panel column bounded scrolling");
+}
+if (!css.includes("@media (max-width: 760px)") || !css.includes("stacked-scroll")) {
+  // `stacked-scroll` remains the M0/M1 named narrow contract in app.js.
+  if (!app.includes('layoutContract: window.innerWidth <= 760 ? "stacked-scroll"')) {
+    throw new Error("browser assets do not retain the explicit narrow scrolling contract");
+  }
 }
 
 const docs = await readFile(join(dist, "docs/world-model.html"), "utf8");

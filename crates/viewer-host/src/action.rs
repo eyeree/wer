@@ -22,7 +22,8 @@ pub enum NudgeDirection {
 }
 
 /// Browser/native worker strategy selected by a typed control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum WorkerBackend {
     /// Run tasks inline.
     Inline,

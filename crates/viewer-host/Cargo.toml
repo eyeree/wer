@@ -14,8 +14,10 @@ workspace = true
 log.workspace = true
 pov-host = { path = "../pov-host" }
 renderer = { path = "../renderer" }
+serde.workspace = true
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }
 
 [dev-dependencies]
+serde_json.workspace = true
 sha2.workspace = true

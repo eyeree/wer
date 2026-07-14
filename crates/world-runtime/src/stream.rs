@@ -162,7 +162,7 @@ impl Default for StreamConfig {
 
 /// Per-frame counters (phase-2-plan.md §8.2, §13). `deferred_*` report budget
 /// backpressure — expected and healthy, not an error.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct FrameStats {
     /// Authoritative regions inserted this frame.
     pub loaded: usize,

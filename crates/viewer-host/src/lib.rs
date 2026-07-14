@@ -24,7 +24,10 @@ pub use controller::{
     PovGroundSampler, PovStateSnapshot, PresentationDirty, ServiceNotification, ServiceResponse,
     ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewerController,
 };
-pub use inspect::{CellInfo, CursorInfo, EcologyInfo, HoverInfo, OrganismInfo};
+pub use inspect::{
+    map_hover, organism_info, pick_map_organism_info, sample_cell, CellInfo, CellStatus,
+    EcologyInfo, HoverInfo, OrganismInfo,
+};
 pub use layout::{
     resolve_view_layout, MapGridCoverage, MapViewportProjection, PixelRect, PresentationMode,
     ResolvedViewLayout, ViewKind, ViewLayout, MAP_ROUND_TRIP_CELL_TOLERANCE, MAX_SPLIT_RATIO,
@@ -37,7 +40,13 @@ pub use map::{
     PreparedGpuMap, PreparedMapSource, CHANNEL_DESCRIPTORS, MAP_LAYER_DESCRIPTORS,
     MAP_LAYER_SEQUENCE, MAP_OVERLAY_DESCRIPTORS, ORGANISM_PICK_ZOOM,
 };
-pub use panel::{InfoPanelModel, PanelFieldId, PlatformTelemetry};
+pub use panel::{
+    build_panel_document, build_panel_sections, CameraInfo, FrameInfo, InfoPanelModel,
+    PanelBuildInput, PanelColumn, PanelDocument, PanelDocumentCache, PanelDocumentKey, PanelField,
+    PanelFieldId, PanelSection, PanelSpan, PerformanceInfo, PersistenceInfo, PlatformTelemetry,
+    RendererInfo, Severity, StreamingInfo, StreamingSupplement, VaultInfo, ViewerWarning,
+    WarningRegistry,
+};
 pub use world::{
     ExplorationWorld, NoopWorldTickHook, TravelerState, WorldPostUpdate, WorldPreUpdate,
     WorldServiceInput, WorldTickHook, WorldTickOutput,

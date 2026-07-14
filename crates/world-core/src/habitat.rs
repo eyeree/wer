@@ -43,7 +43,7 @@ const TEMPERATURE_MAX: f32 = 40.0;
 /// The environmental class a species roster is a function of. Coarse on
 /// purpose (phase-3-plan.md §4.1): nearby cells share a signature so rosters
 /// are shared and visible zonation emerges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub struct HabitatSignature {
     /// [`Biome::id`] of the cell.
     pub biome: u8,

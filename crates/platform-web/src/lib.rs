@@ -15,8 +15,11 @@ use viewer_host::{
     atlas::{AtlasManager, RefinementRequest},
     controller::{GroundSample, PovGroundSampler},
     input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent},
-    map::{Channel, MapBackend, MapComposer, MapDecor, MapRenderRequest},
-    panel::{Severity, ViewerWarning},
+    map::{Channel, MapBackend, MapBackendFallback, MapComposer, MapDecor, MapRenderRequest},
+    panel::{
+        PanelBuildInput, PanelDocumentCache, PanelDocumentKey, PerformanceInfo, PersistenceInfo,
+        RendererInfo, Severity, StreamingSupplement, VaultInfo, ViewerWarning, WarningRegistry,
+    },
     resolve_view_layout, ExplorationWorld, MapViewportProjection, NoopWorldTickHook, PixelRect,
     PlatformTelemetry, PresentationMode, ResolvedViewLayout, ServiceNotification, ServiceResponse,
     ServiceResponseResult, ServiceResponseSequence, TickInput, TickOutput, ViewKind, ViewerAction,
@@ -41,17 +44,12 @@ use world_core::{
     },
     route::attraction_anchors,
     species::{species_roster, species_seed},
-    terrain, Biome, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, POSSIBILITY_DIMS,
-    REGION_SIZE, WORLD_ALGORITHM_VERSION,
+    terrain, FeatureKey, PossibilityField, PossibilityVector, RegionCoord, REGION_SIZE,
+    WORLD_ALGORITHM_VERSION,
 };
 use world_runtime::stream::RegionMap;
-use world_runtime::task::{InlineExecutor, TaskExecutor};
+use world_runtime::task::InlineExecutor;
 use world_runtime::tier::ResourceTier;
-use world_runtime::{
-    CHANNEL_DIVERSITY, CHANNEL_ELEVATION, CHANNEL_FERTILITY, CHANNEL_HARDNESS, CHANNEL_HERBIVORE,
-    CHANNEL_MOISTURE, CHANNEL_PREDATOR, CHANNEL_RIVER, CHANNEL_SOIL_DEPTH, CHANNEL_TEMPERATURE,
-    CHANNEL_VEGETATION, CHANNEL_WETNESS,
-};
 
 /// Shared native/wasm parity expectations. The wasm integration suite imports
 /// these exact constants, so the two execution gates cannot drift apart.
@@ -375,20 +373,29 @@ struct BrowserHostState {
     pov_radius: i32,
     benchmark_ms: f32,
     worker_mode: &'static str,
-    worker_backlog: u32,
     workers: u32,
-    cancellations: u32,
-    stale_results: u32,
     storage: &'static str,
     pending_writes: u32,
     storage_failures: u32,
     record_count: u32,
     renderer: &'static str,
+    effective_map_backend: MapBackend,
+    map_fallback: Option<MapBackendFallback>,
     renderer_ready: bool,
     force_cpu_map_redraw: bool,
     gpu_map_retry_scheduled: bool,
     device_losses: u32,
-    warnings: Vec<String>,
+    surface_format: Option<String>,
+    surface_losses: u32,
+    warnings: WarningRegistry,
+    panel_cache: PanelDocumentCache,
+    panel_key: Option<PanelDocumentKey>,
+    panel_revision: u64,
+    hover_world: Option<(f64, f64)>,
+    hover_revision: u64,
+    performance: PerformanceInfo,
+    telemetry_revision: u64,
+    platform_revision: u64,
     pending_effects: Vec<ViewerEffect>,
     service_sequence: u64,
     last_action: &'static str,
@@ -420,6 +427,70 @@ struct BrowserFrame {
     service_response_queued: bool,
     presenter_needs_frame: bool,
     presenter_dirty: bool,
+}
+
+/// Small immediate presentation state used by canvas/control adapters. The
+/// information dock consumes [`viewer_host::PanelDocument`] instead; keeping
+/// this DTO separate avoids rebuilding or serializing that document on every
+/// animation frame.
+#[derive(Debug, serde::Serialize)]
+struct BrowserPresentation {
+    view: BrowserViewPresentation,
+    map: BrowserMapPresentation,
+    tier: BrowserTierPresentation,
+    executor: BrowserExecutorPresentation,
+    storage: BrowserStoragePresentation,
+    renderer: BrowserRendererPresentation,
+    decor_status: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserViewPresentation {
+    mode: PresentationMode,
+    focused: ViewKind,
+    split_ratio: f32,
+    pov_supported: bool,
+    pov: BrowserPovPresentation,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserPovPresentation {
+    motion: &'static str,
+    shadow_ao: bool,
+    detail_normals: bool,
+    water: bool,
+    render_scale: f32,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserMapPresentation {
+    backend: MapBackend,
+    channel: Channel,
+    zoom: u32,
+    refinement: bool,
+    overlays: viewer_host::Overlays,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserTierPresentation {
+    runtime: &'static str,
+    benchmark_ms: f32,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserExecutorPresentation {
+    mode: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserStoragePresentation {
+    mode: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BrowserRendererPresentation {
+    mode: &'static str,
+    device_losses: u32,
 }
 
 struct BrowserGround<'a> {
@@ -490,20 +561,29 @@ impl Default for BrowserHostState {
             pov_radius: 2,
             benchmark_ms: 0.0,
             worker_mode: "inline",
-            worker_backlog: 0,
             workers: 1,
-            cancellations: 0,
-            stale_results: 0,
             storage: "memory",
             pending_writes: 0,
             storage_failures: 0,
             record_count: 0,
             renderer: "cpu-fallback",
+            effective_map_backend: MapBackend::Cpu,
+            map_fallback: None,
             renderer_ready: false,
             force_cpu_map_redraw: false,
             gpu_map_retry_scheduled: false,
             device_losses: 0,
-            warnings: Vec::new(),
+            surface_format: None,
+            surface_losses: 0,
+            warnings: WarningRegistry::default(),
+            panel_cache: PanelDocumentCache::default(),
+            panel_key: None,
+            panel_revision: 0,
+            hover_world: None,
+            hover_revision: 0,
+            performance: PerformanceInfo::default(),
+            telemetry_revision: 0,
+            platform_revision: 0,
             last_action: "",
             pending_effects: Vec::new(),
             service_sequence: 0,
@@ -532,9 +612,13 @@ impl BrowserHostState {
         };
         if config.contains("\"storage\":true") {
             state.storage = "indexeddb-pending";
-            state
-                .warnings
-                .push(String::from("IndexedDB storage lands in Phase 7-7"));
+            state.warn_once(ViewerWarning {
+                id: "indexeddb-pending",
+                message: String::from(
+                    "IndexedDB is not ready; in-memory persistence remains active.",
+                ),
+                severity: Severity::Warning,
+            });
         }
         if config.contains("\"worker_mode\":\"workers\"") {
             state.worker_mode = "workers";
@@ -619,7 +703,7 @@ impl BrowserHostState {
         let mut unavailable = Vec::new();
         for effect in &output.effects {
             if let ViewerEffect::ReportWarning(warning) = effect {
-                self.warn_once(&warning.message);
+                self.warn_once(warning.clone());
             }
             if let Some(request) = unavailable_service_request(effect) {
                 unavailable.push(request);
@@ -663,6 +747,8 @@ impl BrowserHostState {
 
     fn platform_telemetry(&self) -> PlatformTelemetry {
         PlatformTelemetry {
+            present_ms: self.performance.present_ms,
+            dom_updates: self.performance.dom_updates,
             executor_backend: match self.worker_mode {
                 "workers" => WorkerBackend::Workers,
                 "shared-memory" => WorkerBackend::SharedWorkers,
@@ -670,7 +756,7 @@ impl BrowserHostState {
             },
             workers: self.workers as usize,
             storage_available: self.storage == "indexeddb",
-            ..PlatformTelemetry::default()
+            surface_format: self.surface_format.clone(),
         }
     }
 
@@ -691,13 +777,19 @@ impl BrowserHostState {
         self.controller.enqueue_action(action);
     }
 
-    fn warn_once(&mut self, warning: &str) {
-        if !self.warnings.iter().any(|entry| entry == warning) {
-            self.warnings.push(String::from(warning));
+    fn warn_once(&mut self, warning: ViewerWarning) {
+        if self.warnings.upsert(warning) {
+            self.platform_revision = self.platform_revision.saturating_add(1);
         }
     }
 
     fn set_renderer_webgpu(&mut self) {
+        let warning_removed = self.warnings.remove("renderer-device-loss")
+            | self.warnings.remove("renderer-map-fallback");
+        let panel_changed = !self.renderer_ready
+            || self.renderer != "webgpu-ready"
+            || self.map_fallback.is_some()
+            || warning_removed;
         self.renderer_ready = true;
         self.atlas = AtlasManager::default();
         self.overlay_hashes = [None; 2];
@@ -705,16 +797,47 @@ impl BrowserHostState {
         self.gpu_map_retry_scheduled = false;
         // Device readiness alone is not a claim that a GPU map was drawn.
         self.renderer = "webgpu-ready";
+        self.map_fallback = None;
+        if panel_changed {
+            self.platform_revision = self.platform_revision.saturating_add(1);
+        }
         self.enqueue_pov_availability(true, None);
     }
 
-    fn record_map_backend(&mut self, backend: MapBackend) -> bool {
+    fn set_surface_format(&mut self, surface_format: Option<String>) {
+        if self.surface_format == surface_format {
+            return;
+        }
+        self.surface_format = surface_format;
+        self.platform_revision = self.platform_revision.saturating_add(1);
+    }
+
+    fn set_surface_losses(&mut self, surface_losses: u32) {
+        if self.surface_losses == surface_losses {
+            return;
+        }
+        self.surface_losses = surface_losses;
+        self.platform_revision = self.platform_revision.saturating_add(1);
+    }
+
+    fn record_map_result(
+        &mut self,
+        backend: MapBackend,
+        fallback: Option<MapBackendFallback>,
+    ) -> bool {
         let renderer = match backend {
             MapBackend::Cpu => "cpu-fallback",
             MapBackend::GpuAtlas => "webgpu-atlas",
         };
-        let changed = self.renderer != renderer;
+        let changed = self.renderer != renderer
+            || self.effective_map_backend != backend
+            || self.map_fallback != fallback;
         self.renderer = renderer;
+        self.effective_map_backend = backend;
+        self.map_fallback = fallback;
+        if changed {
+            self.platform_revision = self.platform_revision.saturating_add(1);
+        }
         changed
     }
 
@@ -749,9 +872,9 @@ impl BrowserHostState {
         ServiceResponseSequence(self.service_sequence)
     }
 
-    /// Device loss changes platform renderer state immediately, then queues
-    /// the shared capability/fallback transition for the next logical tick.
-    fn renderer_lost(&mut self) {
+    /// Renderer failure changes platform state immediately, then queues the
+    /// shared capability/fallback transition for the next logical tick.
+    fn renderer_failed(&mut self, device_lost: bool) {
         self.renderer_ready = false;
         self.renderer = "cpu-fallback";
         self.atlas = AtlasManager::default();
@@ -759,256 +882,230 @@ impl BrowserHostState {
         self.prepared_cpu_key = None;
         self.force_cpu_map_redraw = true;
         self.gpu_map_retry_scheduled = false;
-        self.device_losses = self.device_losses.saturating_add(1);
+        if device_lost {
+            self.device_losses = self.device_losses.saturating_add(1);
+        }
+        self.effective_map_backend = MapBackend::Cpu;
+        self.map_fallback = Some(MapBackendFallback::GpuUnavailable);
+        self.platform_revision = self.platform_revision.saturating_add(1);
         self.enqueue_pov_availability(
             false,
             Some(ViewerWarning {
-                id: "webgpu-device-lost",
-                message: String::from("WebGPU device lost; CPU map fallback active"),
+                id: if device_lost {
+                    "renderer-device-loss"
+                } else {
+                    "renderer-map-fallback"
+                },
+                message: if device_lost {
+                    String::from("WebGPU device lost; CPU map fallback active")
+                } else {
+                    String::from("WebGPU initialization failed; CPU map fallback active")
+                },
                 severity: Severity::Warning,
             }),
         );
     }
 
-    fn region(&self) -> RegionCoord {
-        let traveler = self.controller.world().traveler().position;
-        RegionCoord::from_world(traveler.0, traveler.1)
+    fn renderer_lost(&mut self) {
+        self.renderer_failed(true);
     }
 
-    fn settle_hash(&self) -> u64 {
-        let region = self.region();
-        let mut h = mix(0xB207_0000_0000_0003, origin_feature_hash());
-        h = mix(h, region.x as u32 as u64);
-        h = mix(h, region.y as u32 as u64);
-        for dim in self.controller.world().field().sample(region).dims {
-            h = mix(h, u64::from(dim.to_bits()));
+    fn renderer_unavailable(&mut self) {
+        self.renderer_failed(false);
+    }
+
+    fn set_hover_world(&mut self, world: Option<(f64, f64)>) -> bool {
+        let world = world.filter(|(x, y)| x.is_finite() && y.is_finite());
+        if self.hover_world == world {
+            return false;
         }
-        h
+        self.hover_world = world;
+        self.hover_revision = self.hover_revision.saturating_add(1);
+        true
     }
 
-    fn snapshot_json(&self) -> String {
-        let region = self.region();
-        let map_preferences = self.controller.map_preferences();
-        let layout = self.controller.layout();
-        let pov = self.controller.pov_state();
-        let world = self.controller.world();
-        let traveler = world.traveler().position;
-        let possibility = world.field().sample(region);
-        let active_channel = Channel::ALL
-            .iter()
-            .position(|channel| *channel == map_preferences.channel)
-            .unwrap_or(0);
-        let focused = match layout.focused {
-            ViewKind::Map => "map",
-            ViewKind::Pov => "pov",
+    fn set_storage_status(&mut self, mode: &str, failures: u32) -> Result<(), String> {
+        let mode = match mode {
+            "memory" => "memory",
+            "indexeddb" => "indexeddb",
+            "indexeddb-pending" => "indexeddb-pending",
+            other => return Err(format!("unknown browser storage mode {other:?}")),
         };
-        let tier = world.tier();
-        let (tier_name, cache_ceiling_mb) = match tier {
-            ResourceTier::Low => ("WebLow", 48),
-            ResourceTier::Mid => ("WebMid", 96),
-            ResourceTier::High => ("WebHigh", 160),
+        let changed = self.storage != mode || self.storage_failures != failures;
+        self.storage = mode;
+        self.storage_failures = failures;
+        let warning_removed = mode == "indexeddb" && self.warnings.remove("indexeddb-pending");
+        if changed || warning_removed {
+            self.platform_revision = self.platform_revision.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_panel_telemetry(
+        &mut self,
+        fps: u32,
+        update_ms: f64,
+        compose_ms: f64,
+        present_ms: f64,
+        upload_kib_per_frame: f64,
+        dom_updates: u64,
+    ) -> bool {
+        let milliseconds = |value: f64| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
         };
-        format!(
-            concat!(
-                "{{",
-                "\"frame_index\":{},",
-                "\"world_pos\":[{:.3},{:.3}],",
-                "\"region\":[{},{}],",
-                "\"possibility\":{},",
-                "\"target\":{},",
-                "\"active_channel\":{},",
-                "\"channel\":\"{}\",",
-                "\"zoom\":{},",
-                "\"map\":{{\"backend\":\"{}\",\"decor_status\":\"browser-vault-unavailable\",",
-                "\"overlays\":{{\"grid\":{},\"rings\":{},\"pinned_flash\":{},\"organisms\":{},\"discovered\":{}}}}},",
-                "\"cache\":{{\"regions\":1,\"bytes\":0}},",
-                "\"executor\":{{\"mode\":\"{}\",\"parallelism\":{},\"workers\":{},\"backlog\":{},\"cancellations\":{},\"stale_results\":{}}},",
-                "\"storage\":{{\"mode\":\"{}\",\"pending_writes\":{},\"failures\":{},\"records\":{}}},",
-                "\"renderer\":{{\"mode\":\"{}\",\"compose\":{},\"refinement\":{},\"device_losses\":{}}},",
-                "\"view\":{{\"mode\":\"{}\",\"focused\":\"{}\",\"split_ratio\":{:.3},\"pov_supported\":{},",
-                "\"pov\":{{\"motion\":\"{}\",\"shadow_ao\":{},\"detail_normals\":{},\"water\":{},\"render_scale\":{:.2}}}}},",
-                "\"tier\":{{\"name\":\"{}\",\"runtime\":\"{}\",\"cache_ceiling_mb\":{},\"benchmark_ms\":{:.3}}},",
-                "\"bias\":{},",
-                "\"stats\":{},",
-                "\"settle_hash\":\"{:#018x}\",",
-                "\"last_action\":\"{}\",",
-                "\"warnings\":[{}]",
-                "}}"
-            ),
-            world.update_serial(),
-            traveler.0,
-            traveler.1,
-            region.x,
-            region.y,
-            vector_json(possibility),
-            vector_json(possibility),
-            active_channel,
-            map_preferences.channel.id(),
-            map_preferences.zoom,
-            match map_preferences.backend {
-                MapBackend::Cpu => "cpu",
-                MapBackend::GpuAtlas => "gpu-atlas",
-            },
-            map_preferences.overlays.grid,
-            map_preferences.overlays.rings,
-            map_preferences.overlays.pinned_flash,
-            map_preferences.overlays.organisms,
-            map_preferences.overlays.discovered,
-            self.worker_mode,
-            InlineExecutor.parallelism(),
-            self.workers,
-            self.worker_backlog,
-            self.cancellations,
-            self.stale_results,
-            self.storage,
-            self.pending_writes,
-            self.storage_failures,
-            self.record_count,
-            self.renderer,
-            self.renderer == "webgpu-atlas",
-            map_preferences.refinement,
-            self.device_losses,
-            layout.mode.as_str(),
-            focused,
-            layout.split_ratio,
-            pov.supported,
-            if pov.walk { "walk" } else { "fly" },
-            pov.shadow_ao,
-            pov.detail_normals,
-            pov.water,
-            pov.render_scale,
-            tier_name,
-            tier.name(),
-            cache_ceiling_mb,
-            self.benchmark_ms,
-            bias_json(world.bias()),
-            self.stats_json(),
-            self.settle_hash(),
-            self.last_action,
-            self.warnings
-                .iter()
-                .map(|warning| format!("\"{}\"", json_escape(warning)))
-                .collect::<Vec<_>>()
-                .join(",")
-        )
+        let next = PerformanceInfo {
+            fps,
+            update_ms: milliseconds(update_ms),
+            compose_ms: milliseconds(compose_ms),
+            present_ms: milliseconds(present_ms),
+            upload_kib_per_frame: milliseconds(upload_kib_per_frame),
+            pass_ms: self.last_stats.pass_ms,
+            dom_updates,
+        };
+        if self.performance == next {
+            return false;
+        }
+        self.performance = next;
+        self.telemetry_revision = self.telemetry_revision.saturating_add(1);
+        true
     }
 
-    /// The streaming/ecology statistics block for the browser info panel —
-    /// the same values the native painted panel reads from `FrameStats`
-    /// (panel.rs), plus the cumulative per-layer regen totals.
-    fn stats_json(&self) -> String {
-        let stats = &self.last_stats;
-        let regen = world_core::layer::LAYERS
-            .iter()
-            .zip(self.regen_totals.iter())
-            .map(|(layer, total)| format!("{{\"name\":\"{}\",\"total\":{total}}}", layer.name))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            concat!(
-                "{{",
-                "\"loaded\":{},\"evicted\":{},\"converged\":{},",
-                "\"dispatched\":{},\"regenerated\":{},\"macro_jobs\":{},",
-                "\"regen_cost\":{},\"deferred_regens\":{},\"active_regions\":{},",
-                "\"cache_bytes\":{},\"macro_cache_bytes\":{},",
-                "\"rosters_built\":{},\"roster_cache_bytes\":{},",
-                "\"authoritative_realized\":{},\"organisms_realized\":{},\"organisms\":{},",
-                "\"resonance\":{:.3},\"resonance_nodes\":{},\"anchors\":{},",
-                "\"cancelled\":{},\"dropped\":{},\"failed\":{},",
-                "\"pool_hits\":{},\"pool_misses\":{},\"pool_bytes\":{},",
-                "\"regen_by_layer\":[{}]",
-                "}}"
-            ),
-            stats.loaded,
-            stats.evicted,
-            stats.converged,
-            stats.layers_dispatched,
-            stats.layers_regenerated,
-            stats.macro_jobs,
-            stats.regen_cost_spent,
-            stats.deferred_regens,
-            stats.active_regions,
-            stats.cache_bytes,
-            stats.macro_cache_bytes,
-            stats.rosters_built,
-            stats.roster_cache_bytes,
-            stats.authoritative_organisms_realized,
-            stats.organisms_realized,
-            stats.organisms,
-            stats.resonance_strength,
-            stats.resonance_nodes,
-            stats.anchors_active,
-            stats.jobs_cancelled,
-            stats.results_dropped,
-            stats.jobs_failed,
-            stats.pool_hits,
-            stats.pool_misses,
-            stats.pool_bytes,
-            regen,
-        )
-    }
-
-    /// The native panel's CURSOR block, as JSON: the settled channel values
-    /// of the cell under a world position. Reads the cache only — never
-    /// generates — so hovering costs nothing.
-    fn inspect_json(&self, wx: f64, wy: f64) -> String {
+    fn streaming_supplement(&self) -> StreamingSupplement {
         let map = self.controller.world().map();
-        let coord = RegionCoord::from_world(wx, wy);
-        let res = map.config().field_resolution;
-        let cell = REGION_SIZE / f64::from(res);
-        let (ox, oy) = coord.origin();
-        let cx = (((wx - ox) / cell) as i64).clamp(0, i64::from(res) - 1) as u16;
-        let cy = (((wy - oy) / cell) as i64).clamp(0, i64::from(res) - 1) as u16;
-        let state = map.get(coord);
-        let tiles = map.cache().get(coord);
-        let channel =
-            |index: usize| tiles.and_then(|t| t.channels[index].as_deref().map(|t| t.get(cx, cy)));
-        let number =
-            |value: Option<f32>| value.map_or_else(|| String::from("null"), |v| format!("{v:.3}"));
-        let biome = tiles.and_then(|t| t.biome.as_deref()).map_or_else(
-            || String::from("null"),
-            |b| format!("\"{:?}\"", Biome::from_id(b.get(cx, cy))),
-        );
-        let status = state.map_or("unloaded", |s| match s.status {
-            world_runtime::GenerationStatus::Unloaded => "unloaded",
-            world_runtime::GenerationStatus::Generating => "generating",
-            world_runtime::GenerationStatus::Ready => "ready",
-        });
-        format!(
-            concat!(
-                "{{",
-                "\"world\":[{:.0},{:.0}],\"region\":[{},{}],\"cell\":[{},{}],",
-                "\"status\":\"{}\",\"stability\":{},\"revision\":{},",
-                "\"elevation\":{},\"temperature\":{},\"moisture\":{},",
-                "\"hardness\":{},\"river\":{},\"wetness\":{},",
-                "\"soil_depth\":{},\"fertility\":{},\"vegetation\":{},",
-                "\"herbivore\":{},\"predator\":{},\"diversity\":{},",
-                "\"biome\":{}",
-                "}}"
-            ),
-            wx,
-            wy,
-            coord.x,
-            coord.y,
-            cx,
-            cy,
-            status,
-            state.map_or_else(|| String::from("null"), |s| format!("{:.2}", s.stability)),
-            state.map_or_else(|| String::from("null"), |s| s.revision.to_string()),
-            number(channel(CHANNEL_ELEVATION)),
-            number(channel(CHANNEL_TEMPERATURE)),
-            number(channel(CHANNEL_MOISTURE)),
-            number(channel(CHANNEL_HARDNESS)),
-            number(channel(CHANNEL_RIVER)),
-            number(channel(CHANNEL_WETNESS)),
-            number(channel(CHANNEL_SOIL_DEPTH)),
-            number(channel(CHANNEL_FERTILITY)),
-            number(channel(CHANNEL_VEGETATION)),
-            number(channel(CHANNEL_HERBIVORE)),
-            number(channel(CHANNEL_PREDATOR)),
-            number(channel(CHANNEL_DIVERSITY)),
-            biome,
+        StreamingSupplement {
+            regen_totals: self.regen_totals,
+            macro_tiles: map.macro_cache().len(),
+            rosters: map.roster_cache().len(),
+            organisms: map.organism_count(),
+            jobs_in_flight: map.jobs_in_flight(),
+            pinned_violations: self.composer.pinned_violations,
+        }
+    }
+
+    fn persistence_info(&self) -> PersistenceInfo {
+        PersistenceInfo {
+            mode: String::from(self.storage),
+            available: self.storage == "indexeddb",
+            vault: (self.storage == "indexeddb").then_some(VaultInfo {
+                records: self.record_count as usize,
+                ..VaultInfo::default()
+            }),
+            pending_writes: u64::from(self.pending_writes),
+            failures: u64::from(self.storage_failures),
+            ..PersistenceInfo::default()
+        }
+    }
+
+    fn renderer_info(&self) -> RendererInfo {
+        RendererInfo {
+            requested_map_backend: self.controller.map_preferences().backend,
+            effective_map_backend: self.effective_map_backend,
+            map_fallback: self.map_fallback,
+            surface_format: self.surface_format.clone(),
+            device_losses: self.device_losses,
+            surface_losses: self.surface_losses,
+        }
+    }
+
+    fn presentation_json(&self) -> Option<String> {
+        let output = self.last_output.as_ref()?;
+        let map = self.controller.map_preferences();
+        let pov = output.pov;
+        let presentation = BrowserPresentation {
+            view: BrowserViewPresentation {
+                mode: output.mode,
+                focused: output.focused,
+                split_ratio: self.controller.layout().split_ratio,
+                pov_supported: pov.supported,
+                pov: BrowserPovPresentation {
+                    motion: if pov.walk { "walk" } else { "fly" },
+                    shadow_ao: pov.shadow_ao,
+                    detail_normals: pov.detail_normals,
+                    water: pov.water,
+                    render_scale: pov.render_scale,
+                },
+            },
+            map: BrowserMapPresentation {
+                backend: map.backend,
+                channel: map.channel,
+                zoom: map.zoom,
+                refinement: map.refinement,
+                overlays: map.overlays,
+            },
+            tier: BrowserTierPresentation {
+                runtime: self.controller.world().tier().name(),
+                benchmark_ms: self.benchmark_ms,
+            },
+            executor: BrowserExecutorPresentation {
+                mode: self.worker_mode,
+            },
+            storage: BrowserStoragePresentation { mode: self.storage },
+            renderer: BrowserRendererPresentation {
+                mode: self.renderer,
+                device_losses: self.device_losses,
+            },
+            decor_status: if self.storage == "indexeddb" {
+                "browser-vault"
+            } else {
+                "browser-vault-unavailable"
+            },
+        };
+        Some(
+            serde_json::to_string(&presentation)
+                .expect("browser presentation contains only serializable finite state"),
         )
+    }
+
+    fn panel_document_json(&mut self) -> Result<Option<String>, serde_json::Error> {
+        let Some(output) = self.last_output.as_ref() else {
+            return Ok(None);
+        };
+        let key = PanelDocumentKey {
+            state: output.frame,
+            hover: self.hover_revision,
+            telemetry: self.telemetry_revision,
+            platform: self.platform_revision,
+        };
+        if self.panel_key != Some(key) {
+            self.panel_revision = self.panel_revision.saturating_add(1);
+            self.panel_key = Some(key);
+        }
+
+        let hover = viewer_host::map_hover(
+            self.controller.world().map(),
+            self.hover_world,
+            output.map.zoom,
+        );
+        let performance = self.performance;
+        let streaming = self.streaming_supplement();
+        let persistence = self.persistence_info();
+        let renderer = self.renderer_info();
+        let capture = self.controller.capture_preferences();
+        let split_ratio = self.controller.layout().split_ratio;
+        let revision = self.panel_revision;
+        let world = self.controller.world();
+        let warnings = self.warnings.warnings();
+        let (document, _) = self.panel_cache.get_or_build(key, || {
+            viewer_host::build_panel_document(PanelBuildInput {
+                tick: output,
+                world,
+                hover,
+                performance,
+                streaming,
+                persistence,
+                renderer,
+                capture,
+                warnings,
+                split_ratio,
+                revision,
+            })
+        });
+        serde_json::to_string(document).map(Some)
     }
 
     /// Image edge length in pixels: one pixel per field cell across the
@@ -1258,29 +1355,6 @@ fn effects_json(effects: Vec<ViewerEffect>) -> String {
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn bias_json(bias: &[f32; POSSIBILITY_DIMS]) -> String {
-    format!(
-        "[{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}]",
-        bias[0], bias[1], bias[2], bias[3], bias[4], bias[5], bias[6], bias[7]
-    )
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn vector_json(vector: PossibilityVector) -> String {
-    format!(
-        "[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}]",
-        vector.dims[0],
-        vector.dims[1],
-        vector.dims[2],
-        vector.dims[3],
-        vector.dims[4],
-        vector.dims[5],
-        vector.dims[6],
-        vector.dims[7]
-    )
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn json_escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -1447,8 +1521,8 @@ mod wasm {
 
     /// Phase 7 browser application facade. JS forwards primitive raw events
     /// and exact action ids; the shared mapper produces typed frame intent and
-    /// ordered actions before this facade updates presentation state. Compact
-    /// snapshots keep DOM/browser APIs out of neutral crates.
+    /// ordered actions before this facade updates presentation state. A cached
+    /// shared panel document keeps DOM/browser APIs out of neutral crates.
     #[wasm_bindgen]
     #[derive(Debug)]
     pub struct WebApp {
@@ -1489,106 +1563,111 @@ mod wasm {
             let pov_active = frame.output.mode == super::PresentationMode::Pov;
             let map_active = frame.output.mode == super::PresentationMode::Map;
             let map_projection = map_active.then(|| self.state.map_projection()).flatten();
-            let (prepared_map_backend, gpu_map_rendered, map_upload_bytes, schedule_map_retry) =
-                if map_active {
-                    VIEWER_RENDERER.with(|slot| {
-                        let mut slot = slot.borrow_mut();
-                        let gpu_available = self.state.renderer_ready && slot.is_some();
-                        let super::BrowserHostState {
-                            controller,
-                            composer,
-                            atlas,
-                            overlay_hashes,
-                            prepared_cpu_key,
-                            gpu_map_retry_scheduled,
-                            ..
-                        } = &mut self.state;
-                        let world = controller.world();
-                        let traveler = world.traveler().position;
-                        let preferences = controller.map_preferences();
-                        composer.set_zoom(preferences.zoom);
-                        let decor = super::MapDecor::default();
-                        let packet = composer.prepare_render(
-                            atlas,
-                            super::MapRenderRequest {
-                                map: world.map(),
-                                player: traveler,
-                                destination: map_projection
-                                    .expect("active Map mode has a resolved destination")
-                                    .destination,
-                                channel: preferences.channel,
-                                overlays: preferences.overlays,
-                                anchors: world.anchors(),
-                                decor: &decor,
-                                requested_backend: preferences.backend,
-                                gpu_available,
-                                refinement: super::RefinementRequest {
-                                    enabled: preferences.refinement,
-                                    octave_count: 3,
-                                },
-                                dirty_key: frame.output.update_serial,
+            let (
+                prepared_map_backend,
+                prepared_map_fallback,
+                gpu_map_rendered,
+                map_upload_bytes,
+                schedule_map_retry,
+            ) = if map_active {
+                VIEWER_RENDERER.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let gpu_available = self.state.renderer_ready && slot.is_some();
+                    let super::BrowserHostState {
+                        controller,
+                        composer,
+                        atlas,
+                        overlay_hashes,
+                        prepared_cpu_key,
+                        gpu_map_retry_scheduled,
+                        ..
+                    } = &mut self.state;
+                    let world = controller.world();
+                    let traveler = world.traveler().position;
+                    let preferences = controller.map_preferences();
+                    composer.set_zoom(preferences.zoom);
+                    let decor = super::MapDecor::default();
+                    let packet = composer.prepare_render(
+                        atlas,
+                        super::MapRenderRequest {
+                            map: world.map(),
+                            player: traveler,
+                            destination: map_projection
+                                .expect("active Map mode has a resolved destination")
+                                .destination,
+                            channel: preferences.channel,
+                            overlays: preferences.overlays,
+                            anchors: world.anchors(),
+                            decor: &decor,
+                            requested_backend: preferences.backend,
+                            gpu_available,
+                            refinement: super::RefinementRequest {
+                                enabled: preferences.refinement,
+                                octave_count: 3,
                             },
-                        );
-                        let backend = packet.backend;
-                        let dirty_key = packet.dirty_key;
-                        let destination = packet.viewport.destination;
-                        match packet.source {
-                            super::PreparedMapSource::Cpu(cpu) => {
-                                debug_assert_eq!(
-                                    cpu.rgba.len(),
-                                    packet.projection.side as usize
-                                        * packet.projection.side as usize
-                                        * 4
-                                );
-                                *prepared_cpu_key = Some(dirty_key);
+                            dirty_key: frame.output.update_serial,
+                        },
+                    );
+                    let backend = packet.backend;
+                    let fallback = packet.fallback;
+                    let dirty_key = packet.dirty_key;
+                    let destination = packet.viewport.destination;
+                    match packet.source {
+                        super::PreparedMapSource::Cpu(cpu) => {
+                            debug_assert_eq!(
+                                cpu.rgba.len(),
+                                packet.projection.side as usize
+                                    * packet.projection.side as usize
+                                    * 4
+                            );
+                            *prepared_cpu_key = Some(dirty_key);
+                            *gpu_map_retry_scheduled = false;
+                            (backend, fallback, false, 0, false)
+                        }
+                        super::PreparedMapSource::GpuAtlas(gpu) => {
+                            *prepared_cpu_key = None;
+                            let pre_grid_changed = overlay_hashes[0] != Some(gpu.pre_grid_hash);
+                            let post_grid_changed = overlay_hashes[1] != Some(gpu.post_grid_hash);
+                            let renderer = slot
+                                .as_mut()
+                                .expect("a prepared GPU packet requires an initialized renderer");
+                            let result = renderer.render_map_gpu_in(
+                                &gpu.params,
+                                &gpu.slots,
+                                &gpu.uploads,
+                                pre_grid_changed.then_some(gpu.pre_grid_rgba),
+                                post_grid_changed.then_some(gpu.post_grid_rgba),
+                                None,
+                                renderer::SurfaceViewport::new(
+                                    destination.x,
+                                    destination.y,
+                                    destination.width,
+                                    destination.height,
+                                ),
+                                None,
+                                CLEAR_COLOR,
+                            );
+                            if let Some(bytes) = result {
+                                *overlay_hashes =
+                                    [Some(gpu.pre_grid_hash), Some(gpu.post_grid_hash)];
                                 *gpu_map_retry_scheduled = false;
-                                (backend, false, 0, false)
-                            }
-                            super::PreparedMapSource::GpuAtlas(gpu) => {
-                                *prepared_cpu_key = None;
-                                let pre_grid_changed = overlay_hashes[0] != Some(gpu.pre_grid_hash);
-                                let post_grid_changed =
-                                    overlay_hashes[1] != Some(gpu.post_grid_hash);
-                                let renderer = slot.as_mut().expect(
-                                    "a prepared GPU packet requires an initialized renderer",
-                                );
-                                let result = renderer.render_map_gpu_in(
-                                    &gpu.params,
-                                    &gpu.slots,
-                                    &gpu.uploads,
-                                    pre_grid_changed.then_some(gpu.pre_grid_rgba),
-                                    post_grid_changed.then_some(gpu.post_grid_rgba),
-                                    None,
-                                    renderer::SurfaceViewport::new(
-                                        destination.x,
-                                        destination.y,
-                                        destination.width,
-                                        destination.height,
-                                    ),
-                                    None,
-                                    CLEAR_COLOR,
-                                );
-                                if let Some(bytes) = result {
-                                    *overlay_hashes =
-                                        [Some(gpu.pre_grid_hash), Some(gpu.post_grid_hash)];
-                                    *gpu_map_retry_scheduled = false;
-                                    (backend, true, bytes, false)
-                                } else {
-                                    // The manager may have consumed delta keys
-                                    // before a failed surface submission. Reset it
-                                    // so a recovered renderer receives full tiles.
-                                    *atlas = super::AtlasManager::default();
-                                    *overlay_hashes = [None; 2];
-                                    let schedule_retry =
-                                        super::claim_gpu_map_retry(gpu_map_retry_scheduled);
-                                    (backend, false, 0, schedule_retry)
-                                }
+                                (backend, fallback, true, bytes, false)
+                            } else {
+                                // The manager may have consumed delta keys
+                                // before a failed surface submission. Reset it
+                                // so a recovered renderer receives full tiles.
+                                *atlas = super::AtlasManager::default();
+                                *overlay_hashes = [None; 2];
+                                let schedule_retry =
+                                    super::claim_gpu_map_retry(gpu_map_retry_scheduled);
+                                (backend, fallback, false, 0, schedule_retry)
                             }
                         }
-                    })
-                } else {
-                    (super::MapBackend::Cpu, false, 0, false)
-                };
+                    }
+                })
+            } else {
+                (super::MapBackend::Cpu, None, false, 0, false)
+            };
             if schedule_map_retry {
                 // Surface Outdated/Lost is repaired by the failed acquire;
                 // request one bounded follow-up frame to present it without
@@ -1598,12 +1677,22 @@ mod wasm {
             let (map_path, map_backend_changed) = if gpu_map_rendered {
                 (
                     "gpu-atlas",
-                    self.state.record_map_backend(super::MapBackend::GpuAtlas),
+                    self.state
+                        .record_map_result(super::MapBackend::GpuAtlas, None),
                 )
             } else {
+                let fallback = prepared_map_fallback.or_else(|| {
+                    (map_active
+                        && self.state.controller.map_preferences().backend
+                            == super::MapBackend::GpuAtlas)
+                        .then_some(super::MapBackendFallback::GpuUnavailable)
+                });
                 (
                     "cpu",
-                    map_active && self.state.record_map_backend(super::MapBackend::Cpu),
+                    map_active
+                        && self
+                            .state
+                            .record_map_result(super::MapBackend::Cpu, fallback),
                 )
             };
             let force_cpu_map_redraw = std::mem::take(&mut self.state.force_cpu_map_redraw);
@@ -1647,20 +1736,30 @@ mod wasm {
                         &frame.removes,
                         organism_upload,
                         CLEAR_COLOR,
+                        renderer::SurfaceViewport::new(0, 0, width, height),
                         None,
                         frame.output.pov.render_scale,
                     )
                 });
+            let surface_losses = VIEWER_RENDERER.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map_or(0, renderer::Renderer::surface_losses)
+            });
+            self.state.set_surface_losses(surface_losses);
             let counters = self.state.pov_chunks.counters();
             let organism_counts = self.state.pov_organisms.counters();
-            let snapshot = self.state.snapshot_json();
+            let presentation = self
+                .state
+                .presentation_json()
+                .expect("the current frame installed presentation state");
             let layout = self.state.layout_json();
             let needs_frame = frame.output.needs_frame
                 || frame.presenter_needs_frame
                 || self.driver.needs_frame();
             Ok(JsValue::from_str(&format!(
                 concat!(
-                    "{{\"snapshot\":{},\"layout\":{},\"map_dirty\":{},\"needs_frame\":{},",
+                    "{{\"presentation\":{},\"layout\":{},\"map_dirty\":{},\"needs_frame\":{},",
                     "\"update_serial\":{},\"travel\":{:.6},",
                     "\"map\":{{\"active\":{},\"path\":\"{}\",\"gpu_submitted\":{},\"upload_bytes\":{}}},",
                     "\"pov\":{{\"active\":{},\"rendered\":{},",
@@ -1669,7 +1768,7 @@ mod wasm {
                     "\"organisms\":{{\"published\":{},\"drawn\":{},",
                     "\"waiting_for_ground\":{}}}}}}}"
                 ),
-                snapshot,
+                presentation,
                 layout,
                 map_dirty,
                 needs_frame,
@@ -1882,6 +1981,12 @@ mod wasm {
         /// Report successful completion of the actual asynchronous renderer
         /// initialization. A navigator capability probe must not call this.
         pub fn renderer_available(&mut self) {
+            let surface_format = VIEWER_RENDERER.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(renderer::Renderer::surface_format_name)
+            });
+            self.state.set_surface_format(surface_format);
             self.state.set_renderer_webgpu();
             self.driver.enqueue_action(
                 &mut self.state,
@@ -1889,12 +1994,26 @@ mod wasm {
             );
         }
 
-        /// Report device loss/initialization failure without forging an action.
+        /// Report an actual device loss without forging an action.
         pub fn renderer_lost(&mut self) {
             VIEWER_RENDERER.with(|slot| {
                 slot.borrow_mut().take();
             });
             self.state.renderer_lost();
+            self.driver.mapper.clear_held_state();
+            self.driver
+                .mapper
+                .set_context(self.driver.context(&self.state));
+            self.driver.dirty = true;
+        }
+
+        /// Report renderer initialization failure separately from a device
+        /// that was successfully created and later lost.
+        pub fn renderer_unavailable(&mut self) {
+            VIEWER_RENDERER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+            self.state.renderer_unavailable();
             self.driver.mapper.clear_held_state();
             self.driver
                 .mapper
@@ -1935,45 +2054,62 @@ mod wasm {
             Ok(JsValue::from_str(&value))
         }
 
-        /// Pick the shared realized-organism marker under a physical surface
-        /// point. Identity is returned as hex so JavaScript never rounds the
-        /// stable `u64`.
-        pub fn map_organism_at(
-            &self,
-            physical_x: f64,
-            physical_y: f64,
+        /// Set the shared cache-only map hover source. Sampling and organism
+        /// precedence remain in `viewer_host::map_hover`; JavaScript forwards
+        /// only the already-inverted world coordinate.
+        pub fn map_hover(&mut self, world_x: f64, world_y: f64) -> bool {
+            self.state.set_hover_world(Some((world_x, world_y)))
+        }
+
+        /// Clear hover when the pointer leaves Map content.
+        pub fn clear_hover(&mut self) -> bool {
+            self.state.set_hover_world(None)
+        }
+
+        /// Serialize the one cached shared panel document. Browser performance
+        /// facts enter at this capped call site and invalidate only the panel
+        /// cache; map/POV buffers and frame scheduling remain untouched.
+        #[allow(clippy::too_many_arguments)]
+        pub fn panel_document(
+            &mut self,
+            fps: u32,
+            update_ms: f64,
+            compose_ms: f64,
+            present_ms: f64,
+            upload_kib_per_frame: f64,
+            dom_updates: u32,
         ) -> Result<JsValue, JsValue> {
-            let world = self.state.controller.world();
-            let zoom = self.state.controller.map_preferences().zoom;
-            let value = self
+            if self.shutdown {
+                return Err(JsValue::from_str("WebApp is shut down"));
+            }
+            self.state.update_panel_telemetry(
+                fps,
+                update_ms,
+                compose_ms,
+                present_ms,
+                upload_kib_per_frame,
+                u64::from(dom_updates),
+            );
+            let json = self
                 .state
-                .map_projection()
-                .and_then(|projection| projection.physical_to_world((physical_x, physical_y)))
-                .and_then(|position| viewer_host::pick_organism(world.map(), position, zoom))
-                .map_or_else(
-                    || String::from("null"),
-                    |organism| {
-                        format!(
-                            "{{\"id\":\"{:#018x}\",\"world\":[{:.9},{:.9}]}}",
-                            organism.id, organism.world_pos.0, organism.world_pos.1
-                        )
-                    },
-                );
-            Ok(JsValue::from_str(&value))
+                .panel_document_json()
+                .map_err(|error| JsValue::from_str(&error.to_string()))?
+                .ok_or_else(|| JsValue::from_str("panel unavailable before the first frame"))?;
+            Ok(JsValue::from_str(&json))
         }
 
-        /// Return the most recent structured snapshot as JSON.
-        pub fn info_snapshot(&self) -> Result<JsValue, JsValue> {
-            Ok(JsValue::from_str(&self.state.snapshot_json()))
+        /// Read-only cadence probe used by browser acceptance tests.
+        pub fn panel_build_count(&self) -> u32 {
+            self.state.panel_cache.builds().min(u64::from(u32::MAX)) as u32
         }
 
-        /// The cursor block (the native panel's CURSOR readout): settled
-        /// channel values of the cell under a world position, as JSON.
-        /// Cache-read only.
-        pub fn inspect(&self, world_x: f64, world_y: f64) -> Result<JsValue, JsValue> {
-            Ok(JsValue::from_str(
-                &self.state.inspect_json(world_x, world_y),
-            ))
+        /// Inject the exact result of the browser IndexedDB capability probe.
+        /// This changes persistence/panel state only; it never schedules or
+        /// advances a world frame.
+        pub fn storage_status(&mut self, mode: String, failures: u32) -> Result<(), JsValue> {
+            self.state
+                .set_storage_status(&mode, failures)
+                .map_err(|error| JsValue::from_str(&error))
         }
 
         /// Stop accepting frame updates.
@@ -1990,11 +2126,11 @@ mod wasm_input_tests {
 
     use super::wasm::WebApp;
 
-    fn snapshot(app: &WebApp) -> String {
-        app.info_snapshot()
-            .expect("snapshot")
+    fn panel(app: &mut WebApp) -> String {
+        app.panel_document(0, 0.0, 0.0, 0.0, 0.0, 0)
+            .expect("panel document")
             .as_string()
-            .expect("string snapshot")
+            .expect("string panel document")
     }
 
     #[wasm_bindgen_test]
@@ -2010,7 +2146,7 @@ mod wasm_input_tests {
             .as_string()
             .expect("frame JSON");
         assert!(first_frame.contains("\"update_serial\":1"));
-        assert!(snapshot(&button).contains("\"refinement\":true"));
+        assert!(panel(&mut button).contains("\"map_refinement\":true"));
         assert!(button
             .action(String::from("Toggle-Refinement"), None)
             .is_err());
@@ -2048,7 +2184,7 @@ mod wasm_input_tests {
             false,
         ));
         keyboard.frame(0.0, 0.0).expect("key frame");
-        assert!(snapshot(&keyboard).contains("\"refinement\":true"));
+        assert!(panel(&mut keyboard).contains("\"map_refinement\":true"));
         assert!(!keyboard.key_event(
             String::from("period"),
             true,
@@ -2062,7 +2198,7 @@ mod wasm_input_tests {
         keyboard.surface_focus(false);
         assert!(!keyboard.key_event(String::from("Tab"), true, false, false, false, false, false,));
         keyboard.frame(0.0, 0.0).expect("toolbar-focus frame");
-        assert!(snapshot(&keyboard).contains("\"view\":{\"mode\":\"map\""));
+        assert!(panel(&mut keyboard).contains("\"view\":{\"mode\":\"map\""));
     }
 
     #[wasm_bindgen_test]
@@ -2080,10 +2216,15 @@ mod wasm_input_tests {
             .expect("frame JSON");
         assert!(frame.contains("\"update_serial\":1"));
         assert!(frame.contains("\"travel\":4.000000"));
-        let snapshot = snapshot(&app);
-        assert!(snapshot.contains("\"view\":{\"mode\":\"pov\""));
-        assert!(snapshot.contains("\"shadow_ao\":false"));
-        assert!(snapshot.contains("\"world_pos\":[-0.000,4.000]"));
+        let document: serde_json::Value =
+            serde_json::from_str(&panel(&mut app)).expect("typed panel JSON");
+        assert_eq!(document["model"]["view"]["mode"], "pov");
+        assert_eq!(document["model"]["view"]["camera"]["shadow_ao"], false);
+        let traveler = document["model"]["frame"]["traveler"]
+            .as_array()
+            .expect("traveler array");
+        assert!(traveler[0].as_f64().expect("traveler x").abs() < 5.0e-4);
+        assert!((traveler[1].as_f64().expect("traveler y") - 4.0).abs() < 5.0e-4);
     }
 
     #[wasm_bindgen_test]
@@ -2110,10 +2251,10 @@ mod wasm_input_tests {
             "the actual wasm facade must compose the settled shared RegionMap"
         );
 
-        let before_read = snapshot(&app);
+        let before_read = panel(&mut app);
         let reread = app.map_pixels().expect("repeat canonical CPU map");
         assert_eq!(
-            snapshot(&app),
+            panel(&mut app),
             before_read,
             "presentation cannot tick the world"
         );
@@ -2147,7 +2288,7 @@ mod wasm_input_tests {
         assert!(frame.contains("\"path\":\"cpu\""));
         assert!(frame.contains("\"gpu_submitted\":false"));
         assert!(frame.contains("\"map_dirty\":true"));
-        assert!(snapshot(&app).contains("\"mode\":\"cpu-fallback\""));
+        assert!(panel(&mut app).contains("\"map_fallback\":\"gpu-unavailable\""));
         assert!(!app.map_pixels().expect("fallback pixels").is_empty());
 
         app.renderer_lost();
@@ -2272,9 +2413,17 @@ mod tests {
         assert!(app.contains("app.frame(dt, now / 1000)"));
         assert!(app.contains("app.map_descriptors()"));
         assert!(app.contains("installMapControls"));
+        assert!(app.contains("app.panel_document("));
+        assert!(app.contains("applyPanelDocument"));
+        assert!(app.contains("app.map_hover(wx, wy)"));
+        assert!(app.contains("app.clear_hover()"));
         assert!(!app.contains("MAP_CHANNELS"));
         assert!(!app.contains("paint_region"));
         assert!(!app.contains("compose_map"));
+        assert!(!app.contains("app.info_snapshot("));
+        assert!(!app.contains("app.inspect("));
+        assert!(!app.contains("app.map_organism_at("));
+        assert!(!app.contains("updatePanelStats"));
         assert!(!app.contains("app.update("));
         assert!(!app.contains("app.pov_frame("));
     }
@@ -2300,9 +2449,10 @@ mod tests {
                 "descriptor {id} must appear exactly once"
             );
         }
-        assert!(super::BrowserHostState::default()
-            .snapshot_json()
-            .contains("\"decor_status\":\"browser-vault-unavailable\""));
+        assert_eq!(
+            super::BrowserHostState::default().persistence_info().mode,
+            "memory"
+        );
     }
 
     /// A small settle-able window so controller-integration tests stay fast.
@@ -2535,9 +2685,102 @@ mod tests {
         let serial = state.controller.world().update_serial();
         let _ = state.cpu_map_pixels();
         let _ = state.cpu_map_json();
-        let _ = state.inspect_json(0.0, 0.0);
-        let _ = state.snapshot_json();
+        state.set_hover_world(Some((0.0, 0.0)));
+        let _ = state
+            .panel_document_json()
+            .expect("serialize panel")
+            .expect("panel after a frame");
+        let _ = state
+            .presentation_json()
+            .expect("presentation after a frame");
         assert_eq!(state.controller.world().update_serial(), serial);
+    }
+
+    #[test]
+    fn panel_document_cache_rebuilds_only_for_typed_inputs() {
+        let mut state = small_controller_app();
+        let _ = state.frame(0.0, viewer_host::input::InputFrame::default());
+        assert_eq!(state.panel_cache.builds(), 0);
+
+        let first = state
+            .panel_document_json()
+            .expect("serialize first panel")
+            .expect("panel after a frame");
+        assert_eq!(state.panel_cache.builds(), 1);
+        let repeated = state
+            .panel_document_json()
+            .expect("serialize repeated panel")
+            .expect("cached panel");
+        assert_eq!(repeated, first);
+        assert_eq!(state.panel_cache.builds(), 1);
+
+        assert!(state.update_panel_telemetry(60, 1.0, 2.0, 3.0, 4.0, 5));
+        let telemetry = state
+            .panel_document_json()
+            .expect("serialize telemetry panel")
+            .expect("telemetry panel");
+        assert_eq!(state.panel_cache.builds(), 2);
+        assert!(telemetry.contains("\"performance.dom-updates\""));
+        assert!(telemetry.contains("\"value\":\"5\""));
+        assert!(!state.update_panel_telemetry(60, 1.0, 2.0, 3.0, 4.0, 5));
+        let _ = state
+            .panel_document_json()
+            .expect("serialize unchanged telemetry panel");
+        assert_eq!(state.panel_cache.builds(), 2);
+
+        let world_serial = state.controller.world().update_serial();
+        state
+            .set_storage_status("indexeddb", 0)
+            .expect("known storage mode");
+        let persistence = state
+            .panel_document_json()
+            .expect("serialize persistence panel")
+            .expect("persistence panel");
+        assert_eq!(state.panel_cache.builds(), 3);
+        assert!(persistence.contains("\"available\":true"));
+        assert_eq!(state.controller.world().update_serial(), world_serial);
+        assert!(state.set_storage_status("unknown", 0).is_err());
+    }
+
+    #[test]
+    fn browser_hover_uses_the_shared_fixed_panel_schema() {
+        let mut state = small_controller_app();
+        settle(&mut state);
+        assert!(state.set_hover_world(Some((10.0, 10.0))));
+        assert!(!state.set_hover_world(Some((10.0, 10.0))));
+        let terrain: serde_json::Value = serde_json::from_str(
+            &state
+                .panel_document_json()
+                .expect("serialize terrain hover")
+                .expect("terrain hover panel"),
+        )
+        .expect("typed terrain document");
+        assert_eq!(terrain["model"]["hover"]["kind"], "terrain");
+        let terrain_fields = terrain["sections"]
+            .as_array()
+            .expect("sections")
+            .iter()
+            .find(|section| section["id"] == "hover")
+            .expect("hover section")["fields"]
+            .as_array()
+            .expect("hover fields");
+        assert!(terrain_fields
+            .iter()
+            .any(|field| field["id"] == "hover.terrain.status" && field["visible"] == true));
+        assert!(terrain_fields
+            .iter()
+            .any(|field| field["id"] == "hover.organism.id" && field["visible"] == false));
+
+        assert!(state.set_hover_world(None));
+        let none: serde_json::Value = serde_json::from_str(
+            &state
+                .panel_document_json()
+                .expect("serialize cleared hover")
+                .expect("cleared hover panel"),
+        )
+        .expect("typed cleared document");
+        assert_eq!(none["model"]["hover"]["kind"], "none");
+        assert_eq!(state.panel_cache.builds(), 2);
     }
 
     #[test]
@@ -2632,11 +2875,18 @@ mod tests {
         );
         assert_eq!(state.controller.world().update_serial(), serial);
 
-        let snapshot = state.snapshot_json();
-        assert!(snapshot.contains("\"stats\":{\"loaded\":"));
-        assert!(state
-            .inspect_json(10.0, 10.0)
-            .contains("\"status\":\"ready\""));
+        state.set_hover_world(Some((10.0, 10.0)));
+        let document: serde_json::Value = serde_json::from_str(
+            &state
+                .panel_document_json()
+                .expect("serialize panel")
+                .expect("panel after settle"),
+        )
+        .expect("typed panel JSON");
+        assert!(document["model"]["streaming"]["stats"]["active_regions"]
+            .as_u64()
+            .is_some_and(|regions| regions > 0));
+        assert_eq!(document["model"]["hover"]["value"]["status"], "ready");
     }
 
     #[test]
@@ -2723,7 +2973,11 @@ mod tests {
         ));
         let unavailable = state.frame(0.0, viewer_host::input::InputFrame::default());
         assert_eq!(unavailable.output.mode, viewer_host::PresentationMode::Map);
-        assert!(state.snapshot_json().contains("POV is unavailable"));
+        assert!(state
+            .panel_document_json()
+            .expect("serialize unavailable panel")
+            .expect("panel after unavailable frame")
+            .contains("POV is unavailable"));
 
         state.set_renderer_webgpu();
         state.enqueue_action(viewer_host::ViewerAction::SetPresentation(
@@ -2754,9 +3008,19 @@ mod tests {
         assert!(fallback.output.effects.iter().any(|effect| matches!(
             effect,
             viewer_host::ViewerEffect::ReportWarning(warning)
-                if warning.id == "webgpu-device-lost"
+                if warning.id == "renderer-device-loss"
         )));
         assert_eq!(state.renderer, "cpu-fallback");
         assert_eq!(state.device_losses, 1);
+
+        let mut unavailable = small_controller_app();
+        unavailable.renderer_unavailable();
+        assert_eq!(unavailable.device_losses, 0);
+        let fallback = unavailable.frame(0.0, viewer_host::input::InputFrame::default());
+        assert!(fallback.output.effects.iter().any(|effect| matches!(
+            effect,
+            viewer_host::ViewerEffect::ReportWarning(warning)
+                if warning.id == "renderer-map-fallback"
+        )));
     }
 }

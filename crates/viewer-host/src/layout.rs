@@ -16,7 +16,8 @@ pub const SPLIT_DIVIDER_HIT_WIDTH: u32 = 9;
 pub const MAP_ROUND_TRIP_CELL_TOLERANCE: f64 = 1.0e-9;
 
 /// Which presentation panes are visible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PresentationMode {
     /// Top-down map only.
     Map,
@@ -50,7 +51,8 @@ impl PresentationMode {
 }
 
 /// A concrete presentation pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ViewKind {
     /// Top-down map.
     Map,
