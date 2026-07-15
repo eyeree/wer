@@ -1,0 +1,22 @@
+/* Native overlay page shims (wry-overlay plan M2). The shared app.css styles
+ * the toolbar and information panel; these pages host each as a full-bleed
+ * standalone document inside a dock-strip webview, so the browser shell's
+ * app-shell grid rows are replaced by full-viewport boxes. */
+html,
+body.overlay-page {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body.overlay-page .toolbar {
+  height: 100%;
+  box-sizing: border-box;
+  align-content: flex-start;
+  overflow-y: auto;
+}
+
+body.overlay-page .info-panel {
+  height: 100%;
+  box-sizing: border-box;
+}

@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- Native overlay control panel (wry-overlay plan M2). The toolbar markup is
+     the browser shell's, verbatim (crates/platform-web/web/index.html); the
+     shared ui/toolbar.js wires it, and bridge-ipc.js replaces the wasm
+     facade. Keep the control set in lockstep with index.html — both are
+     validated against the shared action registry at startup. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Viewer controls</title>
+    <link rel="stylesheet" href="../assets/app.css" />
+    <link rel="stylesheet" href="./overlay.css" />
+  </head>
+  <body class="viewer-page overlay-page">
+    <div class="toolbar" aria-label="Viewer controls">
+      <div class="toolbar-group" role="group" aria-label="View">
+        <span class="toolbar-group-label" aria-hidden="true">View</span>
+        <button type="button" data-action="set-presentation" data-value="map" aria-pressed="true">Map</button>
+        <button type="button" data-action="set-presentation" data-value="pov" aria-pressed="false">POV</button>
+        <button type="button" data-action="set-presentation" data-value="split" aria-pressed="false">Split</button>
+      </div>
+      <div class="toolbar-group" role="group" aria-label="Map">
+        <span class="toolbar-group-label" aria-hidden="true">Map</span>
+        <select data-action="set-map-channel" data-generated="map-channels" aria-label="Map channel"></select>
+        <div class="map-overlay-controls" data-generated="map-overlays" aria-label="Map overlays"></div>
+        <button type="button" data-action="toggle-gpu-compose" aria-pressed="false">Compose</button>
+        <button type="button" data-action="toggle-refinement" aria-pressed="false">Refine</button>
+      </div>
+      <details class="toolbar-group toolbar-disclosure">
+        <summary>Exploration</summary>
+        <div class="toolbar-disclosure-controls" role="group" aria-label="Exploration">
+          <button type="button" data-action="capture-anchor">Capture</button>
+          <button type="button" data-action="cycle-capture-category">Category</button>
+          <button type="button" data-action="toggle-capture-polarity">Polarity</button>
+          <button type="button" data-action="drop-anchor" data-value="emphasize">Emphasize</button>
+          <button type="button" data-action="drop-anchor" data-value="suppress">Suppress</button>
+          <button type="button" data-action="toggle-transition-mode">Transition</button>
+          <button type="button" data-action="clear-anchors">Clear</button>
+        </div>
+      </details>
+      <div class="toolbar-group" role="group" aria-label="Runtime">
+        <span class="toolbar-group-label" aria-hidden="true">Runtime</span>
+        <select data-action="set-resource-tier" aria-label="Resource tier">
+          <option value="low">Low</option>
+          <option value="mid">Mid</option>
+          <option value="high">High</option>
+        </select>
+      </div>
+      <div class="toolbar-group" role="group" aria-label="Storage">
+        <span class="toolbar-group-label" aria-hidden="true">Storage</span>
+        <button type="button" data-action="save-session">Save</button>
+        <button type="button" data-action="request-atlas-export">Export</button>
+        <button type="button" data-action="request-atlas-import">Import</button>
+        <button type="button" data-action="reset-local-vault">Reset</button>
+      </div>
+      <div class="toolbar-group" role="group" aria-label="POV">
+        <span class="toolbar-group-label" aria-hidden="true">POV</span>
+        <button type="button" data-action="toggle-walk" aria-pressed="false">Walk</button>
+        <button type="button" data-action="toggle-pov-shadow-ao" aria-pressed="true">Shadows/AO</button>
+        <button type="button" data-action="toggle-pov-detail-normals" aria-pressed="true">Detail</button>
+        <button type="button" data-action="toggle-pov-water" aria-pressed="true">Water</button>
+        <select data-action="set-pov-render-scale" aria-label="POV render scale">
+          <option value="1">POV scale 1.0</option>
+          <option value="0.5">POV scale 0.5</option>
+          <option value="0.25">POV scale 0.25</option>
+        </select>
+      </div>
+    </div>
+    <script type="module" src="./toolbar.js"></script>
+  </body>
+</html>

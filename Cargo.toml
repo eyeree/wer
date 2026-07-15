@@ -48,6 +48,11 @@ criterion = "0.5"
 # Native-only.
 wgpu = "29"
 winit = "0.30"
+# DOM overlay UI over the native surface (docs/wry-overlay/implementation-plan.md).
+# Requires system WebKitGTK on Linux, so consumers gate it behind an opt-in
+# feature and CI never builds it by default.
+wry = "0.55"
+gtk = "0.18"
 pollster = "1"
 raw-window-handle = "0.6"
 env_logger = "0.11"

@@ -8,6 +8,12 @@ const required = [
   "docs/world-model.html",
   "assets/app.css",
   "assets/app.js",
+  "assets/bridge-wasm.js",
+  "assets/bridge-ipc.js",
+  "assets/ui/panel-dock.js",
+  "assets/ui/toolbar.js",
+  "assets/ui/keys.js",
+  "assets/ui/diagnostics.js",
   "assets/help.js",
   "assets/benchmark.js",
   "assets/storage.js",
@@ -72,7 +78,22 @@ if (!html.includes("data-panel-document") || !html.includes("data-platform-field
   throw new Error("index.html does not separate the shared panel from platform diagnostics");
 }
 
-const app = await readFile(join(dist, "assets/app.js"), "utf8");
+// The viewer runtime spans the thin shell entry plus the shared UI modules
+// and the wasm bridge (the seam the native overlay swaps for bridge-ipc.js).
+// The architectural pattern checks below apply to the concatenation, so a
+// pattern may live in whichever module owns that responsibility.
+const appSources = [
+  "assets/app.js",
+  "assets/bridge-wasm.js",
+  "assets/ui/panel-dock.js",
+  "assets/ui/toolbar.js",
+  "assets/ui/keys.js",
+  "assets/ui/diagnostics.js",
+];
+let app = "";
+for (const source of appSources) {
+  app += await readFile(join(dist, source), "utf8");
+}
 if (/https?:\/\//.test(app)) {
   throw new Error("app.js contains an external network URL");
 }

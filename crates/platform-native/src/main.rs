@@ -87,6 +87,8 @@
 
 mod dump;
 mod input;
+#[cfg(feature = "overlay")]
+mod overlay;
 mod panel;
 
 use std::sync::Arc;
@@ -218,21 +220,31 @@ impl NativeFrameRects {
         }
         // Split the already-fitted destination at one shared source-space
         // seam. Rounding the deck width and panel origin separately can
-        // overlap or leave a one-pixel hole on odd surfaces.
-        let deck_width = ((u64::from(combined.width) * u64::from(view_source_width)
-            + u64::from(source_width) / 2)
-            / u64::from(source_width)) as u32;
-        let deck_width = deck_width.clamp(1, combined.width - 1);
-        let view_deck = PixelRect::new(combined.x, combined.y, deck_width, combined.height);
-        let panel = PixelRect::new(
-            view_deck.right(),
-            combined.y,
-            combined.width - deck_width,
-            combined.height,
-        );
+        // overlap or leave a one-pixel hole on odd surfaces. Zero panel
+        // width means the information panel renders outside this surface
+        // (the DOM overlay dock, wry-overlay plan M2): the deck takes the
+        // whole fitted rect and no strip is reserved.
+        let (view_deck, panel) = if panel_width == 0 {
+            (
+                combined,
+                PixelRect::new(combined.right(), combined.y, 0, combined.height),
+            )
+        } else {
+            let deck_width = ((u64::from(combined.width) * u64::from(view_source_width)
+                + u64::from(source_width) / 2)
+                / u64::from(source_width)) as u32;
+            let deck_width = deck_width.clamp(1, combined.width - 1);
+            let view_deck = PixelRect::new(combined.x, combined.y, deck_width, combined.height);
+            let panel = PixelRect::new(
+                view_deck.right(),
+                combined.y,
+                combined.width - deck_width,
+                combined.height,
+            );
+            (view_deck, panel)
+        };
         let views = resolve_view_layout(view_deck, layout);
-        if panel.width == 0
-            || panel.height == 0
+        if (panel_width != 0 && (panel.width == 0 || panel.height == 0))
             || views
                 .map_pane
                 .is_some_and(|pane| pane.width == 0 || pane.height == 0)
@@ -834,6 +846,15 @@ impl NativePanelState {
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// DOM overlay dock (wry-overlay plan M2): shared toolbar + information
+    /// panel webviews replacing the bitmap strip while active. `None` when
+    /// `WER_OVERLAY` is unset or webview creation failed (bitmap fallback).
+    #[cfg(feature = "overlay")]
+    overlay: Option<overlay::OverlayHost>,
+    /// Whether `--inline` selected the synchronous executor (reported in the
+    /// shared presentation DTO).
+    #[cfg(feature = "overlay")]
+    inline_executor: bool,
     controller: ViewerController,
     services: NativeWorldServices,
     /// The concrete native scheduler remains outside the shared viewer host.
@@ -984,6 +1005,10 @@ impl App {
         Self {
             window: None,
             renderer: None,
+            #[cfg(feature = "overlay")]
+            overlay: None,
+            #[cfg(feature = "overlay")]
+            inline_executor: inline,
             controller,
             services,
             executor: if inline {
@@ -1056,6 +1081,58 @@ impl App {
     fn enqueue_actions(&mut self) {
         for action in self.input.drain_actions() {
             self.controller.enqueue_action(action);
+        }
+    }
+
+    /// Consume upward overlay IPC: shared action ids dispatch through the
+    /// same typed decode as the browser facade, key events join the one
+    /// input mapper, and ready announcements trigger the boot pushes.
+    #[cfg(feature = "overlay")]
+    fn handle_overlay_events(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+        let events = overlay.drain_events();
+        for event in events {
+            match event {
+                overlay::OverlayEvent::Ready { pane } => {
+                    if let Some(overlay) = self.overlay.as_mut() {
+                        overlay.push_boot(pane);
+                    }
+                }
+                overlay::OverlayEvent::Action { id, value } => {
+                    match ViewerAction::decode_exact(
+                        &id,
+                        (!value.is_empty()).then_some(value.as_str()),
+                    ) {
+                        Ok(action) => {
+                            self.input.enqueue_action(action);
+                            self.enqueue_actions();
+                        }
+                        Err(error) => log::warn!("overlay action rejected: {id}: {error}"),
+                    }
+                }
+                overlay::OverlayEvent::Key {
+                    code,
+                    pressed,
+                    repeat,
+                    modifiers,
+                } => {
+                    if let Some(key) = viewer_host::input::PhysicalKey::from_dom_code(&code) {
+                        let event = NormalizedInputEvent::Key {
+                            key,
+                            phase: if pressed {
+                                viewer_host::input::ButtonPhase::Pressed
+                            } else {
+                                viewer_host::input::ButtonPhase::Released
+                            },
+                            repeat,
+                            modifiers,
+                        };
+                        self.handle_input_event(event, event_loop);
+                    }
+                }
+            }
         }
     }
 
@@ -1632,6 +1709,18 @@ impl App {
     fn native_frame_layout(&self, layout: ViewLayout) -> Option<NativeFrameRects> {
         let (width, height) = self.renderer.as_ref()?.size();
         let map_side = self.composer.side();
+        // Overlay dock mode: the DOM toolbar/panel strips own the top and
+        // bottom of the window, the wgpu deck fits between them, and no
+        // bitmap panel column is reserved (wry-overlay plan M2).
+        #[cfg(feature = "overlay")]
+        if let Some(overlay) = self.overlay.as_ref() {
+            return NativeFrameRects::resolve(
+                overlay.deck_rect(width, height),
+                map_side,
+                0,
+                layout,
+            );
+        }
         let panel_width = self.hud.size().0.checked_sub(map_side)?;
         NativeFrameRects::resolve(
             PixelRect::new(0, 0, width, height),
@@ -1822,6 +1911,8 @@ impl App {
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
         self.recover_lost_renderer();
+        #[cfg(feature = "overlay")]
+        self.handle_overlay_events(event_loop);
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f64();
         self.last_frame = now;
@@ -2073,33 +2164,84 @@ impl App {
             capture,
             split_ratio,
         );
-        let map_is_cpu = map_packet
-            .as_ref()
-            .is_some_and(|packet| matches!(&packet.source, PreparedMapSource::Cpu(_)));
-        let (panel_width, panel_height) = if map_is_cpu {
-            let (_, width, height) = self.hud.panel_image(&document.sections);
-            (width, height)
-        } else {
-            let (_, width, height, _) = self
-                .hud
-                .panel_image_for(document.revision, &document.sections);
-            (width, height)
-        };
-        let panel_rgba = self.hud.panel_pixels();
+        // The DOM overlay dock owns both panels while active: push the same
+        // shared documents the browser consumes and attach no bitmap strip.
+        // The Hud stays wired for the bitmap fallback and headless captures.
         let panel_on_map = map_visible;
-        let panel_changed = map_is_cpu
-            || if panel_on_map {
-                self.panel_revision != Some(document.revision)
+        // Field-precise on purpose: `map_packet` above holds closure borrows
+        // of composer/atlas state, so a whole-`self` method call cannot be
+        // used while it is alive.
+        #[cfg(feature = "overlay")]
+        let overlay_active = self.overlay.is_some();
+        #[cfg(not(feature = "overlay"))]
+        let overlay_active = false;
+        #[cfg(feature = "overlay")]
+        if overlay_active {
+            let presentation = viewer_host::dto::presentation_dto(
+                output.mode,
+                output.focused,
+                self.controller.layout().split_ratio,
+                &output.pov,
+                self.controller.map_preferences(),
+                self.tier.name(),
+                viewer_host::dto::PresentationPlatform {
+                    worker_mode: if self.inline_executor {
+                        "inline"
+                    } else {
+                        "lanes"
+                    },
+                    storage: "native-vault",
+                    renderer: "wgpu",
+                    device_losses: self.device_losses,
+                    benchmark_ms: 0.0,
+                    decor_status: "native-vault",
+                },
+            );
+            let presentation_json = serde_json::to_string(&presentation);
+            let document_json = serde_json::to_string(&document);
+            let revision = document.revision;
+            if let Some(overlay) = self.overlay.as_mut() {
+                if let Ok(json) = presentation_json {
+                    overlay.push_presentation(&json);
+                }
+                if let Ok(json) = document_json {
+                    overlay.push_panel_document(revision, &json);
+                }
+            }
+        }
+        let (information, panel_dimensions) = if overlay_active {
+            (None, (0, 0))
+        } else {
+            let map_is_cpu = map_packet
+                .as_ref()
+                .is_some_and(|packet| matches!(&packet.source, PreparedMapSource::Cpu(_)));
+            let (panel_width, panel_height) = if map_is_cpu {
+                let (_, width, height) = self.hud.panel_image(&document.sections);
+                (width, height)
             } else {
-                self.pov_panel_revision != Some(document.revision)
+                let (_, width, height, _) = self
+                    .hud
+                    .panel_image_for(document.revision, &document.sections);
+                (width, height)
             };
-        let information = InformationSurface {
-            upload: panel_changed.then_some(InformationUpload {
-                rgba: panel_rgba,
-                width: panel_width,
-                height: panel_height,
-            }),
-            viewport: frame_rects.panel_viewport(),
+            let panel_rgba = self.hud.panel_pixels();
+            let panel_changed = map_is_cpu
+                || if panel_on_map {
+                    self.panel_revision != Some(document.revision)
+                } else {
+                    self.pov_panel_revision != Some(document.revision)
+                };
+            (
+                Some(InformationSurface {
+                    upload: panel_changed.then_some(InformationUpload {
+                        rgba: panel_rgba,
+                        width: panel_width,
+                        height: panel_height,
+                    }),
+                    viewport: frame_rects.panel_viewport(),
+                }),
+                (panel_width, panel_height),
+            )
         };
         let map_pane = map_packet.as_ref().map(|packet| {
             let source = match &packet.source {
@@ -2126,7 +2268,7 @@ impl App {
                 viewport: frame_rects
                     .map_viewport()
                     .expect("visible Map has a viewport"),
-                information: panel_on_map.then_some(information),
+                information: if panel_on_map { information } else { None },
             }
         });
         let organism_upload = organisms_changed.then(|| self.pov_organisms.upload());
@@ -2138,7 +2280,7 @@ impl App {
             viewport: frame_rects
                 .pov_viewport()
                 .expect("visible POV has a viewport"),
-            information: (!panel_on_map).then_some(information),
+            information: if panel_on_map { None } else { information },
             render_scale: output.pov.render_scale,
         });
         let compose_seconds = compose_start.elapsed().as_secs_f64();
@@ -2178,7 +2320,7 @@ impl App {
             upload_bytes = upload_bytes.saturating_add(commit_pov_panel_upload(
                 &mut self.pov_panel_revision,
                 document.revision,
-                (panel_width, panel_height),
+                panel_dimensions,
                 result.presented,
             ));
         }
@@ -2294,6 +2436,35 @@ impl ApplicationHandler for App {
             self.controller.world().map().config()
         );
 
+        // The DOM overlay dock is the default UI (wry-overlay plan M2);
+        // `WER_OVERLAY=0` keeps the bitmap panel + winit input — the
+        // recovery and benchmark-clean path (spike-notes.md). Failure is
+        // soft but loud: a viewer silently missing its toolbar/panel is
+        // harder to diagnose than one that says why.
+        #[cfg(feature = "overlay")]
+        if overlay_requested() {
+            let size = window.inner_size();
+            match overlay::OverlayHost::new(&window, size.width, size.height) {
+                Ok(host) => {
+                    log::info!("overlay dock active: shared DOM toolbar + information panel");
+                    self.overlay = Some(host);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "overlay dock unavailable, falling back to the bitmap panel \
+                         (set WER_OVERLAY=0 to silence): {error}"
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "overlay"))]
+        if std::env::var("WER_OVERLAY").is_ok_and(|value| value == "1") {
+            eprintln!(
+                "WER_OVERLAY needs the `overlay` feature; it is on by default, \
+                 so this build was made with --no-default-features"
+            );
+        }
+
         self.window = Some(window);
         self.renderer = Some(renderer);
         let notification = self.services.pov_availability(true);
@@ -2313,6 +2484,19 @@ impl ApplicationHandler for App {
         self.last_frame = Instant::now();
     }
 
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // The overlay webviews are serviced by the GTK main loop, which winit
+        // does not drive; a bounded pump plus a short wake keeps them live
+        // without starving the redraw-chain pacer (spike-notes.md, M0 item 4).
+        #[cfg(feature = "overlay")]
+        if let Some(overlay) = self.overlay.as_ref() {
+            overlay.pump();
+            _event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(8),
+            ));
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -2324,6 +2508,10 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
+                }
+                #[cfg(feature = "overlay")]
+                if let Some(overlay) = self.overlay.as_ref() {
+                    overlay.set_bounds(size.width, size.height);
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -2894,6 +3082,12 @@ fn run_pov_script(script: &str) -> Result<(), String> {
 /// `ERROR_SURFACE_LOST_KHR` followed by "Connection reset by peer"), killing
 /// the app. The same session is stable through XWayland, so under WSL we force
 /// the X11 backend; set `WER_FORCE_WAYLAND=1` to opt back in.
+/// Whether this run should host the DOM overlay dock (default yes;
+/// `WER_OVERLAY=0` opts out — the benchmark-clean/recovery mode).
+fn overlay_requested() -> bool {
+    std::env::var("WER_OVERLAY").map_or(true, |value| value != "0")
+}
+
 fn build_event_loop() -> EventLoop<()> {
     #[cfg(target_os = "linux")]
     {
@@ -2903,9 +3097,14 @@ fn build_event_loop() -> EventLoop<()> {
         let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some();
         let x11_available = std::env::var_os("DISPLAY").is_some();
         let overridden = std::env::var_os("WER_FORCE_WAYLAND").is_some();
-        if on_wsl && wayland_session && x11_available && !overridden {
+        // The overlay dock's child webviews only attach on X11 (spike-notes
+        // §consequences), so an overlay run prefers X11 exactly like WSL does.
+        let wants_overlay = cfg!(feature = "overlay") && overlay_requested();
+        if (on_wsl || wants_overlay) && wayland_session && x11_available && !overridden {
             use winit::platform::x11::EventLoopBuilderExtX11;
-            log::info!("WSL detected: using the X11 backend (WER_FORCE_WAYLAND=1 to override)");
+            log::info!(
+                "using the X11 backend (WSL or overlay dock; WER_FORCE_WAYLAND=1 to override)"
+            );
             match EventLoop::builder().with_x11().build() {
                 Ok(event_loop) => return event_loop,
                 Err(err) => log::warn!("X11 event loop failed ({err}); using default backend"),

@@ -112,6 +112,11 @@ pinned `wasm-bindgen-test` 0.3.76 / `wasm-pack` 0.13.1 (ADR 0027).
 # screenshot.ppm plus state.txt for Map, POV, or Split (mode/focus/panes,
 # traveler/camera/hover, steering, telemetry, dep hashes, vault counters) —
 # to ./dump/<UTC datetime>/, for diagnosing problems after the fact.
+# The default UI is the wry overlay dock: the same DOM toolbar + information
+# panel the browser shell renders (docs/wry-overlay/implementation-plan.md;
+# Linux needs libwebkit2gtk-4.1-dev — see README prerequisites). WER_OVERLAY=0
+# keeps the legacy bitmap panel + winit-only input (the benchmark-clean path);
+# headless captures never create webviews.
 cargo run --bin wer
 
 # Deterministic inspector: world position -> region + origin feature hash.

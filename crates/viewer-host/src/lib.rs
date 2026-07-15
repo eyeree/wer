@@ -8,6 +8,7 @@
 pub mod action;
 pub mod atlas;
 pub mod controller;
+pub mod dto;
 pub mod input;
 pub mod inspect;
 pub mod layout;

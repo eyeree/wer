@@ -10,9 +10,23 @@ description = "Native desktop application shell: windowing, event loop, and nati
 [lints]
 workspace = true
 
+[features]
+# The DOM overlay dock (docs/wry-overlay/implementation-plan.md) is the
+# default native UI. On Linux it needs the WebKitGTK dev packages (see
+# README prerequisites; CI installs them). `--no-default-features` builds
+# the bitmap-panel-only shell, and `WER_OVERLAY=0` disables the dock at
+# runtime (the headless/benchmark-clean path).
+default = ["overlay"]
+overlay = ["dep:wry", "dep:gtk", "dep:serde_json"]
+
 [[bin]]
 name = "wer"
 path = "src/main.rs"
+
+[[example]]
+name = "overlay_spike"
+path = "examples/overlay_spike.rs"
+required-features = ["overlay"]
 
 [dependencies]
 world-core = { path = "../world-core" }
@@ -36,6 +50,14 @@ pollster = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 font8x8 = { workspace = true }
+# Overlay-spike only (see [features]).
+wry = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+# wry on Linux is WebKitGTK-hosted; the spike must init and pump the GTK main
+# loop alongside winit (implementation-plan.md §5).
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+gtk = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Byte-exact mesher determinism assertions (3d-phase-1-plan.md §10).

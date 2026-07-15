@@ -13,11 +13,11 @@
 use viewer_host::input::{ButtonPhase, Modifiers, PhysicalKey, PointerButton, WheelDelta};
 use viewer_host::PreparedMapSource;
 use viewer_host::{
-    action::{ActionScope, ServiceRequestId, ViewerEffect, WorkerBackend, ACTION_DESCRIPTORS},
+    action::{ServiceRequestId, ViewerEffect, WorkerBackend},
     atlas::{AtlasManager, RefinementRequest},
     controller::{GroundSample, PovGroundSampler},
-    input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent, BINDING_DESCRIPTORS},
-    map::{Channel, MapBackend, MapBackendFallback, MapComposer, MapDecor, MapRenderRequest},
+    input::{InputContext, InputFrame, InputMapper, NormalizedInputEvent},
+    map::{MapBackend, MapBackendFallback, MapComposer, MapDecor, MapRenderRequest},
     panel::{
         PanelBuildInput, PanelDocumentCache, PanelDocumentKey, PerformanceInfo, PersistenceInfo,
         RendererInfo, Severity, StreamingSupplement, VaultInfo, ViewerWarning, WarningRegistry,
@@ -470,70 +470,6 @@ struct BrowserFrame {
     presenter_needs_frame: bool,
     presenter_dirty: bool,
     hover_changed: bool,
-}
-
-/// Small immediate presentation state used by canvas/control adapters. The
-/// information dock consumes [`viewer_host::PanelDocument`] instead; keeping
-/// this DTO separate avoids rebuilding or serializing that document on every
-/// animation frame.
-#[derive(Debug, serde::Serialize)]
-struct BrowserPresentation {
-    view: BrowserViewPresentation,
-    map: BrowserMapPresentation,
-    tier: BrowserTierPresentation,
-    executor: BrowserExecutorPresentation,
-    storage: BrowserStoragePresentation,
-    renderer: BrowserRendererPresentation,
-    decor_status: &'static str,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct BrowserViewPresentation {
-    mode: PresentationMode,
-    focused: ViewKind,
-    split_ratio: f32,
-    pov_supported: bool,
-    pov: BrowserPovPresentation,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct BrowserPovPresentation {
-    motion: &'static str,
-    shadow_ao: bool,
-    detail_normals: bool,
-    water: bool,
-    render_scale: f32,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct BrowserMapPresentation {
-    backend: MapBackend,
-    channel: Channel,
-    zoom: u32,
-    refinement: bool,
-    overlays: viewer_host::Overlays,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct BrowserTierPresentation {
-    runtime: &'static str,
-    benchmark_ms: f32,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct BrowserExecutorPresentation {
-    mode: &'static str,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct BrowserStoragePresentation {
-    mode: &'static str,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct BrowserRendererPresentation {
-    mode: &'static str,
-    device_losses: u32,
 }
 
 struct BrowserGround<'a> {
@@ -1106,49 +1042,28 @@ impl BrowserHostState {
         }
     }
 
-    fn presentation(&self) -> Option<BrowserPresentation> {
+    fn presentation(&self) -> Option<viewer_host::dto::PresentationDto> {
         let output = self.last_output.as_ref()?;
-        let map = self.controller.map_preferences();
-        let pov = output.pov;
-        Some(BrowserPresentation {
-            view: BrowserViewPresentation {
-                mode: output.mode,
-                focused: output.focused,
-                split_ratio: self.controller.layout().split_ratio,
-                pov_supported: pov.supported,
-                pov: BrowserPovPresentation {
-                    motion: if pov.walk { "walk" } else { "fly" },
-                    shadow_ao: pov.shadow_ao,
-                    detail_normals: pov.detail_normals,
-                    water: pov.water,
-                    render_scale: pov.render_scale,
+        Some(viewer_host::dto::presentation_dto(
+            output.mode,
+            output.focused,
+            self.controller.layout().split_ratio,
+            &output.pov,
+            self.controller.map_preferences(),
+            self.controller.world().tier().name(),
+            viewer_host::dto::PresentationPlatform {
+                worker_mode: self.worker_mode,
+                storage: self.storage,
+                renderer: self.renderer,
+                device_losses: self.device_losses,
+                benchmark_ms: self.benchmark_ms,
+                decor_status: if self.storage == "indexeddb" {
+                    "browser-vault"
+                } else {
+                    "browser-vault-unavailable"
                 },
             },
-            map: BrowserMapPresentation {
-                backend: map.backend,
-                channel: map.channel,
-                zoom: map.zoom,
-                refinement: map.refinement,
-                overlays: map.overlays,
-            },
-            tier: BrowserTierPresentation {
-                runtime: self.controller.world().tier().name(),
-                benchmark_ms: self.benchmark_ms,
-            },
-            executor: BrowserExecutorPresentation {
-                mode: self.worker_mode,
-            },
-            storage: BrowserStoragePresentation { mode: self.storage },
-            renderer: BrowserRendererPresentation {
-                mode: self.renderer,
-                device_losses: self.device_losses,
-            },
-            decor_status: if self.storage == "indexeddb" {
-                "browser-vault"
-            } else {
-                "browser-vault-unavailable"
-            },
-        })
+        ))
     }
 
     fn panel_document_json(&mut self) -> Result<Option<String>, serde_json::Error> {
@@ -1331,72 +1246,13 @@ impl BrowserViewerDriver {
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn action_descriptors_json() -> String {
-    let descriptors = ACTION_DESCRIPTORS
-        .iter()
-        .map(|descriptor| {
-            let scope = match descriptor.scope {
-                ActionScope::Global => "global",
-                ActionScope::FocusedView => "focused-view",
-                ActionScope::Map => "map",
-                ActionScope::Pov => "pov",
-            };
-            let bindings = descriptor
-                .default_binding_ids
-                .iter()
-                .map(|id| {
-                    let binding = BINDING_DESCRIPTORS
-                        .iter()
-                        .find(|binding| binding.id == *id)
-                        .expect("action descriptor names a registered binding");
-                    serde_json::json!({
-                        "id": binding.id,
-                        "help": binding.help,
-                    })
-                })
-                .collect::<Vec<_>>();
-            serde_json::json!({
-                "id": descriptor.id.as_str(),
-                "label": descriptor.label,
-                "help": descriptor.help,
-                "scope": scope,
-                "bindings": bindings,
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&descriptors).expect("action descriptors are serializable")
+    // One authority for both shells (viewer_host::dto, wry-overlay plan M2).
+    viewer_host::dto::action_descriptors_json()
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn map_descriptors_json() -> String {
-    let channels = viewer_host::CHANNEL_DESCRIPTORS
-        .iter()
-        .map(|descriptor| {
-            serde_json::json!({
-                "id": descriptor.id,
-                "label": descriptor.label,
-                "group": descriptor.group.id(),
-                "group_label": descriptor.group.label(),
-                "order": descriptor.order,
-            })
-        })
-        .collect::<Vec<_>>();
-    let overlays = viewer_host::MAP_OVERLAY_DESCRIPTORS
-        .iter()
-        .map(|descriptor| {
-            serde_json::json!({
-                "id": descriptor.id,
-                "label": descriptor.label,
-                "group": descriptor.group.id(),
-                "group_label": descriptor.group.label(),
-                "order": descriptor.order,
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&serde_json::json!({
-        "channels": channels,
-        "overlays": overlays,
-    }))
-    .expect("map descriptors are serializable")
+    viewer_host::dto::map_descriptors_json()
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -2787,7 +2643,18 @@ mod tests {
         assert!(!help.contains("data-help-action="));
         assert!(help_script.contains("viewer_action_descriptors()"));
         assert!(help_script.contains("row.dataset.helpAction = descriptor.id"));
-        let app = include_str!("../web/assets/app.js");
+        // The viewer runtime spans the thin shell entry plus the shared UI
+        // modules and the wasm bridge seam (docs/wry-overlay plan M1); the
+        // architectural pattern assertions apply to the concatenation.
+        let app = [
+            include_str!("../web/assets/app.js"),
+            include_str!("../web/assets/bridge-wasm.js"),
+            include_str!("../web/assets/ui/panel-dock.js"),
+            include_str!("../web/assets/ui/toolbar.js"),
+            include_str!("../web/assets/ui/keys.js"),
+            include_str!("../web/assets/ui/diagnostics.js"),
+        ]
+        .concat();
         assert!(!app.contains("MOVE_KEYS"));
         assert!(!app.contains("POV_MOVE"));
         assert!(!app.contains("requestPointerLock"));

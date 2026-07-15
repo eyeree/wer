@@ -50,6 +50,21 @@ wasm canvas-surface adapter in `renderer` (see
 - Rust (stable) via [rustup](https://rustup.rs). The pinned toolchain and the
   `wasm32-unknown-unknown` target are declared in [`rust-toolchain.toml`](rust-toolchain.toml).
 - Native GPU drivers with a Vulkan/Metal/DX12 backend (for running `wer`).
+- The native viewer's default UI is the shared DOM overlay dock (the same
+  toolbar and information panel the browser shell renders — see
+  [`docs/wry-overlay/implementation-plan.md`](docs/wry-overlay/implementation-plan.md)).
+  On Linux this needs the WebKitGTK/GTK development packages at build time:
+
+  ```sh
+  sudo apt install -y pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
+  ```
+
+  On Windows the overlay uses the preinstalled WebView2 runtime; macOS
+  needs nothing extra. `WER_OVERLAY=0` runs with the legacy bitmap panel
+  and winit-only input instead (the benchmark-clean/recovery mode, and the
+  automatic fallback when no X11/WebKitGTK is available); building with
+  `--no-default-features` produces that minimal shell without the wry
+  dependency at all.
 
 ## Common commands
 

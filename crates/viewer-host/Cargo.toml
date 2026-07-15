@@ -15,9 +15,11 @@ log.workspace = true
 pov-host = { path = "../pov-host" }
 renderer = { path = "../renderer" }
 serde.workspace = true
+# Shared control-surface serializations (dto module): both shells consume the
+# same descriptor/presentation JSON, so it is built here (wry-overlay plan M2).
+serde_json.workspace = true
 world-core = { path = "../world-core" }
 world-runtime = { path = "../world-runtime" }
 
 [dev-dependencies]
-serde_json.workspace = true
 sha2.workspace = true
