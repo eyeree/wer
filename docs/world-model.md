@@ -18,11 +18,11 @@ game.
 
 ## 1. Non-technical overview
 
-The project is an exploration game about travelling through landscapes and
+The project is an exploration game about traveling through landscapes and
 through *possibilities* at the same time. It does not treat possible worlds as
 separate levels selected by portals or loading screens. Instead, every place
 has a natural tendency toward a particular kind of reality, and the player can
-gradually bend that tendency while travelling.
+gradually bend that tendency while traveling.
 
 The landscape is reconstructed from its coordinates. Mountains, rock
 provinces, river routes, climate, soil, vegetation, ecosystems, species, and
