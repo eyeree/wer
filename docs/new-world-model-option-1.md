@@ -1,4 +1,4 @@
-# New World Model Option 1: a navigable manifold of procedural planets
+# New World Model Option 1 — a navigable manifold of procedural planets
 
 ## Status and purpose
 
