@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use loom_core::{
     AtomEntry, IntentTerm, Mass, MeasureKind, NormalizedIntent, StatePacket, MASS_ONE,
 };
-use loom_transport::{parity_fixture, probe, verify_certificate, ProbeOutcome};
+use loom_transport::{
+    parity_fixture, probe, probe_with_execution, verify_certificate, ProbeOutcome, UnresolvedReason,
+};
 
 /// Summary returned by the Stage 0A sign-off harness.
 #[derive(Debug)]
@@ -103,11 +105,40 @@ fn exhaustive_small(violations: &mut Vec<String>) -> usize {
                     },
                 ];
                 compare_orders(&source, &terms, violations, "exhaustive");
+                let intent = NormalizedIntent::normalize(terms.to_vec()).unwrap();
+                if let ProbeOutcome::Complete(result) = probe(&source, &intent, u64::MAX) {
+                    if let Some(mode) = result
+                        .modes
+                        .iter()
+                        .find(|mode| mode.signature == loom_transport::PathSignature::Direct)
+                    {
+                        let oracle = balanced_chain_oracle(&source, &mode.endpoint);
+                        if mode.certificate.objective_lower != oracle {
+                            violations.push(format!(
+                                "exhaustive oracle mismatch: {} != {oracle}",
+                                mode.certificate.objective_lower
+                            ));
+                        }
+                    }
+                }
                 cases += 1;
             }
         }
     }
     cases
+}
+
+fn balanced_chain_oracle(source: &StatePacket, endpoint: &StatePacket) -> u64 {
+    let mut cost = 0u64;
+    for level in 0..loom_core::MAX_ACTIVE_LEVELS {
+        let mut cumulative = 0i64;
+        for atom in 0..loom_core::MAX_ATOMS - 1 {
+            cumulative += i64::from(source.mass(MeasureKind::Material, level, atom).raw())
+                - i64::from(endpoint.mass(MeasureKind::Material, level, atom).raw());
+            cost += cumulative.unsigned_abs();
+        }
+    }
+    cost
 }
 
 fn randomized_permutations(violations: &mut Vec<String>) -> usize {
@@ -161,7 +192,8 @@ fn compare_orders(
         .expect("valid reversed harness intent");
     let a = probe(source, &forward, u64::MAX);
     let b = probe(source, &reverse, u64::MAX);
-    if forward != reverse || a != b {
+    let scheduled = probe_with_execution(source, &forward, u64::MAX, &[1, 0], 0b11);
+    if forward != reverse || a != b || a != scheduled {
         violations.push(format!(
             "{label}: permutation or schedule changed canonical result"
         ));
@@ -222,18 +254,88 @@ fn ordinary_corpus(violations: &mut Vec<String>) -> (usize, usize, Duration, Dur
 
 fn adversarial_corpus(violations: &mut Vec<String>) -> (usize, usize) {
     let (source, intent, fixture) = parity_fixture().expect("frozen parity fixture");
-    let cases = [
-        probe(&source, &intent, 0),
-        probe(&source, &intent, u64::MAX),
-    ];
-    let complete = cases
-        .iter()
-        .filter(|case| matches!(case, ProbeOutcome::Complete(_)))
-        .count();
-    if !matches!(cases[0], ProbeOutcome::Unresolved(_)) || fixture.modes.is_empty() {
-        violations.push("adversarial length boundary did not fail closed".into());
+    let mut passed = 0;
+    let mut check = |condition: bool, name: &str| {
+        if condition {
+            passed += 1;
+        } else {
+            violations.push(format!("adversarial case failed: {name}"));
+        }
+    };
+    check(
+        matches!(
+            probe(&source, &intent, 0),
+            ProbeOutcome::Unresolved(UnresolvedReason::LengthLimit)
+        ),
+        "zero length",
+    );
+    check(!fixture.modes.is_empty(), "unlimited length");
+    check(
+        NormalizedIntent::normalize(vec![
+            IntentTerm {
+                id: 1,
+                kind: MeasureKind::Material,
+                level: 0,
+                atom: 0,
+                delta: 1,
+                weight: 1,
+            },
+            IntentTerm {
+                id: 1,
+                kind: MeasureKind::Trait,
+                level: 0,
+                atom: 0,
+                delta: 1,
+                weight: 1,
+            },
+        ])
+        .is_err(),
+        "conflicting id",
+    );
+    check(Mass::new(MASS_ONE + 1).is_err(), "Q24 overflow");
+    check(
+        StatePacket::normalize(
+            vec![AtomEntry {
+                kind: MeasureKind::Material,
+                level: 0,
+                atom: 64,
+                mass: Mass::new(1).unwrap(),
+            }],
+            Mass::new(1).unwrap(),
+            Mass::ONE,
+        )
+        .is_err(),
+        "atom cap",
+    );
+    check(
+        StatePacket::normalize(
+            vec![AtomEntry {
+                kind: MeasureKind::Material,
+                level: 0,
+                atom: 0,
+                mass: Mass::new(1).unwrap(),
+            }],
+            Mass::new(2).unwrap(),
+            Mass::ONE,
+        )
+        .is_err(),
+        "inventory mismatch",
+    );
+    let mut tampered = fixture.modes[0].clone();
+    tampered.certificate.dual_potentials[0] = 1;
+    check(
+        verify_certificate(&source, &intent, &tampered).is_err(),
+        "dual witness tamper",
+    );
+    check(
+        probe_with_execution(&source, &intent, u64::MAX, &[1, 0], 0b11)
+            == probe(&source, &intent, u64::MAX),
+        "schedule and cancellation",
+    );
+    if passed != 8 {
+        return (passed, 8);
     }
-    (complete, cases.len())
+    (passed, 8)
 }
 
 fn packet(material: [u32; 3], total: u32) -> StatePacket {

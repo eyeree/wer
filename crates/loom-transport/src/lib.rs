@@ -22,18 +22,18 @@ pub const SOLVER_REVISION: u16 = 1;
 pub const REWRITE_LENGTH: u64 = 1_000;
 const BIRTH_DEATH_COST: u64 = 8;
 
-/// One normalized path signature. Different sweeps are structurally distinct
-/// certified modes while converging to the same unique endpoint in Stage 0A.
+/// One normalized path signature. Alternatives differ in control magnitude,
+/// never solver traversal order.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum PathSignature {
-    /// Lexicographic atom sweep.
+    /// Apply the full normalized control.
     Direct = 0,
-    /// Reverse atom sweep; useful as a stable alternate route.
+    /// Apply a tempered half-strength control.
     Reverse = 1,
-    /// Activate the optional trait law, then sweep lexicographically.
+    /// Activate the optional trait law with full control.
     RewriteDirect = 2,
-    /// Activate the optional trait law, then sweep in reverse.
+    /// Activate the optional trait law with tempered control.
     RewriteReverse = 3,
 }
 
@@ -42,8 +42,11 @@ impl PathSignature {
         matches!(self, Self::RewriteDirect | Self::RewriteReverse)
     }
 
-    const fn reverse(self) -> bool {
-        matches!(self, Self::Reverse | Self::RewriteReverse)
+    const fn numerator(self) -> i64 {
+        match self {
+            Self::Direct | Self::RewriteDirect => 2,
+            Self::Reverse | Self::RewriteReverse => 1,
+        }
     }
 }
 
@@ -85,6 +88,9 @@ pub struct SegmentCertificate {
     pub objective_upper: u64,
     /// Solver/checker revision.
     pub solver_revision: u16,
+    /// Material/trait × level × atom dual potentials proving the exact
+    /// transport lower bound independently of planner replay.
+    pub dual_potentials: Vec<i8>,
 }
 
 impl SegmentCertificate {
@@ -102,6 +108,11 @@ impl SegmentCertificate {
         bytes.extend_from_slice(&self.material_residual.to_be_bytes());
         bytes.extend_from_slice(&self.objective_lower.to_be_bytes());
         bytes.extend_from_slice(&self.objective_upper.to_be_bytes());
+        bytes.extend(
+            self.dual_potentials
+                .iter()
+                .map(|value| value.to_be_bytes()[0]),
+        );
         bytes
     }
 }
@@ -144,6 +155,21 @@ pub enum ProbeOutcome {
 /// Probe one path-constrained minimizing-movement step.
 #[must_use]
 pub fn probe(source: &StatePacket, intent: &NormalizedIntent, length_limit: u64) -> ProbeOutcome {
+    probe_with_execution(source, intent, length_limit, &[0, 1], 0)
+}
+
+/// Execute the same immutable mode jobs in a caller-supplied completion order.
+/// Bits in `cancel_once` suppress that job's first result; the canonical cold
+/// retry must still settle identically. This is the Stage 0A scheduler harness
+/// surface, not an identity input.
+#[must_use]
+pub fn probe_with_execution(
+    source: &StatePacket,
+    intent: &NormalizedIntent,
+    length_limit: u64,
+    completion_order: &[u8],
+    cancel_once: u8,
+) -> ProbeOutcome {
     if intent
         .terms()
         .iter()
@@ -162,7 +188,25 @@ pub fn probe(source: &StatePacket, intent: &NormalizedIntent, length_limit: u64)
         &[PathSignature::Direct, PathSignature::Reverse]
     };
     let mut modes = Vec::with_capacity(signatures.len());
-    for &signature in signatures.iter().take(MAX_MODES) {
+    let mut scheduled = Vec::with_capacity(signatures.len());
+    for &index in completion_order {
+        if let Some(&signature) = signatures.get(usize::from(index)) {
+            if !scheduled.contains(&signature) {
+                scheduled.push(signature);
+            }
+        }
+    }
+    for &signature in signatures {
+        if !scheduled.contains(&signature) {
+            scheduled.push(signature);
+        }
+    }
+    for (job, &signature) in scheduled.iter().take(MAX_MODES).enumerate() {
+        if cancel_once & (1 << job) != 0 {
+            // A canceled immutable job publishes nothing. Its cold retry below
+            // consumes the same inputs and is therefore the only accepted result.
+            let _discarded = solve_mode(source, intent, length_limit, signature);
+        }
         match solve_mode(source, intent, length_limit, signature) {
             Ok(mode) => modes.push(mode),
             Err(UnresolvedReason::LengthLimit) => {}
@@ -205,6 +249,8 @@ fn solve_mode(
         }
         let weighted = i64::from(term.delta)
             .checked_mul(i64::from(term.weight))
+            .and_then(|value| value.checked_mul(signature.numerator()))
+            .map(|value| value / 2)
             .ok_or(UnresolvedReason::ArithmeticOverflow)?;
         let slot = &mut desired[term.kind as usize][term.level as usize][term.atom as usize];
         let next = i64::from(*slot)
@@ -214,20 +260,14 @@ fn solve_mode(
             .map_err(|_| UnresolvedReason::ArithmeticOverflow)?;
     }
 
-    // Fixed-count deterministic relaxation. Each pass restores the material
-    // inventory and trait capacity; later passes are stable fixed points.
-    for _ in 0..SCALING_ITERATIONS {
-        restore_total(
-            &mut desired[MeasureKind::Material as usize],
-            source.material_total().raw(),
-            signature.reverse(),
-        )?;
-        cap_total(
-            &mut desired[MeasureKind::Trait as usize],
-            source.trait_capacity().raw(),
-            signature.reverse(),
-        );
-    }
+    restore_total(
+        &mut desired[MeasureKind::Material as usize],
+        source.material_total().raw(),
+    )?;
+    cap_total(
+        &mut desired[MeasureKind::Trait as usize],
+        source.trait_capacity().raw(),
+    );
 
     let mut entries = Vec::new();
     for kind in [MeasureKind::Material, MeasureKind::Trait] {
@@ -248,7 +288,7 @@ fn solve_mode(
     let endpoint =
         StatePacket::normalize(entries, source.material_total(), source.trait_capacity())
             .map_err(|_| UnresolvedReason::InvalidEndpoint)?;
-    let transport = transport_cost(&masses, &desired)?;
+    let (transport, dual_potentials) = transport_cost_and_dual(&masses, &desired)?;
     let rewrite = if signature.uses_rewrite() && endpoint.trait_rewrite_active() {
         REWRITE_LENGTH
     } else {
@@ -272,6 +312,7 @@ fn solve_mode(
         objective_lower: transport,
         objective_upper: transport,
         solver_revision: SOLVER_REVISION,
+        dual_potentials,
     };
     let mode_id = mode_id(source, intent, &endpoint, signature);
     Ok(EgressMode {
@@ -287,31 +328,26 @@ fn solve_mode(
 fn restore_total(
     values: &mut [[u32; MAX_ATOMS as usize]; MAX_ACTIVE_LEVELS as usize],
     required: u32,
-    reverse: bool,
 ) -> Result<(), UnresolvedReason> {
     let sum = values.iter().flatten().try_fold(0u32, |sum, &value| {
         sum.checked_add(value)
             .ok_or(UnresolvedReason::ArithmeticOverflow)
     })?;
     if sum < required {
-        adjust(values, required - sum, true, reverse);
+        adjust(values, required - sum, true);
     } else if sum > required {
-        adjust(values, sum - required, false, reverse);
+        adjust(values, sum - required, false);
     }
     Ok(())
 }
 
-fn cap_total(
-    values: &mut [[u32; MAX_ATOMS as usize]; MAX_ACTIVE_LEVELS as usize],
-    capacity: u32,
-    reverse: bool,
-) {
+fn cap_total(values: &mut [[u32; MAX_ATOMS as usize]; MAX_ACTIVE_LEVELS as usize], capacity: u32) {
     let sum = values
         .iter()
         .flatten()
         .fold(0u64, |sum, &value| sum + u64::from(value));
     if sum > u64::from(capacity) {
-        adjust(values, (sum - u64::from(capacity)) as u32, false, reverse);
+        adjust(values, (sum - u64::from(capacity)) as u32, false);
     }
 }
 
@@ -319,14 +355,9 @@ fn adjust(
     values: &mut [[u32; MAX_ATOMS as usize]; MAX_ACTIVE_LEVELS as usize],
     mut amount: u32,
     add: bool,
-    reverse: bool,
 ) {
     for index in 0..usize::from(MAX_ACTIVE_LEVELS) * usize::from(MAX_ATOMS) {
-        let flat = if reverse {
-            usize::from(MAX_ACTIVE_LEVELS) * usize::from(MAX_ATOMS) - 1 - index
-        } else {
-            index
-        };
+        let flat = index;
         let slot = &mut values[flat / usize::from(MAX_ATOMS)][flat % usize::from(MAX_ATOMS)];
         let room = if add { MASS_ONE - *slot } else { *slot };
         let change = room.min(amount);
@@ -342,31 +373,90 @@ fn adjust(
     }
 }
 
-fn transport_cost(
+fn transport_cost_and_dual(
     source: &[[[u32; MAX_ATOMS as usize]; MAX_ACTIVE_LEVELS as usize]; 2],
     target: &[[[u32; MAX_ATOMS as usize]; MAX_ACTIVE_LEVELS as usize]; 2],
-) -> Result<u64, UnresolvedReason> {
+) -> Result<(u64, Vec<i8>), UnresolvedReason> {
     let mut cost = 0u64;
+    let mut witness = Vec::with_capacity(2 * MAX_ACTIVE_LEVELS as usize * MAX_ATOMS as usize);
     for kind in [MeasureKind::Material, MeasureKind::Trait] {
         for level in 0..MAX_ACTIVE_LEVELS as usize {
-            let mut imbalance = 0i64;
-            for atom in 0..MAX_ATOMS as usize {
-                imbalance += i64::from(source[kind as usize][level][atom])
-                    - i64::from(target[kind as usize][level][atom]);
-                cost = cost
-                    .checked_add(imbalance.unsigned_abs())
-                    .ok_or(UnresolvedReason::ArithmeticOverflow)?;
+            let mut delta = [0i64; MAX_ATOMS as usize];
+            for (atom, value) in delta.iter_mut().enumerate() {
+                *value = i64::from(target[kind as usize][level][atom])
+                    - i64::from(source[kind as usize][level][atom]);
             }
-            if kind == MeasureKind::Trait {
-                cost = cost
-                    .checked_add(imbalance.unsigned_abs().saturating_mul(BIRTH_DEATH_COST))
-                    .ok_or(UnresolvedReason::ArithmeticOverflow)?;
-            } else if imbalance != 0 {
+            if kind == MeasureKind::Material && delta.iter().sum::<i64>() != 0 {
                 return Err(UnresolvedReason::Infeasible);
             }
+            let bound = if kind == MeasureKind::Trait {
+                BIRTH_DEATH_COST as i8
+            } else {
+                (MAX_ATOMS - 1) as i8
+            };
+            let (block, potentials) =
+                maximize_chain_dual(&delta, bound, kind == MeasureKind::Material)?;
+            cost = cost
+                .checked_add(block)
+                .ok_or(UnresolvedReason::ArithmeticOverflow)?;
+            witness.extend_from_slice(&potentials);
         }
     }
-    Ok(cost)
+    Ok((cost, witness))
+}
+
+fn maximize_chain_dual(
+    delta: &[i64; MAX_ATOMS as usize],
+    bound: i8,
+    anchored: bool,
+) -> Result<(u64, [i8; MAX_ATOMS as usize]), UnresolvedReason> {
+    const WIDTH: usize = 127;
+    const OFFSET: i16 = 63;
+    const NEG_INF: i128 = i128::MIN / 4;
+    let low = -i16::from(bound);
+    let high = i16::from(bound);
+    let mut previous = [NEG_INF; WIDTH];
+    let mut parent = [[0i8; WIDTH]; MAX_ATOMS as usize];
+    for potential in low..=high {
+        if !anchored || potential == 0 {
+            previous[(potential + OFFSET) as usize] = i128::from(delta[0]) * i128::from(potential);
+        }
+    }
+    for atom in 1..MAX_ATOMS as usize {
+        let mut next = [NEG_INF; WIDTH];
+        for potential in low..=high {
+            let slot = (potential + OFFSET) as usize;
+            for prior in (potential - 1).max(low)..=(potential + 1).min(high) {
+                let candidate = previous[(prior + OFFSET) as usize]
+                    + i128::from(delta[atom]) * i128::from(potential);
+                if candidate > next[slot] {
+                    next[slot] = candidate;
+                    parent[atom][slot] = prior as i8;
+                }
+            }
+        }
+        previous = next;
+    }
+    let (mut slot, &best) = previous
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| {
+            let potential = *slot as i16 - OFFSET;
+            (low..=high).contains(&potential)
+        })
+        .max_by_key(|(slot, value)| (**value, core::cmp::Reverse(*slot)))
+        .ok_or(UnresolvedReason::Infeasible)?;
+    let mut potentials = [0i8; MAX_ATOMS as usize];
+    for atom in (0..MAX_ATOMS as usize).rev() {
+        potentials[atom] = (slot as i16 - OFFSET) as i8;
+        if atom != 0 {
+            slot = (i16::from(parent[atom][slot]) + OFFSET) as usize;
+        }
+    }
+    Ok((
+        u64::try_from(best).map_err(|_| UnresolvedReason::Infeasible)?,
+        potentials,
+    ))
 }
 
 fn yearning_cost(
@@ -414,10 +504,20 @@ pub fn verify_certificate(
         || certificate.path_length != mode.path_length
         || certificate.path_length > certificate.length_limit
         || certificate.material_residual != 0
-        || certificate.objective_lower > certificate.objective_upper
+        || certificate.objective_lower != certificate.objective_upper
         || mode.mode_id != mode_id(source, intent, &mode.endpoint, mode.signature)
     {
         return Err(CertificateError::Mismatch);
+    }
+    let rewrite = if mode.signature.uses_rewrite() && mode.endpoint.trait_rewrite_active() {
+        REWRITE_LENGTH
+    } else {
+        0
+    };
+    if certificate.objective_upper.checked_add(rewrite) != Some(certificate.path_length)
+        || !verify_dual_witness(source, &mode.endpoint, certificate)
+    {
+        return Err(CertificateError::InvalidDualWitness);
     }
     let replay = probe(source, intent, certificate.length_limit);
     let ProbeOutcome::Complete(replay) = replay else {
@@ -441,10 +541,57 @@ pub fn verify_certificate(
 pub enum CertificateError {
     /// A committed field does not match canonical inputs.
     Mismatch,
+    /// Dual potentials violate a bound or do not attain the claimed objective.
+    InvalidDualWitness,
     /// Replaying the bounded solver did not resolve.
     ReplayUnresolved,
     /// The certified mode was absent from the complete prefix.
     ModeMissing,
+}
+
+fn verify_dual_witness(
+    source: &StatePacket,
+    endpoint: &StatePacket,
+    certificate: &SegmentCertificate,
+) -> bool {
+    let expected_len = 2 * MAX_ACTIVE_LEVELS as usize * MAX_ATOMS as usize;
+    if certificate.dual_potentials.len() != expected_len {
+        return false;
+    }
+    let mut objective = 0i128;
+    let mut offset = 0;
+    for kind in [MeasureKind::Material, MeasureKind::Trait] {
+        let bound = if kind == MeasureKind::Trait {
+            BIRTH_DEATH_COST as i16
+        } else {
+            i16::from(MAX_ATOMS - 1)
+        };
+        for level in 0..MAX_ACTIVE_LEVELS {
+            let potentials = &certificate.dual_potentials[offset..offset + MAX_ATOMS as usize];
+            offset += MAX_ATOMS as usize;
+            if (kind == MeasureKind::Material && potentials[0] != 0)
+                || potentials
+                    .iter()
+                    .any(|&value| i16::from(value).abs() > bound)
+                || potentials
+                    .windows(2)
+                    .any(|pair| (i16::from(pair[1]) - i16::from(pair[0])).abs() > 1)
+            {
+                return false;
+            }
+            let mut balance = 0i64;
+            for atom in 0..MAX_ATOMS {
+                let delta = i64::from(endpoint.mass(kind, level, atom).raw())
+                    - i64::from(source.mass(kind, level, atom).raw());
+                balance += delta;
+                objective += i128::from(delta) * i128::from(potentials[atom as usize]);
+            }
+            if kind == MeasureKind::Material && balance != 0 {
+                return false;
+            }
+        }
+    }
+    u64::try_from(objective).ok() == Some(certificate.objective_lower)
 }
 
 impl fmt::Display for CertificateError {
@@ -541,38 +688,38 @@ pub fn frozen_parity_vector_matches() -> bool {
     ];
     let expected_modes = [
         [
+            0x83, 0xbd, 0x9a, 0x31, 0xec, 0xb8, 0xb8, 0x4a, 0x17, 0x12, 0x8c, 0x8a, 0x65, 0x2d,
+            0xcb, 0xcd, 0x09, 0xf5, 0x3e, 0x61, 0xe0, 0xd1, 0x39, 0xc3, 0x43, 0xd6, 0x81, 0x14,
+            0x48, 0x0d, 0xe1, 0x22,
+        ],
+        [
             0x9f, 0x41, 0x2d, 0xda, 0xf2, 0x7d, 0x39, 0xac, 0x13, 0x0d, 0xbf, 0x7a, 0xee, 0x62,
             0x04, 0x15, 0x0e, 0x5b, 0x35, 0x07, 0xa6, 0x13, 0xee, 0x1d, 0xe5, 0xfe, 0xf4, 0x42,
             0x80, 0x2f, 0x89, 0xef,
         ],
-        [
-            0x31, 0x22, 0xc1, 0x53, 0x5f, 0xad, 0xd5, 0x1e, 0x90, 0x10, 0xe1, 0x5f, 0x03, 0xf6,
-            0xd1, 0x5e, 0x21, 0x96, 0xac, 0x06, 0xb6, 0xca, 0xd5, 0x15, 0x3f, 0xb5, 0x2f, 0x4f,
-            0x7c, 0xc1, 0x6a, 0xbf,
-        ],
     ];
     let expected_endpoints = [
+        [
+            0x74, 0x88, 0x47, 0x32, 0xa1, 0xfb, 0x5e, 0xd7, 0xb4, 0xbc, 0x70, 0x88, 0x64, 0x6c,
+            0x38, 0xbd, 0x00, 0x97, 0x25, 0xdd, 0x80, 0xc1, 0x5e, 0x13, 0x0c, 0xcf, 0x71, 0x65,
+            0x5c, 0xe6, 0xa9, 0xf7,
+        ],
         [
             0xbb, 0x54, 0xf4, 0xee, 0x8f, 0x75, 0xcd, 0x49, 0x68, 0x75, 0xde, 0x0e, 0x70, 0xfe,
             0x6e, 0xea, 0x99, 0x85, 0x8c, 0x0c, 0x23, 0xf9, 0xa7, 0xe6, 0xff, 0x0b, 0x5d, 0xb4,
             0x69, 0xac, 0xe2, 0x2e,
         ],
-        [
-            0x4b, 0x59, 0xb1, 0x7b, 0x27, 0xac, 0xe9, 0xa9, 0x01, 0xa5, 0x02, 0xad, 0x0a, 0x94,
-            0xc1, 0x3c, 0xf0, 0x26, 0x9c, 0x81, 0x64, 0x04, 0xbb, 0x32, 0x6d, 0x8b, 0xb1, 0x73,
-            0xde, 0x69, 0xa2, 0x40,
-        ],
     ];
     let expected_certificates = [
         [
-            0x46, 0x3b, 0x4e, 0x3b, 0xde, 0xf7, 0x91, 0x7c, 0x0f, 0x87, 0x76, 0xeb, 0x1f, 0x4b,
-            0x58, 0x19, 0xb3, 0xdf, 0xa9, 0x6e, 0xe1, 0xc7, 0x73, 0xda, 0x5f, 0xaa, 0xcb, 0xda,
-            0x5e, 0x00, 0xf6, 0x2e,
+            0x57, 0xda, 0x88, 0x91, 0xc3, 0x8b, 0x6f, 0xf4, 0x51, 0x78, 0x49, 0xfd, 0x88, 0xbe,
+            0x31, 0x08, 0xbb, 0x23, 0x53, 0xd8, 0xb8, 0x7e, 0x17, 0x14, 0xaf, 0x9b, 0x0c, 0x1b,
+            0x87, 0x30, 0xe7, 0x9f,
         ],
         [
-            0xd0, 0xc9, 0xc9, 0xaf, 0xf3, 0x44, 0x31, 0x17, 0xb4, 0x59, 0x4c, 0x01, 0xd6, 0x16,
-            0x3b, 0x69, 0xec, 0x9c, 0x67, 0x0a, 0x3a, 0x35, 0x33, 0x0b, 0x23, 0xca, 0x78, 0xa5,
-            0x05, 0x4e, 0x74, 0x52,
+            0x04, 0x2e, 0x9d, 0x27, 0x4a, 0x07, 0x14, 0x7b, 0xca, 0x30, 0xdb, 0x6f, 0x17, 0x3a,
+            0x28, 0xc5, 0x2c, 0x05, 0x43, 0x22, 0x5f, 0x63, 0x25, 0xef, 0x57, 0xd7, 0x5e, 0xeb,
+            0x74, 0x60, 0x21, 0xac,
         ],
     ];
     source.root() == expected_source
@@ -656,6 +803,47 @@ mod tests {
         assert_eq!(
             probe(&source, &intent, 0),
             ProbeOutcome::Unresolved(UnresolvedReason::LengthLimit)
+        );
+    }
+
+    #[test]
+    fn exact_chain_oracle_and_dual_tamper_are_checked() {
+        let source = StatePacket::normalize(
+            vec![AtomEntry {
+                kind: MeasureKind::Material,
+                level: 0,
+                atom: 0,
+                mass: Mass::new(4).unwrap(),
+            }],
+            Mass::new(4).unwrap(),
+            Mass::ONE,
+        )
+        .unwrap();
+        let intent = NormalizedIntent::normalize(vec![IntentTerm {
+            id: 1,
+            kind: MeasureKind::Material,
+            level: 0,
+            atom: 2,
+            delta: 1,
+            weight: 1,
+        }])
+        .unwrap();
+        let ProbeOutcome::Complete(result) = probe(&source, &intent, u64::MAX) else {
+            panic!("small exact fixture must resolve");
+        };
+        let direct = result
+            .modes
+            .iter()
+            .find(|mode| mode.signature == PathSignature::Direct)
+            .unwrap();
+        // One unit moved across two unit-cost chain edges.
+        assert_eq!(direct.certificate.objective_lower, 2);
+        verify_certificate(&source, &intent, direct).unwrap();
+        let mut tampered = direct.clone();
+        tampered.certificate.dual_potentials[0] = 1;
+        assert_eq!(
+            verify_certificate(&source, &intent, &tampered),
+            Err(CertificateError::InvalidDualWitness)
         );
     }
 }

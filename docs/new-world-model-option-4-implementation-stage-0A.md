@@ -56,8 +56,9 @@ Randomized evidence is not treated as proof for unbounded inputs.
 - A packet has at most 4,096 explicit entries and canonical encoded size no
   greater than 64 KiB. Stage 0A emits only two measures and one optional rewrite,
   but the public validator enforces the architectural caps.
-- A probe considers no more than eight modes and performs a fixed 24 relaxation
-  rounds. Exceeding a request or arithmetic bound fails closed.
+- A probe considers no more than eight modes. The ratified Stage 0A chain metric
+  uses a finite exact integer dual program rather than convergence-qualified
+  scaling. Exceeding a request or arithmetic bound fails closed.
 
 ### Two-law grammar
 
@@ -99,10 +100,10 @@ schedule therefore cannot affect the normalized request digest.
 
 For each enabled path signature, the solver builds a target by applying the
 normalized signed deltas, clamps only where the typed law permits it, and then
-executes exactly 24 deterministic pair-relaxation rounds. Material conservation
-is restored by lexicographic cheapest movement; trait deficit/excess may use the
-fixed birth/death edge. Every accepted endpoint is normalized through
-`loom-core`.
+performs one bounded deterministic projection. Material conservation is restored
+canonically; trait deficit/excess may use the fixed birth/death edge. An exact
+finite dynamic program solves the one-dimensional chain-transport dual for every
+law/level block. Every accepted endpoint is normalized through `loom-core`.
 
 The Stage 0A certificate records source/destination roots, request digest,
 normalized path signature, quantized directed length and limit, exact inventory
@@ -195,16 +196,44 @@ complete while the Stage 0A research gate remains explicitly unratified.
 
 - [x] Canonical packet normalization is injective on the implemented fragment.
 - [x] Types, units, totals, capacity, format, and complexity bounds fail closed.
-- [x] Canonical results survive eviction/recomputation, input permutation,
-      simulated task schedule, and cache warmness.
-- [x] Native and Node wasm frozen vectors are byte-identical.
-- [x] One canonical default and stable distinct alternatives are returned.
-- [x] Every complete mode carries a replayable, independently checked path
-      certificate.
+- [x] Canonical results survive cold recomputation, input permutation, simulated
+      task schedule, and cancellation. Cache warmness remains out of scope until
+      a Loom cache exists.
+- [x] Native and Node wasm frozen vectors are byte-identical for the ratified
+      solver and certificate format.
+- [x] One canonical default and stable, semantically distinct control modes are
+      returned.
+- [x] Every complete mode carries independently checked primal feasibility and
+      dual optimality witnesses, not only same-solver replay.
 - [x] Zero credit commits zero Egress; equal cumulative credit commits equal
       prefixes independent of frame cadence.
-- [x] Exhaustive small cases and 10,000 randomized cases pass.
-- [x] At least 99% of the frozen ordinary corpus is complete within both native
-      and wasm interaction targets.
-- [x] Adversarial resolution and every unresolved reason are reported rather
-      than folded into the ordinary success claim.
+- [x] Exhaustive small cases and 10,000 randomized cases pass, with balanced
+      small cases checked against an independent cumulative-flow oracle.
+- [x] At least 99% of the preregistered ordinary corpus is complete within both
+      native and wasm interaction targets.
+- [x] Capacity, quantization, conflicting-id, inventory, witness-tamper,
+      schedule/cancellation, and length adversaries report resolution by reason.
+
+## Ratification correction and remediation
+
+The first implementation demonstrated canonical packets, portable frozen
+vectors, and ample latency headroom, but its forward/reverse repair routine was
+not the transport/minimizing-movement solver described above. Repeating an
+already-stable repair 24 times did not constitute a scaling solve; assigning the
+same computed cost to certificate lower and upper bounds did not independently
+prove optimality; reversing request order did not simulate task schedules; and
+the two-case adversarial corpus was not representative. Consequently Stage 0A
+was not ratified by that run.
+
+Ratification now additionally requires:
+
+1. an exact discrete one-dimensional transport oracle for the Stage 0A ground
+   metric, with bounded creation/destruction for the trait law;
+2. a dual potential witness checked by code that does not call the planner;
+3. alternate modes that differ by normalized control magnitude or rewrite path,
+   never merely by solver traversal order;
+4. simulated job completion, cancellation, and cold recomputation schedules that
+   all settle to identical canonical bytes (warm-cache checks begin with a Loom
+   cache); and
+5. preregistered ordinary and adversarial tables whose membership is fixed in
+   source before the measured gate is run.
