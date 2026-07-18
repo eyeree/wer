@@ -7,6 +7,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/loom-core",
+    "crates/loom-transport",
     "crates/world-core",
     "crates/world-runtime",
     "crates/renderer",
@@ -63,6 +65,7 @@ font8x8 = { version = "0.3", default-features = false }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 wasm-bindgen-test = "=0.3.76"
+js-sys = "0.3"
 web-sys = "0.3"
 console_error_panic_hook = "0.1"
 

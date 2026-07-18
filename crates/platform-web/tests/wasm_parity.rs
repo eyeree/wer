@@ -3,6 +3,34 @@
 use wasm_bindgen_test::wasm_bindgen_test;
 
 #[wasm_bindgen_test]
+fn loom_stage_zero_a_frozen_vector_matches_native() {
+    assert!(loom_transport::frozen_parity_vector_matches());
+}
+
+#[wasm_bindgen_test]
+fn loom_stage_zero_a_probe_meets_wasm_interaction_gate() {
+    let (source, intent, _) = loom_transport::parity_fixture().unwrap();
+    for _ in 0..10 {
+        assert!(matches!(
+            loom_transport::probe(&source, &intent, u64::MAX),
+            loom_transport::ProbeOutcome::Complete(_)
+        ));
+    }
+    let started = js_sys::Date::now();
+    for _ in 0..100 {
+        assert!(matches!(
+            loom_transport::probe(&source, &intent, u64::MAX),
+            loom_transport::ProbeOutcome::Complete(_)
+        ));
+    }
+    let average_ms = (js_sys::Date::now() - started) / 100.0;
+    assert!(
+        average_ms < 10.0,
+        "average wasm probe took {average_ms:.3} ms"
+    );
+}
+
+#[wasm_bindgen_test]
 fn every_public_parity_probe_matches_the_shared_native_golden() {
     assert_eq!(
         platform_web::origin_feature_hash(),

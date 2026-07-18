@@ -20,6 +20,8 @@ world-core = { path = "../world-core" }
 # committed baseline snapshots (phase-6-plan.md §10, §12). Native-only crate,
 # so the feature is safe here.
 world-runtime = { path = "../world-runtime", features = ["pass-timing"] }
+loom-core = { path = "../loom-core" }
+loom-transport = { path = "../loom-transport" }
 
 [[bin]]
 name = "wer-replay"
@@ -44,3 +46,7 @@ path = "src/bin/vault.rs"
 [[bin]]
 name = "wer-scale"
 path = "src/bin/scale.rs"
+
+[[bin]]
+name = "wer-loom"
+path = "src/bin/loom.rs"

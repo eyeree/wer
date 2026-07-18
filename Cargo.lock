@@ -1888,6 +1888,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "loom-core"
+version = "0.0.1"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "loom-transport"
+version = "0.0.1"
+dependencies = [
+ "loom-core",
+ "sha2",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2574,7 +2589,9 @@ version = "0.0.1"
 dependencies = [
  "console_error_panic_hook",
  "glam",
+ "js-sys",
  "log",
+ "loom-transport",
  "pov-host",
  "renderer",
  "serde",
@@ -3557,6 +3574,8 @@ dependencies = [
 name = "tools"
 version = "0.0.1"
 dependencies = [
+ "loom-core",
+ "loom-transport",
  "world-core",
  "world-runtime",
 ]

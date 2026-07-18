@@ -12,6 +12,7 @@ pub mod ecology;
 pub mod executor;
 pub mod filestore;
 pub mod ledger;
+pub mod loom;
 pub mod replay;
 pub mod scale;
 pub mod vault;
@@ -25,6 +26,7 @@ pub use ecology::{run_ecology_harness, EcologyReport};
 pub use executor::LaneExecutor;
 pub use filestore::FileStorage;
 pub use ledger::{run_invalidation_ledger, ScenarioReport};
+pub use loom::{run_loom_harness, LoomReport};
 pub use replay::{
     regional_history_hash, run_continuity_replay, state_hash, ReplayConfig, ReplayReport,
 };
