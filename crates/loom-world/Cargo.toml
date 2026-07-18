@@ -1,0 +1,17 @@
+[package]
+name = "loom-world"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Platform-neutral closed-world and host contracts for World Loom Stage 0B."
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-core = { path = "../loom-core" }
+loom-transport = { path = "../loom-transport" }
+sha2.workspace = true
+

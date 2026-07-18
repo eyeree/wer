@@ -9,6 +9,7 @@ resolver = "2"
 members = [
     "crates/loom-core",
     "crates/loom-transport",
+    "crates/loom-world",
     "crates/world-core",
     "crates/world-runtime",
     "crates/renderer",

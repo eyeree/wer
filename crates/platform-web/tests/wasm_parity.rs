@@ -31,6 +31,35 @@ fn loom_stage_zero_a_probe_meets_wasm_interaction_gate() {
 }
 
 #[wasm_bindgen_test]
+fn loom_stage_zero_b_host_contract_matches_on_wasm() {
+    assert!(loom_world::frozen_parity_vector_matches());
+    let (packet, position, intent) = loom_world::fixture().unwrap();
+    let mut host = loom_world::LoomHost::new(packet, position);
+    let complete = host.plan(&intent, None).unwrap();
+    assert_eq!(complete.modes.len(), 2);
+    let frame = host
+        .update(loom_world::TravelerPathSegment {
+            start: position,
+            end: position,
+            distance_mm: complete.modes[0].path_length,
+        })
+        .unwrap();
+    assert_eq!(frame.map.state_root, frame.pov.state_root);
+    assert_eq!(frame.map.traveler, frame.pov.traveler);
+    assert!(!frame.transition.unwrap().canonical_bytes().is_empty());
+
+    let started = js_sys::Date::now();
+    for _ in 0..100 {
+        assert!(loom_world::parity_digest().is_ok());
+    }
+    let average_ms = (js_sys::Date::now() - started) / 100.0;
+    assert!(
+        average_ms < 20.0,
+        "average wasm Stage 0B fixture took {average_ms:.3} ms"
+    );
+}
+
+#[wasm_bindgen_test]
 fn every_public_parity_probe_matches_the_shared_native_golden() {
     assert_eq!(
         platform_web::origin_feature_hash(),
