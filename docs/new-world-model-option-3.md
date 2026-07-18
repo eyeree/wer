@@ -26,6 +26,21 @@ Option 2, and this document says so where it happens — but it changes the
 *foundation* underneath the skeleton, and two commitments make it its own
 proposal.
 
+A later proposal — **the World Loom**
+([`new-world-model-option-4.md`](new-world-model-option-4.md), styled internally as
+another "third option"; the repo's file numbering and in-document titles are out of
+sync) — is V3's true near-neighbor rather than Options 1/2: it also abandons the
+smooth latent vector and it also builds on optimal transport. The single sentence
+that separates them: in the World Loom, **optimal transport *is* the navigation
+metric and the Egress mechanism** (bounded transport solves decide which world is
+reached), whereas in V3 **navigation is closed-form information geometry** — a
+metric that is an algebraic Hessian identity, a natural-gradient step in closed
+form, and KL-as-Bregman comparison with no transport solve anywhere — and optimal
+transport is confined to *continuity presentation only* (§10), transient and
+never authoritative. V3 trades the World Loom's open-ended, extensible causal
+program for a compact fixed-point coordinate whose navigation algebra is
+identity-checkable and cheap; §17 draws the full contrast.
+
 **The V3 thesis, in one paragraph.** A world is not a bundle of parameters; it is
 a *probability law over what a Traveler can observe*. Points of Possibility are
 therefore members of an **exponential family of world-laws**, and one convex
@@ -44,7 +59,14 @@ than only lagging a coordinate. These two geometries, information geometry for
 *navigation* and optimal transport for *continuity*, are kept strictly separate;
 they are the two ideas that make V3 its own proposal.
 
-The design has five goals, in addition to the four shared with Option 1:
+The design has five goals of its own, in addition to the four it shares with
+Option 1 — restated here so this document stands alone: (i) deterministic,
+portable, bit-reproducible world identity across native and wasm; (ii) lazy
+realization at bounded per-sample and per-frame cost, independent of explored
+area; (iii) a non-Euclidean Possibility metric under which a numerically small but
+consequential move is metrically *far*; and (iv) weighted, validity-respecting
+Yearning reconciliation that does not depend on input order. The five that are
+distinctive to V3:
 
 1. every representable coordinate is a *valid, well-posed probability law* by
    construction (validity is membership in a convex moment set, not a clamp);
@@ -102,7 +124,7 @@ Yearnings (Impressions + Influence + Scope + weights)  +  community Attractors
         ▼  MODEL: canonical reduction to aggregates (π, μ̄, θ_A)  →  one convex program
    reconciled target law  θ⁺ = argmin over the marginal polytope      (§7)
         │
-   MODEL: resonance ρ (susceptibility + ecological support)           (§9)
+   MODEL: resonance ρ = ecological support × law alignment            (§9)
         │
         ▼  TRAVELER POLICY: step length Δs = β · ρ · ‖Δx_traveler‖     (§8.3)
    θ⋆ ← Π( θ⋆ + Δs · û(θ⋆→θ⁺) )              (canonical world-law advances)
@@ -184,7 +206,8 @@ while *"emergent or chaotic behaviour may still create sharp local differences"*
 The **Model State** is exactly $(M,\theta)$; everything else is derived. $M$ is
 the Model identity — family, major version, minor version, and a public $128$-bit
 world-family seed — folded into every hash domain (as in Option 1's $M$). A
-practical first instance uses $k\approx 40$ natural parameters, split into a
+practical first instance uses $k\approx 40$ natural parameters (the navigation
+algebra of §5, §8, and §13 is budgeted for $k\le48$), split into a
 **prevalence block** $\theta_{p}$ (bounded traits — §3.2) and a **scalar block**
 $\theta_{s}$ (unbounded magnitudes), grouped to mirror the prototype's eight
 possibility domains but giving each domain a small sub-vector rather than one
@@ -619,10 +642,12 @@ penalty; (ii) the feasible set is the **marginal polytope**, so "Model validity
 takes precedence over literal satisfaction" is automatic — an impossible
 combination is simply not in $\mathcal P$ and the flow settles at the
 $A^*$-Bregman-closest feasible law; and (iii) the whole thing is one **convex
-program with a unique minimizer**, where Option 2 relies on a sequential
-Emphasize-first/Suppress-last blend that needs a canonical raw-bit sort to recover
-order-independence. V3 still needs canonicalization — but only of the *input
-reduction*, not of the blend.
+program with a unique global minimizer**. Order-independence here is *shared* with
+Option 2, not a point of difference over it: both discard the **prototype's**
+sequential Emphasize-first/Suppress-last blend and the canonical raw-bit sort it
+needs (world-model.md §2.4) in favour of an order-independent program. V3 still
+needs canonicalization — but only of the *input reduction* (IEEE float addition is
+not associative), not of a blend.
 
 ---
 
@@ -1147,9 +1172,9 @@ reading:
 - *Genuinely V3* — the **metric** is the exact Hessian identity $g=\nabla^2A=
   \operatorname{Cov}[T]$ with no weight matrix and no rank-floor (contrast: Option 1
   differentiates a 256-probe *realized moment summary*; Option 2 differentiates an
-  *analytic attribute chart* exactly with dual numbers, with a hand-chosen weight
-  $S$ and an $\varepsilon$-floor — V3 has neither the probe nor the weight nor the
-  floor); **Scope** is literally a mean parameter; **ecology** is an LGCP whose
+  *analytic attribute chart* exactly with dual numbers, with a fixed design
+  weight $S$ and an $\varepsilon$-floor — V3 has neither the probe nor the weight
+  nor the floor); **Scope** is literally a mean parameter; **ecology** is an LGCP whose
   intensity marginal is (calibrated to be) the mean map; **Attractors** are
   conjugate pseudo-counts; and **continuity transports living/biome mass** across
   World Space under unbalanced OT.
@@ -1165,6 +1190,31 @@ by their own means (Option 2's triangular parent-gated chart; Option 1's total
 smooth decoder); V3's marginal-polytope-from-an-archetype-bank is a different route
 to the same properties, not a correction of a deficiency they lack.
 
+**Contrast with the World Loom.** The World Loom
+([`new-world-model-option-4.md`](new-world-model-option-4.md)) is the proposal V3
+is most easily confused with — both discard the latent vector, both invoke
+optimal transport, both are honest research architectures — so the difference is
+worth stating exactly.
+
+| Concern | World Loom | V3 |
+|---|---|---|
+| Coordinate | a typed causal-constitution *program packet* (variable size, Merkle-rooted, extensible) | a compact fixed-point *vector* $\hat\theta$ (~40 dims, one global address) |
+| Validity | by typed *compilation* + numeric feasibility certificates | membership in the marginal polytope of one convex free energy $A$ |
+| Navigation metric | multiscale optimal transport (W₂/WFR summed over scales) + a directed Finsler control length | the closed-form Fisher identity $g=\nabla^2A=\operatorname{Cov}[T]$; no transport solve |
+| Egress | a JKO-*inspired* constrained minimizing-movement problem with bounded route search | one strictly convex maxent program + a closed-form natural-gradient step |
+| Role of optimal transport | **the navigation mechanism** (decides which world is reached) | **continuity presentation only** (transient, discarded, never authoritative) |
+| What it optimizes for | open-ended expressivity and extensibility of *what a world can be* | closed-form, identity-checkable, cheap navigation of a *fixed* observable schema |
+
+Neither dominates. The World Loom can grow new physics without re-versioning a
+fixed axis set; V3 cannot — its expressivity is bounded by the observable schema
+$T$ and the archetype bank (§3.4). In exchange V3 gets a navigation subsystem that
+is small, allocation-free, and machine-checkable against identities rather than
+against a transport solver's convergence, and a per-tick cost measured in tens to
+hundreds of microseconds (§13) rather than in bounded-but-heavier transport
+solves. V3 is the right pick when *cheap, provable, portable navigation of a
+well-understood world family* matters more than open-ended authoring; the World
+Loom is the right pick when the reverse holds.
+
 Compatibility is neither required nor implied. Current anchors, preserves, routes,
 eight-component signatures, and generated regions cannot be reinterpreted as V3
 addresses. A migration tool could embed a current observation as a Yearning and
@@ -1173,7 +1223,66 @@ world.
 
 ---
 
-## 18. Acceptance criteria for an implementation
+## 18. Risks and honest failure modes
+
+The honesty is distributed through the document; consolidated here so a
+decision-maker sees the whole liability in one place. Ordered roughly by how much
+of the design each threatens.
+
+1. **The archetype bank is fitted, and everything geometric flows from it.** $A$,
+   the mean map, the metric, the feasible polytope, and the realized prevalences
+   are all determined by $\{c_r,\pi_r\}$, $(Q_0,q)$, and $T$ (§3.4). Those are a
+   *fitted* fixture validated by held-out world-quality tests, **not** by an
+   identity. A mis-fitted bank yields worlds that are bit-exactly reproducible and
+   still wrong. This is the explicit boundary of goal 4 and V3's single largest
+   risk; it is stated plainly rather than hidden behind "the metric is handed to
+   us."
+2. **Expressivity is capped by the fixed observable schema $T$.** A world property
+   nobody chose as a sufficient statistic cannot be a Yearning target, and changing
+   a statistic's meaning bumps the Model major version (§4, §12). Adding statistics
+   is backward-compatible, but V3 has nothing like the World Loom's open-ended,
+   re-versionable causal program — its ceiling on "what a world can be" is set once,
+   at fit time.
+3. **The prevalence tie is calibrated, not automatic.** "A trait's Scope target
+   equals the fraction of organisms expressing it" holds only in the large-domain,
+   large-$N$ limit and only within a tolerance covering finite-$N$ sampling, the
+   fBm-vs-Matérn variance bias, and the ergodic gap (§6.3, acc. 3). If calibration
+   drifts, what a Yearning asks for and what the Traveler counts on the ground pull
+   apart — the tightest tie of the three proposals, but still a harness-policed
+   equality, not an equation.
+4. **The lazy field path is (locally) stationary and isotropic.** The
+   fBm↔Matérn correspondence is asymptotic in the high-frequency slope and has no
+   $O(1)$-per-sample certificate for a fully nonstationary covariance (§6.2). Sharp
+   tectonic or biome boundaries with strong spatial nonstationarity fall outside
+   the fast path and rely on slow domain-warp modulation.
+5. **Live cross-platform navigation is only conditionally reproducible.** The
+   reconciliation solve, the $\nabla A^*$ inversion, the Bures square root, and
+   Sinkhorn are float pipelines — exact on one target, portable across targets only
+   in canonical mode (fixed iterations, portable transcendentals, specified
+   rounding; §12 grade 2). Cross-platform play leans on sharing the *committed*
+   $\hat\theta$, exactly as the prototype's anchor-reduction contract already does.
+6. **Abiotic continuity reshapes in place; it does not slide features.** Terrain and
+   climate morph by Bures spectral interpolation with the sample's phase fixed by
+   its hash (§10.2), so a specific ridge re-textures rather than migrating
+   horizontally. The "large changes resolve on approach" experience for abiotic
+   layers comes from the streaming annulus (§10.3), not from transport, and the
+   document does not claim otherwise.
+7. **The dual route buys feasibility, not speed.** Forming $\theta^{+}=\nabla A^*$
+   and taking the metric step each cost *several* matrix-free solves (§8.2); a naïve
+   dense reconcile is hundreds of µs, not tens (§13). It is comfortably real-time,
+   but "closed-form metric" does not mean "free."
+8. **The implementation surface is the largest of Options 1–3.** Information
+   geometry, unbalanced optimal transport, LGCP point processes, Matérn/SPDE
+   fields, Bures interpolation, and unbalanced Sinkhorn each carry their own
+   determinism discipline, all of it behind the neutral-core boundary. More
+   machinery is more that can break; the payoff is that the *navigation* core (§14's
+   `world-model-v3-core`/`-nav`) stays small and identity-checkable even as the
+   field and flow crates grow.
+9. **Time and Builds are inherited, not solved.** Canonical-time membership and
+   Build-reproduction fidelity are left open (§16); the temporal cycles the project
+   overview envisions have only a placeholder $\hat t$ in the Impression record.
+
+## 19. Acceptance criteria for an implementation
 
 V3 is implementable when a prototype demonstrates, without special cases:
 
