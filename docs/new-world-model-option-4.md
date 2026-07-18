@@ -1,17 +1,25 @@
-# New World Model Option 3: The World Loom
+# New World Model Option 4: The World Loom
 
 ## Status and purpose
 
-This document proposes a third complete Model for
+This document proposes a fourth complete Model for
 [`conceptual-model.md`](conceptual-model.md). It is a design, not a description of
 landed behavior. The implemented prototype remains documented in
 [`world-model.md`](world-model.md).
 
-[Option 1](new-world-model-option-1.md) and
-[Option 2](new-world-model-option-2.md) are variations on one strong idea: a small global latent vector
-is smoothly decoded into procedural parameters, observable derivatives induce a
-Riemannian metric, and a gradient-like solve moves the Traveler through that
-manifold. This proposal deliberately explores a different family.
+The sibling proposals explore three compact-coordinate designs:
+[Option 1](new-world-model-option-1.md) uses a 32-dimensional latent cube and a
+perceptual pullback metric; [Option 2](new-world-model-option-2.md) uses a
+24--48-dimensional latent manifold and a travel-gated realization wake; and
+[Option 3](new-world-model-option-3.md) makes Possibility an exponential family
+of world-laws with Fisher geometry, using unbalanced transport for spatial
+continuity. All three deliberately freeze a small global coordinate vocabulary.
+This proposal explores what becomes possible when the vocabulary itself is
+typed, extensible, and navigable.
+
+The name **V4** identifies this proposed contract, not the current value of
+`WORLD_ALGORITHM_VERSION` and not a claim that four implementation generations
+already exist.
 
 > **Central departure.** A point in Possibility is a normalized, typed
 > **causal constitution**: a content-addressed program plus compatible measures
@@ -31,12 +39,15 @@ The proposal is called **The World Loom** because it separates three things:
 - the **weave**, the unique, lazily queried Realization obtained by reconciling
   the constitution and thread on a planetary cell complex.
 
-This design intentionally spends more complexity on authoring and verification
-than Options 1 and 2. That is a feature, not an accidental cost. A versioned
-Model package may contain thousands of generated restriction maps, reduced
-bases, sparse operators, interval bounds, and conformance fixtures. Agents can
-build and maintain that artifact offline. The runtime remains finite,
+V4 accepts substantially more package-building and verification complexity than
+the compact-coordinate options. A versioned Model package may contain thousands
+of generated restriction maps, reduced bases, sparse operators, interval bounds,
+and conformance fixtures. An offline compiler, maintained by people and agents,
+may generate that artifact; the runtime must still remain finite,
 deterministic, inspectable, and independent of any online model or service.
+That trade is justified only if the staged gates below show that the generated
+artifacts make rich change tractable rather than merely moving complexity out of
+sight.
 
 This is a staged research architecture, not a claim that its most ambitious
 pieces already compose into a production system. The typed packet, measure,
@@ -55,9 +66,61 @@ The main claims of the proposal are:
 4. projective refinement makes declared coarse summaries and their fine queries
    agree by construction, while other outputs carry narrowing intervals;
 5. a transition is a first-class correspondence plan rather than only a blend
-   amount; and
-6. the shipped Model can be much too large and intricate for a person to tune
-   manually while remaining tractable for automated maintenance.
+   amount;
+6. a compiler-generated Model can exceed what anyone would tune matrix by
+   matrix while keeping its semantic laws, bounds, and failures reviewable; and
+7. every bounded runtime query either returns a certified result, a deterministic
+   continuation, or an explicit `Unresolved` status instead of guessing.
+
+## Decision summary
+
+V4 is the strongest option when the project's durable advantage is meant to be
+**semantically rich world change**: not only turning fixed knobs, but adding and
+removing ecological roles, changing causal regimes, transporting prevalence,
+preserving typed inventories, and explaining how entities correspond across the
+change. Its State Packet is larger and its toolchain is harder, but the state is
+not permanently limited to the concepts anticipated by one latent decoder.
+
+It is not the strongest option if the primary objective is the shortest path to
+a production viewer, the smallest shareable address, or a uniformly smooth
+low-dimensional navigation surface. Options 1--3 make those trades more
+directly. V4 should be selected only if the following bets survive measurement:
+
+| Design bet | Player-facing payoff | Evidence required before commitment |
+|---|---|---|
+| Typed programs and measures can stay canonical | worlds may change regime or relational structure without becoming arbitrary scripts | a terminating, confluent bounded grammar fragment with injective packet normalization |
+| Transport and rewrite paths can resolve interactively | Yearnings can express prevalence, birth/death, split/merge, and relational change | Stage 0 latency **and resolved-rate** ledgers on representative and adversarial requests |
+| Projective realization can reconcile local detail with planetary promises | distant refinement does not contradict oceans, rivers, climate, or ecology already observed | seam, conservation, restriction, and error-bound gates through Stages 1--3 |
+| Transition correspondence is useful enough to justify its cost | change reads as migration, succession, and transformation rather than a global reload | playtests plus bounded match/event coverage and visible low-margin reporting |
+| Generated artifacts remain reviewable and bounded | a richer Model need not require runtime learning or an online service | reproducible package builds, independent witness checking, hard compiler caps, and useful failure diagnostics |
+
+A representative play sequence shows the intended difference. A Traveler might
+capture a gliding canopy organism and a basalt archipelago, ask for gliding to
+become pervasive, and Hold the current river topology. V4 does not turn a
+"gliding" scalar upward. It transports trait and habitat mass, considers a
+bounded set of causal routes such as denser air, taller canopies, or cliff
+ecologies, and returns distinct feasible modes when those routes imply materially
+different worlds. Exploration commits one selected route. Its Transition Plan
+then tells the Visualization which species and landscape features persist,
+split, merge, appear, or disappear. The result can surprise the Traveler while
+remaining attributable to typed laws and explicit compromises.
+
+V4 is not a claim to reproduce Earth science, a license for arbitrary runtime
+code, or a runtime machine-learning system. It is a deterministic synthetic
+world model whose most ambitious components remain hypotheses until their stage
+gates pass.
+
+The document deliberately specifies three architectural layers:
+
+| Layer | Normative content | Selection meaning |
+|---|---|---|
+| **Loom kernel** | typed packets, measures, grammar rewrites, transport geometry, bounded queries, identity, and determinism | the minimum implementation that may call itself V4-compatible |
+| **Reference planetary family** | the icosahedral planet, projective physical/ecological solvers, species modes, and transition extractors | one ambitious family used to test whether the kernel produces the desired game |
+| **Optional integration profiles** | durable records, Attractors/service privacy, Builds, complete Visualization replay, and production host integration | independently negotiated capabilities; absence does not invalidate the kernel |
+
+Later acceptance criteria name the applicable profile. In particular, selecting
+the Loom kernel does not commit the project to deploying Privacy Pass or a
+network service.
 
 ## 1. System overview
 
@@ -108,39 +171,79 @@ becomes a Model State.
 
 ### 2.1 Model identity and package
 
-A stable `GenerationId` is
+A stable semantic `GenerationId` is
 
 $$
-M_g=(\text{family},\text{major},h_{\rm core},K).
+M_g=(\text{family},\text{major},h_{\rm semantics},K).
 $$
 
-A loadable `PackageId` is
+A loadable semantic `PackageId` is
 
 $$
 P=(M_g,\text{minor},h_{\rm extensions}).
 $$
 
+The bytes of one compiled package have a separate
+
+$$
+A_P=H(\texttt{"loom-artifact"}\mathbin\|\text{canonical package bytes}),
+$$
+
+called its `ArtifactId`.
+
 Here:
 
-- `family` names the World Loom contract;
-- `major` or $h_{\rm core}$ changes the meaning of an existing base address or
+- `family` names one concrete Model family implementing the V4 contract;
+- `major` or $h_{\rm semantics}$ changes the meaning of an existing base address or
   canonical result;
 - `minor` and $h_{\rm extensions}$ may append optional capabilities without
   changing an old address, field, counter, or id;
-- $h_{\rm core}$ identifies every base grammar rule, atom dictionary, unit,
-  ground cost, solver constant, rounding point, and test vector; and
+- $h_{\rm semantics}$ identifies every base grammar rule, atom dictionary,
+  unit, ground cost, solver constant, rounding point, and other input that can
+  change a canonical result; and
 - $K$ is a public 128- or 256-bit family key used by the universal innovation
   field.
 
-The names `GenerationId` and `PackageId` are normative API types, not two
-spellings of a generic `ModelId`. The package contains no secret weights and performs no learning at runtime. It
-is an immutable compilation product. Package equality requires identity and
-canonical manifest bytes; a digest is an index, not a magical substitute for
-the data it names. A State Packet records $M_g$ plus only those extension ids it
-actually uses. Installing an unused optional extension cannot change its root.
+Test vectors, certificates, documentation, compiler metadata, and optimized
+code that leave semantics unchanged affect `ArtifactId`, not `GenerationId`.
+Better evidence for the same semantics must not reidentify a world. The names
+`GenerationId`, `PackageId`, and `ArtifactId` are normative API types, not three
+spellings of a generic `ModelId`. A State Packet records $M_g$ plus only those
+extension ids it actually uses. Installing an unused optional extension cannot
+change its root.
+
+All V4 Merkle roots, chunks, manifests, and untrusted record ids use a
+domain-separated, versioned cryptographic digest; the initial profile uses
+SHA-256. The counter generator used for procedural innovation is not an
+integrity hash. A compiler may emit an unsigned candidate, but only the reviewed
+release pipeline signs an `ArtifactId` after independent witness checks. The
+trusted base is the neutral opcode kernels, canonical decoder/checker, digest
+implementation, and release key—not the agent or compiler that proposed the
+artifact.
+
+#### Runtime package form
+
+A runtime package is immutable **data**, not dynamically loaded Rust or native
+code. It contains no secret weights, and the runtime performs no learning. Its
+grammar nodes lower only to a bounded opcode/kernel set implemented by
+the versioned neutral runtime. Compiler-generated Rust scalar/SIMD kernels are
+ahead-of-time optimization artifacts: shipping them requires rebuilding the
+native/wasm application and binding the resulting kernel ABI in `ArtifactId`.
+A minor extension may compose supported opcodes and add data; a new opcode or
+new canonical operation requires an application/kernel version change.
+
+Each deployment profile declares hard limits for total package bytes, required
+startup-closure bytes, decoded working memory, chunk count/depth/fanout, and
+lazy-load work. The static browser artifact embeds the required base closure;
+optional immutable chunks may be supplied lazily, but no canonical query may
+depend on an implicit network fetch. A missing or corrupt required chunk is a
+bounded `ModelError`; a missing optional closure disables its advertised
+capability. Stage 1 must replace these profile limits with measured native and
+wasm startup, download, decode, and peak-memory ledgers before the planetary
+package is accepted.
 
 Every primitive has a typed domain tag. A permanent hash or random counter folds
-the stable domain identity
+the stable `InnovationId`
 
 $$
 (\text{family},\text{major},K,\text{semantic channel id},
@@ -148,12 +251,15 @@ $$
 $$
 
 plus scale, canonical spatial address, and ordinal in a specified order. It does
-not blindly fold `minor` or the extension-package digest. Floating-point bits
-are never sources of identity.
+not blindly fold `minor`, `ArtifactId`, or the extension-package digest.
+Unchanged channels intentionally retain the same innovation thread across a
+semantic-manifest revision; changing a channel's innovation semantics bumps its
+channel revision. Floating-point bits are never sources of identity.
 
 ### 2.2 A typed causal constitution
 
-A constitution has a normalized typed program $G$ and numeric laws $q$:
+A constitution has a normalized typed program $G$ and a numeric assignment
+$q$ of inventories, measures, couplings, and coefficients:
 
 $$
 \omega=(G,q).
@@ -198,7 +304,13 @@ native calls, dynamic allocation policies, or unbounded recursion in the
 language. Every node lowers to a bounded neutral-core kernel plus a dependency
 declaration.
 
-### 2.3 Laws as compatible measures
+In the rest of this document, $\omega=(G,q)$ denotes an interpreted constitution
+or Model State, $\hat\omega$ denotes its canonical `StatePacket`, $q_\ell$
+denotes numeric assignment data at one level, and $\Gamma$ denotes an Egress
+path. API prose may say “packet” or “current state” when the distinction is
+already explicit; rewrite history is never part of any of these values.
+
+### 2.3 Typed assignments as compatible measures
 
 For each type $c$ and scale $\ell$, the package defines a compact motif space
 $A_{c,\ell}$. Examples include lithology mixtures, storm-track modes, leaf
@@ -230,7 +342,7 @@ climate relation may couple heat-source, moisture-carrier, and seasonal-mode
 measures under analogous typed balance maps. These couplings let a state
 describe relational structure, not only a bag of scalar prevalence values.
 
-State measures are **laws, priors, capacities, and inventories**. They are not
+State measures encode **priors, capacities, rates, and inventories**. They are not
 automatically the realized population measures shown to a player. The ecology
 block, for example, derives $\nu_x^*$ and a food-web flow from state priors and
 budgets. Canonical prevalence integrates those derived outputs. Egress transports
@@ -300,8 +412,8 @@ than being asserted to form a quotient or moduli space.
 The canonical **State Packet** is the Possibility Coordinate. It contains:
 
 ```text
-stable generation identity, core manifest digest, and sorted used extension ids
-normalized program/rewrite signature
+GenerationId, semantic package closure, and sorted used extension ids
+program normal-form id (rewrite history excluded)
 sorted fixed-point measure atoms and relation couplings
 sorted fixed-point constitutive coefficient patches
 procedural-tail rule and packet-format version
@@ -328,13 +440,24 @@ The packet is a finite sparse patch over a versioned procedural tail. The tail
 is a fixed part of the Model package, so omitting a fine coefficient never means
 “whatever happens to be in cache.” Removing all finite complexity ceilings would
 make finite patches a natural approximation family for the theoretical inverse
-limit. V1's fixed 64 KiB/4,096-entry subset is finite and is not claimed to be
+limit. V4's fixed 64 KiB/4,096-entry subset is finite and is not claimed to be
 dense by itself.
 
-A 256-bit Merkle root makes structural sharing and lookup cheap. The root does
-not make a state self-decoding. An Impression or atlas bundle must carry the
-immutable chunks it references, directly or through a content-addressed bundle
-whose availability is part of the record validation result.
+A 256-bit Merkle root makes structural sharing and lookup cheap. `StatePacket`
+names the decoded normalized value bounded above; `StateAddress` is only
+`(GenerationId, root)`, and `StateEnvelope` carries that address plus a bounded
+closure of canonical packet chunks. A `StateBundle` may deduplicate chunk bytes
+across several envelopes. A root alone is not self-decoding. An Impression or
+atlas bundle must carry the immutable closure it references, directly or through
+its own self-contained bundle envelope whose availability is part of record
+validation.
+
+Neutral code never discovers those chunks by opening a file or URL. A caller
+either supplies a complete `StateEnvelope` or passes an explicit bounded,
+read-only `ChunkSource`; missing chunks become a deterministic continuation or
+`ModelError` according to the request. `ChunkSource` is distinct from the
+mutable durable `Storage` trait and conveys no authority to fetch from an
+implicit network service.
 
 The root is computed over the normalized payload and child-chunk digests,
 excluding the root field itself. Packet validation recomputes it before any
@@ -361,16 +484,24 @@ The three sets from the conceptual model have precise meanings:
 - **Theoretical Possibility** is $\Theta$, including real-valued, infinitely
   refined compatible constitutions admitted by the grammar.
 - **Representable Possibility** is the set of canonical State Packets obeying
-  the finite complexity ceiling, fixed-point formats, supported grammar, and a
-  valid certificate.
-- **Reachable Possibility** from $q_0$ is the set of packets at the end of a
+  the finite complexity ceiling, fixed-point formats, and supported grammar for
+  which the semantic validity predicate holds. A certificate proves that
+  intrinsic fact; availability of a particular witness does not change set
+  membership.
+- **Reachable Possibility** from $\hat\omega_0$ is the set of packets at the end of a
   finite certified path whose directed transport length and grammar rewrites obey the
   directional controls in Section 3 and whose hard feasibility residual is zero.
 
 Representable coordinates form a finite quantized subset at one Model
-version, while Egress maintains a continuous internal path of measures and
-coefficients. Error-feedback quantization commits canonical packets without
-losing sub-quantum motion.
+version, while Egress plans a continuous path of measures and coefficients
+between them. Error-feedback quantization commits canonical packets without
+losing sub-quantum motion while the same selected plan remains active.
+
+The API distinguishes four statuses that are easy to conflate: syntactically
+representable bytes, semantically valid State, locally available and verified
+State closure, and reachability from a named source. A packet can be intrinsically
+valid while its required chunks or current checker evidence are unavailable;
+`open` then fails or continues explicitly rather than redefining Possibility.
 
 The package must bound the largest change in every declared **continuous
 channel or moment** caused by one packet quantum. That bound must fall below its
@@ -382,11 +513,13 @@ remains available between packet crossings; quantization is not permission for
 a visible global step.
 
 Sub-quantum path length is a `NavigationAccumulator` owned by the Traveler. It
-is movement credit along a named Egress Plan, not a partially realized local world
-or a second canonical coordinate. It belongs in an exact run-session snapshot
-but not in an Impression. Until the next packet boundary is crossed, canonical
-Realization remains at the current packet. Replanning transports or clears the
-credit by a specified deterministic rule.
+is movement credit along a named Selected Egress Plan, not a partially realized
+local world or a second canonical coordinate. It belongs in an exact run-session
+snapshot but not in an Impression. Until the next packet boundary is crossed,
+canonical Realization remains at the current packet. Continuing the identical
+`selected_plan_id` preserves credit; any replan that changes that id clears it.
+World Space arclength not yet converted when a boundary is crossed is handled by
+the event rule in Section 8.2 and is not discarded or double counted.
 
 Reachability is generally directed. Adding atmospheric oxygen through a slow
 biogeochemical control need not cost the same as consuming it; acquiring a
@@ -396,17 +529,20 @@ are therefore separate concepts.
 
 ### 2.6 World Space and canonical time
 
-V1 World Space is an oblate planet addressed on a recursively subdivided
+V4 World Space is an oblate planet addressed on a recursively subdivided
 icosahedron. A canonical surface point is
 
 $$
 x=(f,b_0,b_1),
 $$
 
-where $f\in\{0,\ldots,19\}$ is a base face, $b_0,b_1$ are signed fixed-point
-barycentric coordinates at one fixed Q2.46 precision. Signed centimetre altitude
-along the reference normal completes a three-dimensional address. Tie rules on
-edges and vertices choose one canonical face. A hierarchical **cell** address
+where $f\in\{0,\ldots,19\}$ is a base face and $b_0,b_1$ use one fixed Q2.46
+storage format. Validation requires $b_0\ge0$, $b_1\ge0$, and
+$b_0+b_1\le1$ exactly; the third barycentric component is the exact remainder.
+Signed centimetre altitude along the reference normal completes a
+three-dimensional address. On an edge or vertex, the lowest numbered incident
+face wins and coordinates are remapped through the manifest's oriented vertex
+order before hashing. A hierarchical **cell** address
 has a separate level $L$; it is not another encoding of the point. The World
 Space path metric is the declared product metric
 
@@ -424,6 +560,12 @@ and discrete calculus. World Space is finite in extent but resolution is
 scale-extensible. A planar development Model could implement the same contract,
 but the first World Loom target should be planetary so astronomy, seams, and
 global inventories are not deferred architectural problems.
+
+This deliberately changes where the project's “infinite” promise lives. One V4
+State is one finite, complete planet; unbounded exploration comes from the
+continuum and combinatorial depth of reachable planets in Possibility, not from
+one endless planar World Space. A family that requires a literally unbounded
+World Space can implement the Loom kernel with a different spatial profile.
 
 Canonical model time is an integer number of SI seconds from a versioned epoch.
 The Model exposes orbital, lunar, tidal, illumination, and seasonal forcing, as
@@ -592,7 +734,7 @@ The Model exposes:
 
 This can admit branches, one-way controls, and phase boundaries. Calling two
 rewrite sequences homotopic would additionally require versioned 2-cells and
-path-equivalence laws, which V1 does not assume. A single local Jacobian is not
+path-equivalence laws, which V4 does not assume. A single local Jacobian is not
 expected to describe all of Possibility.
 
 ### 3.3 Finite route search
@@ -622,21 +764,30 @@ promise. Each transport block must return a feasible primal upper bound and a
 dual lower bound; failure to meet the requested gap returns `Unresolved` for
 that mode.
 
-The Model may return up to three non-dominated modes when intent is genuinely
-multimodal. The Traveler chooses explicitly or a versioned policy chooses by
-objective, then lexicographic path signature. An arbitrary iteration order can
-never decide which world is reached.
-If the certified non-dominated frontier exceeds three, the query returns a
-`Partial` page with a continuation or `Unresolved(ModeFrontierTooLarge)`; it
-never silently discards a mode that could change the choice.
+The Model certifies at most one candidate per normalized path-mode signature.
+Two candidates are mode-equivalent only when their normalized rewrite/control
+signature and canonical checkpoint sequence are equal; equivalent candidates
+deduplicate by `mode_id`. A `mode_id` is derived from the source root, request
+digest, normalized signature, endpoint root, and consumed solver revisions—not
+from discovery order.
 
-Selection is an explicit pure Model operation. Choosing a returned `mode_id`
+A complete result contains a deterministic `default_mode_id`, the globally
+least certified lexicographic key, plus at most two best structurally distinct
+alternatives under that same ordering. This is a bounded alternative policy,
+not an undefined Pareto frontier. If branch-and-bound cannot prove the default
+and top-three prefix complete, the query returns `Partial` with a continuation
+or `Unresolved(ModePrefixTooLarge)`; it never lets iteration order decide the
+default or silently omits a candidate that could enter that prefix.
+
+Selection is an explicit pure Model operation. The Traveler may accept the
+default or choose another returned `mode_id`; that choice becomes canonical
+request input. Choosing it
 mints a `SelectedEgressPlan` whose id commits to source root, normalized intent
 and Attractor digest, mode-specific certified path, Resonance/rate inputs, and
 length horizon. Only that selected plan can be advanced; a collection containing
 three alternatives is never itself an ambiguous path. Selection is enabled only
-after the frontier is `Complete`, or when a certificate proves omitted pages
-cannot dominate the explicitly chosen mode.
+after the top-three prefix is `Complete`, or when a certificate proves omitted
+pages cannot outrank the explicitly chosen mode.
 
 Long travel replans from committed states in model-predictive-control fashion.
 This does not make endpoint realization path-dependent: a State Packet always
@@ -793,8 +944,9 @@ evidence, not mathematical proofs.
 
 ### 5.1 The universal innovation thread
 
-All worlds sharing one stable generation identity use one addressable innovation
-tower. For semantic channel $c$, let
+All worlds sharing one `InnovationId` use one addressable innovation tower; two
+`GenerationId`s may intentionally retain unchanged channels of that thread as
+specified in Section 2.1. For semantic channel $c$, let
 
 $$
 \zeta_{c,\ell,k}=R(D_c,\ell,k),
@@ -830,7 +982,7 @@ block wants a finite-element approximation to correlated or white forcing, the
 compiler declares its load covariance explicitly; iid vertex counters are not
 mislabeled finite-element white noise. Exact Galerkin white-noise loads have
 covariance equal to the finite-element mass matrix $M$. Because
-$\mathcal L^TM^{-1}\mathcal L$ is generally dense, V1 gets a sparse canonical
+$\mathcal L^TM^{-1}\mathcal L$ is generally dense, V4 gets a sparse canonical
 coefficient precision only through a diagonal mass-lumped $\widetilde M$ or
 another specifically verified construction with a versioned error certificate.
 A retained auxiliary forcing variable may give a sparse **joint** system; its
@@ -913,7 +1065,7 @@ $$
 \qquad r_c\in\mathbb N.
 $$
 
-V1 permits only integer local powers, lowered through auxiliary variables to
+V4 permits only integer local powers, lowered through auxiliary variables to
 sparse operators. A fractional power is nonlocal and is unsupported at Canonical
 grade unless a separately versioned rational approximation has its own error
 certificate. Positive bounds on $\kappa,\tau,H$, the ordering shown above, the
@@ -940,10 +1092,10 @@ primal, boundary, and truncation bounds certify the declared hierarchical Model.
 
 The constitution carries bounded distributions and inventories for stellar
 luminosity, orbital elements, moons, atmosphere, hydrosphere, and crust. A typed
-orbital block rejects unstable configurations under the V1 horizon and exposes
+orbital block rejects unstable configurations under the V4 horizon and exposes
 integer-time illumination and tide forcing.
 
-Terrain is a coupled variational material problem, not an octave sum. One V1
+Terrain is a coupled variational material problem, not an octave sum. One V4
 form is
 
 $$
@@ -961,7 +1113,7 @@ allow faults, cratons, volcanic arcs, and basins to emerge from one coupled
 equilibrium. Integer active-set extraction names robust plate/fault features and
 reports the objective margin to the next candidate.
 
-The displayed ingredients do not automatically make this energy convex. A V1
+The displayed ingredients do not automatically make this energy convex. A V4
 instantiation must either certify a positive Hessian lower bound within each
 finite material active set or use the bounded candidate rule of Section 4.2.
 Uncertified coefficients are not valid State cells.
@@ -1082,24 +1234,32 @@ queryable without simulating individual predation.
 
 The local solves do not require a scan of every habitat cell to define a global
 species. Each projective ecology tile restricts to a fixed summary of trait
-mass, habitat membership, and trophic moments. The 1,280-face base complex plus
-certified tail bounds therefore defines one bounded global trait/habitat measure
+mass, habitat membership, and trophic moments. The 1,280-face canonical ecology
+summary level plus certified tail bounds therefore defines one bounded global
+trait/habitat measure
 using at most 256 atoms per declared trait block. A canonical scale-space
 clustering rule first extracts modes on that coarse atom grid. Refinement may
 resolve a mode whose interval was previously ambiguous, but may not rename a
 mode already reported canonical; a tail bound crossing a split/merge threshold
 returns `Unresolved`.
 
-Species are those persistent modes of the bounded global trait/habitat measure.
+Species are the resolved modes of the bounded global trait/habitat measure.
 Each has:
 
-- an **ancestry key** derived from the family innovation basin and motif path,
-  stable while that mode persists across nearby constitutions;
-- an **exact manifestation id** derived from State root, ancestry key, and mode
+- a path-independent **lineage-basin key** derived from the family innovation
+  basin, motif path, and canonical coarse support basin, used as one matching
+  feature rather than asserted as cross-world identity;
+- an **exact manifestation id** derived from State root, lineage-basin key, and mode
   ordinal;
 - a trait distribution, tolerance, niche, trophic relations, and classifier
   margin; and
-- split/merge ancestry emitted in a Transition Plan.
+- transition-local predecessor, successor, split, and merge relations emitted
+  by a Transition Plan with costs and margins.
+
+The same endpoint always yields the same species modes and lineage-basin keys,
+regardless of the path used to reach it. Only the exact manifestation id is an
+identity. “Ancestry” across worlds is correspondence evidence local to a named
+transition; it is not a hidden path-dependent lineage state.
 
 A canonical organism manifestation is an addressable representative sample
 
@@ -1134,12 +1294,22 @@ pub enum EgressOutcome {
     ProvenUnreachable(UnreachableCertificate),
 }
 
+/// Read-only immutable content supplied explicitly by a platform adapter.
+pub trait ChunkSource {
+    fn chunk(
+        &self,
+        id: ChunkId,
+        out: &mut [u8],
+    ) -> Result<QueryStatus<ChunkInfo>, ModelError>;
+}
+
 pub trait LoomModel {
     fn validate_state(
         &self,
-        packet: &StatePacket,
-    ) -> Result<QueryStatus<StateCertificate>, ModelError>;
-    fn open(&self, packet: &StatePacket) -> Result<QueryStatus<Snapshot>, ModelError>;
+        input: &StateInput<'_>, // StateEnvelope + optional explicit ChunkSource
+    ) -> Result<QueryStatus<ValidatedState>, ModelError>;
+    fn open(&self, state: &ValidatedState)
+        -> Result<QueryStatus<Snapshot>, ModelError>;
     fn plan_egress(
         &self,
         request: &EgressRequest,
@@ -1188,6 +1358,14 @@ complete result backed by a grammar-cut certificate. All results depend only on
 the snapshot, request, continuation, and manifest. Caller-provided scratch
 storage and a declarative job graph keep execution policy outside the neutral
 crates.
+
+The manifest also caps total intent terms, Attractor modes, State-envelope
+bytes/chunks/depth, certified-path checkpoints and collocation points, coupling
+nonzeros, continuation-token bytes, Transition Plan bytes, certificate-chain
+length, and Build graph nodes/edges/content bytes. Every count is validated
+before allocation or expensive decoding. Caller-owned output buffers are
+transactional: an error or unresolved page leaves them unchanged, and a
+`Partial` result commits only the complete prefix named by its continuation.
 
 `ModelError` is reserved for invalid/corrupt inputs, missing required immutable
 data, unsupported versions, or violated internal integrity contracts. Expected
@@ -1243,17 +1421,20 @@ weather, motion, organism behavior, sound, and other activity. Its complete
 simulation seed, parameters, resource tier, and time are explicit Visualization
 inputs.
 
-The versioned `VisualizationReplayBundle` for exact replay names the complete
-tuple: Visualization and simulator definitions
-and versions; backend/hardware class wherever it can affect an observable;
-assets, preferences, resource tier, and parameters; Realization snapshot and
-World Space location; canonical initial simulation snapshot; deterministic
+The versioned `VisualizationReplayBundle` names the complete tuple:
+Visualization and simulator definitions and versions; content-addressed assets,
+preferences, resource tier, and parameters; Realization snapshot and World
+Space location; canonical initial simulation snapshot; deterministic
 action/event log (or a replacement full snapshot); and simulation time. The
-same tuple must produce bit-identical declared observable state and output.
-Backend variation cannot be waived behind a vague determinism grade: it is
-either eliminated from the declared output or represented in the tuple's
-identity. A different tuple may present the same Model differently, but it
-cannot change canonical Model observations, Egress, Resonance, or Reachability.
+reference CPU simulation state and declared semantic event outputs are
+bit-identical for the same tuple. GPU-rendered pixels, timing-dependent audio,
+and other derived presentation are outside that bit-exact surface and instead
+carry a declared semantic or tolerance grade. Exact pixels require a separately
+versioned reference software renderer. A backend/hardware class may be recorded
+to reproduce an approximate presentation profile, but naming it cannot turn
+driver variation into bit identity. A different tuple may present the same
+Model differently, but it cannot change canonical Model observations, Egress,
+Resonance, or Reachability.
 
 ## 7. Observables, Impressions, and Yearnings
 
@@ -1271,10 +1452,11 @@ $O_a$ declares:
 - sensitivity support, which may be an analytic derivative, a dual solution,
   or certified finite differences.
 
-Unlike Option 2, the observable vector is not also the coordinate chart. The
-constitution may contain causes that have no direct player-facing attribute,
-and two different causal arrangements may produce similar observables. This is
-where surprise can live without making navigation meaningless.
+Unlike Option 2's attribute chart and Option 3's natural/mean dual coordinates,
+the observable catalog is not the coordinate system. The constitution may
+contain causes that have no direct player-facing attribute, and two different
+causal arrangements may produce similar observables. This is where surprise can
+live without making navigation meaningless.
 
 Cross-Model compatibility uses semantic ids plus explicit adapters. A generic
 attribute such as `organism.body_plan.limb_count` may be shared; a Model-specific
@@ -1336,7 +1518,7 @@ requested by the Influence**, not a fraction of the remaining possible change:
 | **Hold** | penalize transport of selected moments/couplings away from their value when the Yearning was activated |
 | **Disable** | emit no term and no constraint |
 
-If $p_0$ is the current canonical prevalence when the Yearning is activated, V1
+If $p_0$ is the current canonical prevalence when the Yearning is activated, V4
 uses the monotone one-sided prevalence targets
 
 $$
@@ -1417,7 +1599,7 @@ pretending one local gradient expresses the full intent.
 A portable Impression contains or references a self-contained bundle with:
 
 ```text
-GenerationId, used extension ids, State root, and required immutable State chunks
+GenerationId, PackageId, compatible ArtifactId, State root, and required immutable State chunks
 exact fixed-point World Space address and attachment frame
 optional canonical model time / forcing phase
 canonical subject id and margin, or a canonical attribute-by-value record
@@ -1459,13 +1641,13 @@ and subject from the Impression.
 
 ### 8.1 One navigation probe
 
-Let $q_n$ be the current constitution, $\mathcal Y$ the aggregate Yearning
+Let $\omega_n$ be the current constitution, $\mathcal Y$ the aggregate Yearning
 energy, and $\mathcal A$ an optional Attractor potential. The manifest declares
 a hard per-plan directed-length horizon $\Delta L_{\rm model}$; the caller may
 request a smaller horizon but never a larger one. For bounded path mode $m$, let
-$\mathcal C_m(q_n)$ be the class of paths that:
+$\mathcal C_m(\omega_n)$ be the class of paths that:
 
-- start at $q_n$;
+- start at $\omega_n$;
 - remain in the continuous law-feasible set for every path parameter, with
   exact inventory/declared-balance constraints and certified derived-solver bounds;
 - obey the mode's directed controls, measure continuity equations, and rewrite
@@ -1478,7 +1660,7 @@ The primary generalized proximal-control problem is
 
 $$
 \Gamma_m^\dagger\in
-\arg\min_{\substack{\Gamma\in\mathcal C_m(q_n)\\
+\arg\min_{\substack{\Gamma\in\mathcal C_m(\omega_n)\\
 \mathscr L_m^{\rightarrow}[\Gamma]\le\Delta L}}
 \left[
 \frac{\mathscr L_m^{\rightarrow}[\Gamma]^2}{2\tau}
@@ -1523,7 +1705,7 @@ string and never overrides hard feasibility or primary intent.
 Entropic regularization turns individual finite transport blocks into bounded
 matrix-scaling iterations. The whole problem can still be nonconvex because
 derived observables, support choices, physical guards, and rewrites are
-nonconvex. V1 enumerates their bounded active sets and reports the best
+nonconvex. V4 enumerates their bounded active sets and reports the best
 **certified candidate within the searched horizon**, together with primal upper
 bounds, dual/lower bounds where available, and a horizon status. It does not
 claim a global optimum over unsearched programs. The mathematical distance, the
@@ -1540,7 +1722,7 @@ transport/control path
 
 $$
 \Gamma:[0,L_{\max}]\to\Theta,
-\qquad \Gamma(0)=q_n,
+\qquad \Gamma(0)=\omega_n,
 $$
 
 parameterized by cumulative directed path length, plus canonical packet crossing
@@ -1570,8 +1752,9 @@ sample per render frame.
 $\beta>0$ converts World Space length to Possibility length; both Resonance
 factors are dimensionless and cannot create negative progress.
 The selected plan commits to the exact $\rho_{\rm plan}$, local-factor
-capability revision, quadrature rule, and normalized request digest used by this
-calculation.
+capability revision, $\beta$, World Space metric revision, controller-path
+quantization and collision semantics, quadrature rule, and normalized request
+digest used by this calculation.
 
 The `NavigationAccumulator` stores the mode-specific `selected_plan_id`,
 cumulative consumed path length, and unspent fixed-point credit.
@@ -1582,9 +1765,10 @@ crosses a boundary, it replans there and applies the remaining arclength to the
 new plan. This event-driven rule makes subdivision of the same input path into
 frames irrelevant.
 
-Unspent sub-quantum credit persists only while the same intent/Attractor digest
-and path mode remain active. An explicit intent or mode change clears it; credit
-cannot be banked under one desire and spent under another. Zero Exploration
+Unspent sub-quantum credit persists only while the exact same
+`selected_plan_id` remains active. An intent, Attractor digest, source packet,
+rate contract, or mode change therefore clears it; credit cannot be banked under
+one desire and spent under another. Zero Exploration
 supplies zero path-length credit and therefore zero Egress. Build-only
 collision is resolved before the Traveler supplies its normalized canonical
 World Space path to this accumulator. Walking into a loaded Build wall therefore
@@ -1603,6 +1787,10 @@ the Model's distance, or the canonical path returned for explicit inputs.
 Resonance reports how much **certified continuation within this probe's bounded
 horizon** the current intent has. Core Resonance uses only canonical Model
 queries, the current State, normalized request, and directed-length horizon.
+It is computed per returned path mode: both diagnostic probes below are
+restricted to that mode's normalized rewrite/control signature, and a
+`SelectedEgressPlan` carries only its own score. Resonance from an easier
+unselected mode cannot accelerate the path actually advanced.
 
 Let $L_{\rm req}=\mathcal Y-\gamma\mathcal A$. Resonance uses two diagnostic
 probes distinct from the proximal choice in Section 8.1. Both have identical
@@ -1622,12 +1810,18 @@ $\widetilde L_{\rm req}$ over its relaxed
 control/moment space, with certified intervals and
 $\widetilde L_{\rm req}=L_{\rm req}$ on valid global sections. Without that
 extension, fit is `Unresolved`. A free diagnostic point can never be normalized
-as a State Packet, mint an entity, or be captured in an Impression. Define
+as a State Packet, mint an entity, or be captured in an Impression.
+
+Both probes include the zero-length idle path, so their best improvement is
+never negative. The valid feasible set embeds in the relaxed set under the same
+mode signature and objective extension; this is the ordering used below.
+
+Define
 
 $$
-I_{\rm free}=L_{\rm req}(q_n)-\widetilde L_{\rm req}(q^R_{\rm free}),
+I_{\rm free}=L_{\rm req}(\omega_n)-\widetilde L_{\rm req}(\omega^R_{\rm free}),
 \qquad
-I_{\rm valid}=L_{\rm req}(q_n)-L_{\rm req}(q^R_{\rm valid}),
+I_{\rm valid}=L_{\rm req}(\omega_n)-L_{\rm req}(\omega^R_{\rm valid}),
 $$
 
 and
@@ -1726,7 +1920,7 @@ directed-length complete world need not be obvious to a player.
 
 ### 9.1 Transition Plan
 
-For two canonical packets $q_0,q_1$ and requested World Space bounds, the Model
+For two canonical packets $\hat\omega_0,\hat\omega_1$ and requested World Space bounds, the Model
 returns a `TransitionPlan` containing:
 
 - the constitution-level law-space transport couplings $\pi_{c,\ell}$;
@@ -1803,8 +1997,14 @@ change is predictable.
 
 ### 9.3 Presentation history is not authority
 
-At every instant the Traveler has one canonical point $q(s)$. The canonical
-Realization is $W(q(s),x)$ everywhere. A Visualization may:
+At every instant the Traveler has exactly one canonical committed State Packet
+$\hat\omega_n$, denoting $\omega_n$, and its canonical Realization is
+$W(\omega_n,x)$ everywhere. The selected
+Egress Plan carries a certified continuous path between packet checkpoints for
+rate accounting and transition semantics, but an intermediate non-packet point
+is not a second capturable world. Packet quanta must satisfy the continuous-
+channel tolerance in Section 2.5; discrete changes use explicit events. A
+Visualization may:
 
 - preserve old meshes and simulation state in a near zone;
 - advect features using the Transition Plan;
@@ -1823,9 +2023,48 @@ that state is explicitly noncanonical. If an Impression claims such replay, its
 `VisualizationReplayBundle` includes the continuity/blend snapshot and every
 referenced old presentation asset/state chunk.
 
-## 10. Attractors and community evidence
+## 10. Durable records, Attractors, and community evidence
 
-### 10.1 A future external service boundary
+### 10.1 Local routes, preserves, discovery, and sessions
+
+V4 retains the prototype's player-facing durability without persisting derived
+terrain, ecology tiles, meshes, or simulated organisms. The local record profile
+stores sparse authored or traveled deviations:
+
+- an **Expedition Route** is an ordered canonical World Space path with State
+  checkpoints, cumulative 3-D arclength, selected-plan ids, and optional route
+  certificates. A compatible route may be offered to the planner as an explicit
+  bounded soft prior; it never proves reachability from a different source or
+  changes the Model's path metric;
+- a **Preserve Covenant** is a spatially scoped Hold over named canonical
+  observations and intervals. It enters the normalized Egress request with
+  explicit finite weight, or as a separately declared hard safety constraint.
+  It never pins one region to an old Possibility state. An infeasible covenant
+  yields a certified compromise, no progress, or `Unresolved`, not a second
+  regional authority;
+- the discovered-address set, names, and journals are sparse local records keyed
+  by State and World Space addresses; and
+- the exact run-local session records the package/artifact identities and
+  required State closure, current packet, World Space address and model time,
+  Yearnings/Holds/covenants, selected plan and `NavigationAccumulator`, active
+  route recorder, and any claimed `VisualizationReplayBundle` state.
+
+Save, load, and settle must reproduce the same canonical State, plan prefix,
+World address, records, and declared reference CPU simulation state as an
+uninterrupted run. Shareable records use canonical integer encodings and their
+own self-contained State-envelope closures; bundles may deduplicate chunks
+without turning one record into a dangling cross-record pointer. Their merge and
+deletion algebra requires a successor record ADR because remove-wins service
+tombstones and content-addressed State closures are not the prototype vault's
+local-delete/self-contained-record semantics.
+
+The current browser runtime may report this entire durable profile unavailable
+until a real storage adapter exists. IndexedDB capability probing is not
+durability. Native and browser adapters must preserve the backend success
+meaning of [ADR 0022](adr/0022-persistence-success-requires-durable-backend-commit.md)
+before claiming an exact save.
+
+### 10.2 A future external service boundary
 
 The current repository has no server, networking, or accounts. This section
 defines a future record interface, not work performed by the Model runtime.
@@ -1862,7 +2101,7 @@ valid source/policy route segment or checkpoint chain. The service replays that
 claim under the referenced Model before it contributes weight; missing chunks,
 bounded-search `Unresolved`, or a certificate for a different source is rejected.
 
-### 10.2 Distributions, not one averaged coordinate
+### 10.3 Distributions, not one averaged coordinate
 
 Evidence is clustered under the transport/rewrite distance. Incompatible or
 multimodal strata remain a mixture rather than being averaged into a possibly
@@ -1876,7 +2115,7 @@ $$
 
 Compatible measure blocks reduce to Wasserstein/HK barycenter subproblems;
 coefficients, grammar rewrites, and feasibility constraints do not. The bounded
-representable candidate set gives an existence rule for V1. If several exact
+representable candidate set gives an existence rule for V4. If several exact
 minimizers remain, the summary publishes deterministic separate modes and their
 zero/low margin rather than inventing a unique center.
 
@@ -1932,7 +2171,7 @@ packet. Reachability is source-specific: a contributor's certificate never
 proves that a new Traveler can reach the destination. Egress always plans and
 certifies a fresh path from the Traveler's current packet.
 
-### 10.3 Anonymous abuse resistance
+### 10.4 Anonymous abuse resistance
 
 Visit reporting is enabled by default but may be disabled by the Traveler, and
 is designed not to publish a stable visitor identity. A future service could
@@ -1963,7 +2202,7 @@ Stronger reusable anonymous quota protocols are deferred until a reviewed
 construction and threat model exist. The Model itself verifies only State
 representation and route certificates.
 
-### 10.4 Dual-space travel
+### 10.5 Dual-space travel
 
 An Attractor target is a distribution in Possibility and, optionally, a World
 Space address conditional on an exact destination packet. The distances remain
@@ -2058,10 +2297,11 @@ platform-dependent best effort at Canonical grade.
 
 State identity is the normalized packet, not the result of a floating solve.
 Entity identity folds `GenerationId`, State root, integer spatial key, kind,
-only the consumed capability/channel revision, innovation ancestry key where
-applicable, and ordinal. It never folds an unused `PackageId` extension. Exact manifestation ids
-change with the world; ancestry and Transition correspondence express continuity
-honestly.
+only the consumed capability/channel revision, lineage-basin key where
+applicable, and ordinal. It never folds an unused `PackageId` extension. Exact
+manifestation ids change with the world; lineage-basin keys are matching
+features, while only a named Transition correspondence expresses cross-world
+continuity.
 
 ### 12.2 Schedule and cache independence
 
@@ -2089,7 +2329,8 @@ readback creates identity, steering, persistence, Resonance, or gameplay input.
 
 The design needs distinct identities for:
 
-- `GenerationId`, `PackageId`, and used-extension manifest closure;
+- `GenerationId`, semantic `PackageId`, `ArtifactId`, and used-extension
+  manifest closure;
 - individual law/operator algorithm revisions;
 - State Packet encoding;
 - Impression/atlas record format;
@@ -2108,10 +2349,10 @@ reinterpreted.
 
 The first implementation should fix these ceilings:
 
-| Operation | V1 ceiling | Acceptance target |
+| Operation | V4 ceiling | Acceptance target |
 |---|---:|---:|
 | State validation/normalization | 64 KiB, 4,096 patches | < 1 ms native, < 3 ms wasm |
-| Egress probe | 8 modes, 2 rewrites, 4 active levels, <= 12 typed transport blocks, <= 256 atoms/block, <= 4,096 packet nonzeros, 24 scaling iterations | < 4 ms native, < 10 ms wasm at 10 Hz **when resolved** |
+| Egress probe | 8 modes, 2 rewrites, 4 active levels, <= 12 sparse/separable typed transport blocks, <= 256 atoms/block, <= 4,096 packet nonzeros, 24 scaling iterations | < 4 ms native, < 10 ms wasm at 10 Hz, and >= 99% Complete on the representative corpus |
 | Coarse planetary section | 1,280 faces, 48 reduced variables | < 3 ms incremental |
 | Primitive 33x33 tile + halo | 8 coupled channels, 3 refinement levels | < 0.8 ms native |
 | Derived terrain-to-soil tile | fixed 6-block job graph | < 2.0 ms native |
@@ -2125,6 +2366,10 @@ These are proposed gates, not measured claims. A prototype must replace them
 with native and wasm benchmark ledgers. Every dimension above is a hard request
 cap. Overflow returns `Partial` with a canonical continuation or `Unresolved`;
 it never allocates until the machine happens to run out of memory.
+The maxima are not permission to run every block as a dense worst case: each
+manifest supplies a certified sparse/separable operation-count bound. Missing a
+gate causes a smaller supported profile or a different algorithm, not a latency
+claim qualified away after the fact.
 
 Transport benchmarks report both latency and the fraction of adversarial and
 representative blocks whose primal/dual gap resolves within 24 iterations. A
@@ -2188,10 +2433,12 @@ can:
 6. use equality saturation to optimize exact expressions while checking
    reference equivalence;
 7. fuzz active-set margins, seams, and quantization boundaries;
-8. emit Rust scalar/SIMD kernels, manifests, documentation, and parity fixtures;
+8. emit data-only manifests, documentation, parity fixtures, and optional Rust
+   scalar/SIMD AOT candidates whose use requires a reviewed application rebuild;
 9. execute native/wasm differential suites and long-route adversarial probes;
    and
-10. sign and content-address the resulting immutable package.
+10. emit a content-addressed unsigned candidate for independent checking and
+    release-pipeline signing.
 
 Agents may propose new causal motifs, automatically split parameter cells, or
 repair a failed reduced basis. They do not tune a live world after release. A
@@ -2209,21 +2456,31 @@ still names a law node, dependency, unit, residual, parameter cell, and fixture.
 
 ## 14. Relationship to the other designs and current implementation
 
-### 14.1 Why this is genuinely a third option
+### 14.1 Why this is genuinely a fourth option
 
-| Concern | Options 1 and 2 | World Loom |
-|---|---|---|
-| Possibility ontology | fixed low-dimensional smooth latent manifold | glued inverse-limit space of typed causal programs and measures, with certified strata where available |
-| Coordinate | 24--48 fixed-point scalars | canonical sparse State Packet with structural sharing |
-| Validity | smooth bounded decoder / feasible chart | type, unit, conservation, marginal, and numeric certificates |
-| Geometry | pullback Riemannian metric | multiscale balanced/unbalanced transport plus rewrite length |
-| Egress | local gradient/trust-region direction | proximal minimum-directed-length path with bounded alternate modes |
-| Scope | statistic or global attribute target | absolute mass-ratio objective on an applicability measure |
-| Realization | parameterized procedural fields | frozen innovations plus certified variational global section |
-| World change correspondence | derivatives, margins, or a scalar wake | transport couplings, feature matches, and topology events |
-| Ecology | fixed lineage pool / parameterized roster | trait measures, trophic couplings, and persistent modes |
-| Extensibility | add axes/decoder outputs | add typed motifs, strata, refinement laws, and adapters |
-| Maintenance | hand/fitted finite manifest | agent-compiled certificate-carrying operator library |
+| Concern | Options 1 and 2 | Option 3 | World Loom (Option 4) |
+|---|---|---|---|
+| Possibility ontology | fixed low-dimensional smooth latent manifold | fixed-dimensional exponential family of observable world-laws | glued inverse-limit space of typed causal programs and measures, with certified strata where available |
+| Coordinate | 32 or 24--48 fixed-point scalars | about 40 fixed-point natural parameters | canonical sparse State Packet with structural sharing |
+| Validity | total bounded decoder or feasible chart | membership in a convex marginal polytope | type, unit, conservation, marginal, and numeric certificates |
+| Geometry | observable pullback Riemannian metric | Fisher metric and KL/Bregman comparison | multiscale balanced/unbalanced transport plus rewrite length |
+| Egress | local gradient/trust-region direction | natural-gradient motion toward a convex maximum-entropy target | proximal minimum-directed-length path with bounded alternate modes |
+| Scope | statistic or global attribute target | an expectation/mean parameter of the world-law | absolute mass-ratio objective on a schema-declared applicability measure |
+| Realization | parameterized procedural fields | one deterministic spatial sample from the statistical law | frozen innovations plus a certified variational global section |
+| World change correspondence | derivatives, margins, or a scalar wake | unbalanced spatial transport of living/biome content for continuity | constitution couplings, feature matches, transition-local ancestry, and topology events |
+| Ecology | fixed lineage pool or parameterized roster | log-Gaussian Cox intensity and marked point processes | trait measures, trophic couplings, and persistent modes |
+| Extensibility | add axes or decoder outputs | extend/refit the observable and archetype bank | add typed motifs, strata, refinement laws, and semantic adapters |
+| Maintenance | hand-authored or fitted finite manifest | fitted finite statistical bank | compiler-generated, certificate-carrying operator library |
+
+V4 shares mathematical vocabulary with Option 3, especially measures,
+unbalanced transport, and maximum-entropy closures, but assigns it a different
+authority. Option 3 keeps information geometry as the geometry of Possibility
+and uses optimal transport to present spatial continuity. V4 makes typed
+measures and programs the state itself, uses transport and rewrite length for
+navigation, and reuses the resulting couplings as evidence for endpoint
+correspondence. It can therefore express a change in causal or relational
+structure that has no coordinate in Option 3's frozen sufficient-statistic
+family.
 
 The price is substantially more infrastructure, larger addresses, and harder
 solver engineering. The benefit is that causal regimes, relational Yearnings,
@@ -2244,7 +2501,8 @@ The current implementation has valuable engineering patterns:
 - CRDT union-by-content-id record exchange.
 
 World Loom should reuse those patterns and harness philosophy, not reinterpret
-the current eight-component regional state as a Loom constitution.
+the current eight-dimensional regional possibility vector as a Loom
+constitution.
 
 ### 14.3 Incompatibilities and ADR work
 
@@ -2256,12 +2514,25 @@ A migration tool may turn an old capture into an attribute-by-value Impression,
 construct a Yearning, and search for a similar Loom state. The result is a new
 world and must say so.
 
-Accepted ADRs remain immutable. Landing this option would require successor ADRs
-for at least whole-world Possibility, canonical species/organism meaning,
-transport navigation, State Packet content addressing, transition
-correspondence, and the exact location of travel gating. Existing crate-boundary,
-CPU-authority, dependency, persistence, and schedule-independence ADRs should
-continue to govern.
+Accepted ADRs remain immutable. V4 must record its applicability explicitly
+rather than claiming that every prototype persistence or navigation decision
+continues unchanged:
+
+| Treatment for V4 | Existing decisions | Required action |
+|---|---|---|
+| Retain the boundary or success meaning | [ADR 0002](adr/0002-workspace-crate-boundaries.md) neutral/platform dependency direction; [ADR 0017](adr/0017-gpu-compute-is-derived-presentation.md) and [ADR 0021](adr/0021-file-bound-debug-captures.md) CPU authority/readback boundary; [ADR 0022](adr/0022-persistence-success-requires-durable-backend-commit.md) durable-success meaning | cite them directly from Loom crates and adapters |
+| Generalize the invariant to Loom keys and jobs | [ADR 0003](adr/0003-deterministic-integer-hashing.md), [ADR 0008](adr/0008-tiles-are-functions-of-their-dependency-hash.md), [ADR 0016](adr/0016-simd-kernels-bit-identical-to-scalar-twins.md), [ADR 0018](adr/0018-settled-state-is-schedule-independent.md), and [ADR 0019](adr/0019-dependency-hashes-gate-integration.md) | add successor ADRs defining cryptographic content ids separately from procedural counters, Loom dependency closures, and canonical schedule independence |
+| Preserve the presentation principle, not the concrete `RegionMap` API | [ADR 0024](adr/0024-gameplay-uses-one-canonical-organism-slot.md) separates canonical gameplay samples from tier-only density; [ADR 0028](adr/0028-shared-viewer-host-and-one-world-multi-view.md) requires one traveler, one world update, and one surface frame | define Loom manifestations and the model-neutral or parallel host boundary during Stage 0B |
+| Supersede only for the Loom family; leave prototype history intact | ADRs governing travel-fueled regional convergence, anchor/resonance math, presentation-grade species identity, route anchors, preserve ownership, and the deviations-only record schema | write successors for whole-world Possibility, transport Egress, species/mode identity, Preserve Covenants, ordered Expedition Routes, State envelopes, Transition Plans, and local/service deletion algebra |
+| Keep prototype generation math scoped to the coexisting prototype | the declared nine-layer DAG and Terrain/Drainage revisions, including [ADR 0027](adr/0027-fixed-point-drainage-and-halo-sampled-terrain.md) | reuse its fixed-point topology and executed native/wasm parity **harness pattern**, not its layer algorithms or addresses |
+
+In particular, [ADR 0014](adr/0014-vault-stores-deviations-with-crdt-merge.md)'s
+deviations-only, self-contained, no-cross-record-pointer vault and
+[ADR 0022](adr/0022-persistence-success-requires-durable-backend-commit.md)'s
+local durable deletion are not automatically a
+remove-wins distributed tombstone protocol. V4's self-contained State-envelope
+closures and service tombstones need a successor decision before they are
+called compatible.
 
 ## 15. Risks and honest failure modes
 
@@ -2319,21 +2590,47 @@ continue to govern.
 19. **Local opportunity is only a rate heuristic.** Keeping it out of
    Reachability preserves the ontology, but may make the travel rate feel
    disconnected from a valid route; playtesting must judge that tradeoff.
+20. **Fail-closed can feel like no game at all.** `Unresolved` is the correct
+    semantic result, but ordinary requests must almost always resolve within the
+    interaction envelope. Resolution rate is a product gate, not merely solver
+    telemetry.
 
 ## 16. Proposed implementation sequence
 
-### Stage 0: mathematical kernel
+### Stage 0A: mathematical kernel
 
-Build the authoritative two-domain planar kernel in neutral `loom-core` and
+Build a topology-independent two-law kernel in neutral `loom-core` and
 `loom-transport`, with harnesses in `tools`: 64-atom material and trait
-measures, one optional grammar rewrite, fixed-point unbalanced transport, State
-Packet normalization, and one path-constrained minimizing-movement step.
-Machine-check permutation, quantization, native/wasm, and certificate replay
-properties before adding terrain.
+measures, one optional grammar rewrite, sparse/separable fixed-point unbalanced
+transport, State Packet normalization, and one path-constrained
+minimizing-movement step. Machine-check permutation, quantization, native/wasm,
+and certificate replay properties before adding physical world generation.
 
 Exit criterion: exhaustive small cases plus 10,000 randomized intent
-permutations and schedules demonstrate one canonical endpoint and valid path-length
-certificates. Randomized tests are evidence, not proofs of the unbounded case.
+permutations and schedules demonstrate one canonical default, stable alternate
+mode ids, and valid path-length certificates. On a frozen representative corpus,
+at least 99% of ordinary probes must return a complete default within the
+Section 13 native/wasm latency targets; adversarial resolution rate is reported
+separately. Missing either latency or ordinary resolution stops planetary work
+and forces smaller atom sets, fewer modes, or simpler certificates. Randomized
+tests are evidence, not proofs of the unbounded case.
+
+### Stage 0B: playable and host-boundary kill gate
+
+Build a tiny closed 20-face spherical world with one material field, one habitat
+measure, one organism trait, one Accentuate/Repress/Hold interaction, physical
+travel gating, two visibly distinct Egress modes, and one bounded Transition
+Plan. In parallel, spike either a model-backend abstraction with model-neutral
+presentation DTOs or a separate Loom host. The spike must define a canonical
+`TravelerPathSegment`, planetary Map projection/local-tangent POV inputs, and
+the one-update/one-traveler rule required by ADR 0028 on native and wasm.
+
+Exit criterion: representative interactions retain the 99% complete-rate gate,
+no transition performs a global blank/reload, and a preregistered playtest shows
+that at least 80% of participants can identify the requested direction while a
+majority still rate the consequences as non-obvious but coherent. Failure means
+choose a cheaper option or simplify the Loom before building climate and
+ecology—not move the fun test to Stage 4.
 
 ### Stage 1: projective planet and primitive section
 
@@ -2342,7 +2639,10 @@ restrictions, counter innovations, one coupled SPDE field, and sheaf overlap
 checks. Render only elevation/material.
 
 Exit criterion: all face seams and parent/child restrictions are canonical;
-local refinements lie inside global reference error bounds.
+local refinements lie inside global reference error bounds. The complete base
+package and startup closure meet ratified static-web download, decode, peak
+memory, and startup-time caps on the reference browser; otherwise the operator
+family is reduced before Stage 2.
 
 ### Stage 2: inventories and hydrology
 
@@ -2354,6 +2654,9 @@ Exit criterion: mass is exact, topology changes are preceded by margins/events,
 every robust entity in the bounded workload is matched or explicitly labeled
 birth/death/split/merge/unresolved, low correspondence margins are visible, and
 walking transitions never substitute presentation history for canonical state.
+On the representative visible-transition corpus, fewer than 1% of robust
+requested entities may remain unresolved after the background continuation
+budget; otherwise matching is simplified before ecology is added.
 
 ### Stage 3: climate, soil, and ecology
 
@@ -2362,13 +2665,19 @@ soil/productivity solve, trait measures, trophic couplings, species modes, and
 canonical organism manifestations.
 
 Exit criterion: Scope changes measured prevalence within returned bounds; live
-organism simulation remains replaceable and cannot affect navigation.
+organism simulation remains replaceable and cannot affect navigation. A frozen
+world-quality corpus must show multiple stable niches, nontrivial trophic
+structure, and materially different but coherent ecosystems across nearby and
+distant States; a solver that passes residual checks but collapses to repetitive
+ecology fails the stage.
 
 ### Stage 4: full navigation and records
 
 Add multimode route search, all Influence types, Resonance diagnostics,
-Impressions, Builds, State chunk bundles, and Attractor summary import/export.
-Keep external service and anonymous-token issuance mocked behind record types.
+Impressions, State chunk bundles, expedition routes, Preserve Covenants,
+discovery/journal records, exact session restore, and Attractor summary
+import/export. Builds are an optional profile. Keep the external service and
+anonymous-token issuance mocked behind record types.
 
 Exit criterion: every in-scope Model and record-algebra invariant has a
 machine-checkable harness; the mocked quota/replay/privacy boundary passes its
@@ -2377,10 +2686,14 @@ deployment audit.
 
 ### Stage 5: production integration
 
-Integrate neutral crates through `viewer-host`, `pov-host`, and `renderer`;
-implement continuity policy in the shared host while native and web shells stay
-environment adapters; establish memory ceilings, optimize scalar/SIMD paths,
-and run prolonged fast-travel tests. GPU kernels remain presentation-only.
+Productionize the host direction selected in Stage 0B. The current
+`viewer-host`/`pov-host` APIs are concrete over planar `RegionMap`; V4 must not
+pretend an icosahedral planet plugs into them unchanged. Either generalize them
+behind model-neutral Realization/presentation DTOs or ship a parallel Loom host,
+while preserving ADR 0028's one traveler, one world update, and one surface
+frame. Native and web shells stay environment adapters. Establish memory
+ceilings, optimize scalar/SIMD paths, and run prolonged fast-travel tests. GPU
+kernels remain presentation-only.
 
 Exit criterion: CI parity, determinism, schedule, cache, cancellation, tier,
 memory, performance, and browser sign-off gates pass without reinterpreting an
@@ -2390,14 +2703,14 @@ old Model address.
 
 | # | Invariant | World Loom construction |
 |---:|---|---|
-| 1 | One Possibility point is one complete world | one normalized State Packet denotes one global constitution; $W(q,\cdot)$ covers the planet |
+| 1 | One Possibility point is one complete world | one normalized State Packet denotes one global constitution $\omega$; $W(\omega,\cdot)$ covers the planet |
 | 2 | One canonical current point; local history only for continuity | the Traveler holds one packet; all retention/blending is Visualization state |
 | 3 | Possibility and World Space are independent | transport/rewrite length and icosahedral geodesic distance are separate |
 | 4 | Egress and Exploration are distinct | constitution path versus World Space motion |
 | 5 | Gameplay couples them, but neither Model nor Visualization owns coupling | Traveler derives explicit Egress-length budget from physical displacement |
 | 6 | Realization carries stable meaning | versioned typed capabilities and Canonical queries |
 | 7 | Simulation belongs to Visualization | Model exposes forcing, distributions, response modes, and representative samples only |
-| 8 | Identical inputs reproduce outputs | canonical packets, counters, operation order, solvers, and error policy are specified; Visualization replay names its complete simulator/backend/input tuple |
+| 8 | Identical inputs reproduce outputs | canonical packets, counters, operation order, solvers, and error policy are specified; reference CPU simulation state is bit-exact, while derived pixels/audio use declared tolerance profiles |
 | 9 | Impressions remain meaningful across Visualizations | packet chunks + canonical address + subject/value schema reproduce Model meaning |
 | 10 | Yearnings are weighted and order-independent | one canonical multiset objective with integer aggregation and simultaneous solve |
 | 11 | Scope is prevalence, not spatial falloff | an exact mass ratio over a declared applicable measure |
@@ -2411,10 +2724,10 @@ old Model address.
 |---|---|
 | Model State and compact coordinate | a normalized typed causal program plus a projective tower of fixed-point measures/coefficients, encoded as a bounded sparse State Packet |
 | Metric, neighborhood, topology | multiscale balanced/unbalanced transport inside certified cells; zero-mass grammar morphisms glue the candidate quotient; directed length defines admissible paths |
-| Continuity risk and chaotic divergence | solver/glue residuals, active-set margins, persistent-homology events, and explicit feature/ancestry correspondence |
+| Continuity risk and chaotic divergence | solver/glue residuals, active-set margins, persistent-homology events, and explicit feature/transition correspondence |
 | Realization contract and capability negotiation | typed versioned channels with units, inputs, time semantics, error grades, refinement behavior, and required/optional status |
 | Canonical versus Visualization time | integer astronomy/seasonal forcing and response modes are Model time; weather, behavior, and other transient evolution are Visualization simulation time |
-| Canonical organism information | exact manifestation id + ancestry key + trait/niche/relationship record + representative sample address and margin; live pose/behavior excluded |
+| Canonical organism information | exact manifestation id + lineage-basin matching key + trait/niche/relationship record + representative sample address and margin; cross-world ancestry is transition-local and live pose/behavior is excluded |
 | Attribute and Scope representation across Models | semantic observable ids with explicit adapters; Scope is a mass ratio over a schema-declared applicability measure |
 | Hold strength | finite weighted transport resistance against the activation snapshot; hard only for separately declared safety invariants; validity always wins |
 | Resonance role | bounded-horizon fit, conditioned controllability, work, and topology diagnostics; a strictly rate-only local opportunity factor; no finite probe is called a global reachability proof |
@@ -2425,7 +2738,20 @@ old Model address.
 
 ## 19. Acceptance criteria
 
-An implementation is not conforming until it demonstrates all of the following:
+Conformance is profile-scoped. Criteria are cumulative only for the profiles an
+implementation claims; a full reference product claims every row, while a Loom
+kernel does not need a server, Builds, or a production renderer.
+
+| Claimed profile | Required criteria |
+|---|---|
+| **Core Loom kernel** | 1--2, 5--8, 10--11, 20--21, 23, 25--27, 29, and 32 |
+| **Reference planetary/ecology family** | Core plus 3--4, 9, 12--14, and 28 |
+| **Portable records and replay** | applicable Model profile plus 15--17 and 31 |
+| **Build** | portable records plus 18 |
+| **Future Attractor service/privacy** | portable records plus 19 |
+| **Production native/web integration** | applicable profiles plus 22, 24, and 30 |
+
+The numbered criteria are:
 
 1. canonical packet encoding is injective over normalized representable states,
    bounded, round-trippable, and bit-identical on native and wasm;
@@ -2462,7 +2788,9 @@ An implementation is not conforming until it demonstrates all of the following:
     world canonical id;
 17. Model time forcing and Visualization simulation can be independently
     changed without conflating their identities, and replaying the identical
-    complete Visualization tuple produces bit-identical declared output;
+    complete Visualization tuple produces bit-identical reference CPU
+    simulation state and semantic events; pixels/audio meet only their declared
+    tolerance unless a reference software renderer is named;
 18. an unloaded Build is absent, loading its owning Impression makes it
     available, hiding/removing/unloading makes it absent again, and none of
     those operations changes any canonical query, State root, planned Egress
@@ -2480,9 +2808,10 @@ An implementation is not conforming until it demonstrates all of the following:
     SIMD path, and long-travel history do not change settled canonical output;
 22. memory use reaches a plateau under long fast travel;
 23. every approximate result contains an error/residual bound that encloses the
-    canonical reference in randomized tests; and
-24. the benchmark ledger meets or consciously revises the V1 ceilings in
-    Section 13 before a production claim is made;
+    canonical reference in randomized tests;
+24. the benchmark ledger meets the V4 ceilings in Section 13 before a production
+    claim is made; changing a ceiling requires a reviewed profile/version change,
+    not a qualification attached to a failed result;
 25. installing an unused optional minor extension leaves every prior packet,
     counter, canonical query, entity id, and golden fixture bit-identical;
 26. all bounded collection APIs either complete, return a deterministic
@@ -2494,10 +2823,17 @@ An implementation is not conforming until it demonstrates all of the following:
     summaries obey their declared parent/refinement contracts;
 29. path feasibility is certified for every returned segment, not inferred from
     endpoint validity, and every committable checkpoint satisfies packet
-    support/rank and constrained-rounding contracts; and
+    support/rank and constrained-rounding contracts;
 30. native and web continuity tests traverse packet, topology, and rewrite
     boundaries without a global blank/reload, while eviction and blend history
-    leave the canonical packet and queries unchanged.
+    leave the canonical packet and queries unchanged;
+31. save--load--settle reproduces the exact canonical packet, World address and
+    model time, Yearnings/Holds/Preserve Covenants, selected path prefix and
+    accumulator, expedition recorder, sparse records, and claimed reference CPU
+    replay state; and
+32. at least 99% of probes in the frozen ordinary-intent corpus return a complete
+    canonical default within the claimed native/wasm interaction budget, while
+    adversarial and continuation-heavy resolution rates are reported separately.
 
 ## 20. Research basis
 
@@ -2567,6 +2903,20 @@ claims for this Model.
 ## Appendix A: illustrative packet and runtime types
 
 ```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StateAddress {
+    pub generation: GenerationId,
+    pub root: StateRoot,
+}
+
+/// Self-contained wire closure; bundles may deduplicate these chunk bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateEnvelope {
+    pub address: StateAddress,
+    pub compatible_artifact: ArtifactId,
+    pub chunks: Box<[StateChunk]>,
+}
+
 /// Canonical bytes are the identity; the root accelerates sharing and lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatePacket {
@@ -2604,6 +2954,7 @@ pub enum LawPatch {
 pub struct EgressPlan {
     pub source: StateRoot,
     pub intent: IntentDigest,
+    pub default_mode: ModeId,
     pub modes: Box<[EgressMode]>,
 }
 
@@ -2644,7 +2995,7 @@ layout.
 
 ## Appendix B: one navigation tick
 
-Given current packet $q_n$, active Yearnings $Y$, Attractor summaries $A$, a
+Given current packet $\hat\omega_n$, active Yearnings $Y$, Attractor summaries $A$, a
 `NavigationAccumulator`, and a newly traversed canonical World Space path
 segment after loaded-Build/other Exploration collision resolution:
 
@@ -2654,8 +3005,8 @@ segment after loaded-Build/other Exploration collision resolution:
 4. solve the proximal Egress candidates and the separate free/valid Resonance
    diagnostic probes with canonical reductions;
 5. compute objective intervals, transport plans, topology risk, and Resonance;
-6. return non-dominated modes, then explicitly select one mode to mint a
-   `SelectedEgressPlan`;
+6. return the certified default plus up to two ordered alternatives, then accept
+   the default or explicitly select another mode to mint a `SelectedEgressPlan`;
 7. let the Traveler integrate the segment under that selected plan with
    canonical cell-boundary quadrature, compute new credit
    $\beta\rho_{\rm plan}\int r_{\rm local}(x(s))ds$, and add it to the same
