@@ -1,4 +1,4 @@
-# World Model v1 — A Proposed Mathematical Design for the Model
+# bwq World Model Option 2 — A Proposed Mathematical Design for the Model
 
 This document proposes a concrete mathematical design for the **Model** as
 defined in [`conceptual-model.md`](conceptual-model.md). It is a *complete
