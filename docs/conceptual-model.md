@@ -1,4 +1,4 @@
-# New World Model 1
+# World Explorer Conceptual Model
 
 ## Purpose
 
@@ -52,8 +52,8 @@ A Model State describes an entire world, not one local region within a world. Sp
 geography, climate, environments, and ecosystems is part of the world derived from that state.
 
 The compact coordinates used to identify or navigate Model States need not expose every derived
-property of a world. A Model may map a compact **Possibility Coordinate** through its constraints and
-relationships to a much richer Model State.
+property of a world. A Model may map a compact **Possibility Coordinate** through its constraints
+and relationships to a much richer Model State.
 
 ## Possibility
 
