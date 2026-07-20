@@ -2,12 +2,14 @@
 
 ## Status and purpose
 
-This document proposes a third complete Model for the concepts in
+This document proposes the third complete Model for the concepts in
 [`conceptual-model.md`](conceptual-model.md), a sibling to
 [`new-world-model-option-1.md`](new-world-model-option-1.md) (a latent cube
 decoded into a procedural planet) and
 [`new-world-model-option-2.md`](new-world-model-option-2.md) (a plane with a
-travel-gated relaxation "wake"). It is a design, not a description of landed
+travel-gated relaxation "wake"), and distinct from
+[`new-world-model-option-4.md`](new-world-model-option-4.md) (the World Loom's
+typed causal constitution). It is a design, not a description of landed
 behavior; the current prototype is documented in
 [`world-model.md`](world-model.md), and references to it are comparisons, not
 compatibility requirements.
@@ -17,40 +19,40 @@ The name **V3** identifies this proposed contract, not the current value of
 
 Options 1 and 2 converge on a common shape: a compact latent coordinate, a
 frozen decoder into generator parameters, an analytic *pullback* metric built by
-weighting a Jacobian, and a travel-gated gradient Egress. They differ mainly in
-World Space (planet vs. plane), in how the metric weight is chosen, and in the
-continuity trick (a reported sensitivity descriptor vs. a lagged-coordinate
-crossfade). V3 shares that overall skeleton deliberately — the Egress *step*, the
-per-attribute request fusion, and the one-point Impression are the same shape as
-Option 2, and this document says so where it happens — but it changes the
-*foundation* underneath the skeleton, and two commitments make it its own
-proposal.
+weighting a Jacobian, and a travel-gated gradient Egress. V3 retains a compact
+fixed-dimensional coordinate and travel-gated motion, but it is not another
+latent decoder: the coordinate is the natural parameter of the world-law and
+the geometry follows from that law.
 
-A later proposal — **the World Loom**
-([`new-world-model-option-4.md`](new-world-model-option-4.md), styled internally as
-another "third option"; the repo's file numbering and in-document titles are out of
-sync) — is V3's true near-neighbor rather than Options 1/2: it also abandons the
-smooth latent vector and it also builds on optimal transport. The single sentence
-that separates them: in the World Loom, **optimal transport *is* the navigation
-metric and the Egress mechanism** (bounded transport solves decide which world is
-reached), whereas in V3 **navigation is closed-form information geometry** — a
-metric that is an algebraic Hessian identity, a natural-gradient step in closed
-form, and KL-as-Bregman comparison with no transport solve anywhere — and optimal
-transport is confined to *continuity presentation only* (§10), transient and
-never authoritative. V3 trades the World Loom's open-ended, extensible causal
-program for a compact fixed-point coordinate whose navigation algebra is
-identity-checkable and cheap; §17 draws the full contrast.
+The World Loom is V3's closest conceptual neighbor because both use statistical
+measures and optimal transport. They nevertheless put those ideas on opposite
+sides of the Model boundary. The Loom stores a variable-sized typed causal
+program and uses multiscale transport, rewrites, directed control paths, and
+bounded mode search to choose and explain a destination. V3 stores an
+approximately 40-dimensional fixed-point natural-parameter vector and uses the
+Fisher Hessian of one frozen statistical family to navigate. In V3, optimal
+transport is confined to transient Realization continuity (§10); it never
+chooses a canonical destination. V3 therefore keeps its fixed-vocabulary ceiling
+in exchange for compact addresses, a unique convex target within a selected
+statistical mode, and a small identity-checkable navigation kernel. Section 17
+states the trade precisely without claiming that either proposal can gain new
+canonical physics without versioning.
 
 **The V3 thesis, in one paragraph.** A world is not a bundle of parameters; it is
-a *probability law over what a Traveler can observe*. Points of Possibility are
+a *probability law over canonical whole-planet summaries of what a Traveler can
+observe*. Points of Possibility are
 therefore members of an **exponential family of world-laws**, and one convex
 **free-energy function** $A(\theta)$ generates the navigation subsystem: its
 Hessian *is* the Fisher information metric on Possibility (the unique metric
 invariant under sufficient statistics, up to scale, by Chentsov's theorem, once
 the observables are fixed — computed as an exact algebraic identity, never a
-differentiated probe summary); its gradient *is* the vector of prevalences that
-Scope acts on; and it turns Yearning reconciliation into a convex maximum-entropy
-program with a unique minimizer. Continuity is handled at a *second* geometric
+differentiated probe summary); its gradient *is* the expectation-coordinate
+vector, including the prevalence coordinates that Scope acts on; and it turns
+Yearning reconciliation into a convex maximum-entropy
+program with a unique minimizer. That law is exposed as one finite **spherical
+planet**: World Space is $S^2$ with a nested twelve-patch equal-area address,
+and every law transforms the same coordinate-independent innovation field rather
+than reseeding the ground sample. Continuity is handled at a *second* geometric
 level by **unbalanced optimal transport** (the Wasserstein–Fisher–Rao metric):
 the world's *living and biome content are spatial mass distributions*, so when the
 law changes they genuinely *transport and grow* across World Space — forests
@@ -74,14 +76,14 @@ distinctive to V3:
    is literally a mean coordinate of the world-law, so it cannot be a spatial
    falloff even in principle;
 3. Yearning reconciliation is a *strictly convex program with a unique minimizer*,
-   so the destination is well-defined and, given a canonical input reduction,
-   order-independent;
+   within each fixed statistical regime; separated causal regimes remain explicit
+   candidates rather than being silently averaged (§7.3);
 4. the navigation algebra, *given the frozen parameter bank*, reduces to small
-   closed-form operations that an AI maintainer can check against identities
+   algebraically specified operations that an AI maintainer can check against identities
    (metric $=\nabla^2A$, KL $=$ Bregman, idempotent projection) rather than
    against a screenshot; and
-5. continuity is a physical *transport* of realized living content with a provable
-   per-frame cost bound.
+5. continuity is a physical *transport* of realized living content with fixed
+   resident-memory and per-frame work caps.
 
 Goal 4 is deliberately scoped: the algebra is identity-checkable, but the frozen
 parameter bank that instantiates $A$ is a *fitted* object validated by
@@ -94,54 +96,60 @@ world-quality tests, not by an identity (§3.4, §13).
 The Model is the tuple
 
 $$
-\mathfrak M=\big(M,\ \mathcal D,\ A,\ \varphi,\ g,\ \mathcal W,\ \Pi\big),
+\mathfrak M=\big(M,\ \Omega,\ \boldsymbol\nu,\ A,\ \varphi,\ g,\ \mathcal U,\ \mathcal D,\ \mathcal W,\ \Pi_\mu\big),
 $$
 
 | Symbol | Name | Role | § |
 |---|---|---|---|
-| $M$ | Model identity | family + version + public seed; scopes every hash | 2.2 |
-| $\mathcal D$ | Decoder | maps the compact coordinate to the coefficients of $A$ and the field hyperparameters | 3 |
+| $M$ | Compatibility descriptor/root | family seed plus separable law, sphere, innovation, and layer identities | 2.2, 12 |
+| $\Omega$ | World Space | a finite spherical planet plus signed altitude | 2.3 |
+| $\boldsymbol\nu$ | Canonical observation measures | fix the area/time/population denominator of every statistic | 2.4, 4 |
 | $A$ | Free energy (log-partition) | the single generating function of the navigation subsystem | 3 |
-| $\varphi$ | Observables / mean map | $\varphi(\theta)=\nabla A(\theta)$: the prevalences Yearnings act on | 4 |
+| $\varphi$ | Observables / mean map | $\varphi(\theta)=\nabla A(\theta)$: scalar means and prevalences Yearnings act on | 4 |
 | $g$ | Information metric | $g(\theta)=\nabla^2A(\theta)$: the (Chentsov-unique) metric on Possibility | 5 |
-| $\mathcal W$ | Realization | the World Space fields/organisms drawn from the law | 6 |
-| $\Pi$ | Feasibility projection | Bregman projection onto the valid moment set | 3.3 |
+| $\mathcal U$ | Common innovation | coordinate-independent spherical modes, candidates, and lineage slots | 6.2 |
+| $\mathcal D$ | Realization decoder | maps law means/responsibilities to physical and field coefficients | 6 |
+| $\mathcal W$ | Realization | the spherical fields, topology, and canonical entities exposed by the law | 6 |
+| $\Pi_\mu$ | Typed feasibility projection | Bregman projection of **means** onto a safe interior moment set | 3.3 |
 
 The running coordinate $\theta$ ranges over the manifold $\Theta$; it is the
 **Model State** (§2.2), carried over the static structure $\mathfrak M$, not a
 component of it.
 
-Around this the **Traveler** carries a canonical coordinate $\theta_\star(t)$
-moved by **Egress** (§7–8), a World Space position $x_\star(t)$ moved by
-**Exploration**, and a derived **transition state** that morphs the realized
-world along an optimal-transport path (§10) — never an authoritative coordinate.
+Around this the **Traveler** carries a committed coordinate $\hat\theta_\star$
+moved by **Egress** (§7–8), a spherical World Space position $x_\star$ moved by
+**Exploration**, Canonical Model time when requested, and a derived presentation
+transition that morphs the realized world (§10) — never an authoritative
+coordinate.
 
 The pipeline for one navigation tick, with the Model/Traveler boundary marked:
 
 ```text
 Yearnings (Impressions + Influence + Scope + weights)  +  community Attractors
         │
-        ▼  MODEL: canonical reduction to aggregates (π, μ̄, θ_A)  →  one convex program
-   reconciled target law  θ⁺ = argmin over the marginal polytope      (§7)
+        ▼  MODEL: canonical one-sided request groups + separate clusters/regimes
+   ≤ K_nav combined candidates; one unique convex mean target μ⁺ each (§7)
+        │  Traveler selects a mode or receives AmbiguousModes
         │
-   MODEL: resonance ρ = ecological support × law alignment            (§9)
+   MODEL: Canonical ρ = spherical ecological support × law alignment  (§9)
         │
-        ▼  TRAVELER POLICY: step length Δs = β · ρ · ‖Δx_traveler‖     (§8.3)
-   θ⋆ ← Π( θ⋆ + Δs · û(θ⋆→θ⁺) )              (canonical world-law advances)
+        ▼  TRAVELER POLICY: Δs = β̂ · ρ̂ · accumulated spherical arclength
+   MODEL: follow μ(α)=(1-α)μ⋆+αμ⁺; enclose dual and one Q24 cell       (§8)
+        │  Complete commit or fail-closed Pending/Unresolved
         │
-        ▼  VISUALIZATION drives, MODEL supplies geodesic data:
-   unbalanced optimal transport on the streaming annulus              (§10)
+        ▼  VISUALIZATION rebases; MODEL supplies endpoint/correspondence data
+   spherical unbalanced transport in the bounded streaming annulus   (§10)
      ecology/biome measures: TRANSPORT across World Space + GROW/FADE (WFR)
-     terrain/climate fields:  in-place spectral reshaping (Bures)
+     abiotic fields: exact commuting/matrix Bures blocks + bounded spectral blend
         │
-        ▼  deterministic, lazy, cached by quantization bucket
-   𝒲( θ̂, x )  →  terrain, climate, hydrology, soils, biome, food web, organisms
+        ▼  Canonical, lazy, cached by committed address/cell/time/layer
+   𝒲( M, θ̂, x, t ) → geology, terrain, water/drainage, climate, soils, ecology
 ```
 
 The reconciliation and Resonance are Model math (information geometry, no
-Visualization dependence, satisfying invariant 12). The step-length coupling
-$\Delta s=\beta\rho\lVert\Delta x\rVert$ is a **Traveler policy** (invariant 5);
-$\beta$ is a game-feel dial, not part of Model identity. The transport is a
+Visualization dependence, satisfying invariant 12). Mode selection and the
+conversion $\Delta s=\hat\beta\hat\rho\Delta\ell_W$ are a versioned **Traveler
+policy** (invariant 5), not Model generation identity. The transport is a
 transient *presentation of the path already travelled*, so it never changes
 $\theta_\star$ (invariant 2), and the Model supplies only its endpoints and
 geodesic parameters — the Visualization owns the morph state (invariant 7).
@@ -157,55 +165,123 @@ integer/fixed-point quantities carry a hat, $\hat\theta$. Vectors are columns.
 
 ## 2. Possibility as a statistical manifold
 
-### 2.1 A world is a law over observations
+### 2.1 A world is a law over whole-planet observation records
 
-Fix a set of **observable features** $T(x)=(T_1,\dots,T_k)$ — real functions of
-"a thing a Traveler can encounter" $x$ (a patch of terrain, a climate sample, an
-organism). Examples: local relief, aridity, drainage density, canopy fraction,
-an organism's body-scale, branching count, hue. A **world-law** is the
-probability distribution of $T$ that the Traveler would measure by sampling the
-whole world — the world's *statistical fingerprint*.
+V3 does not put a terrain patch, lineage, and organism into one fictitious common
+sampling measure. Instead, each attribute $a$ first defines a typed encounter
+stratum $\mathcal O_a$, a fixed canonical measure/applicability rule $\nu_a$, and
+a local membership/value $t_a$. Applying all of them to a complete accepted
+planet produces one **whole-planet observation record**
+
+$$
+r(\mathcal W)=\big(R_1,\ldots,R_k\big),\qquad
+R_a=\mathbb E_{o\sim\nu_a(\mathcal W)}[t_a(o)],
+$$
+
+Every coordinate admitted to $T$ has a manifest-proved positive lower bound on
+its applicable denominator throughout $\mathcal P_{\mathrm{safe}}$, so every
+component of $r(\mathcal W)$ is numeric. A useful query whose denominator can be
+empty remains a **derived observable** and may return `NotApplicable`; it is not a
+sufficient-statistic coordinate and is never encoded as numeric zero. A future
+law may instead promote its numerator and applicability mass as two numeric
+statistics, but that is a new schema rather than an implicit ratio convention.
+Examples include mean relief, area-conditioned aridity, drainage density, canopy
+fraction, lineage-weighted body scale, and candidate-weighted branching or hue.
+The **mean-record space** is
+$\overline{\mathcal R}=\mathbb R^{k_s}\times
+\operatorname{conv}\{c_1,\ldots,c_R\}$; a realized representative record is
+serialized in the schema's fixed-point encoding with its quantization bound.
+
+The law itself uses a distinct idealized atom space
+$\mathcal Z=\mathbb R^{k_s}\times\{1,\ldots,R\}$. An atom $z=(x,j)$ carries the
+whole-planet summary $T(z)=(x,c_j)$. Thus the categorical index is part of the
+statistical envelope, not a claim that the coupled representative's prevalence
+record must equal one archetype vertex. The sufficient statistics are identity
+or frozen transforms of these summary components, not functions pretending that
+heterogeneous local subjects share one denominator.
+
+A **world-law** is a probability law over $\mathcal Z$: the statistical family
+of idealized whole-planet summary atoms that the coordinate regards as similar.
+The deterministic planet exposed at one coordinate is coupled to the same
+archetypes and moment-closed so that its record in
+$\overline{\mathcal R}$ matches $\mathbb E_\theta[T]$ within the finite bounds of
+§6.3. It is deliberately a mean-matched representative, not a draw from
+$p_\theta$. A player walking a short route likewise sees local subjects from
+$\mathcal O_a$, not an unbiased draw from $p_\theta$.
 
 V3 restricts world-laws to a **minimal exponential family**
 
 $$
-p(x\mid\theta)=h(x)\,\exp\!\big(\langle\theta,T(x)\rangle-A(\theta)\big),
+p_\theta(dz)=\exp\!\big(\langle\theta,T(z)\rangle-A(\theta)\big)h(dz),
 \qquad
-A(\theta)=\log\!\int h(x)\,e^{\langle\theta,T(x)\rangle}\,dx,
+A(\theta)=\log\!\int_{\mathcal Z}e^{\langle\theta,T(z)\rangle}h(dz),
 $$
 
 with $\theta\in\Theta\subseteq\mathbb R^{k}$ the **natural (canonical)
-parameter** — the compact Possibility Coordinate — $h$ a fixed base measure, and
+parameter** — the compact Possibility Coordinate — $h$ a fixed base probability measure, and
 $A$ the **log-partition** (equivalently **free energy**), convex, and strictly
 convex because the family is minimal (§3). Because the family is minimal, the
 number of natural parameters equals the number of sufficient statistics: **$\dim
 \theta=\dim T=k$**, and the mean map below is a map $\mathbb R^k\to\mathbb R^k$.
 Richer *presented* attributes a Visualization might show are deterministic
-functions of these $k$ coordinates, not additional sufficient statistics.
+functions of existing canonical channels or means, not additional sufficient
+statistics.
 
-This is exactly the Jaynes maximum-entropy law: among all distributions with
-prescribed feature averages, $p(\cdot\mid\theta)$ is the least-committal one, and
-$\theta$ are the Lagrange multipliers. It is also the object macro-ecology already
-uses — Harte's Maximum-Entropy Theory of Ecology and the MaxEnt
-species-distribution models of Phillips, Dudík and Schapire derive the prevalence
-of traits across a landscape as an exponential-family maximum-entropy law over
-ecological sufficient statistics. V3 makes that the definition of a world.
+The base measure is not left implicit. For the first coupled family, $j$ is a
+joint archetype, $c_j$ its prevalence record, and $x$ its normalized
+scalar-summary atom. The frozen measure is
+
+$$
+h(dx,dj)=\pi_j\,\mathcal N(dx;q+d_j,Q_0),
+\qquad T(x,j)=(x,c_j).
+$$
+
+Here $\pi_j>0$ and $\sum_j\pi_j=1$.
+
+Its moment-generating function is exactly the $A$ in §3.1. The Gaussian scalar
+envelope is an explicit statistical idealization: not every atom in its support
+must be the record of a physically realizable finite planet. Representable means
+are restricted to the bounded, physically certified safe set, and the generator's
+one realized record must meet those means (§3.3, §6.3). A held-out ensemble of
+whole generated planets tests the mean bridge and whether this idealized law is
+useful; neither those representatives nor a within-planet histogram are treated
+as draws from $p_\theta$.
+
+This is the Jaynes maximum-entropy construction relative to $h$: among record
+distributions with prescribed sufficient-statistic averages, it adds no further
+commitment, and $\theta$ are the Lagrange multipliers. Maximum-entropy ecology and
+species-distribution models motivate the use of prevalence statistics, but V3's
+law is specifically over **whole-planet records**; it does not borrow a theorem
+that makes its separate spherical Realization automatically correct.
 
 Crucially, the *law* is the shareable, navigable meaning of the world; the
-*specific terrain a Traveler walks on* is one deterministic **sample** of that
-law, fixed by hashing $\theta$ (§6.2). The law is what is close between nearby
-worlds; the sample is what can differ sharply through emergence. This split —
-law for meaning, sample for the ground underfoot — is what lets V3 satisfy both
+*specific terrain a Traveler walks on* is one deterministic **coupled
+representative** of that law. Its innovation ids do not hash $\theta$: nearby coordinates filter,
+tilt, and threshold the same spherical modes, candidate sites, and lineage slots
+(§6.2). The law is what is close between nearby worlds; the shared innovation is
+what makes their samples correspond; nonlinear topology may still differ sharply
+through emergence. This split —
+law for meaning, representative for the ground underfoot — is what lets V3 satisfy both
 halves of the conceptual model's continuity clause at once: *"nearby points in
 Possibility produce related Realizations"* (nearby laws are $\mathrm{KL}$-close)
 while *"emergent or chaotic behaviour may still create sharp local differences"*
-(one sample of a close law can still be locally very different).
+(two coupled representatives of close laws can still differ locally).
 
 ### 2.2 The coordinate and the Model State
 
-The **Model State** is exactly $(M,\theta)$; everything else is derived. $M$ is
-the Model identity — family, major version, minor version, and a public $128$-bit
-world-family seed — folded into every hash domain (as in Option 1's $M$). A
+The **Model State** is exactly $(M,\hat\theta)$; $\theta$ denotes its mathematical
+decode and everything else is derived. $M$ is a compatibility descriptor/root:
+it names the law family, public $128$-bit world-family seed, canonical epoch, and
+the separate law, spatial-profile, innovation, and per-layer-closure identities.
+Records store the complete root so compatibility can be checked, but a canonical
+hash consumes only the smallest identity closure on which its output depends.
+In particular, common innovation consumes the family seed, spatial-profile id,
+and innovation revision — never an unrelated layer revision or the root manifest
+hash — while a layer dependency key consumes that layer and its declared upstream
+revision closure. Updating one downstream layer therefore cannot reseed untouched
+fields or entity slots. A capability
+minor that adds only a derived query is negotiated separately and does not
+silently change generated identity (§12). A
 practical first instance uses $k\approx 40$ natural parameters (the navigation
 algebra of §5, §8, and §13 is budgeted for $k\le48$), split into a
 **prevalence block** $\theta_{p}$ (bounded traits — §3.2) and a **scalar block**
@@ -216,58 +292,152 @@ scalar (Appendix A).
 For determinism the coordinate is stored in fixed point,
 
 $$
-\hat\theta_j=\big\lfloor 2^{B}\,\theta_j\big\rceil\in\mathbb Z,\qquad B=24,
+\hat\theta_j=\big\lfloor 2^{B}\,\theta_j+\tfrac12\big\rfloor\in\mathbb Z,
+\qquad B=24,
 $$
 
-(round-to-nearest, ties by a fixed rule). $\hat\theta$ is the portable identity of
+(round-to-nearest, exact ties toward $+\infty$, so cell $n$ is the half-open
+interval $[n-\tfrac12,n+\tfrac12)$ in scaled units). $\hat\theta$ is the portable identity of
 a world. This mirrors the prototype's $Q=4096$ possibility quantisation but
 promotes it from a per-region device to *the* single global world address and
 widens it so the metric geometry of §5 has room to express fine navigation.
+The shipped manifest also gives finite safe natural-parameter bounds; an `i32`
+bit pattern is never interpreted as an arbitrary divergent parameter (§3.3).
 
-### 2.3 Dual coordinates: natural $\leftrightarrow$ mean
+### 2.3 Spherical World Space
+
+The first V3 spatial profile is one finite sphere of manifest radius $R_P$,
+
+$$
+\Omega=S_{R_P}^2\times[y_{\min},y_{\max}],
+$$
+
+where signed centimetre altitude $y$ follows the outward normal. A full point has
+the canonical body-fixed address
+
+$$
+x=(p,u,v,y),\qquad p\in\{0,\ldots,11\},\quad
+u,v\in\mathrm{Q0.48}[0,1),\quad y\in\mathbb Z\ \text{cm}.
+$$
+
+The profile requires $R_P+y_{\min}>0$.
+
+The first profile is specifically the twelve-base-pixel **HEALPix NESTED**
+equal-area map, not an unspecified twelve-patch projection. The profile freezes
+the piecewise maps $E_p:[0,1)^2\to S^2$, their inverse branch equations, base-face
+orientation table, bit-interleaving order, and every neighbor/edge remap. Those
+normative integer/fixed-point equations and conformance fixtures are part of the
+spatial-profile identity. If a direction has
+multiple patch preimages, the lowest patch id owns it and the edge/corner table
+rewrites $(u,v)$ into that owner's half-open domain; no excluded `1.0` coordinate
+is serialized. A level-$L$ cell is $(p,m)$ with a $2L$-bit Morton path,
+$L\le L_{\max}=32$, and reference-sphere area
+$4\pi R_P^2/(12\cdot4^L)$. Q0.48 point coordinates may locate subcell positions
+beyond the cell hierarchy. Census and entity levels are separately frozen below
+$L_{\max}$ (§6). Equal area always means equal reference-sphere area (equivalently
+equal solid angle), not sloped
+terrain area or water-column volume.
+
+The HEALPix mapping equations guarantee equal reference solid angle; fixtures
+verify implementations at every supported level, along with round-trip
+address ownership, reciprocal neighbors, and continuity at seams, poles, and
+antipodes. Field kernels consume the decoded body-frame unit direction, not patch-local
+coordinates, so patch boundaries are address seams rather than physical seams.
+Seam transforms, neighbor order, antipode handling, and the fixed-point
+direction map are fixtures. Decoded rotation changes inertial illumination and
+tides; it never rotates terrain, Builds, or Impression addresses.
+
+The World Space line element is
+
+$$
+ds_W^2=(R_P+y)^2ds_{\mathrm{unit}}^2+dy^2.
+$$
+
+Walking distance integrates this metric along the fixed-tick terrain path
+$y=Z(n)$; flight and vertical travel use their sampled altitude. Reference-sphere
+great-circle queries set $y=0$. Egress credit uses the fixed-tick path integral,
+not endpoint chord distance or render-frame polylines.
+The twelve-patch hierarchy is only V3's address, equal-area census, and lazy
+field substrate. It is not Option 1's six-face cube-map address or latent-decoder
+geometry, and it is not the World Loom's icosahedral typed-state/constitutive
+solver or its transport navigation substrate.
+
+### 2.4 Canonical observation measure and time
+
+Canonical Model time is signed integer SI seconds $t$ from the epoch in $M$.
+The manifest fixes the orbital/rotation parameterization, admissible ranges,
+epoch convention, and portable fixed-point phase/trigonometric tables; the joint
+law deterministically decodes rotation period, orbital period, obliquity,
+eccentricity, stellar forcing, and tidal coefficients. Static geology and base
+identities do not depend on $t$; illumination, tides, seasonal climate envelopes,
+phenology, and time-conditioned attributes do. Weather, behavior, growth, and
+other live simulation remain Visualization state.
+
+Because $A$ has no free time argument, a steerable sufficient statistic cannot be
+"whatever the value is now." It declares a time-independent value, a cycle
+average, a **fixed named phase-bin** average, or a coefficient in a frozen
+temporal basis. Its spatial/population denominator is likewise explicit:
+equal-solid-angle surface cells, applicable cells, canonical lineages, bounded
+organism candidates, or post-inhibition living-measure mass. Together these declarations form
+$\nu_a$, the canonical observation measure for statistic $a$. An arbitrary-$t$
+field value is a derived Canonical query reconstructed from the forcing/basis
+contract; it is not another coordinate of $\nabla A$. An Impression stores exact
+$t$ or a named phase interval when its observed subject depends on it, while a
+Yearning refers to the corresponding fixed phase-bin/basis statistic.
+
+Time reduction uses checked modular arithmetic with a frozen negative-time and
+overflow rule. Static layers omit time from dependency keys; phase-independent
+and phase-binned layers consume only the minimal declared time key.
+
+### 2.5 Dual coordinates: natural $\leftrightarrow$ mean
 
 Because $A$ is convex, it has a Legendre–Fenchel dual
 $A^*(\mu)=\sup_\theta[\langle\theta,\mu\rangle-A(\theta)]$, and the two are
-conjugate: $\mu=\nabla A(\theta)$, $\theta=\nabla A^*(\mu)$, $A^{**}=A$. $A^*$ is
-the **negative entropy of the law relative to the base measure** $h$ (equal to
-$-H(p_\theta)$ up to the base-measure constant; exactly $-H$ when $h$ is uniform).
+conjugate: $\mu=\nabla A(\theta)$, $\theta=\nabla A^*(\mu)$, $A^{**}=A$. With
+$h$ the normalized base measure, the exact identity is
+$A^*(\mu(\theta))=\mathrm{KL}(p_\theta\Vert h)$. Calling this ordinary negative
+Shannon/differential entropy would be wrong for a nonuniform $h$.
 The two coordinate systems have direct meaning:
 
 - **Natural coordinates $\theta$** are the *knobs* — what Egress moves.
 - **Mean (expectation) coordinates $\mu=\nabla A(\theta)=\mathbb E_\theta[T]$**
-  are the *prevalences* — the average of every observable across the world. Scope
-  acts here, directly (§4, §7).
+  contain scalar means and prevalence means. Scope acts on their schema-normalized
+  values directly (§4, §7).
 
 This duality is the engine of the whole design: it reappears in the metric (§5),
 in reconciliation (§7), in Egress (§8), and in Attractors (§11), each a different
 reading of the same $A$/$A^*$ pair.
 
-### 2.4 Theoretical, Representable, Reachable
+### 2.6 Theoretical, Representable, Reachable
 
 - **Theoretical Possibility** is the natural-parameter domain
   $\Theta=\{\theta:A(\theta)<\infty\}$, convex.
-- **Representable Possibility** is the fixed-point lattice
-  $\hat\theta\in2^{-B}\mathbb Z^{k}\cap\Theta$.
+- **Representable Possibility** is the finite Q24 lattice whose decoded mean lies
+  in the manifest's safe interior set $\mathcal P_{\mathrm{safe}}$ (§3.3).
 - **Reachable Possibility** from $\theta_0$ is the set connected to $\theta_0$ by
-  an admissible Egress path (§8) that stays in $\Theta$ and everywhere has
-  positive Resonance (§9). Generally a proper, path-connected subset.
+  certified selected-mode Egress paths (§7–8) that stay in the safe set and have
+  positive Resonance (§9). It is generally a proper subset; separate unresolved
+  statistical modes need not form one convex region.
 
 A fourth, physically meaningful set is specific to the law view: the **marginal
-polytope**
+convex support**
 
 $$
-\mathcal P=\{\mu:\mu=\mathbb E_p[T]\text{ for some }p\}=\operatorname{conv}\{T(x)\},
+\mathcal P=\{\mu:\mu=\mathbb E_p[T]\text{ for some }p\}=\operatorname{conv}\{T(z):z\in\mathcal Z\},
 $$
 
-the set of *achievable prevalences*. $\nabla A$ is a bijection from $\Theta$ onto
-the **interior** of $\mathcal P$ (Wainwright–Jordan). The prevalence directions of
-$\mathcal P$ are bounded (a trait's average lies in a fixed hull, §3.2); the
-scalar directions are unbounded. On the *prevalence* boundary — a trait pushed to
+the set of achievable expectation vectors. Its prevalence projection is the
+polytope $\operatorname{conv}\{c_r\}$, while its scalar directions are unbounded.
+$\nabla A$ is a bijection from $\Theta$ onto the interior of $\mathcal P$ for the
+minimal regular family. On a *prevalence* boundary — a trait pushed to
 a degenerate extreme (perfectly pervasive, or perfectly absent) — the natural
-parameter diverges and the law becomes deterministic, so $g=\operatorname{Cov}[T]$
-*degenerates* ($\lambda_{\min}\!\to\!0$) in that direction. This boundary is not a
-wall to clamp against; it is exactly where Resonance collapses (§9), giving the
-game a principled reason why "make everything the same" is unreachable.
+parameter diverges and the face-normal prevalence statistic becomes
+deterministic, so $g=\operatorname{Cov}[T]$ *degenerates*
+($\lambda_{\min}\!\to\!0$) in that direction. Scalar variation and variation
+tangent to the face may remain. This is a theoretical
+limit, not a storable address: the safe-set erosion and Resonance response gate
+make "everything exactly the same" unreachable without projecting a finite
+coordinate onto an infinite-parameter boundary.
 
 ---
 
@@ -275,127 +445,174 @@ game a principled reason why "make everything the same" is unreachable.
 
 ### 3.1 One function generates the navigation subsystem
 
-From $A$ alone the Model gets its mean map, its metric, and its reconciliation
-objective. V3 therefore specifies $A$ as a fixed, versioned, convex closed form.
-So that the prevalence directions have a genuine bounded boundary while the scalar
-directions stay well-conditioned, $A$ is built in two blocks:
+From $A$ alone the Model gets its mean map, metric, and reconciliation geometry.
+V3 therefore specifies $A$ as a fixed, versioned, convex closed form. The first
+draft used independent scalar and prevalence blocks; that would make their Fisher
+cross-covariance identically zero and could not carry the claimed physical
+correlations. V3 instead uses one **coupled categorical-Gaussian family**. Each
+joint archetype has an unbounded scalar context $d_r$ and bounded prevalence
+configuration $c_r$:
 
 $$
-A(\theta)=\underbrace{\tfrac12\,\theta_s^\top Q_0\,\theta_s+\langle q,\theta_s\rangle}_{\text{scalar block }A_s(\theta_s)}
-\;+\;\underbrace{\log\!\sum_{r=1}^{R}\pi_r\,\exp\!\big(\langle\theta_p,c_r\rangle\big)}_{\text{prevalence block }A_p(\theta_p)} .
+A(\theta)=\tfrac12\,\theta_s^\top Q_0\theta_s+\langle q,\theta_s\rangle
++\log\!\sum_{r=1}^{R}\pi_r\exp\!\big(
+\langle\theta_s,d_r\rangle+\langle\theta_p,c_r\rangle\big).
 $$
 
-- The **scalar block** is a mild convex form with $Q_0\succ0$ (frozen), modelling
-  unbounded magnitudes (relief energy, aridity level). $Q_0$ is the metric floor,
-  and it acts *only* on scalar coordinates.
-- The **prevalence block** is a categorical/softmax log-partition over a frozen
-  bank of $R$ **world archetypes** $c_r$ (reference prevalence configurations)
-  with priors $\pi_r>0$. It has **no additive quadratic**, so its mean map lands
-  in the bounded hull $\operatorname{conv}\{c_r\}$ and can genuinely saturate at
-  the hull boundary.
+- $Q_0\succ0$ gives scalar magnitudes such as relief energy and mean warmth an
+  unbounded theoretical range and a permanent conditioning floor.
+- $c_r$ lies in the product of the declared bounded prevalence ranges, while
+  $d_r$ records the scalar context in which that prevalence configuration was
+  accepted. The same responsibility $s_r$ therefore couples, for example,
+  productivity and large-body prevalence.
+- The $c_r$ affinely span the prevalence subspace and the complete family is
+  minimal. There is no quadratic floor on a prevalence direction, so the Fisher
+  response can still vanish at the hull boundary.
 
-Both blocks are $C^\infty$ and convex, so $A$ is convex with closed-form
-derivatives. Writing $s_r(\theta_p)=\pi_r e^{\langle\theta_p,c_r\rangle}/\sum_{r'}
-\pi_{r'}e^{\langle\theta_p,c_{r'}\rangle}$ for the softmax weights,
+Writing $a_r=(d_r,c_r)$ and
+$s_r(\theta)=\pi_r e^{\langle\theta,a_r\rangle}/
+\sum_{r'}\pi_{r'}e^{\langle\theta,a_{r'}\rangle}$,
 
 $$
-\nabla A=\big(Q_0\theta_s+q,\ \textstyle\sum_r s_r c_r\big),
+\nabla A=
+\left(Q_0\theta_s+q+\sum_r s_r d_r,\ \sum_r s_r c_r\right),
 \qquad
-\nabla^2A=\begin{pmatrix}Q_0&0\\[2pt]0&\ \operatorname{Cov}_{s}[c]\end{pmatrix},
-\quad
-\operatorname{Cov}_{s}[c]=\sum_r s_r c_rc_r^\top-\Big(\sum_r s_r c_r\Big)\Big(\sum_r s_r c_r\Big)^\top .
+\nabla^2A=
+\begin{pmatrix}Q_0&0\\0&0\end{pmatrix}+\operatorname{Cov}_{s}[a].
 $$
 
-The metric is $Q_0$ on the scalar block (a permanent positive-definite floor,
-well-conditioned navigation) and the softmax covariance of the archetype bank on
-the prevalence block. As the softmax concentrates on a single archetype (a trait
-driven to the hull boundary), $\operatorname{Cov}_s[c]\to0$ and the metric
-degenerates *there and only there* — the singular boundary §2.4 needs.
-Crucially, **the metric is an algebraic identity in $\theta$**: no autodiff, no
-probe set, no finite differences. (This is the single line separating V3's metric
-from its siblings; see §5 and §17 for the precise contrast.)
+The off-diagonal block $\operatorname{Cov}_s[d,c]$ is the missing
+scalar/prevalence coupling. The metric remains algebraically specified and
+matrix-free: apply the block floor plus
+$U(\operatorname{diag}s-ss^\top)U^\top v$, where $U=[a_1\cdots a_R]$. As the
+responsibilities concentrate at a prevalence-hull extreme, response in the
+corresponding prevalence direction vanishes; scalar directions retain $Q_0$.
+No autodiff, realized probe Jacobian, or transport solve defines this metric.
 
 ### 3.2 Validity is intrinsic
 
 There is no plausibility clamp cascade. Every $\theta\in\Theta$ yields a valid
 law, and every reachable prevalence $\mu_p=\sum_r s_r c_r$ lies in the interior of
 $\operatorname{conv}\{c_r\}$ by construction. Physical relationships between
-attributes ("no large animals without productivity", "no vegetation without
-water") are encoded once, as *correlations in the archetype bank*: an archetype
-with high morphology prevalence also has high productivity, so the softmax cannot
-place mass on "giant animals, dead world." Infeasible combinations simply are not
-in $\mathcal P$, so the flow never reaches them and never has to be projected away
-from them. This is validity-by-construction — a different mechanism from, not a
-correction of, Option 2's triangular parent-gated chart, which achieves the same
-property a different way (§17).
+attributes are split by what convex means can honestly guarantee. Archetype
+inequalities constrain the categorical contribution and its covariance, but the
+$Q_0\theta_s$ term means they do **not** by themselves constrain the full scalar
+mean. Frozen linear cross-block halfspaces (for example, large-body prevalence
+bounded by full productivity), scalar ranges, and prevalence-hull erosion are
+therefore explicit facets of $\mathcal P_{\mathrm{safe}}$. Known nonconvex
+alternatives live in separately certified convex regime/corridor cells (§7.3). Inventory,
+topology, and nonlinear physical validity are guaranteed by the bounded spherical
+closures and their safe-set certificate (§6.1, §6.3), not by calling correlation
+causation. Thus statistical validity is intrinsic and the realized-planet contract
+is separately checkable. This is a different mechanism from Option 2's triangular
+parent-gated chart, not a claim that every scientific constraint is convex.
 
-### 3.3 Residual projection $\Pi$
+### 3.3 Typed interior projection
 
-Inputs that arrive off-manifold — an Impression from a newer Model minor version,
-a hand-edited coordinate, quantisation drift after an Egress step — are mapped
-back by the **Bregman (information) projection** onto the closed feasible set,
+The closed prevalence hull contains limiting laws whose natural parameter is
+infinite, so it is not a valid solve domain for a finite `Coord`. The manifest
+therefore defines a compact convex **safe mean set**
+$\mathcal P_{\mathrm{safe}}\subset\operatorname{int}\mathcal P$ by eroding every
+prevalence-hull facet by a fixed rational margin, bounding the scalar means, and
+intersecting frozen cross-block halfspaces and interval-certified nonlinear
+closure cells. Every regime and transition corridor used by navigation is a
+nonempty certified convex subset of this set. Scope targets,
+reconciliation, and external same-schema mean data use this set. The margin is
+small enough to express the intended saturation but large enough to bound
+$\nabla A^*$ and the canonical condition number.
+
+Projection is explicitly typed in mean space and accepts only same-family means
+already in $\operatorname{int}\mathcal P$; data outside the convex support is
+rejected before this operation:
 
 $$
-\Pi(\mu)=\arg\min_{\mu'\in\overline{\mathcal P}}\ B_{A^*}(\mu',\mu),
+\Pi_\mu(\mu)=\arg\min_{\mu'\in\mathcal P_{\mathrm{safe}}}
+B_{A^*}(\mu',\mu),
+\qquad
+\Pi_\theta(\theta)=\nabla A^*\!\left(\Pi_\mu(\nabla A(\theta))\right).
 $$
 
-which is idempotent, $\Pi(\Pi(\cdot))=\Pi(\cdot)$, and — because $\overline{\mathcal P}$
-is convex and $A^*$ strictly convex — has a *unique* value. It is the same
-fixed-point property the prototype proves for its $\Pi$, but here it is a
-projection onto a genuine convex set of laws whose uniqueness is a one-line
-convexity argument an agent can check.
+Because the set is convex and $A^*$ is strictly convex, $\Pi_\mu$ is unique and
+idempotent. Code cannot pass a natural `Coord` to it. Ordinary Egress interpolates
+inside $\mathcal P_{\mathrm{safe}}$ and needs no projection; $\Pi_\theta$ is only
+for same-schema hand edits and quantization recovery. Its real-valued result is
+not yet a `Coord`: Canonical code rounds it under the half-open Q24 contract and
+rechecks an enclosure of the decoded mean against $\mathcal P_{\mathrm{safe}}$.
+A different law/schema
+version is rejected or explicitly migrated, never projected into a new meaning.
 
 ### 3.4 The archetype bank is a fitted fixture, not an identity
 
-The bank $\{c_r,\pi_r\}$, the scalar form $(Q_0,q)$, and the observable schema $T$
-together determine $A$, hence the mean map, the metric, the feasible polytope, and
-(via §6.3) the realized prevalences. Choosing $T$ and $\{c_r\}$ *is* choosing the
+The bank $\{d_r,c_r,\pi_r\}$, the scalar form $(Q_0,q)$, and the observable schema $T$
+together determine $A$, hence the mean map, metric, feasible mean set, and
+(via §6.3) the realized statistics. Choosing $T$ and the joint bank *is* choosing the
 geometry — Chentsov's uniqueness (§5) applies only *after* $T$ and $A$ are fixed,
 so this is as much a design surface as Options 1/2's weight matrices, merely
-relocated into a bank of frozen data. It is fitted once, offline, from a corpus of
-accepted worlds (bootstrapped from hand-authored seed worlds, then grown), subject
-to: $Q_0\succ0$; archetypes spanning the desired feasible worlds with the physical
-inequalities baked in as correlations; prevalence ranges matching the Scope band
-$[\tau_{\min},\tau_{\max}]$; and the LGCP calibration of §6.3. **Its correctness is
-validated by held-out world-quality tests, not by an identity** — this is the part
-of the system goal 4 does *not* cover, and it is stated plainly rather than hidden
-behind "the metric is handed to us." Once fitted, the bank is hashed into the
-Model major identity and becomes an immutable fixture (Appendix A).
+relocated into a bank of frozen data. It is fitted once, offline, from a
+content-addressed corpus of accepted spherical worlds, with immutable training,
+validation, and held-out splits. Release gates require affine rank and condition
+bounds, facet coverage beyond every Scope target, named cross-block constraints,
+schema-wide realized-moment bounds (§6.3), held-out diversity and repeated-motif
+limits, and provenance for every accepted world. A bank that misses any gate is
+rejected rather than reweighted at runtime. **World quality remains empirical,
+not an algebraic identity.** Once accepted, the complete bank and split manifest
+are hashed into the law identity (Appendix A).
 
 ---
 
 ## 4. Observables — the Realization/attribute contract
 
-The Model exposes the fixed **observable schema** $T=(T_1,\dots,T_k)$ and the
-**mean map** $\varphi(\theta)=\nabla A(\theta)=\mathbb E_\theta[T]$ — one language
-for three subsystems: what Yearnings push on, what Impressions capture, and the
-coordinates of the feasible marginal polytope.
+The Model exposes the fixed **sufficient-statistic schema**
+$T=(T_1,\dots,T_k)$ and the mean map
+$\varphi(\theta)=\nabla A(\theta)=\mathbb E_\theta[T]$. Each entry fixes:
+
+- units, range, membership function, and whether it is scalar or prevalence;
+- its subject population and applicability predicate;
+- its area, lineage, candidate, living-mass, and/or canonical-time denominator;
+- for a steerable coordinate, a certified positive applicability floor; for a
+  derived observable only, zero-denominator behavior (`NotApplicable`, never an
+  invented zero prevalence);
+- the final Realization channels from which it is measured; and
+- a Canonical estimator $R_a(\hat\theta)$ and maximum admitted error
+  $\varepsilon_a$ against the law mean.
+
+This is one language for what Yearnings push on, what Impressions capture, and
+what the finite spherical census verifies. The player-facing meaning is the
+statistic over its declared applicable population, not an unqualified average of
+unlike terrain patches and organisms.
 
 Two attribute *kinds* matter for Yearnings, distinguished as in the conceptual
 model:
 
-- **Scalar attributes** name a world-wide magnitude (sea fraction, mean warmth) —
+- **Scalar attributes** name a world-wide magnitude (relief energy, mean warmth) —
   a scalar-block mean.
 - **Prevalence attributes** name *how widespread* a trait is across the world's
   species or regions. This is where V3 is structurally clean: a prevalence *is*,
   by definition, a prevalence-block mean $\mu_a=\mathbb E_\theta[T_a]\in[0,1]$ —
-  the fraction of the sampled population expressing the trait. Scope therefore
+  the fraction of the declared applicable population expressing the trait. Scope therefore
   cannot be a spatial falloff even in principle (invariant 11); it targets a
   coordinate of $\theta$'s image. "Make branching plants pervasive" sets a target
   for the mean of the branching-indicator statistic.
 
-**Query and accuracy contract.** The Realization is queried through immutable
-snapshots (the trait surface of §14) at three accuracy tiers, exactly as Option 1
-specifies: **Preview** (fewer octaves/iterations), **Interactive** (bounded error
-against a supplied tolerance), and **Canonical** (fixed octave counts, fixed
-solver iterations, canonical rounding, portable transcendentals — the reference
-result an Impression commits, §12). Every approximate result carries
-componentwise error bounds and an integer dependency key; refinement narrows the
-bounds without changing canonical identity. A Visualization declares which
-attribute groups and accuracy tiers it consumes; a Model/Visualization pair is
-compatible iff the consumed groups are present at compatible versions. Adding
-statistics to $T$ is backward compatible; changing a statistic's meaning bumps the
-Model major version (§12).
+**Query and accuracy contract.** Immutable snapshots support **Preview** (cheap,
+uncertified), **Interactive** (a bounded approximation), and **Canonical** (the
+portable reference kernel of §12). Results are `Complete`, `Pending` with a
+deterministic continuation, `Partial` with certified componentwise bounds when
+the consumer permits it, or `Unresolved`; a Canonical best effort is never
+silently returned. Every result carries dependency keys, population count or
+mass, applicability, temporal measure, and error bounds. Refinement narrows the
+bounds without changing identity.
+
+An entry is steerable only when its held-out and runtime bounds demonstrate
+$|R_a(\hat\theta)-\nabla A(\theta)_a|\le\varepsilon_a$ across the admitted
+coordinate set and twice that error plus coordinate/quota quantization error is
+strictly narrower than every adjacent Scope-band gap.
+Otherwise it remains a diagnostic derived observable or reports `Unresolved`.
+A Visualization declares the groups and accuracy it consumes. Adding an optional
+observable that is purely derived from existing canonical channels can be a
+compatible capability addition; adding a sufficient statistic changes $k$, $A$,
+the bank, metric, address, and moment closure, and therefore creates a new major
+law family (§12).
 
 ---
 
@@ -415,10 +632,10 @@ positive definite on the interior of $\Theta$. By **Chentsov's theorem** (Čenco
 extended to continuous sample spaces by Ay–Jost–Lê–Schwachhöfer), the Fisher
 metric is the *unique* Riemannian metric, up to a single positive scale, invariant
 under sufficient statistics — the unique metric that does not depend on how we
-coordinatise observations, *once the observable schema $T$ is chosen*. The
-siblings both *build* a metric and must choose its weighting; V3 does not choose a
-metric at all, only the observables and $A$ (§3.4), after which the metric is
-determined and its only free constant is an overall scale (a game-feel dial for how
+coordinatise observations, *once the observable schema $T$, family $A$, and fitted
+bank are chosen*. V3 has no additional independent metric-weight matrix after
+those choices (§3.1); the metric is then determined and its only free constant is
+an overall scale (a game-feel dial for how
 "far" a given amount of world-change feels).
 
 Local distance is the metric length $d_g(\theta,\theta+\delta)^2\approx\delta^\top
@@ -426,7 +643,8 @@ g(\theta)\delta$, and the phenomenon the conceptual model asks for falls out: a
 small numeric move where $\operatorname{Cov}[T]$ is large (the law responds
 strongly) is metrically *far*; a large numeric move in a flat direction of the
 covariance is metrically *near*. High-sensitivity / continuity-risk directions are
-the large-eigenvalue directions of $g$, read off for free.
+the large-eigenvalue directions of $g$, derived from that same metric when the
+bounded eigensolve is worth its cost.
 
 For a *closed-form* comparison of two world-laws — needed far more often than a
 geodesic length — V3 uses the **KL / Bregman divergence**, which for an
@@ -448,289 +666,523 @@ so the two are consistent; the geodesic Fisher–Rao *distance* has no closed fo
 for a general family, and V3 never needs it — metric *steps* for Egress, Bregman
 *divergences* for comparison.)
 
-Cost: $g$ is $k\times k$ with $k\lesssim48$, block-diagonal (§3.1), assembled in
-closed form. Egress needs $g^{-1}\nabla$ against it; §8 and §13 give an exact
-low-rank / matrix-free form so the solve is cheap.
+Cost: $g$ is $k\times k$ with $k\le48$ in the first manifest. Its block floor
+plus joint-archetype covariance is algebraically specified and applied
+matrix-free in $O(Rk)$. Egress still needs bounded Newton/CG solves; the identity
+removes numerical differentiation, not numerical inversion (§8, §13).
 
 ---
 
-## 6. Realization: the World Space field drawn from the law
+## 6. Realization: one spherical statistical planet
 
-### 6.1 The law fixes the *statistics*; a stack of fields realizes them
+### 6.1 The layer graph and planetary closures
 
-Given a coordinate $\theta$ and a World Space position $x\in\Omega$ (a plane in V3;
-the construction is stated on a generic domain $\Omega$ and transfers to a sphere
-$S^2$ for a planet later), the world is a deterministic stack of fields
+For a committed coordinate, canonical surface address, and Model time,
 
 $$
-\mathcal W(\theta,x)=\big(z,\ \kappa,\ h,\ u,\ b,\ e,\ \Lambda\big):\ \
-\text{terrain}\to\text{climate}\to\text{hydrology}\to\text{soils}\to\text{biome}\to\text{food web}\to\text{organisms},
+\mathcal W(M,\hat\theta,x,t)=
+(P,G,Z,W,D,C,H,S,B,E,\Lambda),
 $$
 
-the same dependency chain the overview lists and the prototype implements. The
-possibility input is the *global* $\theta$, so there is exactly one world; spatial
-structure comes entirely from $x$.
+is a declared dependency graph:
 
-Each abiotic layer is a **Gaussian random field** whose second-order law is
-decoded from $\theta$. V3 uses the **Matérn** family because it is the standard
-two-and-a-half-parameter model of a spatially correlated field and because its
-distances have closed forms (§10). Its covariance and spectral density are
+```text
+planet/orbit P
+  ├─ geology G ─ terrain/slope Z ─┬─ water level W ─ macro drainage D
+  │                               └──────────────────────────┐
+  ├─ finite water inventory ────────────────> W              │
+  └─ atmosphere/orbit + time forcing ───────> climate C <────┘
+                elevation Z + ocean W ──────> C
+                      D + C ─ hydrology H ─ soils S ─ biome B
+                                                   └─ ecology E ─ entities Λ
+```
+
+The profile fixes geometric radius and the address chart. The joint law decodes
+gravity, rotation, atmosphere and finite water inventory, geological spectral
+energy, climate response, soil rates, and ecological coefficients. On census
+radial columns with solid angle $\Delta\Omega_i$, water volume determines one
+global sea level from the monotone finite-sphere equation
 
 $$
-C(r)=\sigma^2\,\frac{2^{1-\nu}}{\Gamma(\nu)}(\kappa r)^\nu K_\nu(\kappa r),
-\qquad
-S(k)\ \propto\ \big(\kappa^2+\lvert k\rvert^2\big)^{-(\nu+d/2)},
-\qquad
-\kappa=\frac{\sqrt{2\nu}}{\ell},
+V(h)=\sum_i\frac{\Delta\Omega_i}{3}
+\left[(R_P+h)^3-(R_P+z_i)^3\right]_+.
 $$
 
-with variance $\sigma^2$ (relief energy), range $\ell$, and smoothness $\nu$
-decoded smoothly from $\theta$. The Whittle–Matérn SPDE representation
-$(\kappa^2-\Delta)^{(\nu+d/2)/2}(\tau z)=\mathcal W_{\!wn}$ (Lindgren–Rue–Lindström,
-$\mathcal W_{\!wn}$ white noise) gives a local Markov characterisation and the
-*offline* ground-truth path (§6.2).
+The canonical solve chooses the least representable $h$ whose enclosure contains
+the inventory target, then apportions its subquantum boundary-column residual in
+cell-id order so the water ledger closes exactly. Zero inventory gives a dry
+planet; the safe set excludes inventories above $V(y_{\max})$; shoreline equality
+uses the lower/dry owner and then cell id. Macro drainage uses
+integer centimetre elevations, canonical spherical neighbors, hierarchical
+priority flooding, and feature-id tie breaks; every non-endoreic route terminates
+at the ocean when one exists, and flux is conserved at cell junctions. Integer-time insolation,
+elevation, ocean distance, and transport envelopes drive a fixed-order coarse
+energy/moisture climate closure with residual enclosures; hydrology,
+soils, biome, and ecology consume the settled upstream products. Each nonlinear
+closure has a residual/error result and a fixed work cap rather than assuming one
+converged float answer.
 
-### 6.2 Law versus sample: lazy, deterministic synthesis
+Global sea-level, coarse drainage, cycle forcing, and moment-ledger work is
+bounded by one frozen census, not by explored area, but it is real cold work and
+is included in §13's ledger. A refined child set inherits its parent's outlet and
+inventory, and every added residual has zero parent-weighted sum; restriction
+therefore reproduces the parent value exactly. A refinement that cannot satisfy
+those conservative residual and outlet conditions is unavailable rather than
+silently replacing a settled parent closure.
 
-The *law* (the decoded Matérn spectrum) is what navigation uses. The *sample* the
-Traveler walks on is produced lazily by **summed hashed-gradient noise tuned to
-that spectrum**. A multi-octave fBm with octave frequencies $f_i=f_0L^i$
-(lacunarity $L$) and amplitudes $a_i=r^i$ has Hurst regularity $H$ when the octave
-gain satisfies $-\ln r/\ln L=H$; to match a Matérn field of smoothness $\nu$, set
-$H=\nu$ (i.e. $r=L^{-\nu}$) and $f_0\approx\kappa/2\pi$. The realized field then has
-the Matérn power-spectrum exponent $2\nu+d$ (the amplitude-slope $-2\ln r/\ln L=2\nu$
-plus the spatial dimension $d$). The primitive is the same hashed-gradient noise
-as the prototype's `terrain.rs`, so per-sample cost is $O(1)$, bit-deterministic,
-and cross-platform by the existing rules.
+### 6.2 Spherical fields over common innovation
 
-Two honest limits. (i) The correspondence is **stationary and isotropic**: a
-domain-warp can modulate range and grain slowly across the world, but a fully
-nonstationary SPDE covariance has *no* $O(1)$-per-sample lazy certificate — the
-lazy path is scoped to (locally) stationary Matérn, and this is also what the
-closed-form transport of §10 requires. (ii) The match is asymptotic in the
-high-frequency slope and the range; circulant-embedding and FEM/GMRF solves are
-the offline "blessing" path that certifies the stationary match and never run
-per-frame.
+Smooth primitive channels use a spherical Matérn-like law. On $S_{R_P}^2$, the
+Laplace--Beltrami eigenvalue for harmonic degree $\ell$ is
+$\ell(\ell+1)/R_P^2$, so the isotropic reference spectrum is
 
-This is the concrete meaning of "law for navigation, sample for the ground": a
-small Egress step reshapes the whole spectrum smoothly, while whether any given
-ridge survives is a property of the sample and may change sharply — emergence,
-exactly as intended.
+$$
+S_\ell(\theta)\propto
+\left(\kappa(\theta)^2+\frac{\ell(\ell+1)}{R_P^2}\right)^{-(\nu_M(\theta)+1)}.
+$$
 
-### 6.3 Organisms and vegetation as point processes
+Here $\kappa$ is inverse range and $\nu_M$ is Matérn smoothness, distinct from the
+measure family $\boldsymbol\nu$. The lazy sample combines a frozen number of low
+spherical-harmonic modes, localized needlet bands with explicit truncation error,
+and compactly supported geodesic residual kernels on the equal-area hierarchy.
+Low-degree joint cross-channel filters, a body-frame anisotropic covariance field
+with positive-eigenvalue bounds, and a shared plate/regime skeleton supply
+nonstationary tectonic and climatic structure; locally Matérn residuals supply
+detail. The anisotropy changes covariance/filter response, not spatial coordinates,
+so it cannot fold the sphere or introduce a chart seam. The fast path is not a
+globally stationary isotropic texture, though its local covariance family remains
+bounded and inspectable.
 
-The living layers are **marked point processes** whose intensity is decoded from
-the law. Placement uses a **log-Gaussian Cox process**: intensity
-$\lambda(x)=\exp(Z_\theta(x))$ for a Gaussian suitability field $Z_\theta$, so
-dense forests and sparse steppes are the high/low-intensity regimes of one field.
-Individual organisms are a deterministic hash-thinning of $\lambda$ (accept a
-candidate at $p$ iff $\mathrm{hash}(p)/2^{64}<\lambda(p)/\lambda_{\max}$); marks
-(species, body-scale, hue) are hashed samples from the law's trait distribution.
-Regular inhibited spacing uses a hash-based Poisson-disk proxy for a determinantal
-point process (exact DPP sampling is $O(N^3)$ and sequential).
+Most importantly, every coefficient, plate seed, candidate site, and lineage slot
+comes from a **common innovation id**
 
-The intensity is a genuine **spatial mass distribution over World Space** — which
-is what makes the continuity transport of §10 physical for the living layers.
+$$
+u=H(\text{family seed},\text{spatial-profile id},\text{innovation revision},
+\text{channel},\text{band},\text{cell/mode},\text{slot}),
+$$
 
-**The prevalence tie is a calibrated constraint, not an automatic identity.** The
-whole-world trait prevalence
-$\int_\Omega\lambda(x)\pi_a(x)\,dx/\int_\Omega\lambda(x)\,dx$ and the law's mean
-$\mu_a=\nabla A(\theta)_a$ are properties of two *separately decoded* objects (the
-LGCP intensity and the free energy $A$). Equality is a **decoder moment-matching
-constraint** the fitting step (§3.4) must impose — that the LGCP trait marginals
-reproduce $\nabla A$ across $\Theta$ — and it holds only in the large-domain,
-large-$N$ limit: a finite hash-thinned sample gives an $O(1/\sqrt N)$ estimate,
-the lazy-fBm variance is slightly biased (§6.2), and $\mathbb E[\lambda\pi]/
-\mathbb E[\lambda]$ equals the ratio of expectations only ergodically. So the tie
-is a calibrated, harness-verified equality within a stated tolerance (acceptance
-criterion 3), not "the same number by construction." It is still the tightest tie
-any of the three proposals draws between what a Yearning asks for (a mean
-parameter) and what the Traveler counts on the ground.
+which excludes $\hat\theta$. The coordinate changes gains, cross-channel filters,
+thresholds, and marks over the same $u$. Nearby laws therefore reshape the
+same ridges, regime patches, candidate sites, and lineage possibilities until a
+named topology threshold is crossed. Cache dependency keys and coordinate-specific
+manifestation ids include $\hat\theta$; innovation and lineage-slot ids do not.
+This common-random-number coupling is a fixed field bank, not the World Loom's
+typed innovation program or transport navigation.
 
-### 6.4 Determinism and caching by bucket
+Canonical field evaluation freezes basis order, coefficient quantization,
+portable tables, seam transforms, refinement reductions, and topology tie rules.
+Preview/Interactive may use fewer bands or hardware floats; they cannot create an
+Impression or permanent entity.
 
-$\mathcal W$ never consumes a live float $\theta$; it consumes the bucketed
-$\hat\theta$. A *tile* is a pure function of
-$(\hat\theta,\text{region},\text{layer},\text{version})$, hashed to a dependency
-key as world-model.md §2.6 does, with the global $\hat\theta$ replacing the
-per-region vector, so sub-bucket Egress advances the coordinate, metric, and
-Resonance while regenerating nothing. The dependency-hash graph, per-layer
-`algorithm_revision`, cache ceilings, and farthest-first eviction carry over
-unchanged; only the *inputs* to the hash change.
+### 6.3 Mean-preserving spatial structure
+
+The Realization consumes the law's joint-archetype responsibilities $s_r$ through
+the single bounded canonical quantization $\hat s_r$ below; they are not two
+unrelated decoders connected only by an ecological fit. Let
+$\mathcal C_L$ be the $N=12\cdot4^L$-cell equal-solid-angle canonical census.
+The manifest contains archetype-specific common spherical residuals $G_r(i)$ and
+bounded amplitudes $\gamma_r$. Canonical balanced apportionment first turns the
+real responsibilities $s_r$ into integer global column quotas $n_r$ using the
+manifest's fixed per-cell responsibility denominator $Q_R$, with
+$\sum_r n_r=NQ_R$, defining $\hat s_r=n_r/(NQ_R)$ and an explicit
+$|\hat s_r-s_r|$ bound. Begin with the positive spatial prior
+
+$$
+\widetilde q_{ir}=\hat s_r(\theta)\exp(\gamma_rG_r(i)).
+$$
+
+Local responsibilities are the unique KL/I-projection
+
+$$
+q=\arg\min_{q\ge0}\sum_{i,r}q_{ir}\log\frac{q_{ir}}{\widetilde q_{ir}}
+\quad\text{s.t.}\quad
+\sum_rq_{ir}=1,\qquad \frac1N\sum_iq_{ir}=\hat s_r\ \ \forall r.
+$$
+
+Canonical matrix scaling with fixed row/column order, residual enclosures, and a
+cold certified interval/high-precision fallback approximates the unique
+I-projection while preserving the integer row/column quotas exactly. Separate $\gamma_r$ values let rare
+archetypes vary in relative spatial concentration instead of one tiny $s_r$
+forcing all spatial variation to zero. The safe parameter bounds and responsibility
+precision ensure no shipped column falls below the representable mass quantum.
+Thus the planet has correlated spatial regimes while their whole-sphere joint
+mean is $\hat s$, within the declared discretization bound of the $s$ that
+generates $A$. Each scaling sweep is $O(NR)$; the sweep cap and slower certified
+fallback are reported and cached explicitly in §13's moment-ledger row. Scalar primitive fields use the
+analogous centered form
+$F_a(i)=\mu_a+\widetilde F_a(i)-N^{-1}\sum_j\widetilde F_a(j)$.
+
+These identities close linear census moments. They do not magically preserve a
+mean through sea-level selection, drainage, ecological competition, or another
+nonlinear layer, so the final layer graph owns a **moment ledger**. Each steerable
+statistic names a monotone correction parameter or a balanced discrete
+apportionment, a bracket, and an error budget. Fixed-order bracketed solves set
+scalar moments; common-innovation ranks assign exact integer quotas for bounded
+memberships over applicable cells, lineages, or candidates. Coupled corrections
+are an $A^*$-Bregman/I-projection in the same fixed statistic space, followed by
+the affected dependency closure. Corrections run in one frozen dependency order;
+every sweep reruns all affected downstream closures. The manifest admits a safe
+parameter cell only after analytic bounds or outward interval evaluation over the
+**whole cell** proves the correction map contractive, the brackets valid, and
+conservation compatible—sampling the enormous Q24 lattice is not called
+certification. After the bounded sweep, one simultaneous interval check covers
+every conservation residual and steerable moment. Rerunning a settled closure is
+bit-idempotent; otherwise the result is unresolved and the coordinate or
+capability is not admitted.
+
+The Canonical result reports the finite-planet estimator and a bound. A bounded
+prevalence with $N_a$ applicable subjects has unavoidable discretization at most
+$1/N_a$; steerable prevalence coordinates have the schema-proved positive
+applicability floor from §2.1. A derived query outside that contract may return
+`NotApplicable`. If a correction or bound cannot finish under its cap, the query
+is `Pending` or `Unresolved` and no Impression or Egress decision consumes it.
+This schema-wide bridge covers abiotic and biotic statistics, replacing the
+earlier asymptotic ecology-only promise.
+
+The single realized planet supplies one record $r(\mathcal W)$, not a histogram
+of draws from the whole-record law. The ledger therefore checks each component
+against $\mu=\nabla A(\theta)$ and may separately report bounded, schema-specific
+local histograms without identifying them with $p_\theta$. Offline release tests
+use an independent ensemble of generated planets to measure the conditional
+residual $r(\mathcal W_\theta)-\nabla A(\theta)$, physical correlations, and
+visible higher-order quality. The separate archetype corpus fits the idealized
+atom law. Neither test equates a distribution of mean-matched representatives
+with $p_\theta$. Failure rejects the bank or demotes a capability; this is an
+empirical family-quality gate, not canonical identity for one planet.
+
+### 6.4 Bounded hash-thinned ecology and entities
+
+Living content is a finite marked candidate population with a real dominating
+bound. A finite-band Gaussian suitability field $Z_\theta(x,t)$ feeds a
+**bounded logistic-normal activation density**
+
+$$
+\lambda_\theta(x,t)=\lambda_{\mathrm{cap}}
+\operatorname{sigmoid}(Z_\theta(x,t)),\qquad
+0\le\lambda_\theta\le\lambda_{\mathrm{cap}},
+$$
+
+where every equal-area entity cell at frozen $L_e\le L_{\max}$ has exactly $C_e$
+common candidate sites of reference area $A_e$, and
+$\lambda_{\mathrm{cap}}=C_e/A_e$. Thus
+$\lambda/\lambda_{\mathrm{cap}}$ is exactly the pre-inhibition activation
+probability and $\lambda$ its expected pre-inhibition density. These are manifest
+constants. This Bernoulli/hash thinning of a finite population is deliberately
+not called a Cox or Poisson process, whose cell count would be unbounded.
+Candidate ids come from common innovation. A candidate
+is active iff its canonical hash fraction is below
+$\lambda/\lambda_{\mathrm{cap}}$; deterministic neighbor priority supplies
+inhibited spacing. Canonical trait marks use balanced rank apportionment over the
+active applicable candidates, so their census prevalence meets the moment-ledger
+quota rather than relying on an infinite-domain ergodic argument. The canonical
+hierarchical quota summary stores prefix counts and rank intervals over all
+$12\cdot4^{L_e}$ cells; cold construction is finite and ledgered, while a local
+tile expands only its bounded interval.
+
+A separately capped set of lineage slots derives immutable genomes and traits
+from the same innovation root. Integer compatibility and energy-budget predicates
+form trophic edges; stable lineage/edge ids, canonical tie order, and productivity
+and biomass quotas bound the local food-web assembly. Slot identity
+persists across nearby laws; a manifestation id additionally includes the
+committed coordinate. Higher resource tiers may add decorative individuals but
+cannot change the canonical candidate population, Scope, or capture.
+
+After inhibition and quota marks, the canonical finite atomic measure
+$\varrho=\sum_i w_i\delta_{x_i}$ (or its fixed presentation kernel) and its
+trait-specific submeasures are the living mass transported for presentation in
+§10; the suitability or pre-inhibition $\lambda$ is not substituted for that
+population.
+
+### 6.5 Determinism and caching by committed address
+
+$\mathcal W$ consumes only committed $\hat\theta$, a canonical spherical cell or
+point, and canonical time where relevant. A tile is a pure function of
+
+$$
+(M_{\mathrm{law}},M_{\mathrm{sphere}},M_{\mathrm{closure(layer)}},
+\hat\theta,\text{spherical cell},\text{canonical time key},\text{layer}),
+$$
+
+where $M_{\mathrm{closure(layer)}}$ contains only that layer's algorithm revision
+and declared upstream revision identities, not the compatibility root. The tile key
+uses exact $t$ unless the channel declares a forcing bucket with invariant output
+or a returned interval bound; it never aliases two changing Canonical values.
+It includes $\hat\theta$ even though its innovation phases do not. Global census,
+sea-level, climate, and routing summaries have separate immutable keys and byte
+ceilings. Farthest-first eviction, cancellation, or a smaller cache may repeat
+work but cannot change a settled result. There is no authoritative sub-bucket
+world state: unconsumed travel and numeric remainder belong to the Traveler
+commit policy, and the world changes only when §8 certifies a new address.
 
 ---
 
 ## 7. Yearnings → a reconciled target law
 
-Reconciliation produces a single **target law** by a strictly convex program whose
-inputs are order-independent aggregates. This unifies what §8 moves toward — there
-is one objective and one destination, with community Attractors folded in.
+Reconciliation produces one unique **target law after a statistical regime and,
+if used, an Attractor cluster have been selected**. It does not average separated
+community destinations or incompatible causal regimes into one pseudo-count.
+Within a selected mode the program is strictly convex and all inputs are reduced
+canonically.
 
 ### 7.1 Per-attribute requests
 
 Each active Yearning $y$ has weight $w_y>0$, source Impressions, and for each
-usable attribute $a$ an Influence intention and a Scope level, emitting at most one
-soft request — a target mean $\bar\mu_{y,a}$ and a precision $\pi_{y,a}\ge0$:
+usable attribute $a$ an Influence and Scope. An observed subject selects a
+**fixed schema prevalence predicate**: for a binary trait this is its membership;
+for a scalar observation the UI snaps to a versioned predicate/bin such as
+“applicable cells at least this warm,” whose whole-planet prevalence is already a
+sufficient-statistic coordinate. It never turns Scope into a scalar-magnitude
+dial. The Impression stores that predicate id and the source planet's applicable
+global prevalence $p_{0,y,a}$; the subject's own membership is evidence for which
+predicate was selected, not the prevalence baseline.
 
-| Influence | target mean $\bar\mu_{y,a}$ | precision $\pi_{y,a}$ |
+Multiple source Impressions create separate predicate terms. Terms with the same
+schema/predicate id are grouped by checked weight and breakpoint reductions;
+different predicates are never averaged into a new undeclared statistic. Frozen
+nonnegative source/attribute shares $\omega_{y,a}$ sum to one over the active
+terms, and $w_{y,a}=w_y\omega_{y,a}$, so adding another source cannot silently
+multiply the Yearning's total weight.
+
+Accentuate and Repress therefore apply only to prevalence coordinates
+$p_a(\mu)=\mu_a$. Hold may apply to either a prevalence or scalar coordinate; the
+schema supplies an affine scalar normalization $z_a(\mu_a)\in[0,1]$, with
+$z_a=p_a$ for prevalence, and stores $h_{y,a}$ **once when Hold becomes active**.
+The exact convex request penalty is
+
+| Influence | threshold/reference | penalty $q_{y,a}(\mu_a)$ |
 |---|---|---|
-| **Accentuate** | Scope-implied prevalence, biased **above** the captured value | $w_y$ |
-| **Repress** | Scope-implied prevalence, biased **below** the captured value | $w_y$ |
-| **Hold** | the *current* prevalence $\mu_a(\theta_\star)$ | $w_y\,\eta_{\text{hold}}$ (stiff) |
+| **Accentuate** | $\ell_{y,a}=\max(p_{0,y,a},\tau(s_y))$ | $\tfrac12w_{y,a}[\ell_{y,a}-p_a(\mu)]_+^2$ |
+| **Repress** | $u_{y,a}=\min(p_{0,y,a},1-\tau(s_y))$ | $\tfrac12w_{y,a}[p_a(\mu)-u_{y,a}]_+^2$ |
+| **Hold** | $h_{y,a}=z_a(\mu_a(\hat\theta_{\mathrm{activation}}))$ | $\tfrac12w_{y,a}\eta_{\mathrm{hold}}[z_a(\mu_a)-h_{y,a}]^2$ |
 | **Disable** | — | $0$ |
+
+Here $[x]_+=\max(x,0)$. Accentuate is an absolute one-sided lower request;
+Repress is the complement-based absolute upper request. An already-satisfied
+request exerts no force in the wrong direction. A scalar magnitude can be Held,
+but it can be Accentuated or Repressed with Scope only through one of the fixed
+prevalence predicates above. Hold ignores Scope, and its
+fixed-point activation snapshot remains unchanged until the request is disabled,
+reactivated, or explicitly reconfigured; it is part of canonical replay input.
+This prevents a moving-current Hold from ratcheting after the state it was meant
+to protect.
 
 Scope maps to a target through a fixed monotone table
 $\text{singular}\to\text{common}\to\text{pervasive}$, kept strictly interior —
 $\tau(s)=\tau_{\min}^{1-s}\tau_{\max}^{s}$ with $0<\tau_{\min}<\tau_{\max}<1$ (so
 "pervasive" asks for, say, $80\%$, never $100\%$; the last approach to totality is
-where Resonance vanishes, §9). Hold and Disable are distinct as the conceptual
-model requires: Disable contributes nothing ($\pi=0$); Hold pins the attribute to
-its current mean with a stiff precision that *competes* with other requests rather
-than dominating them.
-
-The per-attribute request table and the fusion below are the **same shape as
-Option 2** — this is a shared mechanism, stated as such.
+where Resonance vanishes, §9). For Repress, pervasive Scope means the complement
+should be pervasive and therefore asks for at most $1-\tau_{\max}$ of the selected
+trait. Hold is finite and can be outweighed by stronger aggregate intent or
+feasibility; Disable contributes nothing.
 
 ### 7.2 A convex maximum-entropy program (order-independent)
 
-Aggregate requests on each attribute by precision-weighted fusion, and community
-Attractors by their pseudo-count natural parameter $\theta_{\!A}$ (§11.2):
+The squared hinges cannot in general be collapsed into one average target without
+changing their one-sided meaning. V3 groups equal fixed-point breakpoints and
+accumulates their weights with checked integers, then evaluates groups in
+attribute-id/breakpoint order. For an optional selected Attractor cluster define
+the well-typed term
 
 $$
-\pi_a=\sum_y\pi_{y,a},
-\qquad
-\bar\mu_a=\frac{\sum_y\pi_{y,a}\,\bar\mu_{y,a}}{\pi_a}\ (\pi_a>0),
-\qquad
-\theta_{\!A}=\sum_i n_i\,\theta_i .
+Q_i(\mu)=
+\begin{cases}
+\kappa_i B_{A^*}(\mu,\mu_i),&\text{cluster }i\text{ selected},\\
+0,&\text{no cluster selected}.
+\end{cases}
 $$
 
-These reductions are **commutative and associative in exact arithmetic**, but IEEE
-float addition is not associative, so V3 accumulates each contribution in fixed
-point (or in a canonical order keyed by Yearning content-id) *before* the solve.
-Given the deterministic aggregates, the reconciled target is the minimizer, over
-the marginal polytope, of the strictly convex objective in **mean coordinates**:
+For selected regime $m$, let $\mathcal C_m(\mu_\star)$ be the certified
+transition corridor of §7.3. The target is the minimizer in **mean coordinates**:
 
 $$
-\mu^{+}=\arg\min_{\mu\in\overline{\mathcal P}}\ \Big[
+\mu_{m,i}^{+}=\arg\min_{\mu\in\mathcal C_m(\mu_\star)}\ \Big[
 \underbrace{B_{A^*}\!\big(\mu,\mu(\theta_\star)\big)}_{\text{KL to the current law}}
-+\underbrace{\tfrac12\sum_a\pi_a\big(\mu_a-\bar\mu_a\big)^2}_{\text{soft moment fit}}
--\underbrace{\langle\theta_{\!A},\mu\rangle}_{\text{attractor pull}}\Big],
-\qquad \theta^{+}=\nabla A^*(\mu^{+}).
++\underbrace{\sum_{y,a}q_{y,a}(\mu_a)}_{\text{one-sided intent and activation Hold}}
++\underbrace{Q_i(\mu)}_{\text{zero or one selected community destination}}\Big],
+\qquad \theta_{m,i}^{+}=\nabla A^*(\mu_{m,i}^{+}),
 $$
 
-This objective is **genuinely strictly convex**: $B_{A^*}(\cdot,\mu_\star)$ has
-Hessian $\nabla^2A^*=g^{-1}\succ0$ on $\operatorname{int}\mathcal P$, the moment
-term is a convex quadratic, and the attractor term is linear; over the convex set
-$\overline{\mathcal P}$ the minimizer $\mu^{+}$ exists and is unique for *any*
-requests, including contradictory ones. Order-independence is then a genuine
+This objective is **strictly convex**:
+$B_{A^*}(\cdot,\mu_\star)$ has Hessian $g^{-1}\succ0$, hinges and the Attractor
+term are convex, and the nonempty feasible set is compact and convex. The minimizer exists,
+is finite, and is unique for contradictory requests. Order-independence is then a
 theorem — a unique minimizer of a strictly convex function does not depend on the
-order in which the (deterministically reduced) terms were formed — and it is
-machine-checkable: permute the Yearning list, re-reduce in the canonical order,
-re-solve, assert bit-equality of the quantised $\hat\theta^{+}$.
+input order — and is machine-checkable after the checked canonical reduction.
 
 Posing the fit in mean coordinates matters. The earlier natural-coordinate form
 $\tfrac12\sum_a\pi_a(\nabla A(\theta)_a-\bar\mu_a)^2$ is a nonlinear least-squares
 penalty whose exact Hessian carries an indefinite third-derivative term; it is
 *not* convex for large residuals. The mean-coordinate form above is convex by
-construction. Two honesties about how this relates to Option 2: the **moment-fit
-term** is a precision-weighted quadratic in mean coordinates — the same shape as
-Option 2's weighted least squares (Option 2's attributes are also prevalences), so
-the *compromise between conflicting Accentuate/Repress requests is Euclidean in
-mean space, as in Option 2*. What is genuinely different is (i) the **proximal
-term is the exact $\mathrm{KL}$** to the current law, not a coordinate-distance
-penalty; (ii) the feasible set is the **marginal polytope**, so "Model validity
-takes precedence over literal satisfaction" is automatic — an impossible
-combination is simply not in $\mathcal P$ and the flow settles at the
+construction. What is genuinely V3 is (i) the **proximal term is exact KL** to
+the current law; (ii) the feasible set is the **safe moment set**, so
+"Model validity takes precedence over literal satisfaction" is automatic — an impossible
+combination is simply not in the selected chart and the flow settles at the
 $A^*$-Bregman-closest feasible law; and (iii) the whole thing is one **convex
-program with a unique global minimizer**. Order-independence here is *shared* with
-Option 2, not a point of difference over it: both discard the **prototype's**
-sequential Emphasize-first/Suppress-last blend and the canonical raw-bit sort it
-needs (world-model.md §2.4) in favour of an order-independent program. V3 still
-needs canonicalization — but only of the *input reduction* (IEEE float addition is
-not associative), not of a blend.
+program with a unique minimizer inside the chosen fixed mode**. Canonicalization
+still covers reduction, numeric evaluation, and quantization enclosure (§12); the
+mathematical uniqueness alone does not make IEEE reductions portable.
+
+### 7.3 Fixed statistical modes, not averaged causal stories
+
+A convex family can place its mean between archetypes that correspond to visibly
+different causal stories. V3 does not pretend that mathematical uniqueness makes
+such an average intuitive. The immutable bank therefore labels each archetype
+with one of a small, versioned set of **statistical regime charts** (for example,
+canopy-supported versus cliff-supported gliding). Each chart contributes a convex
+safe destination core $\mathcal R_m\subset\mathcal P_{\mathrm{safe}}$; it adds no
+runtime grammar or new state dimension. Empty or uncertified cores are discarded.
+Because the current mean need not already be in that core, the actual solve and
+path use the explicitly certified convex corridor
+
+$$
+\mathcal C_m(\mu_\star)=
+\operatorname{conv}\big(\{\mu_\star\}\cup\mathcal R_m\big)
+\subseteq\mathcal P_{\mathrm{safe}}.
+$$
+
+Thus the current point is feasible and every path point is valid. A weak or
+conflicted request may minimize before entering $\mathcal R_m$; in that case the
+Model reports progress toward the mode, not that the destination regime has
+already been reached.
+
+The Model evaluates at most $K_m$ manifest-bounded candidate charts and no more
+than $K_{\mathrm{nav}}$ combined chart/Attractor candidates. It returns their unique targets, objective
+bounds, predicted moment changes, and stable mode ids. A Traveler may select one.
+An optional deterministic policy may select the lowest certified objective with
+mode-id tie breaks and hysteresis, but if separated candidates remain within the
+ambiguity tolerance it returns `AmbiguousModes` rather than silently averaging
+them. Once selected, §8 follows one Fisher-geometric target. This bounded atlas
+preserves V3's fixed vocabulary and convex kernel; it is not the Loom's open-ended
+typed rewrite and path search.
+
+A chart/Attractor pair is admitted only when the enclosed cluster center belongs
+to that chart's destination core; otherwise it is reported incompatible rather
+than pulling a corridor toward a center it cannot contain.
 
 ---
 
 ## 8. Egress dynamics
 
 Egress is a single Resonance- and travel-gated step from the current coordinate
-$\theta_\star$ toward the reconciled target $\theta^{+}$ of §7. There is one
-objective and one destination; §8 is only the commit.
+$\theta_\star$ toward one selected reconciled target $\theta^{+}$ of §7. The
+Model proposes and certifies the information-geometric step; the Traveler owns
+the travel credit and mode-selection policy.
 
 ### 8.1 The step direction
 
-The step ascends toward $\theta^{+}$ in the information metric. The metric-
-normalized direction is
+Natural-coordinate straight lines do not give a simple proof that the convex
+mean-space objective decreases. V3 therefore follows the **mixture geodesic**,
+the straight segment in expectation coordinates,
 
 $$
-d=g(\theta_\star)^{-1}\,\nabla_\theta\Big[-\tfrac12\,\mathrm{KL}\big(p_{\theta}\Vert p_{\theta^{+}}\big)\Big]\Big|_{\theta_\star}
-\ =\ \tfrac12\big(\theta^{+}-\theta_\star\big),
+\mu(\alpha)=(1-\alpha)\mu_\star+\alpha\mu^+,
 \qquad
-\hat d=\frac{d}{\lVert d\rVert_g},
+\theta(\alpha)=\nabla A^*(\mu(\alpha)),\qquad 0\le\alpha\le1.
 $$
 
-using the exponential-family identity
-$\nabla_\theta\mathrm{KL}(p_\theta\Vert p_{\theta^{+}})=-g(\theta)(\theta^{+}-\theta)$,
-so the natural-gradient direction of the proximal objective is *exactly* the
-displacement toward $\theta^{+}$ (the scalar $\tfrac12$ is absorbed by
-normalization). No separate utility is ascended — the attractor pull and the
-stay-near-current proximal term already live inside the §7 program that produced
-$\theta^{+}$.
+The selected transition corridor is convex and contains both endpoints, so the
+entire curve is feasible and has a finite natural parameter. Its Fisher arclength is
+
+$$
+L(\alpha)=\int_0^\alpha
+\sqrt{(\mu^+-\mu_\star)^\top
+g(\theta(a))^{-1}(\mu^+-\mu_\star)}\,da.
+$$
+
+A fixed quadrature and bracket choose the largest $\alpha$ whose enclosed length
+does not exceed the allowed step. Because the §7 objective is convex in $\mu$ and
+$\mu^+$ is its minimizer, its value along this segment is non-increasing before
+quantization. This replaces the earlier natural-coordinate step and fixes the
+monotonicity contract rather than merely changing its sign.
 
 ### 8.2 Computing $\nabla A^*$ and the solve
 
-Two quantities need the metric: forming $\theta^{+}=\nabla A^*(\mu^{+})$ (inverting
-the mean map) and taking the metric-normalized step. Neither has a closed form for
-a softmax family; both are computed by damped Newton iterations
+Inverting $\mu=\nabla A(\theta)$ and evaluating arclength have no closed form for
+the joint softmax family. Damped Newton iterations use
 $\theta\leftarrow\theta-g(\theta)^{-1}(\nabla A(\theta)-\mu)$ at a fixed iteration
-budget. Each iteration assembles $g$ and solves a $k\times k$ system, so — stated
-honestly — the mirror/dual route costs *several* metric solves, not zero; it does
-**not** avoid the solve. Its genuine benefit is that $\nabla A^*$ lands inside the
-marginal polytope, so the target stays feasible without a separate projection in
-the interior (near the boundary, $\Pi$ of §3.3 or a damped step guards it — this is
-not projection-free unconditionally). The Raskutti–Mukherjee equivalence (mirror
-descent with mirror map $A$ $\equiv$ natural-gradient descent on the dual manifold)
-is used here as a *correctness identity* for the dual step, not as a cost argument.
+budget for Interactive evaluation. The Canonical path additionally computes
+residual/roundoff enclosures; a fixed iteration count alone is not a determinism
+or accuracy proof. The benefit of the dual route is feasibility and the monotone
+mixture curve, not zero cost.
 
-Because $g$ is $Q_0\oplus\operatorname{Cov}_s[c]$ and the prevalence block is
-$\operatorname{Cov}_s[c]=C(\operatorname{diag}s-ss^\top)C^\top$ with
-$C=[c_1\cdots c_R]$, the solve uses the matrix-free low-rank form: each
-metric–vector product is $O(Rk)$ and a fixed-iteration conjugate gradient avoids
-forming or factoring the dense Hessian (§13).
+With $U=[a_1\cdots a_R]$, each metric--vector product is
+
+$$
+\begin{pmatrix}Q_0&0\\0&0\end{pmatrix}v+
+U(\operatorname{diag}s-ss^\top)U^\top v,
+$$
+
+so fixed-order preconditioned CG is $O(Rk)$ per metvec and never forms a dense
+Hessian. Near the safe-set boundary, interval residuals may force the slower
+canonical factorization path named in the manifest.
 
 ### 8.3 Resonance- and travel-gated step (Traveler policy)
 
-The step length couples Egress to Exploration and gates it by Resonance
-(invariants 4, 5; conceptual model §Egress capability and resonance). This
-coupling is a **Traveler/gameplay
-policy**, not Model structure — the Model exposes only $\hat d$ and $\rho$:
+The Traveler accumulates **credited spherical path arclength** $\Delta\ell_W$ in
+fixed-point millimetres from the actual body-frame path sampled at the fixed
+navigation tick, including altitude, and consumes it at that cadence. Endpoint
+chord distance and render frames are not used. The accumulator is tagged by an
+**intent digest** of the canonically reduced requests, Hold snapshots, selected
+regime revision/mode, normalized Attractor snapshot root/center/precision, and
+Traveler policy. Retained credit is direction-specific:
+changing that digest deterministically discards it and cancels its continuation;
+newly walked distance starts a new accumulator rather than steering a stale
+request.
+The allowed Fisher length is
 
 $$
-\Delta s=\beta\,\rho\,\max\big(\lVert\Delta x_\star\rVert,0\big),
-\qquad
-\theta_\star\leftarrow\Pi\!\big(\theta_\star+\Delta s\,\hat d\big),
+\Delta s=\hat\beta\,\hat\rho\,\Delta\ell_W,
 $$
 
-with $\Delta x_\star$ the Traveler's World Space displacement this frame,
-$\rho\in[0,1]$ Resonance (§9), and $\beta$ a **tunable game-feel rate** owned by
-the Traveler layer — *not* hashed into Model identity. Zero travel or zero
-Resonance gives exactly zero Egress. This is the prototype's
-$\text{travel}\times\text{resonance}$ convergence rule (world-model.md §2.5) and
-Option 2's Egress step lifted to the global coordinate; the Egress *dynamics* are
-deliberately shared with Option 2, and V3's distinctness in this subsystem is
-entirely inherited from the metric it rides on and the target it aims at, not from
-the step itself.
+where $\hat\rho$ is Canonical Resonance (§9) and $\hat\beta$ belongs to a versioned
+Traveler policy, not Model identity. The policy id, rate, cadence, carried travel
+remainder, selected mode, and Hold activation snapshots are replay inputs. Fixed
+cadence plus the carried integer remainder makes the result independent of frame
+subdivision. Zero credited travel or zero Resonance gives exactly zero Egress.
+
+Every permanent commit runs the frozen Canonical solve even if Interactive math
+already previewed a direction. It produces an interval enclosure for every
+component of $\theta(\alpha)$. A new $\hat\theta$ is committed only if every
+enclosure lies wholly inside one Q24 rounding cell and its decoded mean remains
+inside both the safe set and selected corridor. Q24 rounding cells are half-open
+under the frozen ties-toward-$+\infty$ rule of §2.2; an exact rational equality certificate at a
+half-quantum selects that rule's owner, so exact boundary values do not refine
+forever. If an enclosure otherwise straddles a cell boundary, the Model follows
+the deterministic cold refinement schedule. Exhausting the cap returns
+`Pending` with a continuation or `UnresolvedQuantization`; the current address
+and unconsumed travel credit remain unchanged.
+
+A same-cell completion consumes no credit, so subquantum walking accumulates
+until a distinct address can be certified. A shortened monotone step consumes
+only the exact fixed-point credit used by that step and carries the conversion
+remainder. A `Pending` continuation freezes its original intent digest, input
+snapshot, and offered credit. Its extended snapshot digest also includes $M$,
+$\hat\theta_\star$, canonical position/time, the support dependency key, and a
+monotone navigation-sequence number. Distance walked later accumulates separately and cannot alter
+the continuation's result or completion timing. `Pending` retains its frozen
+credit while the digest is unchanged. `UnresolvedQuantization` has no hidden
+continuation: it releases the offered credit back into the same-digest active
+accumulator, and a fresh solve is attempted only after new credited distance is
+added (or the digest changes, which discards it). This avoids both consuming
+subquantum motion and indefinitely blocking later credit behind an unresolvable
+snapshot. Only a distinct successful commit consumes credit; any later-credit
+bucket is then solved afresh from the new coordinate. There is no
+platform-dependent "nearest" commit. Continuation results are consumed in
+navigation-sequence order, so later movement cannot race a stale support snapshot.
 
 ### 8.4 Reachability and settling
 
-Integrating §8.3 from $\theta_0$ produces an Egress path that stays in $\Theta$ and
-moves only where $\rho>0$; its image over all admissible Yearning schedules is
-Reachable Possibility (§2.4). Reachability depends only on Model quantities
-($A$, $g$, and the portable core of $\rho$, §9) — never on the Visualization
-(invariant 12). Between commits the pre-quantization step is monotone in the §7
-objective (a descent of the reconciliation free energy, a testable property); the
-committed step is monotone up to one quantization quantum, which is the honest form
-of the invariant a harness can assert.
+Integrating §8.3 from $\theta_0$ produces an Egress path that stays in the selected
+safe transition corridor and moves only where $\rho>0$; its image over all admissible Yearning schedules is
+Reachable Possibility (§2.6). Reachability depends only on Model quantities
+($A$, $g$, certified regime candidates, and Canonical $\rho$) plus explicit
+Traveler policy — never on Visualization readiness (invariant 12). The
+pre-quantization §7 objective is non-increasing along the mixture segment. A
+commit is accepted only when interval evaluation proves the quantized endpoint
+does not increase it at all; otherwise the step is shortened or remains
+unresolved. This is a per-tick statement: the KL
+proximal term is recentered at the next committed state, so V3 does not claim one
+unchanging global Lyapunov objective across an entire expedition.
 
 ---
 
@@ -742,23 +1194,22 @@ from Model fields only, as two factors,
 $\rho=\rho_{\text{support}}\cdot\rho_{\text{align}}\in[0,1]$.
 
 **Support** — is there enough living, connectable world around the Traveler? A
-spatial average of the Model's ecological connectivity intensity $\kappa_{\!e}$
-(derived by $\mathcal W$ from productivity/vegetation — a canonical field, *not*
-rendered organism instances):
+spherical-cap average of the Model's canonical ecological connectivity intensity
+$\kappa_{\!e}$ (not rendered organism instances) is
 
 $$
-\rho_{\text{support}}=\operatorname{clamp}\!\Big(\tfrac{1}{\pi r_n^2}\!\int_{\lVert x-x_\star\rVert\le r_n}\!\kappa_{\!e}(\theta_\star,x)\,dx,\,0,\,1\Big).
+\rho_{\text{support}}=\operatorname{clamp}\!\left(
+\frac{1}{A_{\mathrm{cap}}(r_n)}
+\int_{B_{S^2}(x_\star,r_n)}\kappa_{\!e}(\hat\theta_\star,x,t)\,dA,0,1\right),
+\qquad
+A_{\mathrm{cap}}(r)=2\pi R_P^2\big(1-\cos(r/R_P)\big),
 $$
 
-This factor is the **same construction as Option 2's** $\rho_{\text{support}}$
-(differing only in evaluating at $\theta_\star$); it is a spatial ecology average,
-not a susceptibility, and V3 claims no novelty for it. To keep Reachability
-Visualization- and tier-independent (invariant 12), the *reachability-determining*
-use of $\rho_{\text{support}}$ — the $\rho>0$ support test and the $\rho\ge\rho_{\min}$
-gate — is computed as a **canonical, portable quadrature at a fixed resolution
-independent of resident tiles and resource tier**; only the smooth rate scaling
-that multiplies $\Delta s$ may use the cheaper resident-tile reduction and be
-presentation-grade.
+with $0<r_n<\pi R_P$. It is a spatial ecology average, not a susceptibility. Every
+use that can change a commit, including the smooth rate multiplier, uses the same
+portable fixed-cell quadrature and canonical time policy; resident tiles and
+resource tier may supply only a UI preview. The result includes quadrature and
+field error bounds, and an unresolved support interval prevents a commit.
 
 **Alignment** — this is the genuinely new, exponential-family part. It reports
 whether the *net requested move* is one the law can actually make, and whether the
@@ -766,31 +1217,66 @@ Yearnings agree:
 
 $$
 \rho_{\text{align}}
-=\underbrace{\frac{v^\top g(\theta_\star)\,v}{v^\top g(\theta_\star)\,v+\varepsilon_\rho}}_{\text{can the law respond?}}\cdot
-\underbrace{\exp\!\Big(-\frac{1}{\sigma_0^2}\sum_a\pi_a\operatorname{Var}_y[\bar\mu_{y,a}]\Big)}_{\text{do the Yearnings agree?}},
-\qquad v=\frac{\theta^{+}-\theta_\star}{\lVert\theta^{+}-\theta_\star\rVert}.
+=\underbrace{\frac{\chi}{\chi+\varepsilon_\rho}}_{\text{can the law respond?}}\cdot
+\underbrace{\exp\!\Big(-D_Y/\sigma_0^2\Big)}_{\text{do the active request forces agree?}}.
 $$
 
-The **response** factor uses the law's susceptibility $v^\top g\,v=
-\operatorname{Var}_\theta[\langle v,T\rangle]$ in the requested direction. As a
-prevalence is driven toward its degenerate boundary the law becomes deterministic,
-$\operatorname{Cov}[T]\to0$, so $g$ collapses in that direction and the factor
+The mixture path's actual initial mean tangent is
+$d_\mu=\mu^+-\mu_\star$, not the endpoint chord. Let
+$\bar\mu=z(\mu)$ apply the frozen schema affine normalizers, and let
+$\bar g^{-1}=J_z^{-\top}g(\theta_\star)^{-1}J_z^{-1}$ be the Fisher metric in
+those normalized mean coordinates. For
+$u=(\bar\mu^+-\bar\mu_\star)/
+\lVert\bar\mu^+-\bar\mu_\star\rVert$, define
+
+$$
+\chi=\big[u^\top\bar g^{-1}u\big]^{-1}.
+$$
+
+This is the reciprocal Fisher cost along the **actual mixture tangent**. It is
+continuous as a prevalence component appears, includes every scalar/prevalence
+cross block, and never mixes natural- and mean-coordinate vectors. A zero tangent
+defines $\chi=0$; a prevalence-only Schur value may be reported as a diagnostic,
+but it does not replace this rate factor.
+
+Here $\widetilde r_y=-w_y^{-1}\nabla_{\bar\mu}\sum_a
+q_{y,a}(\mu_{\star,a})=-w_y^{-1}J_z^{-\top}\nabla_\mu\sum_a
+q_{y,a}(\mu_{\star,a})$ is one request's **unweighted**, schema-normalized desired
+direction, and $\mathcal Y_+=\{y:\lVert\widetilde r_y\rVert>0\}$. Over that set,
+$\bar r=(\sum_{y\in\mathcal Y_+}w_y\widetilde r_y)/
+(\sum_{y\in\mathcal Y_+}w_y)$ and
+$D_Y=(\sum_{y\in\mathcal Y_+}w_y\lVert\widetilde r_y-\bar r\rVert^2)/
+(\sum_{y\in\mathcal Y_+}w_y)$. These sums use the same
+checked canonical grouping as §7. Satisfied one-sided requests are excluded
+rather than misread as zero-direction opposition;
+opposed active requests increase disagreement without inventing an averaged
+target value. With $\mathcal Y_+=\varnothing$, $D_Y=0$; with
+$\theta^+=\theta_\star$, the response factor is defined as zero because there is
+no requested Egress direction.
+
+The **response** factor uses this effective susceptibility in the requested
+direction. As a prevalence is driven toward its degenerate
+boundary, the face-normal prevalence statistic becomes deterministic and its
+effective susceptibility collapses, so the factor
 $\to0$: the law can no longer respond, and Resonance vanishes — the principled
 reason "make everything the same" stalls. (This is the correct boundary physics:
 susceptibility *vanishes* at a deterministic limit; it does not diverge. The
-mean-coordinate cost of further prevalence gain, $1/\lambda_{\min}(g)$, diverges
-correspondingly — the dual reading of the same fact.) The **agreement** factor
-falls when Yearnings on an attribute disagree (large precision-weighted variance of
-their targets) — "low Resonance indicates ambiguity, incompatibility, or
-insufficient local support."
+mean-coordinate cost of further prevalence gain diverges correspondingly — the
+dual reading of the same fact. Scalar and tangent-to-face variation may remain.) The representable safe set
+never reaches that singular limit. Its finite prevalence-response cutoff is a
+frozen, empirically calibrated design gate, tested over the safe boundary cells;
+it is not claimed to follow automatically from positive definiteness or scalar
+cross-coupling. The **agreement** factor falls when
+active request forces disagree — "low Resonance indicates ambiguity,
+incompatibility, or insufficient local support."
 
 Resonance is thus simultaneously a **rate scale** (it multiplies $\Delta s$), a
 **confidence signal** (its factors report *why* movement is slow — barren
 surroundings, a saturated request, or conflicting desires), and a **threshold**
 under the trivial policy $\rho<\rho_{\min}\Rightarrow\Delta s=0$. It never touches
-rendered geometry, frame timing, or hardware. Half of it (support) is shared in
-form with Option 2; the alignment half is the law-susceptibility content unique to
-V3.
+rendered geometry, frame timing, or hardware. Ecological support is a shared
+design pattern; the Fisher susceptibility and convex-request disagreement are
+specific to V3's law geometry.
 
 ---
 
@@ -800,7 +1286,7 @@ This is the second, distinct geometry of V3. Egress changes the world-law; the
 realized world must transition without a global reload. V3 does not merely *report*
 the coming change (Option 1's sensitivity descriptor) and does not only *lag* the
 coordinate (Option 2's crossfade). For the layers where content is a genuine
-spatial mass distribution — the **living and biome intensities** — it **moves the
+spatial mass distribution — the **living and biome measures** — it **moves the
 content**: the transition follows a geodesic of **unbalanced optimal transport**,
 so forests spread and ranges migrate across World Space and blooms and extinctions
 happen in place.
@@ -818,16 +1304,20 @@ continuity equation:
 
 $$
 \mathrm{WFR}_{\delta_W}^2(\varrho_0,\varrho_1)
-=\inf_{v,\alpha}\ \tfrac12\!\int_0^1\!\!\int_\Omega\big(\lvert v\rvert^2+\delta_W^2\,\alpha^2\big)\,\varrho\,dx\,dt
+=\inf_{v,\alpha}\ \tfrac12\!\int_0^1\!\!\int_{S_{R_P}^2}
+\big(\lVert v\rVert_{S^2}^2+\delta_W^2\alpha^2\big)\varrho\,dA\,d\tau
 \quad\text{s.t.}\quad
-\partial_t\varrho+\nabla\!\cdot(\varrho\,v)=\varrho\,\alpha .
+\partial_\tau\varrho+\operatorname{div}_{S^2}(\varrho v)=\varrho\alpha,
 $$
 
+where $v$ is tangent to the sphere and the ground cost is great-circle distance.
 The transport field $v$ is horizontal — **content migrates across World Space**.
 The reaction field $\alpha$ is vertical — **content blooms and fades in place**.
-The length-scale $\delta_W$ sets the crossover: below separation $\pi\delta_W$ mass
-is transported; beyond it, mass is destroyed and recreated rather than dragged
-implausibly far. This is exactly the Continuity requirement — near-field content
+The profile freezes one WFR/HK normalization and its derived
+$d_{\mathrm{cut}}(\delta_W)$ table. The length-scale $\delta_W$ sets the
+crossover: below that normalization-specific cutoff transport is favored; beyond
+it, destruction and recreation are favored over implausibly long motion. No
+normalization-independent $\pi\delta_W$ formula is assumed. This is exactly the Continuity requirement — near-field content
 slides smoothly, distant content converges in place — and $\delta_W$ is a physical
 game-feel dial. (A clarification the theory forces: the "Fisher–Rao" *inside* WFR
 is the Hellinger metric on square-roots of spatial mass — a different object from
@@ -838,23 +1328,31 @@ latter.)
 
 ### 10.2 What is closed-form, and what genuinely transports
 
-- **Living and biome intensities ($\lambda(x)$, biome-mixture fields) are spatial
-  measures**, so unbalanced WFR applies literally: the transport field $v$
-  migrates forest belts and species ranges across $\Omega$, and the reaction field
-  $\alpha$ grows and fades them where prevalence changes. Locally the grow/fade
-  part is closed-form, $\lambda_t=\big((1-t)\sqrt{\lambda_0}+t\sqrt{\lambda_1}\big)^2$;
-  the migration part transports the suitability field. Where a non-Gaussian biome
+- **Post-inhibition living measures $\varrho$ and biome-mixture measures are
+  spatial measures**, so unbalanced WFR applies literally: the transport field $v$
+  migrates forest belts and species ranges across the sphere, and the reaction field
+  $\alpha$ grows and fades them where prevalence changes. The coupled WFR solve
+  transports the **realized atomic measure (or its fixed kernel)**, not suitability
+  or the pre-inhibition activation density $\lambda$. For a common slot weight or
+  fixed-kernel density $w$, the square-root curve
+  $w_\tau=((1-\tau)\sqrt{w_0}+\tau\sqrt{w_1})^2$ is only the exact reaction-only
+  fallback at one location; it is not presented as a
+  separable component of a general migrating WFR geodesic. Where a non-Gaussian biome
   boundary must reshape, an **unbalanced Sinkhorn / scaling iteration** at a
-  *fixed* iteration count supplies a deterministic transient approximation. This is
+  fixed work cap supplies a bounded presentation approximation. This is
   the layer where V3's "content physically moves" claim is real, and it is the
   living heart of the game.
-- **Abiotic fields (terrain, climate) are Gaussian**, and their morph is the
-  **balanced Bures–Wasserstein displacement of the field's law**. For stationary
-  fields this is the per-frequency amplitude interpolation
-  $s_t(k)=\big((1-t)\sqrt{s_0(k)}+t\sqrt{s_1(k)}\big)^2$ plus a trend-mean
-  interpolation. Stated honestly: with the sample's phase fixed by its hash seed,
-  this is an **in-place spectral reshaping** — relief re-textures, roughness and
-  anisotropy and level morph — *not* a rigid horizontal slide of a specific ridge.
+- **Abiotic primitive fields** use exact Bures--Wasserstein displacement on
+  shared commuting spectral blocks and explicitly bounded finite SPD matrix
+  blocks. A shared diagonal isotropic harmonic block uses
+  $S_{\ell,\tau}=((1-\tau)\sqrt{S_{\ell,0}}+
+  \tau\sqrt{S_{\ell,1}})^2$; a fixed finite cross-channel block uses the standard
+  matrix Bures map. Noncommuting needlet, anisotropic, or cross-filter pieces use
+  a bounded phase-locked spectral interpolation whose endpoint error is reported
+  and which is explicitly a presentation heuristic, not “exact Bures.” Common
+  innovations keep phase and feature slots coupled. Stated honestly: this is an
+  **in-place spectral reshaping** — relief changes energy,
+  roughness, anisotropy, and level — *not* rigid horizontal migration of a ridge.
   Genuine horizontal migration of an abiotic feature would need optimal transport
   of elevation as a spatial mass (not closed-form); V3 does not claim it on the
   fast path and does not need it, because the "large changes appear in the
@@ -863,163 +1361,267 @@ latter.)
 
 ### 10.3 The streaming annulus and the Model/Visualization split
 
-The transition is computed only in the streaming annulus between the pinned near
-zone and the resolved far zone, so per-frame transport work is $O(\text{band})$,
-not $O(\text{window})$. Near the Traveler the transport rate is zero (content is
-pinned — invariant 2's "nearby content retains realization history"); the far
-field realizes directly at $\theta_\star$ ("newly encountered regions are realized
-according to the newer Model State"); the band between is where content is
-mid-transport. Large changes therefore appear first in the distance (a biome
-colour spreading over the horizon, a forest advancing) and resolve on approach.
+The transition is computed only in the geodesic annulus
+$r_n\le d_{R_P}(x,x_\star)\le r_f<\pi R_P$ between the pinned near zone and resolved
+far zone. The manifest caps the annulus level, active cells, living measures,
+iterations, and two endpoint buffers, so the actual bound is $O(B_{\max})$ with
+fixed memory, not merely an unspecified $O(\text{band})$. Near the Traveler the
+transport rate is zero; the far field realizes directly at the newest canonical
+$\hat\theta_\star$; the band is mid-transport. Large changes therefore appear
+first in the distance and resolve on approach.
 
-The **Model supplies continuity information** — the transport endpoints, the WFR
-length-scale $\delta_W$, the Bures affine map for the abiotic spectra, and the
+Both endpoints are evaluated at the same canonical Model time/key $t_c$; ordinary
+temporal evolution is a separate update and is never hidden inside the morph.
+The **Model supplies continuity information** — canonical endpoint measures, the WFR
+length-scale $\delta_W$, the commuting/matrix Bures descriptors and heuristic
+spectral parameters for abiotic fields, and the
 grow/fade rates — while the **Visualization owns the transient morph state and
 performs the blend** (invariant 7; the conceptual model assigns boundary blending
 to the Visualization). The morph is presentation-grade and discarded once the new
 $\hat\theta$ tiles are resident; history lives entirely here, and the canonical
-coordinate is always the single $\theta_\star$. An Impression captured
+coordinate is always the single $\theta_\star$.
+
+**Interrupted transitions are explicitly rebased.** Canonical commits carry a
+monotone sequence number. If commit $q_2$ arrives while the presentation is still
+morphing $q_0\to q_1$, the Visualization samples its currently displayed annulus
+at the next fixed presentation tick, uses that measure and those band amplitudes
+as the new transient source, targets $q_2$, and discards the superseded endpoint.
+Living mass/source terms and shared-slot correspondence are rebased together;
+abiotic spectra start from their current interpolated amplitudes. Repeated commits
+coalesce in sequence order and never allocate a third endpoint or extend
+canonical Egress. If the bounded transport path is unavailable, Visualization may
+fall back to reaction-only grow/fade and phase-locked crossfade; it cannot delay or
+change the Model State.
+
+An Impression captured
 mid-transition therefore always samples the *canonical* realization
-$\mathcal W(\theta_\star,\hat x)$, never the transient transport buffer; if the
-captured subject has no canonical counterpart (a fading organism), capture snaps to
-the nearest canonical entity or is refused, per the thin-classifier rule of §11.1.
+$\mathcal W(M,\hat\theta_\star,\hat x,t)$, never the transient transport buffer. A
+displayed organism maps to the canonical entity with the same common slot id; if
+that slot is absent at the canonical endpoint, capture is refused rather than
+silently changing the subject.
 
 ---
 
-## 11. Impressions, Attractors, and dual-space travel
+## 11. Impressions, Attractors, Builds, and dual-space travel
 
 ### 11.1 Impressions
 
-An Impression is a small, exact record —
-$I=(M,\hat\theta,\hat x,\hat t?,\{(\text{attr id},\hat\mu_a)\})$: Model identity,
-the quantised global coordinate, a quantised World Space point, an optional
-canonical time, and captured mean-parameter values of the subject. As in **Option
-2**, the single-global-coordinate decision makes an Impression literally one point
-$(\hat\theta,\hat x)$ — this compactness is shared, not V3-specific; what is
-V3-specific is only that the captured values are mean parameters $\hat\mu_a$ that
-seed Yearning targets (§7.1). A Traveler with a compatible Impression re-derives
-the same law by decoding $\hat\theta$ and the same subject by sampling
-$\mathcal W$ at $\hat x$ (invariants 6, 9). Capture a subject by its canonical
-attribute values when its classifier margin is thin (Option 1's rule).
+An Impression is a compact Canonical record containing:
 
-### 11.2 Attractors as conjugate pseudo-counts
+- generation identity $M$ and committed $\hat\theta$;
+- twelve-patch Q0.48 surface address, signed centimetre altitude, and canonical
+  tangent-frame revision;
+- canonical time or phase interval when the subject depends on forcing;
+- subject kind plus common slot/canonical entity id when one exists;
+- for each captured attribute, the quantized observed membership/value, the
+  applicable law mean, estimator bound, and schema id; and
+- an optional versioned Build content id (§11.3).
 
-Published Impressions accumulate into a **community pull in natural-parameter
-space**. Each cluster $i$ of visits near coordinate $\theta_i$ contributes a
-pseudo-count natural parameter, and they add:
-$\theta_{\!A}=\sum_i n_i\theta_i$, with the pseudo-count $n_i$ growing with
-independent visit count, published Builds, and subscriptions. This is a
-product-of-experts / conjugate-prior update — adding a term is exactly the Bayesian
-effect of $n_i$ more "votes" for the law $\theta_i$ — and it enters reconciliation
-directly as the linear term of §7.2,
-so Attractors and Yearnings compromise in one convex program. With grid-bucketed,
-id-keyed, union-merged counters it is CRDT-mergeable (union-by-id, idempotent), so
-the prototype's atlas-bundle sharing (ADR 0014) carries over and strength is
-removable when its records are (invariant 14).
+Capture waits for `Complete` Canonical fields, topology, entity, applicability,
+and moment-ledger results. A thin classifier stores the measured Canonical value
+and margin rather than relying on a reclassified low-precision sample. A
+compatible Model re-derives the law and canonical subject from the exact sphere,
+time, and slot address; a Visualization may depict it differently.
 
-Diffuse-to-precise resolution is automatic: a lone visit is a weak, low-precision
-pull (a broad bias); many independent visits raise $n_i$ until the induced target
-law's metric radius falls below one Possibility quantum, at which point its
-minimizer *is* an exact destination equivalent to an Impression. For summarising an
-expedition's *realized terrain*, a **Bures/Wasserstein barycenter** of the
-published Gaussian field covariances $C_i$ (the globally convergent fixed point
-$C=\sum_i w_i(C^{1/2}C_iC^{1/2})^{1/2}$) gives a canonical "average landscape" —
-this barycenter applies only to realized field covariances, never to the world-laws
-$\theta_i$, whose community average is the natural-parameter sum $\theta_{\!A}$.
+### 11.2 Attractors as normalized, separate clusters
 
-### 11.3 Dual-space travel
+Raw Attractor history may be large, but it is not passed unbounded into a
+navigation tick. A versioned normalization pass applies content-id deduplication,
+publisher/expedition caps, removals, and stable ranking, then emits at most $K_A$
+bounded evidence summaries with a snapshot root. The Canonical Model accepts only
+that normalized shortlist; clustering, barycenters, and rank ties use frozen
+fixed-point reductions and interval enclosures, and the combined regime/Attractor
+candidate count is capped by $K_{\mathrm{nav}}$. The deterministic pass produces separate
+
+$$
+\mathcal A_i=(\text{id}_i,\mu_i,\Sigma_i,\kappa_i,\text{World bounds},
+\text{evidence ids}),
+$$
+
+where the orientation and domain of the center are explicit,
+
+$$
+\mu_i=\arg\min_{\mu\in\mathcal P_{\mathrm{safe}}}
+\sum_{j\in i}\omega_j B_{A^*}(\mu,\mu_j).
+$$
+
+Thus $\mu_i$ is a constrained $A^*$-Bregman barycenter, $\Sigma_i$ is its
+dispersion/radius, and $\kappa_i$ is precision. Repeated evidence at one nonzero
+coordinate leaves $\mu_i$ at that coordinate and increases $\kappa_i$; it does
+not replace the destination by $n\theta_i$. Separated clusters remain separated
+and are ranked or selected before §7's convex solve. A selected cluster contributes
+$\kappa_iB_{A^*}(\mu,\mu_i)$, whose minimizer stays at $\mu_i$ as evidence grows.
+
+The source evidence set is union-by-content-id and idempotent. Each publisher/expedition
+has a manifest/service-profile contribution cap; a visit proof contributes once,
+a Build contributes once per content id, and personal subscriptions change only
+the local ranking. Creator removal or moderation tombstones remove the matching
+contribution on deterministic recomputation. Networking, identity proof, and
+moderation remain external services; the neutral Model accepts only normalized
+records and never opens a socket. These rules make strength historical,
+rate-limited, attributable, and removable rather than an irreversible summed
+counter.
+
+A cluster becomes an exact destination only when its center's Canonical inversion
+is enclosed in one coordinate cell and its metric radius plus numeric error is
+below that cell's inscribed Fisher radius. Until then it supplies a diffuse mode,
+not an invented exact Impression.
+
+### 11.3 Build attachment and reproduction
+
+A Build is a separate, versioned content-addressed payload attached to an
+Impression. Its canonical portion contains the authored construction graph,
+quantized dimensions and transforms, attachment points, collision/interaction
+tags, semantic material roles, terrain-overlay masks, and referenced content ids.
+The Impression supplies $M$, $\hat\theta$, spherical address, relevant Model time,
+and a canonical tangent frame. The frame derives `up` from the sphere normal and
+`east/north` from a versioned reference meridian, with an explicit pole and seam
+tie rule.
+
+Compatible Visualizations must preserve graph connectivity, quantized scale,
+attachments, interaction semantics, and semantic material roles. If collision
+can alter the shared Traveler path or Egress credit, its quantized collision
+geometry and transform are exact inputs to the shared Traveler controller;
+Build-format tolerances apply only to rendered placement. Mesh tessellation, shaders, textures,
+audio, particles, and permitted animation style may differ. A terrain-modifying
+Build is an overlay in Visualization space: loading or removing it never changes
+$\mathcal W$, the moment ledger, Scope, Resonance, or Reachability. A Build appears
+only as an authoritative interactive object at its associated
+$(M,\hat\theta,x,t)$, or under an explicit migration that creates a new anchor.
+At another Model State it may be shown only as a noninteractive ghost/preview: it
+cannot affect collision, path credit, or loaded-placement Attractor evidence. Its removable evidence record
+may increase the precision of the associated Attractor cluster once, as §11.2
+specifies.
+
+### 11.4 Dual-space travel
 
 An Attractor may specify both a Possibility region and a World Space location; the
-two distances are independent (invariant 3): the information metric $d_g$ on
-$\theta$ and the Euclidean $\lVert x-x_{\text{target}}\rVert$ on $\Omega$.
-Coordinated arrival is a rate controller — choose Exploration speed and Yearning
-weighting so normalised progress matches,
+two distances are independent (invariant 3): remaining mixture-curve Fisher
+length $L(1)$ in Possibility and great-circle/altitude path length $d_W$ on the
+sphere. Coordinated arrival is a rate controller that matches estimated times,
 
 $$
-\frac{d_g(\theta_\star,\theta_{\text{target}})}{\text{egress rate}}
+\frac{L(1)}{\text{egress rate}}
 \ \approx\
-\frac{\lVert x_\star-x_{\text{target}}\rVert}{\text{explore speed}},
+\frac{d_W(x_\star,x_{\text{target}})}{\text{explore speed}},
 $$
 
-adjusting the two rates without ever equating the two metrics. Exactness depends on
-the Attractor's precision (its induced metric radius).
+adjusting rates without identifying the spaces. A World Space destination is
+interpreted only with its associated target Model State and chart revision.
+Exactness depends on the Attractor's certified precision.
 
 ---
 
 ## 12. Determinism, identity, and versioning
 
-V3 keeps the prototype's three grades of determinism (world-model.md §2.9), scoped
-carefully to the law/sample split.
+V3 separates four contracts rather than calling every repeatable hash
+"deterministic."
 
-1. **Portable decode identity.** A *given* world address $\hat\theta$ decodes
-   identically on native and wasm: all permanent identities — region hashes,
-   species ids, record ids, tile dependency keys — are integer folds (SplitMix64)
-   over $\hat\theta$, integer World Space indices, layer id, feature index, and
-   version, and no float feeds the *decode* of a fixed $\hat\theta$. This is the
-   guarantee an Impression relies on.
-2. **Live navigation reproducibility is conditional.** The value of the *next*
-   $\hat\theta$ is produced by a float pipeline (the reconciliation solve, the
-   $\nabla A^*$ inversion, rounding), which is exact on one target but only
-   presentation-grade across targets. Two devices running identical Yearnings and
-   travel are guaranteed the same committed world only when the commit pipeline runs
-   in **canonical mode** — fixed iteration counts, portable transcendental
-   approximations, and a specified rounding rule, with the input reductions of §7.2
-   done in fixed point. Otherwise live-navigated $\hat\theta$ is portable in format
-   but not bit-reproducible across platforms, and cross-platform play relies on
-   sharing the committed $\hat\theta$ (a scripted/shared address), exactly as the
-   prototype's anchor-reduction contract does (ADR 0011/0013).
-3. **Settled state.** Tiles are pure functions of their integer dependency key, so a
-   quiescent scripted endpoint is independent of scheduler, worker count, budget,
-   cancellation, and cache capacity (ADR 0018).
+1. **Portable address and identity.** Coordinates, twelve-patch addresses, time,
+   record ids, common innovation/slot ids, manifestation ids, and dependency keys
+   have normalized integer encodings. Innovation and slot ids exclude
+   $\hat\theta$; coordinate-specific manifestations and dependency keys include
+   it. Each hash folds only its declared component identity/revision closure, not
+   the compatibility root wholesale. Hash fold order and every tie rule are frozen.
+2. **Canonical Model operations.** The law/dual/metric solve, normalized Attractor
+   clustering, regime ranking, reconciliation, moment ledger, spherical fields, sea level, drainage topology,
+   climate forcing, canonical candidates/entities, support quadrature, Resonance,
+   and every Egress commit are bit-identical on native and wasm. The operation
+   manifest freezes reduction trees, integer widths and overflow behavior, FMA
+   contraction, subnormal policy, conversions, intermediate rounding, portable
+   `exp`/`log`/`sqrt`/trigonometric tables, CG/preconditioner order, interval
+   outward rounding, and the cold refinement path. Fixed iteration count alone is
+   insufficient. A permanent result is emitted only when its error/quantization
+   enclosure proves the declared result.
+3. **Interactive and Visualization approximation.** Preview fields, fewer bands,
+   resident-tile Resonance display, decorative organisms, Bures/WFR/Sinkhorn
+   morphs, shaders, and live simulation may differ by platform or tier. They never
+   choose a committed address, canonical topology/entity, Impression value, Scope
+   statistic, or Reachability result.
+4. **Settled schedule independence.** A completed snapshot is independent of
+   scheduler, worker count, budget scale, cancellation, cache capacity, resource
+   tier, and frame subdivision. Different execution choices may change completion
+   latency, but never a continuation's frozen inputs, credit, or eventual result.
 
-The float layers that are always presentation-grade and never cross the identity
-boundary: the metric solve and $\nabla A^*$ inversion, the Bures matrix square root,
-Sinkhorn/scaling iterations, and organism samples. Two version axes as before: the
-Model major version changes the generated world's identity (any change to $A$, $T$,
-or $\mathcal W$ altering output for fixed inputs), per-layer `algorithm_revision`
-confines changes, and `RECORD_FORMAT_VERSION` changes serialized schemas. An
-Impression stores $M$ so it is never silently reinterpreted (invariant 8).
+Bounded operations return `Complete`, `Pending { continuation }`, `Partial {
+bounds }` only where the API declares partial semantics useful, or `Unresolved {
+reason }`. A Canonical Egress commit, entity identity, or Impression confirmation
+is all-or-nothing: `Partial` never crosses those boundaries, and `Unresolved`
+retains the prior state. Presentation continuity may degrade without changing the
+result.
+
+Versioning is split by meaning:
+
+- the **law identity** covers coordinate layout, $T$, $A$, joint bank, safe set,
+  regime atlas, and moment contract; adding a sufficient statistic requires a new
+  identity and address schema;
+- the **spatial profile** covers the sphere chart and canonical time decoder, the
+  **innovation identity** covers only the common random root, and each field,
+  topology, or entity kernel has a separate `algorithm_revision` plus its minimal
+  upstream revision closure;
+- optional derived **capability schemas** may advance without changing old
+  results when they consume only existing canonical channels;
+- Traveler/navigation policy, record format, Build format, and Visualization each
+  have separate versions.
+
+An Impression stores every consumed identity. A changed identity is rejected or
+handled by an explicit migration that creates a new Impression; it is never
+silently projected or reinterpreted.
 
 ---
 
-## 13. Performance — why it runs in real time
+## 13. Performance hypotheses and kill gates
 
-Let $k$ be the coordinate dimension ($\le48$), $R$ the archetype count ($\sim256$),
-$T_{\text{res}}$ resident tiles ($\sim10^3$), $n^2$ samples per tile.
+No timing in this proposal is evidence. Let $k\le48$, $R\le256$, at most
+$K_{\mathrm{nav}}$ combined regime/Attractor candidates,
+$N_c=12\cdot4^{L_c}$ canonical census cells, and
+$B_{\max}$ resident transition cells. Matrix-free law evaluation is plausibly
+$O(Rk)$ per metvec, but a navigation commit includes several Newton/CG solves,
+mixture-curve quadrature, support quadrature, interval propagation, and sometimes
+the cold enclosure path. Spherical realization also adds fixed $O(N_c)$ global
+closures. Those costs must be measured together.
 
-The dominant navigation cost is assembling and solving against the prevalence-block
-metric $\operatorname{Cov}_s[c]=C(\operatorname{diag}s-ss^\top)C^\top$. Assembling
-it densely is $O(Rk^2)$ and recurs at every Newton iterate (the softmax weights
-$s$ move with $\theta$), so a naïve dense reconcile ($\sim8$ Newton steps) plus the
-$\nabla A^*$ inversion ($\sim4$ steps) is a few $\times10^6$ FMAs — of order
-**hundreds of microseconds**, not tens. That is still under $3\%$ of a $16.6$ ms
-frame, so real time holds; the honest figure is a few hundred µs per navigation
-tick, not the tens of µs an $O(Rk+k^2)$ mislabel would suggest.
+One committed native/wasm ledger reports cold and warm latency, allocation, peak
+scratch, completion rate, and error/calibration rate for:
 
-The **matrix-free** form removes even that: never form $\operatorname{Cov}_s[c]$;
-each metric–vector product is $C(\operatorname{diag}s-ss^\top)(C^\top v)=O(Rk)$, and
-a fixed-iteration conjugate gradient solves $g\,d=\text{rhs}$ without a dense
-factorization. At $R=256,k=48$ a metvec is $\sim2.5\times10^4$ FMAs and a
-fixed-iteration solve is a handful of those — tens of µs per solve, and the fixed
-iteration count preserves determinism (canonical mode, §12).
+| Ledger row | Required contents |
+|---|---|
+| Package/startup | bank, regime atlas, sphere tables, portable math tables, decode, peak duplicate memory |
+| Navigation | every candidate-mode reconciliation, dual inversion, CG/residual history, mixture arclength, enclosure refinements, commit/no-commit result |
+| Canonical support and Scope | spherical-cap quadrature, applicability, moment-ledger queries, bounds, zero-population cases |
+| Cold spherical state | sea level, coarse drainage, cycle climate, $O(N_cR)$ per responsibility-scaling sweep plus certified fallback, global entity/quota summaries, simultaneous nonlinear moment closure |
+| Visible realization | invalidated cells, all dependency layers, topology/entities, native and wasm throughput |
+| Continuity | WFR/Bures buffers, optional coarse Sinkhorn, rapid rebase/coalescing, degraded fallback |
+| Impression | cold Canonical confirmation of fields, subject, time, statistics, and optional Build anchor |
+| Sustained travel | long/fast/turning/revisiting paths, multiple Yearnings, cache plateau, two endpoint buffers, cancellation and tier variants |
 
-| Step | Matrix-free cost | Note |
-|---|---|---|
-| Evaluate $A,\nabla A$ (softmax over $R$ archetypes) | $O(Rk)$ | one pass over the bank |
-| Reconcile (§7): $\sim8$ CG-based Newton steps | $O(Rk)$ per metvec, fixed iters | strictly convex, unique target |
-| Invert $\nabla A^*$ for $\theta^{+}$ | $\sim4$ Newton steps, same metvec | benefit is feasibility, not cost |
-| Attractor pseudo-counts over nearest clusters | $O(k\cdot\text{clusters})$ | conjugate sum |
-| Resonance (susceptibility + portable support quadrature) | $O(Rk+\text{quad})$ | portable core fixed-resolution |
+Before benchmark results or held-out/playtest labels are opened, a release
+candidate freezes a gate manifest naming native/browser machines, corpora,
+latency percentiles, completion rates, byte ceilings, and quality thresholds.
+They cannot be relaxed after observing results. The first profile starts with:
 
-**Realization** is identical in character and cost to any streaming procedural-
-terrain engine: pointwise hashed noise per sample, GPU-parallelisable, cached per
-tile, regenerated only on a dependency-key change; $\mathcal W$ reads a bucketed
-$\hat\theta$ constant, adding no per-sample possibility cost. **Continuity
-transport** is closed-form grow/fade plus suitability transport for the living
-layers and per-frequency Bures for the abiotic spectra, restricted to the streaming
-annulus, so it is $O(\text{band})$; the optional unbalanced-Sinkhorn path runs at a
-fixed low iteration count on the coarse biome grid only. No cost grows with explored
-area or world size.
+1. the math spike ($k\le48,R\le256$) produces bit-identical native/wasm commits,
+   including adversarial quantization boundaries, and at least 99% of the frozen
+   ordinary-intent corpus completes within the predeclared 10 Hz navigation budget;
+2. the spherical spike passes seams, poles, antipodes, common-innovation
+   correspondence, finite water/drainage, bounded ecology, schema-wide moment
+   bounds, entities, and interrupted-transition tests without a global
+   blank/reload, with at least 99% **end-to-end Canonical completion** on the
+   frozen ordinary spherical corpus (not merely completion of the math solve);
+3. every steerable statistic satisfies
+   $2\varepsilon_a+\varepsilon_{\mathrm{quant}}<$ its adjacent Scope-band gap,
+   and blinded players identify Accentuate, complement Repress, activation Hold,
+   conflict, and mode choice at the predeclared rate; and
+4. cold/warm sustained travel reaches fixed byte ceilings on native and browser,
+   with no latency hidden by frequent `Pending`/`Unresolved` or by incorrect
+   visible prevalence.
+
+All solver iterations, census levels, quadrature points, candidate modes,
+resident cells, endpoint buffers, and continuation bytes are hard caps in the
+manifest. Work does not grow with *explored history*, but cold work does grow with
+the chosen fixed census and visible refinement. Until these gates pass, V3 is a
+research proposal with a credible complexity shape, not a demonstrated real-time
+engine.
 
 ---
 
@@ -1030,58 +1632,93 @@ The neutral core (no threads, filesystem, or GPU — the crate-boundary rule of
 on them.
 
 ```rust
-/// Compact possibility coordinate = natural parameters of a world-law (fixed point).
-/// Split into a bounded prevalence block and an unbounded scalar block (§3.1).
+/// Stable identity of the law/schema that gives numeric arrays their meaning.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Coord { pub q: [i32; K] }            // q_j = round(2^B * theta_j)
+pub struct LawId([u8; 32]);
 
-/// Mean/prevalence coordinates = the observables Yearnings act on (dim = K, minimal family).
-#[derive(Clone, Copy, Debug)]
-pub struct Means { pub mu: [f32; K] }
+/// Compact natural parameters of one world-law, encoded in Q24.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Coord { law: LawId, q24: [i32; K] }
+
+/// Only a validated interior mean may enter the Bregman projection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InteriorMeansQ { law: LawId, values: [i64; K] }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SafeMeansQ { law: LawId, values: [i64; K] }
+
+// Checked constructors validate domain and bind every value to one law identity;
+// only Canonical Model operations construct InteriorMeansQ and SafeMeansQ.
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SphereCell { patch: u8, level: u8, morton: u64 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SpherePoint {
+    patch: u8,
+    u_q48: u64,
+    v_q48: u64,
+    altitude_cm: i64,
+}
+
+// Constructors validate patch < 12, level <= 32, unused Morton bits == 0,
+// Q0.48 components < 2^48, altitude bounds, and canonical seam ownership.
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Canonical<T> {
+    Complete(T),
+    Pending(Continuation),
+    Partial { value: T, bounds: ErrorBounds },
+    Unresolved(UnresolvedReason),
+}
+
+/// Atomic identity/state boundaries cannot carry a Partial payload.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AtomicCanonical<T> {
+    Complete(T),
+    Pending(Continuation),
+    Unresolved(UnresolvedReason),
+}
 
 pub trait Model {
-    fn free_energy(&self, t: Coord) -> f32;                 // A(theta)   (convex)
-    fn mean_map(&self, t: Coord) -> Means;                  // mu = grad A(theta)
-    fn metvec(&self, t: Coord, v: &[f32; K]) -> [f32; K];   // g·v  matrix-free, O(Rk)  (§8.2,§13)
-    fn dual(&self, mu: &Means) -> Coord;                    // theta = grad A*(mu)  (~4 Newton solves)
-    fn project(&self, t: Coord) -> Coord;                   // Pi: Bregman projection onto feasible set
-    fn realize(&self, t: Coord, region: RegionIx, layer: Layer) -> Tile;  // 𝒲, cached by key
-    fn dep_key(&self, t: Coord, region: RegionIx, layer: Layer) -> u64;   // integer identity
-    fn resonance(&self, t: Coord, target: Coord, near: NearField) -> f32; // support × alignment (§9)
-    /// Continuity information only; the Visualization owns the morph state (§10.3, invariant 7).
-    fn transport_plan(&self, old: Coord, new: Coord) -> TransportPlan;
+    fn law(&self, theta: Coord) -> Canonical<LawEval>; // A, grad A, metvec + bounds
+    fn project_mean(&self, mu: InteriorMeansQ) -> Canonical<SafeMeansQ>;
+    /// Includes Q24 quantization and a second safe-set enclosure.
+    fn dual(&self, mu: SafeMeansQ) -> Canonical<CoordEnclosure>;
+    fn snapshot(&self, request: SnapshotRequest) -> Canonical<Snapshot>;
+    fn realize(&self, theta: Coord, cell: SphereCell, time: ModelTime,
+               layer: Layer) -> Canonical<Tile>;
+    fn dep_key(&self, theta: Coord, cell: SphereCell, time: ModelTime,
+               layer: Layer) -> u64;
+    fn resonance(&self, request: ResonanceRequest) -> Canonical<Resonance>;
+    /// Endpoint/correspondence data only; Visualization owns and rebases morph state.
+    fn continuity(&self, old: Coord, new: Coord, time: ModelTime,
+                  bounds: SphereBounds) -> Canonical<ContinuityDescriptor>;
 }
 
-/// One reconciled target law. Order-independent: aggregates reduced in canonical/fixed-point
-/// order, then a strictly convex program with a unique minimizer (§7.2).
-pub fn reconcile_target(
-    m: &impl Model, theta: Coord, yearnings: &[Yearning], attractors: &AttractorField,
-) -> Coord {
-    let (pi, mu_bar, theta_a) = reduce_canonical(theta, yearnings, attractors); // §7.2 fixed-point sums
-    soft_maxent_mean_space(m, theta, &pi, &mu_bar, &theta_a)                     // §7.2 unique μ⁺ → θ⁺
-}
+/// One unique target per bounded regime/Attractor mode; separated modes stay separate.
+pub fn reconcile_modes(m: &impl Model, request: ReconcileRequest)
+    -> Canonical<Vec<ModeTarget>>;
 
-/// One Egress commit: a gated metric-normalized step toward the target. β is a Traveler dial.
-pub fn egress_step(m: &impl Model, theta: Coord, target: Coord, resonance: f32, travel: f32) -> Coord {
-    let dir = unit_metric_step(m, theta, target);           // §8.1 metric-normalized toward θ⁺
-    let ds  = BETA * resonance * travel.max(0.0);            // §8.3  (Traveler layer, not Model identity)
-    m.project(step_along(theta, &dir, ds))
-}
+/// Commit only after mixture-path and Q24 enclosures select one portable cell.
+pub fn egress_commit(m: &impl Model, request: CommitRequest)
+    -> AtomicCanonical<Commit>;
 ```
 
 Suggested neutral crate split:
 
 ```text
-world-model-v3-core   fixed point, hashes, coordinates, free energy A and its derivatives, metvec
-world-model-v3-fields Matern GRFs, LGCP/point processes, canonical entities, prevalence integrals
-world-model-v3-nav    reconciliation, gated Egress, resonance, attractor pseudo-counts
-world-model-v3-flow   WFR/Bures transport-plan data (endpoints, maps, rates) — no morph state
+world-model-v3-core   fixed point, intervals, hashes, sphere addresses, A/grad/Hessian-metvec
+world-model-v3-fields spherical modes/residuals, bounded hash-thinned ecology, physical closures, entities
+world-model-v3-ledger equal-area census, applicability, moment closure, Canonical estimators
+world-model-v3-nav    regime candidates, convex reconciliation, mixture Egress, clusters, Resonance
+world-model-v3-flow   WFR/Bures endpoint/correspondence data — no morph state
 world-model-v3-api    capability and Realization contract types
 ```
 
-Jacobians and Hessians are algebraic (from the block $A$), not autodiff; the metric
-is applied matrix-free, never densely factored; all ordered maps and integer
-tie-breaks reproduce the prototype's count-budgeted, run-stable scheduling.
+The Hessian identity is algebraic, not autodiff. The normal path is matrix-free;
+the manifest may name a bounded dense cold fallback for certification. Platform
+adapters own executors, files, networking, storage, and rendering.
 
 ---
 
@@ -1089,20 +1726,20 @@ tie-breaks reproduce the prototype's count-budgeted, run-stable scheduling.
 
 | # | Invariant | How V3 satisfies it |
 |---|---|---|
-| 1 | One point in Possibility = one complete world | $\theta$ is one global world-law; $\mathcal W(\theta,\cdot)$ is the whole world (§2, §6). |
-| 2 | One canonical point; nearby content keeps history | canonical $\theta_\star$; history is the transient WFR morph state, never authoritative; capture reads the canonical realization (§10.3). |
-| 3 | Possibility and World Space independent metrics | information metric $g$ on $\theta$ (§5) vs. Euclidean/World-Space transport (§10, §11.3). |
+| 1 | One point in Possibility = one complete world | $\theta$ is one global world-law; $\mathcal W(M,\hat\theta,S_{R_P}^2,t)$ is one finite complete planet (§2, §6). |
+| 2 | One canonical point; nearby content keeps history | one committed $\hat\theta_\star$; common innovations couple nearby ground samples and bounded WFR history is transient Visualization state (§6.2, §10.3). |
+| 3 | Possibility and World Space independent metrics | Fisher geometry on $\theta$ (§5, §8) vs. spherical arclength and geodesic transport (§2.3, §10, §11.4). |
 | 4 | Egress = Possibility, Exploration = World Space | distinct flows $\theta_\star$, $x_\star$ (§1, §8). |
-| 5 | Egress coupled to Exploration but owned by neither | coupling is the **Traveler policy** $\Delta s=\beta\rho\lVert\Delta x_\star\rVert$; $\beta$ is a tunable dial, not Model identity (§8.3). |
+| 5 | Egress coupled to Exploration but owned by neither | a versioned Traveler policy converts accumulated fixed-point spherical path arclength to $\Delta s=\hat\beta\hat\rho\Delta\ell_W$ (§8.3). |
 | 6 | Realization carries stable meaning | integer $\hat\theta$ + versioned observable schema $T$/$\mathcal W$ (§4, §12). |
 | 7 | Simulation belongs to Visualization | $\mathcal W$ yields fields/laws only; the Model supplies transport *information*, the Visualization owns the morph (§10.3). |
-| 8 | Identical Model inputs reproduce Realization | decode of a fixed $\hat\theta$ is a pure function of $(\text{version},\hat\theta,x,\hat t)$ (§12 grade 1). |
-| 9 | Impression addresses meaningful across Visualizations | $(\hat\theta,\hat x,\text{version})$ + captured $\hat\mu$ decode identically; capture is canonical (§11.1, §10.3). |
-| 10 | Yearnings weighted, order-independent | unique minimiser of a strictly convex mean-space program over $\mathcal P$, on canonically reduced aggregates (§7.2). |
-| 11 | Scope = prevalence, not spatial falloff | prevalence *is* a mean parameter $\mu_a=\mathbb E_\theta[T_a]$; no falloff appears anywhere (§4, §6.3). |
-| 12 | Visualization does not change Reachable Possibility | reachability depends only on $A,g$ and the **portable core** of $\rho$ at fixed quadrature (§8.4, §9). |
-| 13 | Builds are optional Visualization content | Builds attach to Impressions and only strengthen Attractors; never enter $\theta$, $A$, or $\mathcal W$. |
-| 14 | Attractor evidence historical, abuse-resistant, removable | CRDT-merged pseudo-count clusters; removable weights $n_i$ (§11.2). |
+| 8 | Identical Model inputs reproduce Realization | Canonical $\mathcal W(M,\hat\theta,x,t)$, topology, ledger, and entities are pure portable results or explicit unresolved statuses (§12). |
+| 9 | Impression addresses meaningful across Visualizations | the generation/law identity, spherical address/time, common slot/entity, schema values, and bounds are Canonical (§11.1). |
+| 10 | Yearnings weighted, order-independent | one-sided request groups reduce canonically; every selected regime/Attractor mode has one strictly convex mean-space minimizer (§7). |
+| 11 | Scope = prevalence, not spatial falloff | prevalence is a mean under a declared whole-sphere applicable measure and is checked by the finite moment ledger (§4, §6.3). |
+| 12 | Visualization does not change Reachable Possibility | Reachability uses Canonical regime ranking, law geometry, support quadrature, and Traveler policy; morph readiness never enters (§7–10). |
+| 13 | Builds are optional Visualization content | a versioned semantic payload attaches in the canonical spherical frame but never enters $\theta$, $A$, $\mathcal W$, Scope, or Reachability (§11.3). |
+| 14 | Attractor evidence historical, abuse-resistant, removable | capped id-keyed records form normalized separate clusters; tombstones remove contributions and repeated evidence cannot overshoot (§11.2). |
 
 ---
 
@@ -1121,24 +1758,32 @@ tie-breaks reproduce the prototype's count-budgeted, run-stable scheduling.
 - **Yearning attributes and Scope across Models?** A versioned observable schema
   $T$ with scalar and prevalence kinds; Scope is a monotone map into interior
   prevalence targets $\mu_a$. (§4, §7)
-- **How strongly may Hold resist?** A stiff but finite precision in the convex
-  program; overridden only by greater aggregate precision or by feasibility. (§7)
+- **How strongly may Hold resist?** A stiff but finite penalty against the
+  activation-time snapshot; overridden only by greater aggregate intent or
+  feasibility, never retargeted to the moving current state. (§7.1)
 - **Is Resonance threshold / rate / precision?** All three, from
   $\rho=\rho_{\text{support}}\rho_{\text{align}}$: an ecological-support term
   (shared with Option 2) and a law-susceptibility/agreement term (new). (§9)
-- **Dual-space coordinated arrival?** A rate controller equalising normalised
-  progress in $d_g$ and Euclidean space (restated from the conceptual model, not
-  further resolved). (§11.3)
-- **When does an Attractor become exact?** When accumulated conjugate pseudo-counts
-  shrink the induced target law's metric radius below one Possibility quantum.
+- **Dual-space coordinated arrival?** A rate controller compares remaining
+  mixture-curve Fisher length with great-circle/altitude route length without
+  equating the spaces. (§11.4)
+- **When does an Attractor become exact?** When a normalized cluster center
+  encloses to one coordinate cell and dispersion plus numeric error fits inside
+  its Fisher radius; evidence increases precision without moving past the center.
   (§11.2)
-- **Continuity risk / chaotic divergence between nearby states?** The law/sample
-  split localises it: nearby laws are $\mathrm{KL}$-close, while one sample may
-  diverge sharply, and $g$ reports where. (§2.1, §5)
-
-Left untouched (and §16 claims no more): canonical-time membership and
-Build-reproduction fidelity. Attractor abuse-resistance is inherited from the
-prototype's mechanism, not re-derived.
+- **Continuity risk / chaotic divergence between nearby states?** The
+  law/coupled-representative split and common innovation localise it: nearby laws are $\mathrm{KL}$-close,
+  the same modes/slots provide correspondence, named topology thresholds may
+  still diverge sharply, and $g$ reports susceptibility. (§2.1, §5, §6.2)
+- **Which time belongs to the Model?** Integer epoch-relative orbital,
+  illumination, tide, seasonal envelope, and phenology forcing; weather,
+  behavior, growth history, and replay remain Visualization simulation. (§2.4)
+- **What must a Build reproduce?** Semantic graph, quantized placement/scale,
+  attachments, interactions/collision, and material roles; presentation styling
+  may vary and terrain edits remain overlays. (§11.3)
+- **How are distinct causal modes handled?** A bounded versioned regime atlas
+  returns separate convex candidates and an ambiguity result; it does not grow an
+  open-ended causal grammar. (§7.3)
 
 ---
 
@@ -1148,72 +1793,62 @@ V3 keeps the engineering mechanisms the prototype has proven — integer SplitMi
 hashing and versioned identities; lazy coordinate-derived content; declared
 dependencies and dependency-hash-gated integration; bucketed quantisation as the
 tile-invalidation event; bounded caches, pools, deterministic scheduling, and
-cancellation; the three grades of determinism; the CRDT/atlas sharing laws; and the
+cancellation; explicit determinism grades; the CRDT/atlas sharing laws; and the
 neutral/platform crate boundaries with native/wasm verification. It changes the
 *semantics*:
 
 | Concern | Current prototype | Proposed V3 |
 |---|---|---|
 | Point in Possibility | per-region 8-vector + authoritative current state | one global exponential-family world-law $\theta$ |
-| Validity | ordered `project_plausible` clamp cascade | intrinsic: every $\theta$ is a valid law; validity = the marginal polytope |
+| World Space | streamed planar regions | one finite twelve-patch equal-area spherical planet + altitude/time |
+| Validity | ordered `project_plausible` clamp cascade | intrinsic law validity in a safe convex moment set + certified physical/moment closures |
 | Distance | component differences of scalars | Fisher information metric $g=\nabla^2A$ (Chentsov-unique given $T$) |
-| Steering | Emphasize-first/Suppress-last blend + raw-bit sort | one convex mean-space maxent program; unique minimizer |
-| Scope | not represented as global prevalence | a mean parameter $\mu_a=\mathbb E_\theta[T_a]$ |
+| Steering | Emphasize-first/Suppress-last blend + raw-bit sort | one-sided intent; separate bounded modes; unique convex target per selected mode |
+| Scope | not represented as global prevalence | a mean parameter verified against a finite applicable whole-sphere census |
 | Resonance | near-organism density/diversity gate | ecological support × law-susceptibility/agreement |
 | Continuity | per-region current/target lerp history | unbalanced-OT transport of living/biome mass; Bures spectral reshaping for abiotic |
-| Ecology | habitat-signature roster, ≤12 species | log-Gaussian Cox intensity + marked point process; prevalence = calibrated intensity marginal |
-| Attractors | route/anchor weak steering | conjugate pseudo-counts in natural-parameter space, folded into reconciliation |
+| Ecology | habitat-signature roster, ≤12 species | bounded logistic-normal activation over finite candidate/lineage slots + quota-checked marks |
+| Attractors | route/anchor weak steering | normalized separate clusters; evidence raises precision without overshooting centers |
+| Time / Builds | mostly presentation/runtime concerns | integer canonical forcing; versioned semantic Build attachment remains Visualization overlay |
 
-**Honest distinctness from the siblings.** V3 shares its overall skeleton with the
-others, and the probabilistic structure is genuinely load-bearing in **five**
-subsystems while **five** are the same mechanism as Option 2 with a probabilistic
-reading:
+**Why the sphere does not turn V3 into Option 1.** A finite planet, water
+inventory, time forcing, and drainage are baseline Realization obligations, not a
+Possibility ontology. Option 1 still addresses a latent cube, decodes it through a
+procedural-planet map, and measures a pullback metric at realized probes. V3's
+address is a natural parameter, its metric is the Hessian identity
+$g=\nabla^2A=\operatorname{Cov}[T]$, its whole-sphere census consumes one bounded
+canonical quantization of that law's archetype responsibilities, and its twelve-patch equal-area hierarchy
+is neither Option 1's cube map nor its latent decoder. Option 2 remains distinct in
+its direct attribute chart and path-dependent spatial wake.
 
-- *Genuinely V3* — the **metric** is the exact Hessian identity $g=\nabla^2A=
-  \operatorname{Cov}[T]$ with no weight matrix and no rank-floor (contrast: Option 1
-  differentiates a 256-probe *realized moment summary*; Option 2 differentiates an
-  *analytic attribute chart* exactly with dual numbers, with a fixed design
-  weight $S$ and an $\varepsilon$-floor — V3 has neither the probe nor the weight
-  nor the floor); **Scope** is literally a mean parameter; **ecology** is an LGCP whose
-  intensity marginal is (calibrated to be) the mean map; **Attractors** are
-  conjugate pseudo-counts; and **continuity transports living/biome mass** across
-  World Space under unbalanced OT.
-- *Shared in mechanism with Option 2, stated as such* — the per-attribute request
-  fusion (§7.1); the Euclidean-in-mean compromise term inside the otherwise-convex
-  reconciliation (§7.2); the ecological-support half of Resonance (§9); the
-  one-point Impression record (§11.1); and the travel×resonance natural-gradient
-  Egress *step* (§8.3), whose distinctness is inherited entirely from the metric it
-  rides on.
-
-Both siblings also achieve validity-by-construction and prevalence-as-global-scalar
-by their own means (Option 2's triangular parent-gated chart; Option 1's total
-smooth decoder); V3's marginal-polytope-from-an-archetype-bank is a different route
-to the same properties, not a correction of a deficiency they lack.
+The load-bearing V3 combination is therefore: a coupled exponential family,
+natural/mean duality, Fisher/KL navigation, finite moment closure against the same
+law means, common-random-number spherical fields, bounded hash-thinned ecology,
+and WFR/Bures only for presentation continuity. Spherical geography strengthens
+the sampling measure; it does not replace those commitments.
 
 **Contrast with the World Loom.** The World Loom
 ([`new-world-model-option-4.md`](new-world-model-option-4.md)) is the proposal V3
-is most easily confused with — both discard the latent vector, both invoke
+is most easily confused with — both abandon a generic latent decoder, both invoke
 optimal transport, both are honest research architectures — so the difference is
 worth stating exactly.
 
 | Concern | World Loom | V3 |
 |---|---|---|
 | Coordinate | a typed causal-constitution *program packet* (variable size, Merkle-rooted, extensible) | a compact fixed-point *vector* $\hat\theta$ (~40 dims, one global address) |
-| Validity | by typed *compilation* + numeric feasibility certificates | membership in the marginal polytope of one convex free energy $A$ |
-| Navigation metric | multiscale optimal transport (W₂/WFR summed over scales) + a directed Finsler control length | the closed-form Fisher identity $g=\nabla^2A=\operatorname{Cov}[T]$; no transport solve |
-| Egress | a JKO-*inspired* constrained minimizing-movement problem with bounded route search | one strictly convex maxent program + a closed-form natural-gradient step |
+| Validity | by typed *compilation* + numeric feasibility certificates | membership in the safe convex support of one free energy $A$ |
+| Navigation metric | multiscale balanced/unbalanced transport + rewrite lengths + directed Finsler/control length | algebraic Fisher identity $g=\nabla^2A=\operatorname{Cov}[T]$; no transport navigation solve |
+| Egress | JKO-inspired proximal probes, bounded active-set/mode and rewrite path search | bounded fixed regime candidates; one convex target and numerically certified mixture geodesic per selected mode |
 | Role of optimal transport | **the navigation mechanism** (decides which world is reached) | **continuity presentation only** (transient, discarded, never authoritative) |
-| What it optimizes for | open-ended expressivity and extensibility of *what a world can be* | closed-form, identity-checkable, cheap navigation of a *fixed* observable schema |
+| What it optimizes for | extensible typed causal/relational structure with explicit structural paths | compact, identity-checkable navigation of a *fixed* statistical vocabulary |
 
-Neither dominates. The World Loom can grow new physics without re-versioning a
-fixed axis set; V3 cannot — its expressivity is bounded by the observable schema
-$T$ and the archetype bank (§3.4). In exchange V3 gets a navigation subsystem that
-is small, allocation-free, and machine-checkable against identities rather than
-against a transport solver's convergence, and a per-tick cost measured in tens to
-hundreds of microseconds (§13) rather than in bounded-but-heavier transport
-solves. V3 is the right pick when *cheap, provable, portable navigation of a
-well-understood world family* matters more than open-ended authoring; the World
-Loom is the right pick when the reverse holds.
+Neither dominates. V3 cannot add a sufficient statistic or independent physics
+without a new law identity and refit. The Loom can add some optional structures
+with existing opcodes, but new canonical operations require kernel/application
+versioning and some phenomena require a new stratum or major package. In exchange
+for its lower ceiling, V3's navigation surface is a fixed bank plus small convex
+and linear-algebra kernels rather than transport/rewrite route search. The actual
+latency advantage remains a §13 measurement gate, not a conclusion.
 
 Compatibility is neither required nor implied. Current anchors, preserves, routes,
 eight-component signatures, and generated regions cannot be reinterpreted as V3
@@ -1229,141 +1864,184 @@ The honesty is distributed through the document; consolidated here so a
 decision-maker sees the whole liability in one place. Ordered roughly by how much
 of the design each threatens.
 
-1. **The archetype bank is fitted, and everything geometric flows from it.** $A$,
-   the mean map, the metric, the feasible polytope, and the realized prevalences
-   are all determined by $\{c_r,\pi_r\}$, $(Q_0,q)$, and $T$ (§3.4). Those are a
-   *fitted* fixture validated by held-out world-quality tests, **not** by an
-   identity. A mis-fitted bank yields worlds that are bit-exactly reproducible and
-   still wrong. This is the explicit boundary of goal 4 and V3's single largest
-   risk; it is stated plainly rather than hidden behind "the metric is handed to
-   us."
-2. **Expressivity is capped by the fixed observable schema $T$.** A world property
-   nobody chose as a sufficient statistic cannot be a Yearning target, and changing
-   a statistic's meaning bumps the Model major version (§4, §12). Adding statistics
-   is backward-compatible, but V3 has nothing like the World Loom's open-ended,
-   re-versionable causal program — its ceiling on "what a world can be" is set once,
-   at fit time.
-3. **The prevalence tie is calibrated, not automatic.** "A trait's Scope target
-   equals the fraction of organisms expressing it" holds only in the large-domain,
-   large-$N$ limit and only within a tolerance covering finite-$N$ sampling, the
-   fBm-vs-Matérn variance bias, and the ergodic gap (§6.3, acc. 3). If calibration
-   drifts, what a Yearning asks for and what the Traveler counts on the ground pull
-   apart — the tightest tie of the three proposals, but still a harness-policed
-   equality, not an equation.
-4. **The lazy field path is (locally) stationary and isotropic.** The
-   fBm↔Matérn correspondence is asymptotic in the high-frequency slope and has no
-   $O(1)$-per-sample certificate for a fully nonstationary covariance (§6.2). Sharp
-   tectonic or biome boundaries with strong spatial nonstationarity fall outside
-   the fast path and rely on slow domain-warp modulation.
-5. **Live cross-platform navigation is only conditionally reproducible.** The
-   reconciliation solve, the $\nabla A^*$ inversion, the Bures square root, and
-   Sinkhorn are float pipelines — exact on one target, portable across targets only
-   in canonical mode (fixed iterations, portable transcendentals, specified
-   rounding; §12 grade 2). Cross-platform play leans on sharing the *committed*
-   $\hat\theta$, exactly as the prototype's anchor-reduction contract already does.
-6. **Abiotic continuity reshapes in place; it does not slide features.** Terrain and
-   climate morph by Bures spectral interpolation with the sample's phase fixed by
-   its hash (§10.2), so a specific ridge re-textures rather than migrating
-   horizontally. The "large changes resolve on approach" experience for abiotic
-   layers comes from the streaming annulus (§10.3), not from transport, and the
-   document does not claim otherwise.
-7. **The dual route buys feasibility, not speed.** Forming $\theta^{+}=\nabla A^*$
-   and taking the metric step each cost *several* matrix-free solves (§8.2); a naïve
-   dense reconcile is hundreds of µs, not tens (§13). It is comfortably real-time,
-   but "closed-form metric" does not mean "free."
-8. **The implementation surface is the largest of Options 1–3.** Information
-   geometry, unbalanced optimal transport, LGCP point processes, Matérn/SPDE
-   fields, Bures interpolation, and unbalanced Sinkhorn each carry their own
-   determinism discipline, all of it behind the neutral-core boundary. More
-   machinery is more that can break; the payoff is that the *navigation* core (§14's
-   `world-model-v3-core`/`-nav`) stays small and identity-checkable even as the
-   field and flow crates grow.
-9. **Time and Builds are inherited, not solved.** Canonical-time membership and
-   Build-reproduction fidelity are left open (§16); the temporal cycles the project
-   overview envisions have only a placeholder $\hat t$ in the Impression record.
+1. **The joint archetype bank remains the systemic quality dependency.** $A$, the
+   means, Fisher geometry, reachable combinations, regime atlas, and much of the
+   moment closure flow from $\{d_r,c_r,\pi_r\}$, $(Q_0,q)$, and $T$. Rank, corpus,
+   calibration, and held-out gates can reject a bad bank; no identity proves that
+   an accepted bank is plausible, diverse, or fun. Bit-exactly wrong worlds remain
+   possible.
+2. **The fixed vocabulary is a deliberate ceiling.** A property outside $T$ may be
+   derived but cannot become an independent steering direction. Adding a
+   sufficient statistic, physical degree of freedom, or regime outside the frozen
+   atlas changes the coordinate, free energy, metric, bank, and moment closure. It
+   requires a new major law family rather than a compatible append.
+3. **Finite moment closure is stronger than asymptotic calibration, not a continuum
+   identity.** The law is over idealized archetypal summary atoms; the one planet
+   is a coupled mean-matched representative, not a sample with the law's full
+   higher-order distribution. Linear census quotas are exact at their declared
+   fixed-point target and bounded against the law mean, but nonlinear physical corrections and their bounds
+   are fitted/certified machinery. A coarse census can miss rare or localized
+   visible structure; aggressive recentering can sterilize terrain or introduce a
+   recognizable house style, and an incorrectly certified coupled correction can
+   cycle or repair one moment by breaking conservation elsewhere. The final
+   simultaneous/idempotence gate must demote a statistic that cannot keep its
+   promised bound.
+4. **Coupled fields are still synthetic physics.** Cross-covariance,
+   nonstationary stress deformation, water conservation, and a dependency graph
+   improve causal connection, but they do not prove geophysical fidelity. Shared
+   low modes and plate seeds may become recognizable across worlds; topology
+   thresholds can still change coasts, rivers, and ranges abruptly.
+5. **The bounded regime atlas can miss or misclassify causal alternatives.** It
+   prevents known separated modes from being averaged, but it cannot express an
+   unforeseen regime. Frequent `AmbiguousModes`, unstable mode hysteresis, or
+   semantically bland within-mode compromises would fail the steering gate.
+6. **Portable commits require a substantial numeric kernel.** Softmax/dual
+   inversion, CG, arclength quadrature, interval rounding, spherical tables,
+   moment closure, and adversarial Q24 boundaries all need native/wasm parity.
+   Fail-closed `Pending`/`Unresolved` protects identity but can still make travel
+   unplayable; same-cell credit retention fixes ordinary subquantum progress but
+   does not prove enclosure liveness under every adversarial input. The completion
+   rate and latency must be judged together.
+7. **The finite planet introduces cold global work and broad invalidation.** A new
+   coordinate may require census totals, sea level, drainage, cycle climate, and
+   moment closure before local Canonical queries settle. Cache keys include the
+   whole coordinate, so continuous Egress may regenerate many visible cells even
+   though common innovation preserves correspondence.
+8. **Continuity remains presentation, not physical history.** WFR genuinely moves
+   living measure in the resident annulus, but commuting/matrix Bures blocks
+   and heuristic abiotic spectral blends reshape rather
+   than horizontally transports a ridge. Rapid rebasing, cache eviction, and
+   topology birth/death can still produce artifacts. The fixed two-endpoint cap
+   contains memory; it does not prove visual quality.
+9. **The spherical basis and chart are new trusted surfaces.** Equal-area cell
+   claims, seam transforms, pole/antipode rules, spherical derivatives, drainage
+   adjacency, and canonical area/time measures require independent fixtures.
+   A seam bug can corrupt both the visible planet and the statistics used to
+   steer it.
+10. **The implementation remains research-heavy.** Information geometry,
+    interval Canonical math, spherical random fields, global physical closures,
+    a moment ledger, bounded finite candidate populations, WFR/Bures, clustering, and Build
+    compatibility are more machinery than the current runtime. The small fixed
+    navigation ontology is the payoff, not evidence that the whole system is
+    simple or fast.
 
 ## 19. Acceptance criteria for an implementation
 
 V3 is implementable when a prototype demonstrates, without special cases:
 
-1. any coordinate $\hat\theta$ opens a valid deterministic world-law and world;
-2. a canonical address reproduces selected fields, prevalences, and entities on
-   native and wasm to the specified rounding;
-3. the calibrated prevalence tie holds: the realized fraction of organisms with a
-   trait equals $\mu_a=\nabla A(\theta)_a$ within a stated tolerance covering
-   finite-$N$ sampling, the fBm-vs-Matérn variance bias, and the ergodic gap (§6.3);
-4. the metric equals $\nabla^2A$ (block $Q_0\oplus\operatorname{Cov}_s[c]$) to
-   finite-difference tolerance and is SPD in the interior of $\Theta$;
-5. after canonical fixed-point reduction of the aggregates, arbitrary Yearning
-   permutations produce bit-identical quantised Egress steps and Resonance (§7.2);
-6. singular/common/pervasive requests move planetary prevalence monotonically,
-   saturating (not clamping) as the prevalence hull is approached;
-7. conflicting Accentuate/Repress/Hold terms yield a unique, bounded compromise (the
-   convex program has one minimizer);
-8. a local Realization query has cost independent of travel history and world size;
-9. a long high-speed traversal stays within fixed memory ceilings, and per-frame
-   transport stays $O(\text{band})$;
-10. Resonance falls to zero as a request approaches a degenerate prevalence, and
-    Egress stalls rather than clamps;
-11. the living-layer transport reaches both endpoints, travels at bounded metric
-    speed, and never alters $\theta_\star$;
-12. schedules, cancellation, worker count, and cache capacity do not change settled
-    results; and
-13. measured navigation stays inside a 60 Hz host's background budget on the
-    supported native and browser reference machines.
+1. every certified safe parameter cell has analytic/interval closure coverage,
+   and at least 99% of the frozen ordinary corpus opens a complete finite
+   spherical law/planet whose water, drainage flux, entity, conservation, and
+   simultaneous moment checks pass; bounded unresolved statuses are reserved for
+   the predeclared adversarial corpus rather than counted as success;
+2. twelve-patch addresses are unique and neighbor/field/topology results agree at
+   every seam, pole, and antipode under adversarial fixed-point tests;
+3. Canonical addresses, Egress commits, time forcing, fields, sea/coast and river
+   topology, canonical candidates/entities, applicability, and ledger statistics
+   are bit-identical on native and wasm;
+4. $g=\nabla^2A=\operatorname{diag}(Q_0,0)+\operatorname{Cov}_s[(d,c)]$ matches
+   independent derivative fixtures, is positive definite on the safe interior,
+   and meets named sign/range gates for both fitted cross-block covariance and
+   corresponding realized-planet correlations;
+5. $\Pi_\mu$ is typed, unique, and idempotent; every admitted mean has a finite
+   enclosed dual; no closed-hull target or natural coordinate is passed to it;
+6. for **every** steerable abiotic and biotic statistic,
+   $|R_a(\hat\theta)-\nabla A(\theta)_a|\le\varepsilon_a$ on training-independent
+   interval-certified parameter cells and training-independent coordinates,
+   including rare traits, time-conditioned measures, positive-applicability
+   margins, and the declared discrete quota error;
+7. common innovation ids and lineage slots remain stable across nearby coordinates,
+   while discrete gain/mark/topology events obey named rate and correspondence
+   margins rather than an impossible blanket smoothness claim;
+8. arbitrary input permutations yield bit-identical mode candidates, targets,
+   Resonance, and commits; Accentuate and complement Repress obey their exact
+   one-sided thresholds, Hold stays at its activation snapshot, and Disable has no
+   effect;
+9. each selected regime/Attractor mode has one bounded convex minimizer and a
+   corridor containing the current state; separated modes remain separate or
+   report `AmbiguousModes`, and repeated evidence raises
+   cluster precision without moving its center toward an extreme;
+10. adversarial rounding cases either enclose one Q24 commit or fail closed with the
+    same continuation/status on native and wasm; exact half ties terminate,
+    same-cell attempts retain credit, and no partial result changes state;
+11. integer Model time reproduces forcing and time-conditioned Impressions, while
+    different Visualization simulation histories leave Canonical results unchanged;
+12. compatible Visualizations reproduce Build graph, attachments, interaction,
+    and material semantics within visual tolerance, while credited-path collision
+    geometry/placement is exact in the shared Traveler controller, and loading or
+    removal changes no Model/Scope/Reachability result;
+13. WFR living transport, commuting/matrix Bures blocks, and explicitly heuristic
+    noncommuting spectral blends hit both presentation endpoints,
+    rapid interrupted commits rebase with two bounded buffers, fading-slot capture
+    is refused correctly, and transport never alters $\hat\theta_\star$;
+14. long, fast, turning, and revisiting travel with multiple Yearnings reaches
+    fixed memory ceilings through cache eviction and rapid commits;
+15. scheduler, worker count, budget, cancellation, cache capacity, resource tier,
+    and frame subdivision do not change settled results or fixed-cadence travel
+    accounting;
+16. the single §13 cold/warm ledger meets the predeclared native/wasm latency,
+    completion-rate, allocation, and memory gates without hiding work in
+    `Pending`/`Unresolved`; and
+17. held-out quality tests and blinded playtests meet the thresholds frozen before
+    labels/results were opened for diversity,
+    repeated motifs, physical/ecological failures, nearby-world correspondence,
+    visible coast/river/species transitions, and recognition of requested intent.
 
 ---
 
-## Appendix A: decoded parameter blocks
+## Appendix A: frozen manifest and decoded parameter blocks
 
-The frozen decoder produces the coefficients of $A$ and the field hyperparameters.
-These are derived data, not additional Model State.
+$A$, $T$, the joint bank, sphere profile, and canonical operation rules are
+immutable fixtures; the coordinate does **not** decode new coefficients for $A$.
+The Realization decoder derives physical/field parameters from the law means and
+responsibilities. None of the following is additional Model State.
 
 | Block | Contents | Construction constraint |
 |---|---|---|
-| Free energy — scalar | $Q_0\succ0$ (metric floor on scalar block); linear $q$ | $Q_0$ PD; smooth in the scalar coordinates |
-| Free energy — prevalence | archetype bank $\{c_r\}$; priors $\{\pi_r\}$ | $\pi_r>0$, $\sum\pi_r=1$; archetypes span feasible worlds; physical inequalities baked in as correlations; prevalence hull matches $[\tau_{\min},\tau_{\max}]$ |
-| Observable schema | sufficient statistics $T$ (with $\dim T=\dim\theta=k$); per-attribute kind | prevalence statistics bounded in $[0,1]$; $T$ affinely independent (minimal family) |
-| Terrain/geology spectra | Matérn $(\sigma^2,\ell,\nu)$ + slow anisotropy per abiotic layer, as functions of $\theta$ | $\sigma^2,\ell,\nu>0$; (locally) stationary for the lazy path; smooth in $\theta$ |
-| Hydrology/soils | drainage, retention, nutrient response coefficients | bounded positive rates; stable integer flow topology |
-| Ecology/organisms | LGCP mean/covariance fields; trait-mark laws; connectivity field $\kappa_{\!e}$; **LGCP↔$\nabla A$ prevalence calibration** | log-intensity fields; prevalence integrals equal $\nabla A$ to tolerance (§6.3) |
-| Transport | WFR length-scale $\delta_W$; near/far radii $r_n,r_f$; grow/fade rate | $\delta_W>0$; $0<r_n<r_f$ |
-| Navigation | metric scale; Hold stiffness $\eta_{\text{hold}}$; resonance constants $\varepsilon_\rho,\sigma_0,\rho_{\min}$; Scope band $[\tau_{\min},\tau_{\max}]$ | positive; $\eta_{\text{hold}}>1$; $0<\tau_{\min}<\tau_{\max}<1$ (interior) |
+| Law family | $Q_0\succ0$, $q$, joint bank $\{d_r,c_r,\pi_r\}$, safe polytope, regime atlas | minimal/rank and condition gates; $\pi_r>0$ and $\sum_r\pi_r=1$; cross-block constraints; every regime convex and bounded |
+| Observable schema | $T$, units/ranges, affine normalizers, membership, applicability, population/time measure, estimator and $\varepsilon_a$ | $\dim T=\dim\theta=k$; prevalence in $[0,1]$; adjacent Scope bands wider than admitted error |
+| Sphere/time | radius, twelve-patch chart/ties, neighbor tables, census level/weights, epoch, rotation/orbit/forcing tables | equal-area/seam fixtures; integer time; portable direction and transcendental tables |
+| Common innovation | spherical low modes, needlet bands, archetype residuals $G_r$, amplitudes $\gamma_r$, responsibility denominator $Q_R$, plate/regime seeds, slot/candidate hash domains | hashes exclude $\hat\theta$; KL matrix scaling preserves integer $\hat s_r$ quotas within the declared $s_r$ error; bounded covariance deformation and positive local responsibilities |
+| Planet closures | gravity/atmosphere/water ranges, sea-level bracket, integer drainage, climate/hydrology/soil coefficients | inventory/flux conservation, dependency closure, residual and work caps |
+| Moment ledger | centered scalar controls, monotone brackets, rank apportionment, coupled I-projection, error budgets | every steerable final statistic meets $|R_a-\mu_a|\le\varepsilon_a$ or is unresolved/demoted |
+| Ecology/entities | bounded logistic-normal activation, $L_e$, $\lambda_{\mathrm{cap}}$, candidate/lineage caps, prefix quotas, trophic rules, inhibition, connectivity $\kappa_e$ | finite candidate population; common slot identity; canonical tier-independent population |
+| Transport | $\delta_W$, $r_n,r_f$, $B_{\max}$, endpoint-buffer and iteration caps, fallback | $0<r_n<r_f<\pi R_P$; at most two endpoint buffers; presentation only |
+| Navigation/numerics | Hold stiffness; Scope table; resonance constants; $K_m$, $K_A$, $K_{\mathrm{nav}}$; operation/reduction/interval manifest | safe interior targets; finite caps; adversarial quantization fixtures; fail closed |
 
-The step rate $\beta$ is **not** in this manifest: it is a Traveler/gameplay dial
-(§8.3, invariant 5). The archetype bank and observable schema are *fitted* offline
-from a corpus of accepted worlds and validated by held-out world-quality tests, not
-by an identity (§3.4). An implementation is not conforming until a **parameter
-manifest** supplies every archetype, matrix entry, statistic definition, range
-endpoint, solver iteration count, transcendental approximation, and rounding rule
-named here; the manifest is hashed into the Model major identity and becomes an
-immutable test fixture.
+The rate $\hat\beta$ belongs to a separately versioned Traveler policy and replay,
+not the Model generation identity. The bank, regime atlas, physical decoder, and
+schema are fitted offline and held-out-tested, not proven by the Fisher identities.
+An implementation is not conforming until the manifest supplies every value,
+ordering, cap, approximation, and rounding rule named here and hashes the consumed
+fixtures into the appropriate identity.
 
 ---
 
 ## Appendix B: one navigation tick
 
-Given current canonical state $\theta_\star$, active Yearnings $Y$, Attractor field,
-and Traveler travel $\Delta x$:
+Given committed $\hat\theta_\star$, active Yearnings with Hold snapshots,
+normalized Attractor clusters, selected/automatic mode policy, canonical Model
+time, and accumulated fixed-point spherical arclength:
 
-1. reduce $Y$ and the Attractors to canonical fixed-point aggregates
-   $(\pi_a,\bar\mu_a,\theta_{\!A})$ (§7.2);
-2. solve the strictly convex mean-space maxent program for the unique target
-   $\mu^{+}$; set $\theta^{+}=\nabla A^*(\mu^{+})$ (fixed-iteration Newton, §8.2);
-3. evaluate $g(\theta_\star)$ matrix-free; form the metric-normalized unit direction
-   $\hat d$ toward $\theta^{+}$ (§8.1);
-4. compute Resonance $\rho$ = portable ecological support × law susceptibility/agreement
-   (§9);
-5. set $\Delta s=\beta\rho\max(\lVert\Delta x\rVert,0)$ (Traveler policy); integrate
-   one step, error-feedback-round to $\hat\theta$, apply $\Pi$ (§8.3);
-6. open the new immutable snapshot; hand the old/new coordinate pair to the
-   Visualization as a transport plan for the streaming annulus (§10.3);
-7. the Visualization drives the transient morph and decides where to refine.
+1. group one-sided thresholds and weights with checked canonical reductions;
+2. rank no more than $K_{\mathrm{nav}}$ combined regime/Attractor candidates;
+   return `AmbiguousModes` if the
+   policy cannot select separated near-equal candidates;
+3. for each candidate solve the strictly convex safe mean-space program and
+   enclose its dual target;
+4. compute Canonical spherical-cap support, susceptibility, and request-force
+   disagreement; unresolved Resonance prevents a commit;
+5. set $\Delta s=\hat\beta\hat\rho\Delta\ell_W$ and bracket the mixture-curve
+   fraction whose Fisher arclength fits that allowance;
+6. run the Canonical dual/enclosure path; commit only if every component selects
+   one Q24 cell and the objective monotonicity bound passes, otherwise return a
+   deterministic continuation/status without consuming state or travel credit;
+7. open the new immutable spherical snapshot and emit continuity endpoint data;
+8. Visualization rebases its at-most-two-buffer transient at the next fixed
+   presentation tick and chooses refinement/fallback independently.
 
-The tick is a pure function of its explicit inputs. The gameplay layer may scale
-$\Delta s$ by physical distance, coordinate dual-space arrival, or refuse Egress
-while stationary; none of those policies changes the Model's definition of
-Possibility or Reachability.
+The commit is a pure function of these explicit inputs. Presentation readiness,
+frame cadence, and resource tier cannot change it.
 
 ---
 
@@ -1374,32 +2052,37 @@ properties — the concrete hooks an AI maintainer or CI gate can assert:
 
 | Property | Assertion | Maps to |
 |---|---|---|
-| Metric identity | $g(\theta)=\nabla^2A(\theta)$ to finite-difference tolerance; block $Q_0\oplus\operatorname{Cov}_s[c]$ | acc. 4 |
-| Metric PD | $g\succ0$ on interior samples; $\lambda_{\min}(g)\to0$ only at the prevalence hull | acc. 4, 10 |
+| Metric identity | $g=\nabla^2A=\operatorname{diag}(Q_0,0)+\operatorname{Cov}_s[(d,c)]$, including cross blocks | acc. 4 |
+| Metric PD | $g\succ0$ throughout the safe set; prevalence susceptibility falls toward an eroded hull facet | acc. 4 |
 | KL = Bregman | $\mathrm{KL}(p_{\theta_1}\Vert p_{\theta_2})=B_A(\theta_2,\theta_1)=B_{A^*}(\mu_1,\mu_2)$ (both forms) | §5 |
-| Projection idempotent | $\Pi(\Pi(\mu))=\Pi(\mu)$; feasible set is $\overline{\mathcal P}$ | §3.3 |
-| Order-independence | permute $Y$, re-reduce canonically, re-solve, assert bit-equal $\hat\theta^{+}$ | acc. 5 |
-| Reconciliation uniqueness | one minimizer of the strictly convex mean-space program | acc. 7 |
-| Scope monotonicity/saturation | prevalence moves monotonically toward the Scope target and saturates | acc. 6 |
-| Egress monotone | pre-quantization step non-decreasing in the §7 objective; committed step within one quantum | §8.4 |
-| Transport fidelity | living-layer morph hits both endpoints; $\theta_\star$ unchanged during transition | acc. 11 |
-| Portable decode | fixed $\hat\theta$ decodes bit-identically native/wasm | acc. 2, §12 |
+| Projection typing/idempotence | $\Pi_\mu(\Pi_\mu(\mu))=\Pi_\mu(\mu)$ in $\mathcal P_{\rm safe}$; natural/mean types cannot mix | acc. 5 |
+| Order-independence | permute requests/evidence, re-reduce, assert bit-equal modes, target enclosures, Resonance, and commit | acc. 8 |
+| Influence semantics | one-sided Accentuate/Repress thresholds and immutable Hold activation snapshot | acc. 8 |
+| Reconciliation uniqueness/modes | one minimizer per selected convex mode; separated modes remain separate or ambiguous | acc. 9 |
+| Moment closure | every $R_a$ encloses $\nabla A_a$ within $\varepsilon_a$ on the finite applicable census | acc. 6 |
+| Common innovation | phase/candidate/slot ids ignore $\hat\theta$ while manifestation/dependency ids consume it | acc. 7 |
+| Egress monotone/enclosed | mixture-segment objective is non-increasing; commit enclosure selects one Q24 cell | acc. 10 |
+| Spherical closure | chart seams, area totals, water and drainage flux agree exactly/certifiably | acc. 1, 2 |
+| Transition rebase | endpoints and repeated rebases converge with two buffers; $\hat\theta_\star$ unchanged | acc. 13 |
+| Portable Canonical result | fields, topology, entities, ledger, Resonance, and commits match native/wasm | acc. 3 |
 
-What is *not* on this list, and is validated by world-quality tests instead: the
-fitted archetype bank, the observable schema, and the LGCP prevalence calibration
-(§3.4, §6.3). Naming this boundary honestly is part of the design.
+What is *not* proved by these identities: that the fitted bank, regime atlas,
+synthetic physics, visible worlds, and Build/player experience are diverse,
+plausible, or fun. Held-out quality and blind playtests own that boundary.
 
 ---
 
 ## Appendix D: imported mathematics and references
 
 - **Information geometry / exponential families.** Fisher metric $=\nabla^2A=
-  \operatorname{Cov}[T]$; mean map $\mu=\nabla A$; Legendre dual $A^*=$ negative
-  entropy; KL $=$ Bregman divergence of $A$; dually flat structure — Amari &
+  \operatorname{Cov}[T]$; mean map $\mu=\nabla A$;
+  $A^*(\mu(\theta))=\mathrm{KL}(p_\theta\Vert h)$ relative to the normalized base
+  measure; KL $=$ Bregman divergence of $A$; dually flat structure — Amari &
   Nagaoka, *Methods of Information Geometry*; Amari 1998 (natural gradient).
   Uniqueness of the Fisher metric — Chentsov (Čencov); continuous case —
-  Ay–Jost–Lê–Schwachhöfer. Marginal polytope and $\nabla A$ bijection onto its
-  interior — Wainwright & Jordan. Mirror descent $\equiv$ natural gradient —
+  Ay–Jost–Lê–Schwachhöfer. Marginal convex support (a polytope for finite
+  categorical support) and the $\nabla A$ interior bijection — Wainwright &
+  Jordan. Mirror descent $\equiv$ natural gradient —
   Raskutti & Mukherjee 2015.
 - **Maximum entropy / I-projection.** Jaynes; Csiszár (I-projection, uniqueness,
   Pythagorean). Regularised/soft maxent — Dudík, Phillips & Schapire. Ecological
@@ -1409,18 +2092,24 @@ fitted archetype bank, the observable schema, and the LGCP prevalence calibratio
   Benamou–Brenier; McCann displacement interpolation; Agueh–Carlier and
   Álvarez-Esteban et al. 2016 (Gaussian/Bures barycenter fixed point); Cuturi 2013
   (Sinkhorn); Feydy et al. 2019 (Sinkhorn divergence); Jordan–Kinderlehrer–Otto
-  1998 and Otto 2001 (Wasserstein gradient flow). Bures–Wasserstein Gaussian closed
-  forms as in §10.
+  1998 and Otto 2001 (Wasserstein gradient flow). Bures–Wasserstein Gaussian
+  closed forms are used only under the commuting/finite-matrix conditions in §10.
 - **Unbalanced optimal transport (WFR / Hellinger–Kantorovich).**
   Chizat–Peyré–Schmitzer–Vialard (arXiv:1506.06430, 1607.05816);
   Liero–Mielke–Savaré; Kondratyev–Monsaingeon–Vorotnikov. Dynamic
   continuity-with-source form and the length-scale $\delta_W$ as in §10.
-- **Random fields and point processes.** Matérn covariance/spectral density;
-  Whittle–Matérn SPDE — Lindgren, Rue & Lindström 2011. Log-Gaussian Cox process —
-  Møller, Syversveen & Waagepetersen. Determinantal point processes — Macchi;
-  Hough et al.
+- **Spherical address, random fields, and finite populations.** HEALPix NESTED
+  twelve-pixel equal-area addressing — Górski et al. Spherical Matérn covariance/spectral
+  density; Whittle--Matérn SPDE and its Laplace--Beltrami spectral reading —
+  Lindgren, Rue & Lindström 2011. Spherical harmonics and needlet/localized-frame
+  constructions — including Narcowich, Petrushev & Ward — provide the global/local
+  basis. V3's ecology uses a finite logistic-normal Bernoulli candidate population,
+  not an unbounded Poisson/Cox count law.
+  Determinantal/inhibited-process precedent — Macchi; Hough et al.
 
-Determinism caveat (repeated from §12): these results are used at the *law and
-navigation* level, where their float outputs are presentation-grade; only a
-committed $\hat\theta$ and integer-hashed identities cross the sharing boundary,
-and cross-platform live reproducibility requires canonical mode.
+Determinism caveat (repeated from §12): imported mathematics does not specify a
+portable numeric program. Every operation that influences a Canonical field,
+topology, statistic, entity, Resonance value, or committed $\hat\theta$ follows
+the frozen native/wasm operation-and-enclosure manifest. WFR/Bures/Sinkhorn
+presentation may remain platform-approximate because it cannot affect those
+outputs.
